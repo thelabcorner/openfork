@@ -1,5 +1,9 @@
 import type { Session, SessionGroupMember } from "@opencode-ai/sdk/v2/client"
-import { sessionGroupMemberSession, type SessionGroupEntry } from "@/context/session-groups"
+import type { SessionGroupEntry } from "@/context/session-groups"
+import { sessionGroupMemberSession } from "@/context/session-group-member-projection"
+import { buildSessionPreviewIndex, type SessionPreviewIndex } from "@/context/session-group-preview-index"
+export { buildSessionPreviewIndex }
+export type { SessionPreviewIndex }
 
 /** Known producer-owned special-agent kinds, per `SpecialAgentSession.Kind` in
  * core. Unknown future strings still classify as a special agent (generic
@@ -59,34 +63,6 @@ export interface SessionPreviewRelationships {
   specialAgents: SessionPreviewSpecialAgentRow[]
 }
 
-export interface SessionPreviewIndex {
-  /** sessionID -> every group it is a direct member of. */
-  membership: ReadonlyMap<string, readonly SessionGroupEntry[]>
-  /** anchorSessionID -> the subagent/plugin groups anchored there. Powers
-   * nested traversal: an ordinary subagent can itself anchor another group. */
-  anchoredBy: ReadonlyMap<string, readonly SessionGroupEntry[]>
-}
-
-const STRUCTURAL_ANCHOR_KINDS = new Set(["subagent", "plugin"])
-
-/** Build both indexes once per SessionGroup snapshot. O(groups + members). */
-export function buildSessionPreviewIndex(groups: readonly SessionGroupEntry[]): SessionPreviewIndex {
-  const membership = new Map<string, SessionGroupEntry[]>()
-  const anchoredBy = new Map<string, SessionGroupEntry[]>()
-  for (const group of groups) {
-    for (const sessionID of group.sessionIds) {
-      const list = membership.get(sessionID)
-      if (list) list.push(group)
-      else membership.set(sessionID, [group])
-    }
-    if (group.anchorSessionID && STRUCTURAL_ANCHOR_KINDS.has(group.kind)) {
-      const list = anchoredBy.get(group.anchorSessionID)
-      if (list) list.push(group)
-      else anchoredBy.set(group.anchorSessionID, [group])
-    }
-  }
-  return { membership, anchoredBy }
-}
 
 /** Project one group-detail member into the preview row shape. O(1). */
 export function sessionPreviewRow(member: SessionGroupMember, group?: string): SessionPreviewRow {
@@ -116,7 +92,8 @@ function notArchived(member: SessionGroupMember) {
  * pass over the row list, computed once per open preview.
  */
 export function sessionPreviewTree(rows: readonly SessionPreviewRow[], maxDepth = 3): SessionPreviewTreeRow[] {
-  const ids = new Set(rows.map((row) => row.id))
+  const ids = new Set<string>()
+  for (const row of rows) ids.add(row.id)
   const children = new Map<string | undefined, SessionPreviewRow[]>()
   for (const row of rows) {
     const parent = row.parentID && row.parentID !== row.id && ids.has(row.parentID) ? row.parentID : undefined
@@ -127,16 +104,25 @@ export function sessionPreviewTree(rows: readonly SessionPreviewRow[], maxDepth 
 
   const result: SessionPreviewTreeRow[] = []
   const visited = new Set<string>()
-  const walk = (parent: string | undefined, depth: number) => {
-    const list = children.get(parent) ?? []
-    list.forEach((row, index) => {
-      if (visited.has(row.id)) return
-      visited.add(row.id)
-      result.push({ row, depth: Math.min(depth, maxDepth), last: index === list.length - 1 })
-      walk(row.id, depth + 1)
-    })
+  // Iterative preorder DFS avoids a JS call stack proportional to worker
+  // nesting depth. Preserve original sibling order, last-child markers and
+  // cycle/duplicate handling, even when display depth has already saturated.
+  type Frame = { rows: SessionPreviewRow[]; next: number; depth: number }
+  const stack: Frame[] = [{ rows: children.get(undefined) ?? [], next: 0, depth: 0 }]
+  while (stack.length) {
+    const frame = stack[stack.length - 1]!
+    if (frame.next >= frame.rows.length) {
+      stack.pop()
+      continue
+    }
+    const at = frame.next++
+    const row = frame.rows[at]!
+    if (visited.has(row.id)) continue
+    visited.add(row.id)
+    result.push({ row, depth: Math.min(frame.depth, maxDepth), last: at === frame.rows.length - 1 })
+    const descendants = children.get(row.id)
+    if (descendants?.length) stack.push({ rows: descendants, next: 0, depth: frame.depth + 1 })
   }
-  walk(undefined, 0)
   // Parent cycles have no root; keep those rows reachable, flat.
   for (const row of rows) {
     if (visited.has(row.id)) continue
@@ -325,9 +311,16 @@ export function sessionPreviewRelationships(input: {
 export function sessionPreviewGroupOnly(group: SessionGroupEntry): SessionPreviewSection {
   const kind: SessionPreviewSectionKind =
     group.kind === "plugin" || group.kind === "subagent" || group.kind === "swarm" ? group.kind : "manual"
+  // A group tab can contain thousands of workers. Fuse archive filtering and
+  // structural-row projection into one pass, avoiding the O(N) temporary
+  // filtered-member array allocated by filter().map() on every cold hover.
+  const members: SessionPreviewRow[] = []
+  for (const member of group.sessions) {
+    if (notArchived(member)) members.push(sessionPreviewRow(member))
+  }
   return {
     kind,
     name: group.name,
-    rows: sessionPreviewTree(group.sessions.filter(notArchived).map((member) => sessionPreviewRow(member))),
+    rows: sessionPreviewTree(members),
   }
 }

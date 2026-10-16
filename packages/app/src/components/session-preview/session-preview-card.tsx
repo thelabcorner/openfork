@@ -5,12 +5,14 @@ import {
   For,
   Index,
   Match,
+  on,
   onCleanup,
   Show,
   startTransition,
   Switch,
   type JSX,
 } from "solid-js"
+import { createVirtualizer, defaultRangeExtractor } from "@tanstack/solid-virtual"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { Spinner } from "@opencode-ai/ui/spinner"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
@@ -23,19 +25,29 @@ import { useLanguage } from "@/context/language"
 import { getProjectAvatarVariant, type LocalProject } from "@/context/layout"
 import { ServerConnection } from "@/context/server"
 import { tabKey, useTabs } from "@/context/tabs"
-import { displayName, getProjectAvatarSource, projectForSession } from "@/pages/layout/helpers"
+import { displayName, getProjectAvatarSource, projectForSessionIndexed } from "@/pages/layout/helpers"
 import { formatDuration, formatUSD } from "@/components/usage/usage-format"
 import { getRelativeTime } from "@/utils/time"
 import { sessionTelemetryClientNow, sessionTelemetryElapsedMs } from "@/utils/session-telemetry-time"
 import { tabSessionState } from "@/components/titlebar-tab-state"
 import { TitlebarTabContextMenu } from "@/components/titlebar-tab-context-menu"
+import { measureVirtualRow } from "@/components/virtual-scroll-element"
 import {
   KNOWN_SPECIAL_AGENT_KINDS,
   type SessionPreviewRelationships,
   type SessionPreviewRow,
   type SessionPreviewSectionKind,
-  type SessionPreviewTreeRow,
 } from "./session-preview-model"
+import {
+  forEachPreviewSession,
+  previewRelationshipCount,
+  previewSessionWeights,
+  previewUnopenedCount,
+  previewVisibleRows,
+  type PreviewListItem,
+} from "./session-preview-rows"
+import { previewSparseSummary, samePreviewSummary } from "./session-preview-summary"
+import { previewTelemetryIDs, samePreviewTelemetryIDs } from "./session-preview-telemetry"
 import "./session-preview-card.css"
 
 export const GROUP_PREVIEW_PAGE = 80
@@ -55,17 +67,8 @@ export interface SessionPreviewData {
   branch?: string
 }
 
-type MemberStatus = "working" | "paused" | "waiting" | "idle"
+type MemberStatus = "working" | "paused" | "waiting" | "idle" | "interrupted"
 
-interface PreviewListItem {
-  first: boolean
-  sectionKey: string
-  sectionName: string
-  sectionKind: SessionPreviewSectionKind | "special"
-  sectionCount: number
-  row: SessionPreviewTreeRow
-  parentTitle?: string
-}
 
 const SPECIAL_AGENT_LABEL_KEYS: Record<string, string> = {
   goal_auditor: "sessionPreview.specialAgent.goalAuditor",
@@ -131,6 +134,8 @@ export function SessionPreviewCard(props: {
   data: SessionPreviewData
   relationships: () => SessionPreviewRelationships | undefined
   currentSessionID?: string
+  /** Optional identity for adapters that reuse one physical card across tabs. */
+  previewKey?: string
   server?: ServerConnection.Key
   serverCtx?: () => ServerCtx | undefined
   active: () => boolean
@@ -148,48 +153,109 @@ export function SessionPreviewCard(props: {
   const language = useLanguage()
   const tabs = useTabs()
   let rootEl: HTMLDivElement | undefined
-  let viewportEl: HTMLDivElement | undefined
+  let disposed = false
+  let selectedScrollEpoch = 0
+  let focusFrame = 0
+  onCleanup(() => {
+    disposed = true
+    selectedScrollEpoch++
+    if (focusFrame) cancelAnimationFrame(focusFrame)
+  })
+  const [scrollRoot, setScrollRoot] = createSignal<HTMLDivElement>()
+  const [focusedIndex, setFocusedIndex] = createSignal(-1)
 
   const [visibleLimit, setVisibleLimit] = createSignal(GROUP_PREVIEW_PAGE)
   const [now, setNow] = createSignal(Date.now())
+  // A reused tab-strip card must not carry a previous group's expanded page,
+  // focused virtual row or scroll offset into the next session preview.
+  createEffect(on(
+    () => props.previewKey,
+    (key, previous) => {
+      if (!key || key === previous) return
+      setVisibleLimit(GROUP_PREVIEW_PAGE)
+      setFocusedIndex(-1)
+      const scroller = scrollRoot()
+      if (scroller) scroller.scrollTop = 0
+    },
+    { defer: true },
+  ))
 
   const serverCtx = () => props.serverCtx?.()
   const relationships = createMemo(() => props.relationships())
   const isGroupTab = () => !props.currentSessionID
 
-  const orderedRows = createMemo<PreviewListItem[]>(() => {
-    const rel = relationships()
-    if (!rel) return []
-    const items: PreviewListItem[] = []
-    rel.sections.forEach((section, sectionIndex) => {
-      section.rows.forEach((row, index) => {
-        items.push({
-          first: index === 0,
-          sectionKey: `section-${sectionIndex}`,
-          sectionName: section.name,
-          sectionKind: section.kind,
-          sectionCount: section.rows.length,
-          row,
-        })
-      })
-    })
-    rel.specialAgents.forEach((entry, index) => {
-      items.push({
-        first: index === 0,
-        sectionKey: "special-agents",
-        sectionName: language.t("sessionPreview.section.specialAgents"),
-        sectionKind: "special",
-        sectionCount: rel.specialAgents.length,
-        row: { row: entry.row, depth: 0, last: true },
-        parentTitle: entry.parentTitle,
-      })
-    })
-    return items
-  })
-  const totalCount = createMemo(() => orderedRows().length)
-  const visibleRows = createMemo(() => orderedRows().slice(0, visibleLimit()))
+  const totalCount = createMemo(() => previewRelationshipCount(relationships()))
+  const sessionWeights = createMemo(() => previewSessionWeights(relationships()))
+  const visibleRows = createMemo<PreviewListItem[]>(() =>
+    previewVisibleRows(relationships(), visibleLimit(), language.t("sessionPreview.section.specialAgents")),
+  )
   const hiddenCount = createMemo(() => Math.max(0, totalCount() - visibleRows().length))
   const interactive = createMemo(() => !!props.server && totalCount() > 0)
+  const currentVisibleIndex = createMemo(() => {
+    const id = props.currentSessionID
+    if (!id) return -1
+    return visibleRows().findIndex((item) => item.row.row.id === id)
+  })
+  const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
+    get count() {
+      return visibleRows().length
+    },
+    getScrollElement: () => scrollRoot() ?? null,
+    initialRect: { width: 340, height: 360 },
+    get estimateSize() {
+      const snapshot = visibleRows()
+      return (index: number) => {
+        const item = snapshot[index]
+        if (!item) return 25
+        // 24px member + 1px row rhythm. Section-leading rows also include the
+        // 20px divider and its margin; special-agent dividers are slightly taller.
+        return item.first ? (item.sectionKind === "special" ? 57 : 48) : 25
+      }
+    },
+    overscan: 6,
+    get getItemKey() {
+      const snapshot = visibleRows()
+      return (index: number) => {
+        const item = snapshot[index]
+        return item ? `${item.sectionKey}:${item.row.row.id}` : index
+      }
+    },
+    get rangeExtractor() {
+      return (range: Parameters<typeof defaultRangeExtractor>[0]) => {
+        const indexes = defaultRangeExtractor(range)
+        const pinned = [focusedIndex(), currentVisibleIndex()]
+        for (const index of pinned) {
+          if (index < 0 || index >= range.count || indexes.includes(index)) continue
+          indexes.push(index)
+        }
+        return indexes.sort((a, b) => a - b)
+      }
+    },
+  })
+  const virtualRows = createMemo<
+    Array<{
+      virtualRow: ReturnType<typeof virtualizer.getVirtualItems>[number]
+      item: PreviewListItem | undefined
+      key: string | number
+    }>
+  >((previous = []) => {
+    const prior = new Map(previous.map((entry) => [entry.key, entry] as const))
+    return virtualizer.getVirtualItems().map((virtualRow) => {
+      const item = visibleRows()[virtualRow.index]
+      const key = item ? `${item.sectionKey}:${item.row.row.id}` : virtualRow.index
+      const existing = prior.get(key)
+      if (
+        existing &&
+        existing.item === item &&
+        existing.virtualRow.index === virtualRow.index &&
+        existing.virtualRow.start === virtualRow.start &&
+        existing.virtualRow.size === virtualRow.size
+      ) {
+        return existing
+      }
+      return { virtualRow, item, key }
+    })
+  })
 
   const openSessionIDs = createMemo(() => {
     const server = props.server
@@ -200,14 +266,14 @@ export function SessionPreviewCard(props: {
     }
     return ids
   })
-  // Rows whose session does not yet have a tab. O(rows) set membership; the
-  // data is the already-materialized member projection, never a resolution.
-  const openableCount = createMemo(() => orderedRows().filter((item) => !openSessionIDs().has(item.row.row.id)).length)
+  // Updating an unrelated tab must not revisit every relationship row.
+  // Duplicated cross-group memberships retain their former row counts.
+  const openableCount = createMemo(() => previewUnopenedCount(sessionWeights(), openSessionIDs(), totalCount()))
 
-  const projects = createMemo(() => serverCtx()?.projects.list() ?? [])
-  const projectsByID = createMemo(
-    () => new Map(projects().flatMap((project) => (project.id ? [[project.id, project] as const] : []))),
-  )
+  // Reuse the server-owned index already populated for titlebar avatars and
+  // navigation. A preview with multiple foreign-project members must not
+  // rescan/normalize all project directories for each mounted row or update.
+  const projectIndex = createMemo(() => serverCtx()?.projects.index())
 
   // ---- O(1) per-session reads ------------------------------------------
   const peek = (id: string) => serverCtx()?.sync.session.peek(id)
@@ -226,7 +292,7 @@ export function SessionPreviewCard(props: {
   }
   const projectLabel = (session: Session | undefined) => {
     if (!session) return undefined
-    const project = projectForSession(session, projects(), projectsByID())
+    const project = projectForSessionIndexed(session, projectIndex())
     return displayName(project ?? { worktree: session.directory })
   }
 
@@ -236,33 +302,61 @@ export function SessionPreviewCard(props: {
     let running = 0
     let waiting = 0
     if (!props.active()) return { running, waiting }
-    for (const item of orderedRows()) {
-      const value = status(item.row.row.id)
-      if (value === "working") running += 1
-      else if (value === "waiting") waiting += 1
+    const weights = sessionWeights()
+    const data = serverCtx()?.sync.session.data
+    if (!data) return { running, waiting }
+    // Status maps are sparse: 16K idle group members should not create 16K
+    // fine-grained subscriptions in an otherwise lightweight hover tooltip.
+    // Tiny groups retain narrow per-ID reactive dependencies.
+    // Paired crossover measurements show that enumerating server-global
+    // status maps loses to narrow reads for small groups when hundreds of
+    // unrelated sessions are working. Reserve the sparse path for genuinely
+    // large groups; never make a 25/50/100-worker preview pay global scans.
+    if (weights.size >= 1_024) {
+      return previewSparseSummary({
+        weights,
+        statuses: data.session_status,
+        paused: data.paused,
+        permissions: data.permission,
+        questions: data.question,
+      })
+    }
+    for (const [id, multiplicity] of weights) {
+      const value = status(id)
+      if (value === "working") running += multiplicity
+      else if (value === "waiting") waiting += multiplicity
     }
     return { running, waiting }
-  })
+  }, undefined, { equals: samePreviewSummary })
 
   // One shared clock while the card is visible: seconds only when something is
   // live (turn timers), minutes otherwise (relative activity stamps).
+  // Depend on the *clock resolution* rather than the full summary count.
+  // Bursts of unrelated workers starting/stopping should not repeatedly
+  // tear down/rearm the exact same 1-second interval or cause timer jitter.
+  const secondClock = createMemo(() =>
+    props.active() && (summary().running > 0 || status(props.currentSessionID ?? "") === "working"),
+  )
   createEffect(() => {
     if (!props.active()) return
+    const live = secondClock()
     setNow(Date.now())
-    const live = summary().running > 0 || status(props.currentSessionID ?? "") === "working"
     const timer = setInterval(() => setNow(Date.now()), live ? 1000 : 30_000)
     onCleanup(() => clearInterval(timer))
   })
 
-  // One coalesced telemetry batch for what is actually visible. Known ids are
-  // skipped by the owner, so re-opening the card costs nothing.
+  // One coalesced telemetry batch for rows the virtual window actually mounts.
+  // Known ids are skipped by the owner, so re-opening the card costs nothing.
+  const visibleTelemetryIDs = createMemo(
+    () => previewTelemetryIDs(virtualRows(), props.currentSessionID),
+    undefined,
+    { equals: samePreviewTelemetryIDs },
+  )
   createEffect(() => {
     if (!props.active()) return
     const ctx = serverCtx()
     if (!ctx) return
-    const ids = visibleRows().map((item) => item.row.row.id)
-    if (props.currentSessionID) ids.push(props.currentSessionID)
-    ctx.sync.telemetry.ensure(ids)
+    ctx.sync.telemetry.ensure(visibleTelemetryIDs())
   })
 
   const relative = (ms: number | undefined) =>
@@ -307,15 +401,17 @@ export function SessionPreviewCard(props: {
   // Keep the current session visible when the list is taller than the card.
   createEffect(() => {
     if (!props.active() || !props.currentSessionID) return
-    requestAnimationFrame(() => {
-      const row = viewportEl?.querySelector<HTMLElement>('[data-slot="member"][data-current]')
-      if (!row || !viewportEl) return
-      const top = row.offsetTop
-      const bottom = top + row.offsetHeight
-      if (top < viewportEl.scrollTop || bottom > viewportEl.scrollTop + viewportEl.clientHeight) {
-        viewportEl.scrollTop = top - (viewportEl.clientHeight - row.offsetHeight) / 2
-      }
+    const index = currentVisibleIndex()
+    if (index < 0 || !scrollRoot()) return
+    const epoch = ++selectedScrollEpoch
+    queueMicrotask(() => {
+      if (disposed || epoch !== selectedScrollEpoch || !props.active() || !scrollRoot()?.isConnected) return
+      virtualizer.scrollToIndex(index, { align: "center" })
     })
+  })
+  createEffect(() => {
+    if (props.active()) return
+    setFocusedIndex(-1)
   })
 
   const openSession = (sessionID: string, background = false) => {
@@ -342,9 +438,9 @@ export function SessionPreviewCard(props: {
   const openAllSessions = () => {
     const server = props.server
     if (!server) return
-    for (const item of orderedRows()) {
-      tabs.addSessionTab({ server, sessionId: item.row.row.id })
-    }
+    const ids: string[] = []
+    forEachPreviewSession(relationships(), (id) => ids.push(id))
+    tabs.addSessionTabs({ server, sessionIds: ids })
   }
 
   const memberTabID = (sessionID: string) => {
@@ -370,7 +466,6 @@ export function SessionPreviewCard(props: {
   const showMore = () => setVisibleLimit((current) => current + GROUP_PREVIEW_PAGE)
 
   const moveFocus = (event: KeyboardEvent & { currentTarget: HTMLButtonElement }) => {
-    if (!rootEl) return
     if (event.key === "Enter") {
       event.preventDefault()
       event.stopPropagation()
@@ -379,19 +474,28 @@ export function SessionPreviewCard(props: {
       )
       return
     }
-    const rows = [...rootEl.querySelectorAll<HTMLButtonElement>('[data-slot="member"]')]
-    if (rows.length === 0) return
-    const current = rows.indexOf(event.currentTarget)
+    const count = visibleRows().length
+    if (count === 0) return
+    const parsed = Number(event.currentTarget.dataset.previewIndex)
+    const current = Number.isFinite(parsed) ? parsed : -1
     let next = current
-    if (event.key === "ArrowDown") next = current < 0 ? 0 : (current + 1) % rows.length
-    else if (event.key === "ArrowUp") next = current <= 0 ? rows.length - 1 : current - 1
+    if (event.key === "ArrowDown") next = current < 0 ? 0 : (current + 1) % count
+    else if (event.key === "ArrowUp") next = current <= 0 ? count - 1 : current - 1
     else if (event.key === "Home") next = 0
-    else if (event.key === "End") next = rows.length - 1
+    else if (event.key === "End") next = count - 1
     else return
     event.preventDefault()
     event.stopPropagation()
-    rows[next]?.focus()
-    rows[next]?.scrollIntoView({ block: "nearest" })
+    setFocusedIndex(next)
+    virtualizer.scrollToIndex(next, { align: "auto" })
+    if (focusFrame) cancelAnimationFrame(focusFrame)
+    focusFrame = requestAnimationFrame(() => {
+      focusFrame = 0
+      if (disposed || !props.active()) return
+      const root = scrollRoot()
+      if (!root?.isConnected) return
+      root.querySelector<HTMLButtonElement>(`[data-preview-index="${next}"]`)?.focus({ preventScroll: true })
+    })
   }
 
   // ---- Presentation -----------------------------------------------------
@@ -448,6 +552,8 @@ export function SessionPreviewCard(props: {
       }}
       data-component="session-preview-card"
       data-interactive={interactive() || undefined}
+      data-preview-total={visibleRows().length}
+      data-preview-mounted={virtualRows().length}
       style={props.maxHeight?.() !== undefined ? { "max-height": `${props.maxHeight!()}px` } : undefined}
     >
       {/* ---- Header: what this session/group is ---- */}
@@ -599,11 +705,15 @@ export function SessionPreviewCard(props: {
           <ScrollView
             data-slot="section-scroll"
             class="[&_.scroll-view__viewport]:overscroll-contain"
-            viewportRef={(el) => (viewportEl = el)}
+            viewportRef={setScrollRoot}
           >
-            <div data-slot="members">
-              <For each={visibleRows()}>
-                {(item) => {
+            <div data-slot="members-shell">
+              <div data-slot="members" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+                <For each={virtualRows()}>
+                  {(entry) => {
+                    const item = entry.item
+                    if (!item) return null
+                    const virtualRow = entry.virtualRow
                   const row = item.row
                   const member = row.row
                   const session = () => peek(member.id) ?? member.session
@@ -624,6 +734,7 @@ export function SessionPreviewCard(props: {
                     <button
                       type="button"
                       data-slot="member"
+                      data-preview-index={virtualRow.index}
                       data-special={isSpecial() || undefined}
                       data-current={current() || undefined}
                       data-open-tab={openSessionIDs().has(member.id) || undefined}
@@ -631,6 +742,7 @@ export function SessionPreviewCard(props: {
                       aria-current={current() ? "page" : undefined}
                       title={title()}
                       style={{ "--depth": String(row.depth) }}
+                      onFocus={() => setFocusedIndex(virtualRow.index)}
                       onClick={(event) => {
                         event.preventDefault()
                         event.stopPropagation()
@@ -743,8 +855,13 @@ export function SessionPreviewCard(props: {
                     </Show>
                   )
 
-                  return (
-                    <>
+                    return (
+                      <div
+                        ref={measureVirtualRow(virtualizer, virtualRow.index)}
+                        data-slot="virtual-member"
+                        data-index={virtualRow.index}
+                        style={{ transform: `translateY(${virtualRow.start}px)` }}
+                      >
                       <Show when={item.first}>
                         <div data-slot="section-divider" data-tone={isSpecial() ? "special" : undefined}>
                           <IconV2 name={sectionIcon(item.sectionKind)} size="small" class="size-3 shrink-0" />
@@ -753,10 +870,11 @@ export function SessionPreviewCard(props: {
                         </div>
                       </Show>
                       {wrapped}
-                    </>
-                  )
-                }}
-              </For>
+                      </div>
+                    )
+                  }}
+                </For>
+              </div>
               <Show when={hiddenCount() > 0}>
                 <button type="button" data-slot="more" onClick={showMore}>
                   <IconV2 name="chevron-down" size="small" class="size-3" />

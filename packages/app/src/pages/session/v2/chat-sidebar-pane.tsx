@@ -7,6 +7,7 @@ import {
   getOwner,
   lazy,
   Match,
+  on,
   onCleanup,
   onMount,
   runWithOwner,
@@ -15,9 +16,11 @@ import {
   Switch,
   type Accessor,
   type JSX,
+  untrack,
 } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Portal } from "solid-js/web"
+import { createVirtualizer, defaultRangeExtractor } from "@tanstack/solid-virtual"
 import { A, useIsRouting, useNavigate, useParams } from "@solidjs/router"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { showToast } from "@/utils/toast"
@@ -26,6 +29,7 @@ import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { DenseWorkingIndicator } from "@opencode-ai/ui/spinner"
 import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
+import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { ProjectAvatar } from "@opencode-ai/ui/v2/project-avatar-v2"
 import { useLanguage } from "@/context/language"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
@@ -33,17 +37,33 @@ import { getProjectAvatarVariant, useLayout, type LocalProject } from "@/context
 import { useGlobal } from "@/context/global"
 import { useServerSync } from "@/context/server-sync"
 import { useNotification } from "@/context/notification"
-import { useOxpActivity } from "@/context/oxp-activity"
 import { usePermission } from "@/context/permission"
 import { usePlatform } from "@/context/platform"
+import { useTabs } from "@/context/tabs"
 import { useServerSDK } from "@/context/server-sdk"
 import { ServerConnection } from "@/context/server"
-import { useSessionGroups } from "@/context/session-groups"
-import { SessionPreviewCard } from "@/components/session-preview/session-preview-card"
-import { sessionPreviewRelationships } from "@/components/session-preview/session-preview-model"
+import { sessionGroupMemberSession, useSessionGroups } from "@/context/session-groups"
+import { sessionPreviewProjectionCache } from "@/components/session-preview/session-preview-cache"
 import { sessionTitle } from "@/utils/session-title"
 import { pathKey } from "@/utils/path-key"
+import { sessionHref } from "@/utils/session-route"
 import { startupMark, startupTransportDiagnostic } from "@/utils/startup-perf"
+import { indexChatSidebarStickyHeaders, stickyChatSidebarHeader } from "./chat-sidebar-sticky-index"
+import { sidebarFixedBlockHeight, sidebarStickyBlockOffset } from "./chat-sidebar-virtual-layout"
+import { mergeSortedChatSidebarSessions } from "./chat-sidebar-session-merge"
+import { countSidebarWaiting } from "./chat-sidebar-counts"
+import { visibleChatSidebarGroups } from "./chat-sidebar-group-scope"
+import { sameChatSidebarDirectoryScope, sameChatSidebarIDSet, sameChatSidebarSessionDirectories } from "./chat-sidebar-scope-equality"
+import { reuseChatSidebarVirtualBlocks } from "./chat-sidebar-virtual-reuse"
+import { indexChatSidebarWorkingIDs } from "./chat-sidebar-working-index"
+import { indexChatSidebarRowStates, sameChatSidebarRowStateIndex } from "./chat-sidebar-state-index"
+import { buildChatSidebarSparseStatusSections, indexChatSidebarSparseSource } from "./chat-sidebar-status-sparse"
+import { buildChatSidebarGroupedSparseStatusSections, indexChatSidebarGroupedStatusSource } from "./chat-sidebar-status-grouped"
+import { buildChatSidebarSparseRecentSection } from "./chat-sidebar-recent-sparse"
+import { createChatSidebarWorkingOrder } from "./chat-sidebar-working-order"
+import { withChatSidebarDirectory } from "./chat-sidebar-directory"
+import { createChatSidebarSourceCache } from "./chat-sidebar-source-cache"
+import { chatSidebarIndexedProjectGroupRevisions, createChatSidebarProjectSectionCache, indexChatSidebarProjectMembership, reuseChatSidebarProjectMemberLists, workingChatSidebarProjects } from "./chat-sidebar-project-cache"
 
 startupMark("sidebar.module-evaluated")
 import {
@@ -69,6 +89,10 @@ const ChatSidebarArchivedBody = lazy(() =>
 const SidebarResizeHandle = lazy(() =>
   import("@opencode-ai/ui/resize-handle").then((m) => ({ default: m.ResizeHandle })),
 )
+let sessionPreviewCardModule: Promise<typeof import("@/components/session-preview/session-preview-card")> | undefined
+const loadSessionPreviewCard = () =>
+  (sessionPreviewCardModule ??= import("@/components/session-preview/session-preview-card"))
+const SessionPreviewCard = lazy(() => loadSessionPreviewCard().then((m) => ({ default: m.SessionPreviewCard })))
 type ChatSidebarSearchRuntime = import("./chat-sidebar-search-runtime").ChatSidebarSearchRuntime
 let chatSidebarSearchRuntimeModule: Promise<typeof import("./chat-sidebar-search-runtime")> | undefined
 const loadChatSidebarSearchRuntime = () =>
@@ -77,10 +101,36 @@ import {
   CHAT_SIDEBAR_RECENT_LIMIT_MIN,
   chatSidebarAggregateMetrics,
   chatSidebarWorkingIndicatorAnimated,
+  createChatSidebarIndicatorBudget,
   uniqueSidebarSessions,
   chatSidebarRootSessionVisible,
   type ChatSidebarPaneState,
 } from "./chat-sidebar-pane-state"
+import {
+  buildChatSidebarSections,
+  compareChatSidebarSessions,
+  canReuseChatSidebarItemSlot,
+  CHAT_SIDEBAR_SORT_MODES,
+  CHAT_SIDEBAR_VIEW_MODES,
+  chatSidebarStatusBucket,
+  countChatSidebarClusterStates,
+  reconcileChatSidebarSlots,
+  reuseChatSidebarSections,
+  sameChatSidebarClusterCounts,
+  type ChatSidebarClusterItem,
+  type ChatSidebarClusterScope,
+  type ChatSidebarItem,
+  type ChatSidebarSlot,
+  type ChatSidebarSlotState,
+  type ChatSidebarDensity,
+  type ChatSidebarRowState,
+  type ChatSidebarSection,
+  type ChatSidebarSortMode,
+  type ChatSidebarStatusBucket,
+  type ChatSidebarViewMode,
+} from "./chat-sidebar-tree"
+import { ChatSidebarOxpSection } from "./chat-sidebar-oxp-section"
+import "./chat-sidebar-pane.css"
 import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
 import { findChatProject, isChatProjectAlias, isReservedChatProjectPath } from "@/utils/chat-project"
 import { sessionTelemetryClientNow, sessionTelemetryElapsedMs } from "@/utils/session-telemetry-time"
@@ -127,10 +177,10 @@ function formatDuration(totalSeconds: number): string {
  * the row that implies the user must act soon. Everything else stays neutral
  * so the sidebar reads as one calm surface rather than a dashboard.
  */
-function contextTone(percent: number) {
-  if (percent >= 85) return { bar: "bg-v2-state-fg-danger", text: "text-v2-state-fg-danger" }
-  if (percent >= 65) return { bar: "bg-v2-state-fg-warning", text: "text-v2-state-fg-warning" }
-  return { bar: "bg-v2-icon-icon-muted", text: "text-v2-text-text-faint" }
+function contextTone(percent: number): "danger" | "warning" | undefined {
+  if (percent >= 85) return "danger"
+  if (percent >= 65) return "warning"
+  return undefined
 }
 
 const TELEMETRY_CHARS_PER_TOKEN = 4
@@ -186,15 +236,6 @@ function telemetryLive(
   }
 }
 
-type ChatSessionGroup = {
-  key: string
-  label: string
-  directory: string
-  project?: LocalProject
-  sessions: Session[]
-  total: number
-}
-
 type ChatRowTotals = {
   generatedSeconds: number
   toolSeconds: number
@@ -240,30 +281,10 @@ type ChatRowRuntime = {
 
 type ChatRowRuntimeLease = {
   runtime: ChatRowRuntime
+  update: (session: Session) => void
   release: () => void
 }
 
-const sameRows = (a: Session[], b: Session[]) => {
-  if (a.length !== b.length) return false
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
-  return true
-}
-
-// Sessions in a directory's store always belong to that directory, but some
-// rows carry no `directory` field — backfill it so path comparisons keep them
-// attributed to this store instead of filtering them out. Cached per source
-// object because <For> keys by reference: a fresh {...session} clone on every
-// groups() recompute would remount those rows (and their IntersectionObservers)
-// each time anything in the memo moved.
-const backfilledDirectory = new WeakMap<Session, Session>()
-const withDirectory = (session: Session, dir: string): Session => {
-  if (session.directory) return session
-  const cached = backfilledDirectory.get(session)
-  if (cached) return cached
-  const wrapped = { ...session, directory: dir }
-  backfilledDirectory.set(session, wrapped)
-  return wrapped
-}
 
 export function ChatSidebarPane(props: {
   state: ChatSidebarPaneState
@@ -281,21 +302,23 @@ export function ChatSidebarPane(props: {
   const dialog = useDialog()
   const platform = usePlatform()
   const notification = useNotification()
-  const oxpActivity = useOxpActivity()
   const permission = usePermission()
   const sessionGroups = useSessionGroups()
-  const [oxpLimit, setOxpLimit] = createSignal(5)
-  const visibleOxpActivities = createMemo(() =>
-    oxpActivity.activities().slice(0, oxpLimit()),
-  )
-
-  onMount(() => oxpActivity.ensureLoaded())
-
   // One shared ticker for every live timer in the pane — per-row intervals
-  // would multiply timers by the number of visible sessions.
+  // would multiply timers by the number of visible sessions. Suppress this
+  // 1-Hz timer completely while the pane is closed or every session is idle.
+  // A Solid effect (rather than a permanent interval) preserves live-edge
+  // updates immediately when the first working Session appears.
   const [now, setNow] = createSignal(Date.now())
-  const tick = setInterval(() => setNow(Date.now()), 1000)
-  onCleanup(() => clearInterval(tick))
+  createEffect(() => {
+    if (!props.opened || !workingIDs().size) return
+    setNow(Date.now())
+    const tick = setInterval(() => setNow(Date.now()), 1000)
+    onCleanup(() => clearInterval(tick))
+  })
+
+  // Rations animated working dots (each is a compositor layer) across the pane.
+  const indicatorBudget = createChatSidebarIndicatorBudget()
 
   // A single observer gates working-indicator animation for all rows in the pane.
   const rowVisibility = new Map<Element, (visible: boolean) => void>()
@@ -321,8 +344,12 @@ export function ChatSidebarPane(props: {
   // them reactive at all: relativeLabel previously read Date.now() inline and
   // could go stale ("now" forever) until an unrelated rerender touched the row.
   const [minuteNow, setMinuteNow] = createSignal(Date.now())
-  const minuteTick = setInterval(() => setMinuteNow(Date.now()), 30_000)
-  onCleanup(() => clearInterval(minuteTick))
+  createEffect(() => {
+    if (!props.opened) return
+    setMinuteNow(Date.now())
+    const minuteTick = setInterval(() => setMinuteNow(Date.now()), 30_000)
+    onCleanup(() => clearInterval(minuteTick))
+  })
 
   // The resize handle is an invisible interaction affordance, not first-paint
   // content. Mount it one frame later so its geometry/runtime graph cannot
@@ -371,14 +398,18 @@ export function ChatSidebarPane(props: {
     return conn ? global.ensureServerCtx(conn) : undefined
   })
 
-  const isExpanded = (key: string) => !props.state.isGroupCollapsed(key)
-  const toggleExpanded = (key: string) => props.state.toggleGroup(key)
-
   // Deliberately non-reactive: entries are assigned the first time a session is
   // observed working and deleted when it goes idle, so pinned rows keep their
   // relative arrival order for the whole generation instead of reshuffling.
-  const workingArrival = new Map<string, number>()
-  let arrivalSeq = 0
+  const workingOrder = createChatSidebarWorkingOrder()
+  const workingIDs = createMemo(
+    () => {
+      const data = serverSync().session.data
+      return indexChatSidebarWorkingIDs(data.session_status, data.paused)
+    },
+    undefined,
+    { equals: sameChatSidebarIDSet },
+  )
 
   // Reads the global session store directly: telemetry cold-start/live edges
   // reconcile this canonical status projection in server-sync, so the sidebar
@@ -388,22 +419,7 @@ export function ChatSidebarPane(props: {
     return serverSync().session.data.session_working(session.id)
   }
 
-  const pinWorkingFirst = (rows: Session[]) => {
-    const pinned: Array<{ seq: number; session: Session }> = []
-    const rest: Session[] = []
-    for (const session of rows) {
-      if (!isWorking(session)) {
-        workingArrival.delete(session.id)
-        rest.push(session)
-        continue
-      }
-      const known = workingArrival.get(session.id)
-      const seq = known ?? ++arrivalSeq
-      if (known === undefined) workingArrival.set(session.id, seq)
-      pinned.push({ seq, session })
-    }
-    return [...pinned.sort((a, b) => a.seq - b.seq).map((item) => item.session), ...rest]
-  }
+  const pinWorkingFirst = (rows: Session[]) => workingOrder.pin(rows, workingIDs())
 
   // Stage 1 — pure grouping. Deliberately reads NO working-state signals: a
   // working flip must re-run only the cheap pinning pass in `groups` below,
@@ -429,7 +445,7 @@ export function ChatSidebarPane(props: {
       createRoot((dispose) => ({
         read: createMemo(() => {
           const sessions = (serverSync().child(dir, { bootstrap: false })[0].session ?? []).map((session) =>
-            withDirectory(session, dir),
+            withChatSidebarDirectory(session, dir),
           )
           return projectID
             ? sessions.filter((session) => chatSidebarRootSessionVisible(session, dir, projectID)).sort(compareSessionTime)
@@ -458,8 +474,10 @@ export function ChatSidebarPane(props: {
             : [
                 ...directorySlice(project.worktree)(),
                 ...(project.sandboxes ?? []).flatMap((sandbox) => directorySlice(sandbox)()),
-              ]
-          return rows.sort(compareSessionTime)
+              ].sort(compareSessionTime)
+          // Canonical project-index slices were already sorted at their owner;
+          // do not sort (and mutate) the shared directory memo's array again.
+          return rows
         }),
         dispose,
       })),
@@ -511,14 +529,14 @@ export function ChatSidebarPane(props: {
       entry.dispose()
       directorySlices.delete(key)
     }
-    const recentPool: Session[] = []
+    const recentSources: Session[][] = []
     const projectRows = new Map<string, Session[]>()
     for (const project of projects) {
       const rows = projectSlice(project)()
-      recentPool.push(...rows)
+      recentSources.push(rows)
       projectRows.set(project.worktree, rows)
     }
-    const recent = uniqueSidebarSessions(recentPool).sort(compareSessionTime)
+    const recent = mergeSortedChatSidebarSessions(recentSources)
     if (recent.length > 0) {
       startupMark("sidebar.first-rows", { rows: recent.length, projects: projects.length })
       startupTransportDiagnostic("sidebar.first-rows.transport")
@@ -527,128 +545,502 @@ export function ChatSidebarPane(props: {
     return { projects, projectByID, recentPool: recent, projectRows }
   })
 
-  const visibleRootIDs = createMemo(() => new Set(baseGroups().recentPool.map((session) => session.id)))
-  // Hidden structural members (subagents, plugin/native-swarm workers) no
-  // longer render inline in the pane — they are reachable through the rich
-  // Session preview instead. This projection is still needed for the compact
-  // global working-count badge, which must include hidden workers without
-  // hydrating them. Legacy per-member resolve() compatibility fallback (for
-  // servers predating the lightweight session projection) now lives only in
-  // SessionPreviewCard, triggered on demand while a preview is actually open.
-  const visibleStructuralGroups = createMemo(() => {
-    const roots = visibleRootIDs()
-    return sessionGroups
-      .list()
-      .filter(
-        (group) =>
-          (group.kind === "swarm" && group.sessions.some((member) => roots.has(member.id))) ||
-          ((group.kind === "subagent" || group.kind === "plugin") &&
-            !!group.anchorSessionID &&
-            roots.has(group.anchorSessionID)),
-      )
+  const visibleRootIDs = createMemo(
+    () => new Set(baseGroups().recentPool.map((session) => session.id)),
+    undefined,
+    { equals: sameChatSidebarIDSet },
+  )
+  // Child sessions are intentionally absent from the root slices. Group rows
+  // and the global state badges use their compact SessionGroup projections,
+  // without hydrating history or creating per-member requests.
+  const visibleMemberGroups = createMemo(() => {
+    return visibleChatSidebarGroups(visibleRootIDs(), sessionGroups.list())
   })
 
-  // Stage 2 — pinning + assembly. The only stage that reads working state, so
-  // a flip storm re-runs just this (~pin cost) while stage 1's sorts stay
-  // cached; stableGroups below then finds nothing visibly changed and keeps
-  // every row component alive.
-  const groups = createMemo<ChatSessionGroup[]>(() => {
-    const { projects, projectByID, recentPool, projectRows } = baseGroups()
-    const presentRoots = new Set(recentPool.map((session) => session.id))
-    for (const sessionID of workingArrival.keys()) {
-      if (!presentRoots.has(sessionID)) workingArrival.delete(sessionID)
-    }
-    const result: ChatSessionGroup[] = []
-
-    if (recentPool.length > 0) {
-      const recentOrdered = pinWorkingFirst(recentPool)
-      result.push({
-        key: "recent",
-        label: language.t("chats.group.recent"),
-        directory: "",
-        sessions: recentOrdered.slice(0, props.state.recentLimit()),
-        total: recentOrdered.length,
+  // SessionGroup detail is the authoritative compact roster. Root session
+  // slices omit parented workers, so deriving delegation/manual cluster members
+  // from those slices alone silently shrinks a batch to whichever roots happen
+  // to be loaded. Structural plugin/Swarm workers remain in the rich inspector.
+  const sidebarRootSessionsByID = createMemo(
+    () => new Map(baseGroups().recentPool.map((session) => [session.id, session] as const)),
+  )
+  const sidebarClusterGroups = createMemo(() => {
+    const byGroup = new Map<string, Session[]>()
+    const groupBySession = new Map<string, { id: string; name: string; kind: string }>()
+    const sessionsByID = new Map<string, Session>()
+    let roots: Map<string, Session> | undefined
+    const groups = visibleMemberGroups()
+      .filter((group) => group.kind !== "subagent")
+      .sort((left, right) => {
+        const priority = (kind: string) => (kind === "delegation" ? 0 : kind === "user" ? 1 : 2)
+        return priority(left.kind) - priority(right.kind)
       })
+    for (const group of groups) {
+      const identity = { id: group.id, name: group.name, kind: group.kind }
+      const members: Session[] = []
+      for (const member of group.sessions) {
+        if (member.time?.archived != null) continue
+        let session = sessionGroupMemberSession(member)
+        if (!session) {
+          roots ??= sidebarRootSessionsByID()
+          session = roots.get(member.id)
+        }
+        if (!session) continue
+        members.push(session)
+        if (groupBySession.has(session.id)) continue
+        groupBySession.set(session.id, identity)
+        if (group.kind === "delegation" || group.kind === "user") sessionsByID.set(session.id, session)
+      }
+      byGroup.set(group.id, members)
     }
+    return { byGroup, groupBySession, sessions: [...sessionsByID.values()] }
+  })
 
+  const sidebarGroupSessions = createMemo(() => {
+    const roots = sidebarRootSessionsByID()
+    return sidebarClusterGroups().sessions.map((session) => roots.get(session.id) ?? session)
+  })
+  const presentSidebarSessionIDs = createMemo(() => {
+    const ids = new Set(baseGroups().recentPool.map((session) => session.id))
+    for (const session of sidebarGroupSessions()) ids.add(session.id)
+    return ids
+  })
+  // The common ungrouped Status view needs only a few dozen active IDs and the
+  // first idle page. Index canonical, sorted roots ONCE per index revision, not
+  // on every status/permission/notification event. Any mixed/legacy/grouped
+  // case retains the comprehensive, previously-tested full-tree fallback.
+  const sparseStatusSource = createMemo(() => {
+    if (props.state.view() !== "status" || props.state.sort() !== "updated") return undefined
+    if (sidebarClusterGroups().groupBySession.size || sidebarGroupSessions().length) return undefined
+    return indexChatSidebarSparseSource(baseGroups().recentPool)
+  })
+  const sidebarSourceCache = createChatSidebarSourceCache()
+  onCleanup(() => sidebarSourceCache.clear())
+  const recentWithGroupMembers = createMemo(() => {
+    const rows = baseGroups().recentPool
+    // Projects use their own scoped group membership lists. Do not also
+    // perform the global Recent merge and member sort while viewing Projects.
+    if (props.state.view() === "projects") {
+      sidebarSourceCache.clear()
+      return rows
+    }
+    return sidebarSourceCache.merge(rows, sidebarGroupSessions())
+  })
+
+  // Stage 2 — view projection. The only stage that reads working/attention
+  // state, so a flip storm re-runs just the cheap pin/bucket/fold pass while
+  // stage 1's per-directory sorts stay cached; reuseChatSidebarSections then
+  // keeps every unchanged row component (and its runtime lease) alive.
+  //
+  // Exactly one view renders. Root sessions stay single-row; delegation/manual
+  // clusters add their parented members from the compact roster so each batch
+  // remains complete without adding one top-level row per worker.
+  const titleOf = (session: Session) => sessionTitle(session.title) ?? ""
+
+  // O(1) per session against already-materialized stores; no history reads.
+  const needsInput = (session: Pick<Session, "id"> & Partial<Pick<Session, "directory">>) => {
+    const data = serverSync().session.data
+    if ((data.question[session.id] ?? []).length > 0) return true
+    const pending = data.permission[session.id] ?? []
+    if (pending.length === 0) return false
+    const directory = session.directory ?? ""
+    for (const item of pending) if (!permissionState().autoResponds(item, directory)) return true
+    return false
+  }
+
+  const rowState = (session: Session): ChatSidebarRowState => {
+    if (needsInput(session)) return "attention"
+    if (notification.session.unseenHasError(session.id)) return "error"
+    if (isWorking(session)) return "working"
+    if (notification.session.unseenCount(session.id) > 0) return "unread"
+    return "idle"
+  }
+
+  // The Status view used to subscribe to four individual reactive slots for
+  // EVERY loaded root (including thousands of idle sessions). The data owners
+  // already provide compact sparse maps; derive semantic status from those
+  // projections once and make each row's bucket lookup O(1) without wiring N
+  // subscriptions. Only this view consumes the index; other views remain cold.
+  const statusDirectories = createMemo(() => {
+    if (props.state.view() !== "status") return new Map<string, string>()
+    const dirs = new Map<string, string>()
+    for (const session of baseGroups().recentPool) dirs.set(session.id, session.directory ?? "")
+    for (const session of sidebarGroupSessions()) {
+      if (!dirs.has(session.id)) dirs.set(session.id, session.directory ?? "")
+    }
+    return dirs
+  }, new Map<string, string>(), { equals: sameChatSidebarSessionDirectories })
+  const statusStateIndex = createMemo<ReadonlyMap<string, ChatSidebarRowState>>(
+    () => {
+      if (props.state.view() !== "status") return new Map()
+      const data = serverSync().session.data
+      return indexChatSidebarRowStates({
+        statuses: data.session_status,
+        paused: data.paused,
+        questions: data.question,
+        permissions: data.permission,
+        unseenCounts: notification.session.unseenCounts(),
+        unseenErrors: notification.session.unseenErrors(),
+        directoryByID: statusDirectories(),
+        autoResponds: (request, directory) => permissionState().autoResponds(request, directory),
+      })
+    },
+    new Map<string, ChatSidebarRowState>(),
+    { equals: sameChatSidebarRowStateIndex },
+  )
+
+  // Subagent groups anchor hidden child sessions, never sibling roots. Other
+  // direct memberships, including delegation batches, fold from the roster.
+  const groupOf = (session: Session) => sidebarClusterGroups().groupBySession.get(session.id)
+  const sortedSparseRows = createMemo(() => {
+    // Only one sidebar view renders; title's locale-aware 10k-row sort must
+    // never wake while Projects consumes per-project sections instead.
+    const view = props.state.view()
+    if (view === "projects") {
+      sidebarSourceCache.clear()
+      return undefined
+    }
+    const sort = props.state.sort()
+    if (view === "status" && sort === "updated" && !sidebarClusterGroups().groupBySession.size) {
+      // The ungrouped updated Status view has a cheaper root-only source.
+      sidebarSourceCache.clearSorted()
+      return undefined
+    }
+    return sidebarSourceCache.sort(recentWithGroupMembers(), sort, titleOf)
+  })
+  const indexedSparseSource = createMemo(() => {
+    const rows = sortedSparseRows()
+    if (!rows) return undefined
+    const sort = props.state.sort()
+    // Recent and Status use the SAME source index: toggling views need not
+    // resort titles, re-validate metadata or rebuild an O(10k) group Map.
+    return indexChatSidebarGroupedStatusSource(
+      rows, groupOf, compareChatSidebarSessions(sort, titleOf),
+      // sortChatSidebarSessions() explicitly sorted the newly produced rows
+      // above; avoid re-running an O(N) Intl.Collator verification on the
+      // title-sort cold path. Updated roots retain the conservative check.
+      sort !== "updated",
+    )
+  })
+  const groupedStatusSource = createMemo(() => {
+    if (props.state.view() !== "status") return undefined
+    return indexedSparseSource()
+  })
+  const recentSparseSource = createMemo(() => {
+    if (props.state.view() !== "recent") return undefined
+    return indexedSparseSource()
+  })
+
+  type ChatProjectHead = { key: string; label: string; directory: string; project: LocalProject; total: number }
+
+  const projectHeads = createMemo(() => {
+    const { projects, projectByID, projectRows } = baseGroups()
+    const heads = new Map<string, ChatProjectHead & { sessions: Session[] }>()
     for (const project of projects) {
-      const rows = pinWorkingFirst(projectRows.get(project.worktree) ?? [])
+      const rows = projectRows.get(project.worktree) ?? []
       if (rows.length === 0 && project.id !== "chats") continue
       const [store] = serverSync().child(project.worktree, { bootstrap: false })
-      const meta = (rows[0] ? projectForSession(rows[0], projects, projectByID) : undefined) ?? project
-      result.push({
-        key: pathKey(project.worktree),
+      const key = pathKey(project.worktree)
+      heads.set(key, {
+        key,
         label: displayName(project),
         directory: project.worktree,
-        project: meta,
-        sessions: rows,
+        project: (rows[0] ? projectForSession(rows[0], projects, projectByID) : undefined) ?? project,
         // sessionTotal starts at 0 (not undefined) until the first load, so the
         // loaded-row count is the honest fallback while the estimate is cold.
         total: store.sessionTotal > 0 ? store.sessionTotal : rows.length,
+        sessions: rows,
       })
     }
-
-    return result
+    return heads
   })
 
-  // <For> keys by reference: without this reuse pass, every groups() recompute
-  // (a working flag flipping anywhere, a session list refresh) would produce
-  // fresh group objects and tear down + rebuild EVERY section's DOM — all
-  // ChatRow subtrees and their IntersectionObservers included. Reusing the
-  // previous group object when nothing visible changed keeps row components
-  // alive across recomputes; Solid then diffs the inner session lists by the
-  // stable per-session references instead of remounting. Same reuse pattern as
-  // reuseTimelineRows in timeline/projection.ts.
-  const stableGroups = createMemo((previous: ChatSessionGroup[] | undefined) => {
-    const next = groups()
-    if (!previous) return next
-    const byKey = new Map(previous.map((group) => [group.key, group] as const))
-    return next.map((group) => {
-      const old = byKey.get(group.key)
-      if (!old) return group
-      if (
-        old.label !== group.label ||
-        old.directory !== group.directory ||
-        old.total !== group.total ||
-        old.project !== group.project ||
-        !sameRows(old.sessions, group.sessions)
-      ) {
-        return group
+  const sidebarGroupSessionsByProject = createMemo<Map<string, Session[]>>((previous) => {
+    // Project-head attribution is not used by Recent or Status. Do not
+    // materialize the per-project reverse map for every global member update
+    // while either of those views is active.
+    if (props.state.view() !== "projects") return new Map<string, Session[]>()
+    const heads = projectHeads()
+    const byProject = new Map<string, Session[]>([...heads.keys()].map((key) => [key, []]))
+    const keysByProjectID = new Map<string, string[]>()
+    for (const head of heads.values()) {
+      const id = head.project.id
+      if (!id) continue
+      const keys = keysByProjectID.get(id)
+      if (keys) keys.push(head.key)
+      else keysByProjectID.set(id, [head.key])
+    }
+    for (const session of sidebarGroupSessions()) {
+      const keys = keysByProjectID.get(session.projectID) ?? []
+      const directoryKey = pathKey(session.directory)
+      for (const key of keys) byProject.get(key)?.push(session)
+      // The canonical project ID and its worktree may identify the same head.
+      // Avoid a per-member Set allocation while retaining distinct paths.
+      if (byProject.has(directoryKey) && !keys.includes(directoryKey)) byProject.get(directoryKey)!.push(session)
+    }
+    // Reuse unaffected member arrays even when a different group's roster
+    // changes. The Project section cache uses these exact identities to avoid
+    // touching unrelated projects on worker-spawn/complete events.
+    return reuseChatSidebarProjectMemberLists(previous, byProject)
+  })
+  // Index directory-scoped canonical roots only on root-index revisions;
+  // group renames/member shuffles must not scan 10k unrelated idle roots just
+  // to discover which projects contain their sparse group IDs.
+  const hasScopedSidebarGroups = createMemo(() => sidebarClusterGroups().groupBySession.size > 0)
+  const projectRootMembership = createMemo(() => {
+    if (props.state.view() !== "projects") return new Map<string, readonly string[]>()
+    // No group membership means no group-signature lookups. Avoid allocating
+    // a dense reverse-root index during the common all-ungrouped cold paint.
+    // The boolean memo stays stable across ordinary group title/member edits.
+    if (!hasScopedSidebarGroups()) return new Map<string, readonly string[]>()
+    return indexChatSidebarProjectMembership([...projectHeads().values()], new Map())
+  })
+  const projectGroupRevisions = createMemo(() => {
+    if (props.state.view() !== "projects") return new Map<string, string>()
+    const projection = sidebarClusterGroups()
+    return chatSidebarIndexedProjectGroupRevisions(
+      projectHeads().keys(), projectRootMembership(), sidebarGroupSessionsByProject(),
+      projection.groupBySession, projection.byGroup,
+    )
+  })
+  const hasWorkingSessions = createMemo(() => workingIDs().size > 0)
+  const projectWorkingMembership = createMemo(() => {
+    // Only updated-time sort applies working-first pinning. A worker state
+    // transition under title/created sort must not reindex project membership.
+    // No busy rows = no reason to build a 10k-entry reverse map on first paint.
+    if (props.state.view() !== "projects" || props.state.sort() !== "updated")
+      return new Map<string, readonly string[]>()
+    if (!hasWorkingSessions()) return new Map<string, readonly string[]>()
+    return indexChatSidebarProjectMembership([...projectHeads().values()], sidebarGroupSessionsByProject())
+  })
+  const projectSectionCache = createChatSidebarProjectSectionCache()
+  onCleanup(() => projectSectionCache.clear())
+  createEffect(() => {
+    // A keep-mounted sidebar must not retain all Project sections and their
+    // Session references while rendering Recent or Status instead.
+    if (props.state.view() !== "projects") projectSectionCache.clear()
+  })
+  let projectedServer = paneServerKey()
+
+  const memberInSidebarScope = (
+    session: Session,
+    scope: ChatSidebarClusterScope,
+    stateOf: (session: Session) => ChatSidebarRowState = rowState,
+  ) => {
+    if (scope.kind === "recent") return true
+    if (scope.kind === "status") return chatSidebarStatusBucket(stateOf(session)) === scope.status
+    const project = projectHeads().get(scope.projectKey)
+    if (!project) return false
+    if (project.project.id && session.projectID === project.project.id) return true
+    return pathKey(session.directory) === scope.projectKey
+  }
+
+  const groupMembersInSidebarScope = (
+    group: { id: string; kind: string },
+    scope: ChatSidebarClusterScope,
+    stateOf: (session: Session) => ChatSidebarRowState = rowState,
+  ) => {
+    if (group.kind !== "delegation" && group.kind !== "user") return []
+    const projection = sidebarClusterGroups()
+    const roots = sidebarRootSessionsByID()
+    const result: Session[] = []
+    for (const member of projection.byGroup.get(group.id) ?? []) {
+      if (projection.groupBySession.get(member.id)?.id !== group.id) continue
+      const session = roots.get(member.id) ?? member
+      if (memberInSidebarScope(session, scope, stateOf)) result.push(session)
+    }
+    return result
+  }
+
+  const sections = createMemo<ChatSidebarSection[]>((previous) => {
+    const server = paneServerKey()
+    if (server !== projectedServer) {
+      // Synchronous invalidation before this render matters: an after-render
+      // effect could clear the nonreactive arrival/cache state too late, leaving
+      // the first paint in the new server ordered by the previous server's IDs.
+      workingOrder.clear()
+      projectSectionCache.clear()
+      projectedServer = server
+      previous = undefined
+    }
+    const { recentPool } = baseGroups()
+    const mode = props.state.view()
+    const sort = props.state.sort()
+    // Created/title sorting never pins working rows. Avoid subscribing these
+    // entire structural sections to execution flips: live badges/timers are
+    // already reactive at the mounted-row runtime level. On returning to
+    // updated-time ordering, prune the arrival policy against the latest
+    // authoritative working set before the first pinned projection.
+    if (sort === "updated") workingOrder.prune(presentSidebarSessionIDs(), workingIDs())
+    if (mode === "projects") {
+      const supplemental = sidebarGroupSessionsByProject()
+      return reuseChatSidebarSections(previous, projectSectionCache.build({
+        projects: [...projectHeads().values()],
+        supplemental,
+        working: sort === "updated"
+          ? workingChatSidebarProjects(workingIDs(), projectWorkingMembership())
+          : new Map<string, ReadonlySet<string>>(),
+        sort,
+        groupRevision: projectGroupRevisions(),
+        groupOf,
+        groupMembersOf: (group, scope) => groupMembersInSidebarScope(group, scope),
+        titleOf,
+        pin: pinWorkingFirst,
+      }))
+    }
+    const recentSource = mode === "recent" ? recentSparseSource() : undefined
+    if (recentSource) {
+      const section = buildChatSidebarSparseRecentSection({
+        source: recentSource,
+        working: sort === "updated" ? workingIDs() : new Set<string>(),
+        limit: props.state.recentLimit(),
+        pinWorking: sort === "updated" ? pinWorkingFirst : (rows) => rows,
+        compare: compareChatSidebarSessions(sort, titleOf),
+        titleOf,
+        groupMembersOf: (group) => groupMembersInSidebarScope(group, { kind: "recent" }),
+      })
+      if (section || recentSource.rows.length === 0)
+        return reuseChatSidebarSections(previous, section ? [section] : [])
+    }
+    const sparseSource = mode === "status" && sort === "updated" ? sparseStatusSource() : undefined
+    if (sparseSource) {
+      return reuseChatSidebarSections(
+        previous,
+        buildChatSidebarSparseStatusSections({
+          source: sparseSource,
+          states: statusStateIndex(),
+          limit: props.state.recentLimit(),
+          pin: pinWorkingFirst,
+        }),
+      )
+    }
+    const groupedSource = mode === "status" ? groupedStatusSource() : undefined
+    if (groupedSource) {
+      const state = statusStateIndex()
+      return reuseChatSidebarSections(
+        previous,
+        buildChatSidebarGroupedSparseStatusSections({
+          source: groupedSource,
+          states: state,
+          limit: props.state.recentLimit(),
+          pin: sort === "updated" ? pinWorkingFirst : (rows) => rows,
+          compare: compareChatSidebarSessions(sort, titleOf),
+          titleOf,
+          groupMembersOf: (group, scope) =>
+            groupMembersInSidebarScope(group, scope, (session) => state.get(session.id) ?? "idle"),
+        }),
+      )
+    }
+    // All status-relevant sparse owner values have already been indexed above.
+    // The absence of an ID is semantically idle, never an implicit fetch.
+    const stateForProjection = (session: Session) =>
+      mode === "status" ? statusStateIndex().get(session.id) ?? "idle" : rowState(session)
+    const scopedStatusMembers = new Map<ChatSidebarStatusBucket, Session[]>()
+    if (mode === "status") {
+      for (const member of sidebarGroupSessions()) {
+        const bucket = chatSidebarStatusBucket(stateForProjection(member))
+        const list = scopedStatusMembers.get(bucket)
+        if (list) list.push(member)
+        else scopedStatusMembers.set(bucket, [member])
       }
-      return old
+    }
+    const next = buildChatSidebarSections({
+      mode,
+      sort,
+      recent: sort === "updated" ? recentWithGroupMembers() : recentPool,
+      projects: [],
+      groupOf,
+      stateOf: mode === "status" ? stateForProjection : rowState,
+      titleOf,
+      pin: pinWorkingFirst,
+      limit: props.state.recentLimit(),
+      cluster: true,
+      sessionsForScope: (scope) =>
+        scope.kind === "project"
+          ? sidebarGroupSessionsByProject().get(scope.projectKey) ?? []
+          : scope.kind === "recent"
+            ? sidebarGroupSessions()
+            : scopedStatusMembers.get(scope.status) ?? [],
+      groupMembersOf: (group, scope) => groupMembersInSidebarScope(group, scope, stateForProjection),
+    })
+    return reuseChatSidebarSections(previous, next)
+  })
+
+  const sectionExpanded = (key: string) => !props.state.isGroupCollapsed(key)
+
+
+  // <For> keys by reference; sections and cluster items are re-minted whenever
+  // a count/total/member order moves. Render through key-stable slots instead so
+  // such changes update in place and never remount the section or its rows.
+  const createSlot = <T,>(key: string, value: T): ChatSidebarSlot<T> => {
+    const [get, set] = createSignal(value, { equals: false })
+    return { key, get, set: (next) => set(() => next) }
+  }
+  let sectionSlotState: ChatSidebarSlotState<ChatSidebarSection> | undefined
+  const sectionSlots = createMemo(() => {
+    const next = sections()
+    return untrack(() => {
+      sectionSlotState = reconcileChatSidebarSlots(sectionSlotState, next, (section) => section.key, () => true, createSlot)
+      return sectionSlotState.slots
     })
   })
-
-  // Bootstrap compact metrics once for every session this pane actually
-  // renders. Hidden structural members are no longer rendered inline, so they
-  // are not warmed here — SessionPreviewCard ensures their telemetry in one
-  // coalesced batch only while a preview covering them is open.
-  createEffect(() => {
-    const ids = new Set<string>()
-    for (const group of stableGroups()) {
-      // Collapsed groups have no mounted ChatRows. Avoid warming telemetry for
-      // their entire loaded session slice until the user expands that group.
-      if (!isExpanded(group.key)) continue
-      for (const session of group.sessions) ids.add(session.id)
-    }
-    serverSync().telemetry.ensure(ids)
-  })
+  const itemSlotStates = new Map<string, ChatSidebarSlotState<ChatSidebarItem>>()
+  const itemSlots = (sectionKey: string, items: readonly ChatSidebarItem[]) => {
+    const state = reconcileChatSidebarSlots(
+      itemSlotStates.get(sectionKey),
+      items,
+      (item) => item.key,
+      // A metadata update to an existing session is consumed reactively by its
+      // mounted row; never tear down its observer or session runtime lease.
+      canReuseChatSidebarItemSlot,
+      createSlot,
+    )
+    itemSlotStates.set(sectionKey, state)
+    return state.slots
+  }
 
   // Footer counts server-known roots per directory (sessionTotal estimates),
   // not loaded rows — loaded rows are capped per store and would undercount.
-  const totalSessions = createMemo(() =>
-    (groups() ?? []).reduce((sum, group) => (group?.key === "recent" ? sum : sum + (group?.total ?? 0)), 0),
-  )
+  const totalSessions = createMemo(() => {
+    let sum = 0
+    for (const head of projectHeads().values()) sum += head.total
+    return sum
+  })
+
+  // Preserve the exact session scope of the previous row scans without
+  // subscribing this footer to every idle row's reactive state. Runtime status
+  // and pending responses are materialized in the shared server-session owner.
+  const footerScope = createMemo(() => {
+    const directories = new Map<string, Set<string>>()
+    const add = (id: string, directory: string) => {
+      let scopes = directories.get(id)
+      if (!scopes) {
+        scopes = new Set<string>()
+        directories.set(id, scopes)
+      }
+      scopes.add(directory)
+    }
+    for (const session of baseGroups().recentPool) add(session.id, session.directory ?? "")
+    for (const group of visibleMemberGroups()) {
+      for (const member of group.sessions) add(member.id, member.directory ?? "")
+    }
+    return { directories, ids: new Set(directories.keys()) }
+  }, undefined, { equals: sameChatSidebarDirectoryScope })
+
+  const waitingCount = createMemo(() => {
+    const data = serverSync().session.data
+    return countSidebarWaiting(footerScope().directories, data.question, data.permission, (request, directory) =>
+      permissionState().autoResponds(request, directory),
+    )
+  })
 
   const workingCount = createMemo(() => {
-    const seen = new Set<string>()
-    for (const session of baseGroups().recentPool) if (isWorking(session)) seen.add(session.id)
-    // Structural members may be absent from the loaded root slices. Once their
-    // anchor is part of this pane, include their work state in the global badge.
-    for (const group of visibleStructuralGroups()) {
-      for (const member of group.sessions) if (isWorking(member)) seen.add(member.id)
-    }
-    return seen.size
+    // Reuse the single sparse working projection shared with working-first
+    // ordering instead of independently enumerating all status rows again.
+    const ids = footerScope().ids
+    let count = 0
+    for (const id of workingIDs()) if (ids.has(id)) count++
+    return count
   })
 
   // Reveal-once semantics: the active session's group expands when navigation
@@ -665,9 +1057,7 @@ export function ChatSidebarPane(props: {
   }>()
   const routing = useIsRouting()
   const [pendingSessionId, setPendingSessionId] = createSignal<string | null>(null)
-  // The titlebar navigates to canonical /server/... routes while sidebar rows
-  // retain the legacy directory URL. Derive selection from the route's session
-  // identity instead of relying on <A>'s URL-matched `active` class.
+  // Match the selected session by identity, including group-member routes.
   const activeSessionId = createMemo(() => params.id ?? params.sessionId)
   let pendingSince = 0
   createEffect(() => {
@@ -703,16 +1093,31 @@ export function ChatSidebarPane(props: {
   createEffect(() => {
     const id = params.id
     if (!id || revealedFor === id) return
-    const current = stableGroups()
+    const current = sections()
     const anchorID = sessionGroups
       .list()
       .find((group) => group.sessionIds.includes(id) && !!group.anchorSessionID)?.anchorSessionID
-    const target =
-      current.find((group) => group.sessions.some((session) => session.id === id || session.id === anchorID))?.key ??
-      current.find((group) => group.directory && base64Encode(group.directory) === params.dir)?.key
+    const matches = (session: Session) => session.id === id || session.id === anchorID
+    let target: string | undefined
+    let cluster: string | undefined
+    for (const section of current) {
+      for (const item of section.items) {
+        if (item.type === "session" ? matches(item.session) : item.members.some(matches)) {
+          target = section.key
+          if (item.type === "cluster") cluster = item.group.id
+          break
+        }
+      }
+      if (target) break
+    }
+    target ??= current.find((section) => {
+      const directory = section.projectKey ? projectHeads().get(section.projectKey)?.directory : undefined
+      return directory && base64Encode(directory) === params.dir
+    })?.key
     if (!target) return
     revealedFor = id
     props.state.revealGroup(target)
+    if (cluster) props.state.revealCluster(cluster)
   })
 
   const resizePair = createMemo(() => {
@@ -832,7 +1237,11 @@ export function ChatSidebarPane(props: {
   // responsive; also covers a persisted-expanded group on pane mount.
   createEffect(() => {
     if (!props.state.isArchivedExpanded()) return
-    void fetchArchived()
+    archivedDirectories()
+    // The request reads cached row length to choose its skeleton. That read is
+    // not an invalidation signal: only expansion/visibility/directories should
+    // refetch, or the response would itself trigger another fetch.
+    untrack(() => void fetchArchived())
   })
 
   const showMoreArchived = () => {
@@ -893,6 +1302,7 @@ export function ChatSidebarPane(props: {
       refs: number
       update: (session: Session) => void
       dispose: () => void
+      disposed?: boolean
     }
   >()
 
@@ -949,7 +1359,11 @@ export function ChatSidebarPane(props: {
         if (!info) return undefined
         return info.name ?? info.modelID.split("@")[0] ?? info.modelID
       })
-      const live = createMemo<ChatRowLive | undefined>(() => {
+      // Deliberately NOT a memo: memos are eager, so a memo here would re-run at
+      // 1 Hz for every working session whose runtime is leased, visible or not.
+      // As a plain accessor it subscribes to the shared clock only inside a
+      // consumer (ChatRow's visibility-gated rowLive memo).
+      const live = (): ChatRowLive | undefined => {
         if (!isWorking()) return undefined
         now()
         return telemetryLive(
@@ -957,7 +1371,7 @@ export function ChatSidebarPane(props: {
           serverSync().telemetry.receivedAt(sessionID),
           sessionTelemetryClientNow(),
         )
-      })
+      }
 
       return {
         runtime: {
@@ -996,6 +1410,9 @@ export function ChatSidebarPane(props: {
     let released = false
     return {
       runtime: entry.runtime,
+      update: (next) => {
+        if (next.id === session.id && !entry!.disposed) entry!.update(next)
+      },
       release: () => {
         if (released) return
         released = true
@@ -1003,14 +1420,25 @@ export function ChatSidebarPane(props: {
         if (current !== entry) return
         current.refs -= 1
         if (current.refs > 0) return
-        rowRuntimeEntries.delete(session.id)
-        current.dispose()
+        // A view switch / section re-key disposes the old row subtree and mounts
+        // the new one in the same task. Tearing the runtime down eagerly would
+        // rebuild ~14 memos per row only to recreate them a moment later, so give
+        // re-leasing one microtask of grace before disposing.
+        queueMicrotask(() => {
+          if (current.refs > 0 || current.disposed) return
+          current.disposed = true
+          if (rowRuntimeEntries.get(session.id) === current) rowRuntimeEntries.delete(session.id)
+          current.dispose()
+        })
       },
     }
   }
 
   onCleanup(() => {
-    for (const entry of rowRuntimeEntries.values()) entry.dispose()
+    for (const entry of rowRuntimeEntries.values()) {
+      entry.disposed = true
+      entry.dispose()
+    }
     rowRuntimeEntries.clear()
   })
 
@@ -1020,6 +1448,7 @@ export function ChatSidebarPane(props: {
   // most one MutationObserver (only while a dynamic plain-text tooltip is
   // actually open). Rows publish metadata through data attributes; pointer and
   // focus intent is handled here via event delegation.
+  const SESSION_PREVIEW_HOVER_DELAY_MS = 650
   let paneElement: HTMLDivElement | undefined
   let sharedTooltipElement: HTMLDivElement | undefined
   let tooltipOpenTimer: ReturnType<typeof setTimeout> | undefined
@@ -1032,6 +1461,14 @@ export function ChatSidebarPane(props: {
   let tooltipTextObserver: MutationObserver | undefined
   const sharedTooltipID = "chat-sidebar-shared-tooltip"
   const [sharedTooltip, setSharedTooltip] = createSignal<ChatSidebarTooltipIntent>()
+  const [tooltipSurfaceRequested, setTooltipSurfaceRequested] = createSignal(false)
+  const [richPreviewRequested, setRichPreviewRequested] = createSignal(false)
+  createEffect(() => {
+    const current = sharedTooltip()
+    if (!current) return
+    setTooltipSurfaceRequested(true)
+    if (current.sessionID) setRichPreviewRequested(true)
+  })
   const [sharedTooltipText, setSharedTooltipText] = createSignal("")
   const [sharedTooltipPosition, setSharedTooltipPosition] = createSignal<{ x: number; y: number }>()
   // The rich card is a pane-scoped surface, not a free-floating window
@@ -1088,8 +1525,9 @@ export function ChatSidebarPane(props: {
   }
 
   const closeSharedTooltip = (anchor?: HTMLElement) => {
-    if (pendingTooltip && (!anchor || pendingTooltip.anchor === anchor)) pendingTooltip = undefined
-    if (tooltipOpenTimer !== undefined) {
+    const closingPending = !anchor || pendingTooltip?.anchor === anchor
+    if (closingPending) pendingTooltip = undefined
+    if (closingPending && tooltipOpenTimer !== undefined) {
       clearTimeout(tooltipOpenTimer)
       tooltipOpenTimer = undefined
     }
@@ -1110,6 +1548,7 @@ export function ChatSidebarPane(props: {
     setSharedTooltip(undefined)
     setSharedTooltipPosition(undefined)
     setSharedTooltipMaxHeight(undefined)
+    if (current.sessionID) setHoveredTreeKey(undefined)
     lastTooltipClosedAt = performance.now()
   }
 
@@ -1201,12 +1640,22 @@ export function ChatSidebarPane(props: {
     }
     const current = sharedTooltip()
     if (current?.anchor === intent.anchor && current.sessionID === intent.sessionID) {
+      if (intent.sessionID) {
+        const block = intent.anchor.closest<HTMLElement>("[data-chat-sidebar-virtual-block]")
+        setHoveredTreeKey(block?.dataset.blockKey)
+      }
       syncTooltipText(intent)
       queueSharedTooltipPosition()
       return
     }
     describeTooltipAnchor(intent.anchor)
     syncTooltipText(intent)
+    if (intent.sessionID) {
+      const block = intent.anchor.closest<HTMLElement>("[data-chat-sidebar-virtual-block]")
+      setHoveredTreeKey(block?.dataset.blockKey)
+    } else {
+      setHoveredTreeKey(undefined)
+    }
     setSharedTooltip(intent)
     setSharedTooltipPosition(undefined)
     // Paint immediately from the cheap fallback size so an occluded/throttled
@@ -1218,22 +1667,41 @@ export function ChatSidebarPane(props: {
 
   const scheduleSharedTooltip = (intent: ChatSidebarTooltipIntent) => {
     if (suppressedTooltipAnchor === intent.anchor) return
+    // The rich inspector is hover-only. Start downloading its chunk during the
+    // intent window instead of paying for that module graph at sidebar startup.
+    if (intent.sessionID) void loadSessionPreviewCard()
     const current = sharedTooltip()
-    if (current?.anchor === intent.anchor) return
+    if (current?.anchor === intent.anchor) {
+      if (pendingTooltip && pendingTooltip.anchor !== intent.anchor) {
+        pendingTooltip = undefined
+        if (tooltipOpenTimer !== undefined) {
+          clearTimeout(tooltipOpenTimer)
+          tooltipOpenTimer = undefined
+        }
+      }
+      if (tooltipCloseGraceTimer !== undefined) {
+        clearTimeout(tooltipCloseGraceTimer)
+        tooltipCloseGraceTimer = undefined
+      }
+      return
+    }
     if (tooltipOpenTimer !== undefined) clearTimeout(tooltipOpenTimer)
     pendingTooltip = intent
-    // Match TooltipV2's 400ms initial intent while preserving the familiar
-    // fast handoff between neighboring tooltip targets.
-    const skipDelay = !!current || performance.now() - lastTooltipClosedAt < 300
+    // A session inspector needs a deliberate initial dwell. Once it is open,
+    // keep it responsive while the pointer moves between related rows.
+    const skipDelay = intent.sessionID
+      ? !!current?.sessionID
+      : !!current || performance.now() - lastTooltipClosedAt < 300
     if (skipDelay) {
       showSharedTooltip(intent)
       return
     }
+    const delay = intent.sessionID ? SESSION_PREVIEW_HOVER_DELAY_MS : 400
     tooltipOpenTimer = setTimeout(() => {
       tooltipOpenTimer = undefined
       if (pendingTooltip !== intent) return
       showSharedTooltip(intent)
-    }, 400)
+    }, delay)
   }
 
   const tooltipAnchorFrom = (target: EventTarget | null) => {
@@ -1284,18 +1752,26 @@ export function ChatSidebarPane(props: {
   // grace window instead, cancelled the moment the pointer actually reaches
   // it (card's own onPointerEnter) or re-enters the row.
   const scheduleCloseSharedTooltip = (anchor: HTMLElement) => {
+    if (pendingTooltip?.anchor === anchor) {
+      pendingTooltip = undefined
+      if (tooltipOpenTimer !== undefined) {
+        clearTimeout(tooltipOpenTimer)
+        tooltipOpenTimer = undefined
+      }
+    }
     const current = sharedTooltip()
-    if (current?.anchor !== anchor) return
+    if (!current) return
     if (!current.sessionID) {
-      closeSharedTooltip(anchor)
+      if (current.anchor === anchor) closeSharedTooltip(anchor)
       return
     }
     if (tooltipCloseGraceTimer !== undefined) clearTimeout(tooltipCloseGraceTimer)
+    const closingAnchor = current.anchor
     tooltipCloseGraceTimer = setTimeout(() => {
       tooltipCloseGraceTimer = undefined
       if (sharedTooltipCardHovered || sharedTooltipCardContextMenuOpen()) return
-      if (anchor.matches(":hover")) return
-      closeSharedTooltip(anchor)
+      if (closingAnchor.matches(":hover")) return
+      closeSharedTooltip(closingAnchor)
     }, 200)
   }
 
@@ -1306,7 +1782,10 @@ export function ChatSidebarPane(props: {
     if (suppressedTooltipAnchor === previous) suppressedTooltipAnchor = undefined
     if (next) {
       const intent = tooltipIntentFrom(next)
-      if (intent) scheduleSharedTooltip(intent)
+      if (intent) {
+        scheduleCloseSharedTooltip(previous)
+        scheduleSharedTooltip(intent)
+      }
       return
     }
     scheduleCloseSharedTooltip(previous)
@@ -1371,7 +1850,9 @@ export function ChatSidebarPane(props: {
   })
   const sharedTooltipRelationships = createMemo(() => {
     const sessionID = sharedTooltip()?.sessionID
-    return sessionID ? sessionPreviewRelationships({ sessionID, groups: sessionGroups.list() }) : undefined
+    if (!sessionID) return undefined
+    const groups = sessionGroups.list()
+    return sessionPreviewProjectionCache.session({ sessionID, groups, index: sessionGroups.previewIndex() })
   })
 
   createEffect(() => {
@@ -1425,7 +1906,11 @@ export function ChatSidebarPane(props: {
     onCleanup(() => window.removeEventListener("blur", onBlur))
   })
 
-  onMount(() => {
+  const tooltipVisible = createMemo(() => !!sharedTooltip())
+  createEffect(() => {
+    if (!tooltipVisible()) return
+    // One active positioning observer pair per pane, zero listeners while
+    // closed; switching hovered rows does not re-register these listeners.
     const reposition = () => queueSharedTooltipPosition()
     paneElement?.addEventListener("scroll", reposition, true)
     window.addEventListener("resize", reposition)
@@ -1486,6 +1971,743 @@ export function ChatSidebarPane(props: {
     searchDisposed = true
   })
 
+  const showMoreInSection = (section: ChatSidebarSection) => {
+    if (section.kind !== "project") {
+      // Recent and the Status idle tail are already held in memory, so
+      // revealing more is pure client state.
+      props.state.showMoreRecent()
+      return
+    }
+    const head = section.projectKey ? projectHeads().get(section.projectKey) : undefined
+    if (!head) return
+    const [, setStore] = serverSync().child(head.directory, { bootstrap: false })
+    setStore("limit", (prev) => (prev ?? 5) + 5)
+    void serverSync().project.loadSessions(head.directory, { projectID: head.project.id })
+  }
+
+  const canShowLessInSection = (section: ChatSidebarSection) => {
+    if (section.kind !== "project") {
+      if (section.kind === "status" && section.status !== "idle") return false
+      return props.state.recentLimit() > CHAT_SIDEBAR_RECENT_LIMIT_MIN
+    }
+    const head = section.projectKey ? projectHeads().get(section.projectKey) : undefined
+    return !!head && (serverSync().child(head.directory, { bootstrap: false })[0].limit ?? 5) > 5
+  }
+
+  const showLessInSection = (section: ChatSidebarSection) => {
+    if (section.kind !== "project") {
+      props.state.showLessRecent()
+      return
+    }
+    const head = section.projectKey ? projectHeads().get(section.projectKey) : undefined
+    if (!head) return
+    const [store] = serverSync().child(head.directory, { bootstrap: false })
+    void serverSync().project.loadSessions(head.directory, {
+      shrinkTo: Math.max(5, (store.limit ?? 5) - 5),
+      projectID: head.project.id,
+    })
+  }
+
+  type ChatSidebarVirtualBlock =
+    | { type: "oxp"; key: "oxp" }
+    | { type: "empty"; key: "empty" }
+    | { type: "section-head"; key: string; section: ChatSidebarSlot<ChatSidebarSection> }
+    | {
+        type: "session"
+        key: string
+        section: ChatSidebarSlot<ChatSidebarSection>
+        item: ChatSidebarSlot<ChatSidebarItem>
+        sectionHeadKey: string
+      }
+    | {
+        type: "cluster-head"
+        key: string
+        section: ChatSidebarSlot<ChatSidebarSection>
+        item: ChatSidebarSlot<ChatSidebarItem>
+        sectionHeadKey: string
+      }
+    | {
+        type: "cluster-member"
+        key: string
+        section: ChatSidebarSlot<ChatSidebarSection>
+        item: ChatSidebarSlot<ChatSidebarItem>
+        sectionHeadKey: string
+        clusterHeadKey: string
+        member: Session
+        memberID: string
+        memberIndex: number
+      }
+    | { type: "more"; key: string; section: ChatSidebarSlot<ChatSidebarSection>; sectionHeadKey: string }
+    | { type: "less"; key: string; section: ChatSidebarSlot<ChatSidebarSection>; sectionHeadKey: string }
+    | { type: "archived"; key: "archived" }
+
+  const sameVirtualBlock = (a: ChatSidebarVirtualBlock, b: ChatSidebarVirtualBlock) => {
+    if (a.type !== b.type || a.key !== b.key) return false
+    if (a.type === "oxp" || a.type === "empty" || a.type === "archived") return true
+    if (b.type === "oxp" || b.type === "empty" || b.type === "archived") return false
+    if (a.type === "section-head" && b.type === "section-head") return a.section === b.section
+    if (a.type === "more" && b.type === "more") return a.section === b.section
+    if (a.type === "less" && b.type === "less") return a.section === b.section
+    if (a.type === "session" && b.type === "session") {
+      return a.section === b.section && a.item === b.item && a.sectionHeadKey === b.sectionHeadKey
+    }
+    if (a.type === "cluster-head" && b.type === "cluster-head") {
+      return a.section === b.section && a.item === b.item && a.sectionHeadKey === b.sectionHeadKey
+    }
+    if (a.type === "cluster-member" && b.type === "cluster-member") {
+      return (
+        a.section === b.section &&
+        a.item === b.item &&
+        a.sectionHeadKey === b.sectionHeadKey &&
+        a.clusterHeadKey === b.clusterHeadKey &&
+        a.member === b.member &&
+        a.memberID === b.memberID &&
+        a.memberIndex === b.memberIndex
+      )
+    }
+    return false
+  }
+
+  const treeVirtualBlocks = createMemo<ChatSidebarVirtualBlock[]>((previous = []) => {
+    const slots = sectionSlots()
+    const next: ChatSidebarVirtualBlock[] = [{ type: "oxp", key: "oxp" }]
+    const liveSectionKeys = new Set<string>()
+
+    if (slots.length === 0) next.push({ type: "empty", key: "empty" })
+
+    for (const sectionSlot of slots) {
+      const section = sectionSlot.get()
+      const sectionKey = sectionSlot.key
+      const sectionHeadKey = `section-head:${sectionKey}`
+      liveSectionKeys.add(sectionKey)
+      next.push({ type: "section-head", key: sectionHeadKey, section: sectionSlot })
+       if (!sectionExpanded(sectionKey)) {
+         // A collapsed section retains no mounted rows; drop its row slots too
+         // instead of holding references to its former full session list.
+         itemSlotStates.delete(sectionKey)
+         continue
+       }
+
+      const slotsForSection = untrack(() => itemSlots(sectionKey, section.items))
+      for (const itemSlot of slotsForSection) {
+        const item = itemSlot.get()
+        if (item.type === "session") {
+          next.push({
+            type: "session",
+            key: `session:${sectionKey}:${item.session.id}`,
+            section: sectionSlot,
+            item: itemSlot,
+            sectionHeadKey,
+          })
+          continue
+        }
+
+        const clusterHeadKey = `cluster-head:${sectionKey}:${item.group.id}`
+        next.push({
+          type: "cluster-head",
+          key: clusterHeadKey,
+          section: sectionSlot,
+          item: itemSlot,
+          sectionHeadKey,
+        })
+        if (!props.state.isClusterExpanded(item.group.id)) continue
+        for (let memberIndex = 0; memberIndex < item.members.length; memberIndex++) {
+          const member = item.members[memberIndex]
+          if (!member) continue
+          next.push({
+            type: "cluster-member",
+            key: `cluster-member:${sectionKey}:${item.group.id}:${member.id}`,
+            section: sectionSlot,
+            item: itemSlot,
+            sectionHeadKey,
+            clusterHeadKey,
+            member,
+            memberID: member.id,
+            memberIndex,
+          })
+        }
+      }
+
+      if (section.total > section.sessionCount) {
+        next.push({ type: "more", key: `more:${sectionKey}`, section: sectionSlot, sectionHeadKey })
+      }
+      if (canShowLessInSection(section)) {
+        next.push({ type: "less", key: `less:${sectionKey}`, section: sectionSlot, sectionHeadKey })
+      }
+    }
+
+    for (const key of itemSlotStates.keys()) {
+      if (!liveSectionKeys.has(key)) itemSlotStates.delete(key)
+    }
+    next.push({ type: "archived", key: "archived" })
+
+    return reuseChatSidebarVirtualBlocks(previous, next, sameVirtualBlock)
+  })
+
+  const [treeScrollRoot, setTreeScrollRoot] = createSignal<HTMLDivElement>()
+  const [treeScrollOffset, setTreeScrollOffset] = createSignal(0)
+  // Session ordering can change while the user is interacting (status moves,
+  // working-first pinning, group expansion). Persist a block identity rather
+  // than its index, otherwise a reorder pins an unrelated row and can trap
+  // keyboard focus or leave the tooltip attached to a recycled virtual slot.
+  const [focusedTreeKey, setFocusedTreeKey] = createSignal<string>()
+  const [hoveredTreeKey, setHoveredTreeKey] = createSignal<string>()
+  const treeBlockIndexByKey = createMemo(() => {
+    const result = new Map<string, number>()
+    const blocks = treeVirtualBlocks()
+    for (let index = 0; index < blocks.length; index++) {
+      const block = blocks[index]
+      if (block) result.set(block.key, index)
+    }
+    return result
+  })
+  const focusedTreeBlock = createMemo(() => {
+    const key = focusedTreeKey()
+    return key ? treeBlockIndexByKey().get(key) ?? -1 : -1
+  })
+  const hoveredTreeBlock = createMemo(() => {
+    const key = hoveredTreeKey()
+    return key ? treeBlockIndexByKey().get(key) ?? -1 : -1
+  })
+  const stickyMarkers = createMemo(() => indexChatSidebarStickyHeaders(treeVirtualBlocks()))
+  // TanStack caches virtual measurements by item key. Recreating getItemKey
+  // whenever reactive options are evaluated changes the callback identity and
+  // can invalidate measurements while the user is scrolling; keep it stable.
+  const treeItemKey = (index: number) => treeVirtualBlocks()[index]?.key ?? index
+  const treeRangeExtractor = (range: Parameters<typeof defaultRangeExtractor>[0]) => {
+    const indexes = defaultRangeExtractor(range)
+    const sticky = stickyChatSidebarHeader(stickyMarkers(), range.startIndex)
+    for (const pinned of [focusedTreeBlock(), hoveredTreeBlock(), sticky]) {
+      if (pinned >= 0 && pinned < range.count && !indexes.includes(pinned)) indexes.push(pinned)
+    }
+    return indexes.sort((a, b) => a - b)
+  }
+  const treeVirtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
+    get count() {
+      return treeVirtualBlocks().length
+    },
+    getScrollElement: () => treeScrollRoot() ?? null,
+    onChange: (instance) => setTreeScrollOffset(instance.scrollOffset ?? 0),
+    initialRect: { width: 320, height: 720 },
+    // Keep the estimator callback stable. A fresh closure on each virtualizer
+    // options read can invalidate sizing while sessions stream/reorder.
+    estimateSize: (index) => {
+      const block = treeVirtualBlocks()[index]
+      if (!block) return 24
+      const fixed = sidebarFixedBlockHeight(block.type, props.state.density())
+      if (fixed !== undefined) return fixed
+      if (block.type === "empty") return 100
+      if (block.type === "oxp") return props.state.isGroupCollapsed("oxp") ? 24 : 180
+      return props.state.isArchivedExpanded()
+        ? 24 + Math.max(1, Math.min(archivedState.rows.length, props.state.archivedLimit())) * 30
+        : 24
+    },
+    overscan: 8,
+    paddingEnd: 6,
+    getItemKey: treeItemKey,
+    rangeExtractor: treeRangeExtractor,
+  })
+  // Only density changes reset measured coordinates. An ordinary session
+  // update must never make an already painted row fall back to a 0px slot.
+  createEffect(on(
+    () => props.state.density(),
+    (_density, previous) => {
+      if (previous !== undefined) treeVirtualizer.measure()
+    },
+  ))
+  const activeStickyTreeBlock = createMemo(() => {
+    treeScrollOffset() // The virtualizer's range is mutable; subscribe to scroll.
+    const start = treeVirtualizer.range?.startIndex
+    if (start === undefined) return -1
+    return stickyChatSidebarHeader(stickyMarkers(), start)
+  })
+  const treeVirtualRows = createMemo<
+    Array<{
+      virtualRow: ReturnType<typeof treeVirtualizer.getVirtualItems>[number]
+      block: ChatSidebarVirtualBlock | undefined
+      key: string | number
+    }>
+  >((previous = []) => {
+    const prior = new Map(previous.map((entry) => [entry.key, entry] as const))
+    const blocks = treeVirtualBlocks()
+    return treeVirtualizer.getVirtualItems().map((virtualRow) => {
+      const block = blocks[virtualRow.index]
+      const key = block?.key ?? virtualRow.index
+      const existing = prior.get(key)
+      if (
+        existing &&
+        existing.block === block &&
+        existing.virtualRow.index === virtualRow.index &&
+        existing.virtualRow.start === virtualRow.start &&
+        existing.virtualRow.size === virtualRow.size
+      ) {
+        return existing
+      }
+      return { virtualRow, block, key }
+    })
+  })
+
+const memberForBlock = (
+  block: Extract<ChatSidebarVirtualBlock, { type: "cluster-member" }>,
+) => block.member
+
+  // Warm only rows whose virtual items are mounted. This is deliberately more
+  // selective than the old section-level warming: a 500-session project or a
+  // 200-member swarm costs roughly one viewport of telemetry subscriptions.
+  createEffect(() => {
+    const ids = new Set<string>()
+    for (const entry of treeVirtualRows()) {
+      const block = entry.block
+      if (!block) continue
+      if (block.type === "session") {
+        const item = block.item.get()
+        if (item.type === "session") ids.add(item.session.id)
+      } else if (block.type === "cluster-head") {
+        const item = block.item.get()
+        if (item.type === "cluster") ids.add(item.lead.id)
+      } else if (block.type === "cluster-member") {
+        const member = memberForBlock(block)
+        if (member) ids.add(member.id)
+      }
+    }
+    serverSync().telemetry.ensure([...ids])
+  })
+
+  // JetBrains-style tree keyboard model over mounted nodes. Crossing a virtual
+  // window boundary first scrolls the target block into range, then focuses its
+  // first/last tree item on the next frame.
+  const TREE_ITEM_SELECTOR = '[data-slot="section-head"], [data-tree-item], [data-component="chats-oxp-activity-row"]'
+  let treeElement: HTMLDivElement | undefined
+  let treeFocusRequest = 0
+  onCleanup(() => {
+    // An outstanding animation-frame focus request must not target DOM from
+    // a disposed sidebar after the user closes the pane or switches routes.
+    treeFocusRequest++
+  })
+  const focusVirtualBlock = (index: number, edge: "first" | "last", step: -1 | 1) => {
+    const request = ++treeFocusRequest
+    const seek = (candidate: number) => {
+      const blocks = treeVirtualBlocks()
+      if (request !== treeFocusRequest || candidate < 0 || candidate >= blocks.length) return
+      const key = blocks[candidate]?.key
+      if (!key) return
+      setFocusedTreeKey(key)
+      treeVirtualizer.scrollToIndex(candidate, { align: "auto" })
+      let attempts = 0
+      const focusWhenMounted = () => {
+        if (request !== treeFocusRequest) return
+        // Status updates can reorder virtual blocks between the scroll call
+        // and this frame. Resolve the same *identity*, not yesterday's index;
+        // otherwise ArrowDown/Up may focus a different session.
+        const currentIndex = treeBlockIndexByKey().get(key)
+        if (currentIndex === undefined) {
+          seek(candidate + step)
+          return
+        }
+        if (currentIndex !== candidate) treeVirtualizer.scrollToIndex(currentIndex, { align: "auto" })
+        const block = treeElement?.querySelector<HTMLElement>(
+          `[data-chat-sidebar-virtual-block][data-index="${currentIndex}"]`,
+        )
+        const items = block ? [...block.querySelectorAll<HTMLElement>(TREE_ITEM_SELECTOR)] : []
+        const target = edge === "first" ? items[0] : items[items.length - 1]
+        if (!target) {
+          // A virtualizer can take one additional frame to commit its new
+          // range after scrollToIndex (or after a same-tick status reorder).
+          // Do not skip a legitimate keyboard target before it has mounted.
+          // Bound retries so non-focusable footer blocks are still skipped.
+          if (attempts++ < 2) {
+            requestAnimationFrame(focusWhenMounted)
+            return
+          }
+          seek(currentIndex + step)
+          return
+        }
+        target.focus({ preventScroll: true })
+        target.scrollIntoView({ block: "nearest" })
+      }
+      requestAnimationFrame(focusWhenMounted)
+    }
+    seek(index)
+  }
+  const focusVirtualBlockByKey = (key: string | undefined, edge: "first" | "last" = "first") => {
+    if (!key) return false
+    const index = treeBlockIndexByKey().get(key)
+    if (index === undefined) return false
+    focusVirtualBlock(index, edge, edge === "first" ? 1 : -1)
+    return true
+  }
+  const handleTreeKeyDown = (event: KeyboardEvent) => {
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    if (!(event.target instanceof HTMLElement) || !treeElement) return
+    const item = event.target.closest<HTMLElement>(TREE_ITEM_SELECTOR)
+    if (!item || !treeElement.contains(item)) return
+    const blockElement = item.closest<HTMLElement>("[data-chat-sidebar-virtual-block]")
+    const blockIndex = Number(blockElement?.dataset.index)
+    const items = blockElement ? [...blockElement.querySelectorAll<HTMLElement>(TREE_ITEM_SELECTOR)] : []
+    const index = items.indexOf(item)
+    const focus = (target: HTMLElement | undefined | null) => {
+      if (!target) return
+      treeFocusRequest += 1
+      event.preventDefault()
+      // preventScroll: scrollIntoView below is the single scroll/layout pass.
+      target.focus({ preventScroll: true })
+      target.scrollIntoView({ block: "nearest" })
+    }
+    const expanded = item.getAttribute("aria-expanded")
+    switch (event.key) {
+      case "ArrowDown":
+        if (items[index + 1]) focus(items[index + 1])
+        else if (Number.isFinite(blockIndex)) {
+          event.preventDefault()
+          focusVirtualBlock(blockIndex + 1, "first", 1)
+        }
+        return
+      case "ArrowUp":
+        if (items[index - 1]) focus(items[index - 1])
+        else if (Number.isFinite(blockIndex)) {
+          event.preventDefault()
+          focusVirtualBlock(blockIndex - 1, "last", -1)
+        }
+        return
+      case "Home":
+        event.preventDefault()
+        focusVirtualBlock(0, "first", 1)
+        return
+      case "End":
+        event.preventDefault()
+        focusVirtualBlock(treeVirtualBlocks().length - 1, "last", -1)
+        return
+      case "ArrowRight":
+        if (expanded === "false") {
+          event.preventDefault()
+          item.click()
+        } else if (expanded === "true") {
+          if (items[index + 1]) focus(items[index + 1])
+          else if (Number.isFinite(blockIndex)) {
+            event.preventDefault()
+            focusVirtualBlock(blockIndex + 1, "first", 1)
+          }
+        }
+        return
+      case "ArrowLeft": {
+        if (expanded === "true") {
+          event.preventDefault()
+          item.click()
+          return
+        }
+        if (
+          focusVirtualBlockByKey(
+            blockElement?.dataset.clusterOwnerKey ?? blockElement?.dataset.sectionOwnerKey,
+          )
+        ) {
+          event.preventDefault()
+          return
+        }
+        const cluster = item.closest('[data-slot="cluster-body"]')?.parentElement
+        const owner =
+          cluster?.querySelector<HTMLElement>('[data-slot="cluster-head"]') ??
+          item.closest('[data-slot="section"]')?.querySelector<HTMLElement>('[data-slot="section-head"]')
+        if (owner && owner !== item) focus(owner)
+        return
+      }
+    }
+  }
+
+  const statusTone: Record<ChatSidebarStatusBucket, ChatSidebarRowState> = {
+    attention: "attention",
+    working: "working",
+    unread: "unread",
+    idle: "idle",
+  }
+
+  const clusterIcon = (kind: string) =>
+    kind === "swarm" ? "layers" : kind === "delegation" ? "branch" : kind === "plugin" ? "workspace" : "folder"
+
+  const clusterKindLabel = (kind: string) => {
+    switch (kind) {
+      case "swarm":
+        return language.t("chats.cluster.kind.swarm")
+      case "plugin":
+        return language.t("chats.cluster.kind.plugin")
+      case "delegation":
+        return language.t("chats.cluster.kind.delegation")
+      case "subagent":
+        return language.t("chats.cluster.kind.subagent")
+      default:
+        return language.t("chats.cluster.kind.user")
+    }
+  }
+
+  const renderRow = (
+    input: Session | Accessor<Session>,
+    options: {
+      directory: () => string
+      label?: () => string | undefined
+      member?: boolean
+      inGroupId?: string
+    },
+  ) => {
+    const session = typeof input === "function" ? input : () => input
+    const group = () => groupOf(session())
+    const fallbackGroup = () => sessionGroups.groupForSession(session().id)
+    const relatedCount = () => {
+      const current = group()
+      return current ? sidebarClusterGroups().byGroup.get(current.id)?.length : fallbackGroup()?.sessionIds.length
+    }
+    return (
+      <ChatRow
+        session={session()}
+        label={options.label?.()}
+        density={options.member ? "compact" : props.state.density()}
+        // Group members sit under a head whose bar already shows running state, so
+        // they get the static dot; only top-level rows may draw from the pulse budget.
+        animateWorkingIndicator={!options.member}
+        indicatorBudget={indicatorBudget}
+        observeVisibility={observeRowVisibility}
+        relatedCount={options.member ? undefined : relatedCount()}
+        inGroupId={options.inGroupId ?? group()?.id ?? fallbackGroup()?.id}
+        selected={activeSessionId() === session().id}
+        minuteNow={minuteNow}
+        runtimeLease={leaseRowRuntime}
+        pending={pendingSessionId() === session().id}
+        onPending={(id) => {
+          if (params.id !== id) setPendingSessionId(id)
+        }}
+        archiveSession={() => archiveSession(session())}
+        prefetchSession={() => prefetchSession(session())}
+        onChangeModel={openModelPicker}
+        onNewSessionInProject={() => navigateToNewSession(session().directory || options.directory())}
+        onOpenProjectInExplorer={() => {
+          const directory = session().directory || options.directory()
+          if (directory) void platform.revealPath?.(directory)
+        }}
+        onCopyProjectPath={() => {
+          const directory = session().directory || options.directory()
+          if (directory) void navigator.clipboard.writeText(directory)
+        }}
+        onForkConversation={() => {
+          void import("@/components/dialog-fork").then(({ DialogFork }) =>
+            dialog.show(() => <DialogFork sessionID={session().id} />),
+          )
+        }}
+      />
+    )
+  }
+
+  /** One folded SessionGroup: a single 24px node with a member-state bar. */
+  const ClusterNode = (node: {
+    item: () => ChatSidebarClusterItem
+    directory: () => string
+    renderMembers?: boolean
+  }) => {
+    // The node is the rich preview's anchor for the whole group, so it keeps
+    // its lead's shared runtime alive (one lease, not one per member). The item
+    // is read through a slot: it is replaced when membership/order changes, but
+    // this node (and every expanded member row) stays mounted.
+    let leased = leaseRowRuntime(node.item().lead)
+    let leasedID = node.item().lead.id
+    createEffect(() => {
+      const lead = node.item().lead
+      if (lead.id === leasedID) return
+      const next = leaseRowRuntime(lead)
+      leased.release()
+      leased = next
+      leasedID = lead.id
+    })
+    onCleanup(() => leased.release())
+    const groupID = node.item().group.id
+    const [groupContextMenu, setGroupContextMenu] = createSignal<{ x: number; y: number }>()
+    const expanded = () => props.state.isClusterExpanded(groupID)
+    const containsActive = () => node.item().members.some((member) => member.id === activeSessionId())
+    // Counts are derived per node from the members' fine-grained state signals,
+    // so one member flipping recomputes this tally (and the head bar) only.
+    const counts = createMemo(() => countChatSidebarClusterStates(node.item().members, rowState), undefined, {
+      equals: sameChatSidebarClusterCounts,
+    })
+    const segments = createMemo(() => {
+      const c = counts()
+      return (
+        [
+          ["error", c.error],
+          ["attention", c.attention],
+          ["working", c.working],
+          ["unread", c.unread],
+          ["idle", c.idle],
+        ] as const
+      ).filter(([, count]) => count > 0)
+    })
+    const summary = createMemo(() =>
+      language.t("chats.cluster.summary", {
+        kind: clusterKindLabel(node.item().group.kind),
+        running: String(counts().working),
+        waiting: String(counts().attention),
+        idle: String(counts().idle + counts().unread),
+      }),
+    )
+    return (
+      <>
+      <div data-slot="cluster" role="treeitem" aria-expanded={expanded()}>
+        <button
+          type="button"
+          data-slot="cluster-head"
+          data-tree-item
+          data-cluster-id={groupID}
+          data-current={containsActive() ? "" : undefined}
+          data-chat-tooltip-session={node.item().lead.id}
+          data-chat-tooltip-placement="right"
+          aria-expanded={expanded()}
+          aria-label={`${node.item().group.name}, ${summary()}`}
+          onClick={() => props.state.toggleCluster(groupID)}
+          onContextMenu={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            setGroupContextMenu({ x: event.clientX, y: event.clientY })
+          }}
+        >
+          <IconV2 name="chevron-down" size="small" data-slot="cluster-chevron" />
+          <span data-slot="cluster-icon">
+            <IconV2 name={clusterIcon(node.item().group.kind)} size="small" />
+          </span>
+          <span data-slot="cluster-label">{node.item().group.name}</span>
+          <span data-slot="cluster-bar" aria-hidden="true">
+            <For each={segments()}>
+              {([tone, count]) => <span data-slot="seg" data-tone={tone} style={{ "flex-grow": count }} />}
+            </For>
+          </span>
+          <span data-slot="cluster-stats">
+            <Show when={counts().attention + counts().error > 0}>
+              <span data-slot="stat" data-tone={counts().error > 0 ? "error" : "attention"}>
+                <span data-slot="dot" data-tone={counts().error > 0 ? "error" : "attention"} />
+                {counts().attention + counts().error}
+              </span>
+            </Show>
+            <Show when={counts().working > 0}>
+              <span data-slot="stat" data-tone="working">
+                <span data-slot="dot" data-tone="working" />
+                {counts().working}
+              </span>
+            </Show>
+            <span data-slot="stat">{counts().total}</span>
+          </span>
+        </button>
+        <Show when={node.renderMembers !== false && expanded()}>
+          <div data-slot="cluster-body" role="group">
+            <For each={node.item().members}>
+              {(member, index) =>
+                renderRow(member, {
+                  directory: node.directory,
+                  label: () => node.item().labels[index()],
+                  member: true,
+                  inGroupId: node.item().group.id,
+                })
+              }
+            </For>
+          </div>
+        </Show>
+      </div>
+      <Show when={groupContextMenu()} keyed>
+        {(cursor) => (
+          <Suspense fallback={null}>
+            <SidebarSessionContextMenu
+              cursor={cursor}
+              where="chats"
+              session={node.item().lead}
+              server={paneServerKey()}
+              isGroup
+              groupId={groupID}
+              onChangeModel={openModelPicker}
+              onOpenChange={(open) => {
+                if (!open) setGroupContextMenu(undefined)
+              }}
+            />
+          </Suspense>
+        )}
+      </Show>
+      </>
+    )
+  }
+
+  const SectionHead = (head: { section: () => ChatSidebarSection }) => {
+    const section = head.section
+    const project = () => {
+      const key = section().projectKey
+      return key ? projectHeads().get(key) : undefined
+    }
+    const label = () => {
+      const current = section()
+      if (current.kind === "recent") return language.t("chats.view.recent")
+      if (current.kind === "status") return language.t(`chats.status.${current.status ?? "idle"}`)
+      return project()?.label ?? ""
+    }
+    return (
+      <button
+        type="button"
+        data-slot="section-head"
+        role="treeitem"
+        onClick={() => props.state.toggleGroup(section().key)}
+        aria-expanded={sectionExpanded(section().key)}
+      >
+        <IconV2 name="chevron-down" size="small" data-slot="section-chevron" />
+        <Switch>
+          <Match when={section().kind === "project" && project()}>
+            {(meta) => (
+              <span data-slot="section-icon">
+                <ProjectAvatar
+                  class="!size-3.25"
+                  fallback={displayName(meta().project)}
+                  src={getProjectAvatarSource(meta().project.id, meta().project.icon)}
+                  variant={getProjectAvatarVariant(meta().project.icon?.color)}
+                />
+              </span>
+            )}
+          </Match>
+          <Match when={section().kind === "status"}>
+            <span data-slot="section-icon">
+              <span data-slot="dot" data-tone={statusTone[section().status ?? "idle"]} />
+            </span>
+          </Match>
+        </Switch>
+        <span data-slot="section-label">{label()}</span>
+        <Show when={section().kind === "project" && project()?.directory} fallback={<span data-slot="section-spacer" />}>
+          {(directory) => (
+            <span data-slot="section-meta" data-chat-tooltip-text={directory()} data-chat-tooltip-placement="top">
+              {directory()}
+            </span>
+          )}
+        </Show>
+        <span data-slot="section-count">{section().total}</span>
+        <Show when={section().kind === "project" && project()?.directory}>
+          {(directory) => (
+            <span
+              role="button"
+              tabIndex={0}
+              data-slot="section-action"
+              data-chat-tooltip-text={language.t("command.session.new")}
+              data-chat-tooltip-placement="top"
+              aria-label={language.t("command.session.new")}
+              onClick={(event) => {
+                event.stopPropagation()
+                event.preventDefault()
+                navigateToNewSession(directory())
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" && event.key !== " ") return
+                event.stopPropagation()
+                event.preventDefault()
+                navigateToNewSession(directory())
+              }}
+            >
+              <IconV2 name="plus" size="small" />
+            </span>
+          )}
+        </Show>
+      </button>
+    )
+  }
+
+  const viewIcon = { recent: "clock", projects: "folder", status: "status" } as const
+  const viewLabel = (view: ChatSidebarViewMode) => language.t(`chats.view.${view}`)
+
   return (
     <div
       ref={(element) => {
@@ -1495,6 +2717,7 @@ export function ChatSidebarPane(props: {
       class="relative my-2 ms-2 flex min-h-0 shrink-0 select-none flex-col self-stretch overflow-hidden rounded-[7px] border border-v2-border-border-base/60 bg-v2-background-bg-base shadow-[0_1px_2px_0_var(--v2-alpha-dark-6),0_1px_3px_0_var(--v2-alpha-dark-4),0_0_0_0.5px_var(--v2-alpha-dark-8)]"
       style={{ width: `${props.state.sidebarWidth()}px` }}
       data-chat-sidebar-pane
+      data-view={props.state.view()}
       onPointerOver={handleTooltipPointerOver}
       onPointerOut={handleTooltipPointerOut}
       onFocusIn={handleTooltipFocusIn}
@@ -1505,23 +2728,33 @@ export function ChatSidebarPane(props: {
       }}
       onContextMenu={(event) => suppressTooltipFrom(event.target)}
     >
-      {/* ── Title bar — zinc/IDE dense header ─────────────────── */}
-      <div class="flex h-8 shrink-0 items-center gap-1.5 border-b border-v2-border-border-muted/60 bg-v2-background-bg-base px-2">
-        <span class="select-none text-[10px] font-[620] uppercase leading-none tracking-[0.09em] text-v2-text-text-muted">
-          {language.t("chats.title")}
-        </span>
+      {/* ── Tool-window title bar ─────────────────────────────── */}
+      <div data-slot="titlebar">
+        <span data-slot="title">{language.t("chats.title")}</span>
         <Show when={workingCount() > 0}>
           <span
+            data-slot="pill"
+            data-tone="success"
             data-chat-tooltip-text={language.plural("chats.footer.active", workingCount())}
             data-chat-tooltip-placement="bottom"
-            class="flex items-center gap-1 rounded-[4px] bg-v2-state-bg-success px-1 py-[2px] text-[9px] font-[600] leading-none tabular-nums text-v2-state-fg-success ring-1 ring-inset ring-v2-state-fg-success/20"
           >
-            <span class="size-1 animate-pulse rounded-full bg-v2-state-fg-success" />
+            <span data-slot="dot" class="animate-pulse !bg-v2-state-fg-success" />
             {workingCount()}
           </span>
         </Show>
+        <Show when={waitingCount() > 0}>
+          <span
+            data-slot="pill"
+            data-tone="warning"
+            data-chat-tooltip-text={language.plural("chats.footer.waiting", waitingCount())}
+            data-chat-tooltip-placement="bottom"
+          >
+            <span data-slot="dot" data-tone="attention" />
+            {waitingCount()}
+          </span>
+        </Show>
 
-        <div class="ms-auto flex items-center gap-0.5">
+        <div data-slot="actions">
           <span
             class="flex"
             data-chat-tooltip-text={language.t("scheduledTasks.title")}
@@ -1571,487 +2804,482 @@ export function ChatSidebarPane(props: {
         </div>
       </div>
 
-      {/* ── Session search — zinc inset field ─────────────────── */}
-      <div class="shrink-0 bg-v2-background-bg-base px-2 pb-1.5 pt-1.5">
-        <div
-          ref={(element) => {
-            searchRootElement = element
-            searchRuntime()?.search.element.setRoot(element)
-          }}
-          data-component="chats-session-search"
-          class="relative z-30 w-full"
-        >
-          <Show when={searchRuntime()} keyed>
-            {(runtime) => <Show when={runtime.search.query.open()}>
-            <div
-              data-component="chats-session-search-panel"
-              class="absolute flex flex-col overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-floating)]"
-              style={{ top: "-4px", left: "-4px", width: "calc(100% + 8px)" }}
-            >
-              <div class="flex flex-col pt-8">
-                <Suspense
-                  fallback={
-                    <div
-                      class="flex flex-col gap-px px-3 py-2"
-                      aria-busy="true"
-                      aria-label={language.t("common.loading")}
-                    >
-                      <For each={[0, 1, 2]}>
-                        {() => <div class="h-7 rounded-[6px] bg-v2-background-bg-layer-02 animate-pulse" />}
-                      </For>
-                    </div>
-                  }
-                >
-                  <ChatSidebarSearchResults
-                    language={language}
-                    search={runtime.search}
-                    server={runtime.serverKey}
-                    isOpenTab={runtime.isOpenTab}
-                  />
-                </Suspense>
+      {/* ── Toolbar: search + view switch + view options ──────────
+          The search root spans the whole toolbar so the floating results
+          panel keeps the pane's full width and covers the view controls
+          while a query is open. */}
+      <div
+        ref={(element) => {
+          searchRootElement = element
+          searchRuntime()?.search.element.setRoot(element)
+        }}
+        data-slot="toolbar"
+        data-component="chats-session-search"
+        class="relative z-30"
+      >
+        <Show when={searchRuntime()} keyed>
+          {(runtime) => (
+            <Show when={runtime.search.query.open()}>
+              <div
+                data-component="chats-session-search-panel"
+                class="absolute flex flex-col overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-floating)]"
+                style={{ top: "2px", left: "4px", width: "calc(100% - 8px)" }}
+              >
+                <div class="flex flex-col pt-8">
+                  <Suspense
+                    fallback={
+                      <div
+                        class="flex flex-col gap-px px-3 py-2"
+                        aria-busy="true"
+                        aria-label={language.t("common.loading")}
+                      >
+                        <For each={[0, 1, 2]}>
+                          {() => <div class="h-7 rounded-[6px] bg-v2-background-bg-layer-02 animate-pulse" />}
+                        </For>
+                      </div>
+                    }
+                  >
+                    <ChatSidebarSearchResults
+                      language={language}
+                      search={runtime.search}
+                      server={runtime.serverKey}
+                      isOpenTab={runtime.isOpenTab}
+                    />
+                  </Suspense>
+                </div>
               </div>
-            </div>
-            </Show>}
-          </Show>
-          <label class="relative z-20 flex h-[24px] w-full items-center gap-1.5 rounded-[6px] border border-v2-border-border-base/60 bg-v2-background-bg-layer-01 px-1.5 text-v2-icon-icon-muted shadow-[inset_0_1px_1px_var(--v2-alpha-dark-6),inset_0_0.5px_0.5px_var(--v2-alpha-dark-4)] transition-[border-color,background-color,box-shadow] duration-150 hover:border-v2-border-border-base hover:bg-v2-background-bg-layer-02 focus-within:border-v2-border-border-strong focus-within:bg-v2-background-bg-base focus-within:shadow-[0_0_0_2px_var(--v2-alpha-dark-8)]">
-            <IconV2 name="magnifying-glass" size="small" class="shrink-0 opacity-80" />
-            <input
-              ref={(element) => {
-                searchInputElement = element
-                searchRuntime()?.search.element.setInput(element)
-              }}
-              class="relative z-20 min-w-0 flex-1 border-0 bg-transparent text-[12px] font-[440] leading-none tracking-[-0.01em] text-v2-text-text-base outline-0 placeholder:text-v2-text-text-faint/70 [&::-webkit-search-cancel-button]:hidden [&::-webkit-search-decoration]:hidden"
-              type="text"
-              value={searchRuntime()?.search.query.value() ?? searchDraft()}
-              placeholder={language.t("chats.search.placeholder")}
-              aria-label={language.t("chats.search.placeholder")}
-              aria-expanded={searchRuntime()?.search.query.open() ?? false}
-              aria-controls="chats-session-search-results"
-              aria-autocomplete="list"
-              aria-activedescendant={
-                searchRuntime()?.search.result.active() && searchRuntime()?.search.query.open()
-                  ? `chats-session-search-option-${searchRuntime()!.search.result.active()}`
-                  : undefined
+            </Show>
+          )}
+        </Show>
+        <label class="relative z-20 flex h-[24px] min-w-0 flex-1 items-center gap-1.5 rounded-[6px] border border-v2-border-border-base/60 bg-v2-background-bg-layer-01 px-1.5 text-v2-icon-icon-muted shadow-[inset_0_1px_1px_var(--v2-alpha-dark-6),inset_0_0.5px_0.5px_var(--v2-alpha-dark-4)] transition-[border-color,background-color,box-shadow] duration-150 hover:border-v2-border-border-base hover:bg-v2-background-bg-layer-02 focus-within:border-v2-border-border-strong focus-within:bg-v2-background-bg-base focus-within:shadow-[0_0_0_2px_var(--v2-alpha-dark-8)]">
+          <IconV2 name="magnifying-glass" size="small" class="shrink-0 opacity-80" />
+          <input
+            ref={(element) => {
+              searchInputElement = element
+              searchRuntime()?.search.element.setInput(element)
+            }}
+            class="relative z-20 min-w-0 flex-1 border-0 bg-transparent text-[12px] font-[440] leading-none tracking-[-0.01em] text-v2-text-text-base outline-0 placeholder:text-v2-text-text-faint/70 [&::-webkit-search-cancel-button]:hidden [&::-webkit-search-decoration]:hidden"
+            type="text"
+            value={searchRuntime()?.search.query.value() ?? searchDraft()}
+            placeholder={language.t("chats.search.placeholder")}
+            aria-label={language.t("chats.search.placeholder")}
+            aria-expanded={searchRuntime()?.search.query.open() ?? false}
+            aria-controls="chats-session-search-results"
+            aria-autocomplete="list"
+            aria-activedescendant={
+              searchRuntime()?.search.result.active() && searchRuntime()?.search.query.open()
+                ? `chats-session-search-option-${searchRuntime()!.search.result.active()}`
+                : undefined
+            }
+            onFocus={() => {
+              searchFocused = true
+              void ensureSearchRuntime()
+            }}
+            onBlur={() => {
+              searchFocused = false
+            }}
+            onInput={(event) => {
+              const value = event.currentTarget.value
+              setSearchDraft(value)
+              const runtime = searchRuntime()
+              if (runtime) {
+                runtime.search.query.input(value)
+                return
               }
-              onFocus={() => {
+              // The loader replays the latest draft exactly once when it
+              // resolves. Do not attach one continuation per keystroke while
+              // the chunk is in flight; that would manufacture a microtask
+              // burst and repeatedly reset the search debounce.
+              void ensureSearchRuntime()
+            }}
+            onKeyDown={(event) => {
+              const runtime = searchRuntime()
+              if (event.key === "Escape") {
+                event.preventDefault()
+                if (runtime) runtime.search.query.close()
+                else setSearchDraft("")
+                event.currentTarget.blur()
+                return
+              }
+              if (!runtime || !runtime.search.query.open() || runtime.search.result.list().length === 0) return
+              if (event.altKey || event.metaKey) return
+              if (event.key === "ArrowDown") {
+                event.preventDefault()
+                runtime.search.result.move(1)
+                return
+              }
+              if (event.key === "ArrowUp") {
+                event.preventDefault()
+                runtime.search.result.move(-1)
+                return
+              }
+              if (event.key === "Enter" && !event.isComposing) {
+                event.preventDefault()
+                runtime.search.result.selectActive()
+              }
+            }}
+          />
+          <Show when={searchRuntime()?.search.query.value() ?? searchDraft()}>
+            <IconButtonV2
+              type="button"
+              variant="ghost-muted"
+              size="small"
+              class="relative z-20 shrink-0"
+              icon={<IconV2 name="close" size="large" class="text-v2-icon-icon-muted" />}
+              aria-label={language.t("chats.search.placeholder")}
+              onClick={() => {
+                setSearchDraft("")
+                const runtime = searchRuntime()
+                if (runtime) {
+                  runtime.search.query.close()
+                  runtime.search.query.focus()
+                  return
+                }
+                searchInputElement?.focus()
                 searchFocused = true
                 void ensureSearchRuntime()
               }}
-              onBlur={() => {
-                searchFocused = false
-              }}
-              onInput={(event) => {
-                const value = event.currentTarget.value
-                setSearchDraft(value)
-                const runtime = searchRuntime()
-                if (runtime) {
-                  runtime.search.query.input(value)
-                  return
-                }
-                // The loader replays the latest draft exactly once when it
-                // resolves. Do not attach one continuation per keystroke while
-                // the chunk is in flight; that would manufacture a microtask
-                // burst and repeatedly reset the search debounce.
-                void ensureSearchRuntime()
-              }}
-              onKeyDown={(event) => {
-                const runtime = searchRuntime()
-                if (event.key === "Escape") {
-                  event.preventDefault()
-                  if (runtime) runtime.search.query.close()
-                  else setSearchDraft("")
-                  event.currentTarget.blur()
-                  return
-                }
-                if (!runtime || !runtime.search.query.open() || runtime.search.result.list().length === 0) return
-                if (event.altKey || event.metaKey) return
-                if (event.key === "ArrowDown") {
-                  event.preventDefault()
-                  runtime.search.result.move(1)
-                  return
-                }
-                if (event.key === "ArrowUp") {
-                  event.preventDefault()
-                  runtime.search.result.move(-1)
-                  return
-                }
-                if (event.key === "Enter" && !event.isComposing) {
-                  event.preventDefault()
-                  runtime.search.result.selectActive()
-                }
-              }}
             />
-            <Show when={searchRuntime()?.search.query.value() ?? searchDraft()}>
-              <IconButtonV2
+          </Show>
+        </label>
+
+        <div data-slot="views" role="group" aria-label={language.t("chats.view.label")}>
+          <For each={CHAT_SIDEBAR_VIEW_MODES}>
+            {(view) => (
+              <button
                 type="button"
-                variant="ghost-muted"
-                size="small"
-                class="relative z-20 shrink-0"
-                icon={<IconV2 name="close" size="large" class="text-v2-icon-icon-muted" />}
-                aria-label={language.t("chats.search.placeholder")}
-                onClick={() => {
-                  setSearchDraft("")
-                  const runtime = searchRuntime()
-                  if (runtime) {
-                    runtime.search.query.close()
-                    runtime.search.query.focus()
-                    return
-                  }
-                  searchInputElement?.focus()
-                  searchFocused = true
-                  void ensureSearchRuntime()
-                }}
-              />
-            </Show>
-          </label>
+                data-slot="view"
+                aria-pressed={props.state.view() === view}
+                aria-label={viewLabel(view)}
+                data-chat-tooltip-text={viewLabel(view)}
+                data-chat-tooltip-placement="bottom"
+                onClick={() => props.state.setView(view)}
+              >
+                <IconV2 name={viewIcon[view]} size="small" />
+              </button>
+            )}
+          </For>
         </div>
+
+        <MenuV2 placement="bottom-end" gutter={6}>
+          <MenuV2.Trigger
+            as="button"
+            type="button"
+            data-slot="tool"
+            aria-label={language.t("chats.view.options")}
+            data-chat-tooltip-text={language.t("chats.view.options")}
+            data-chat-tooltip-placement="bottom"
+          >
+            <IconV2 name="outline-sliders" size="small" />
+          </MenuV2.Trigger>
+          <MenuV2.Portal>
+            <MenuV2.Content>
+              <MenuV2.Group>
+                <MenuV2.GroupLabel>{language.t("chats.sort.label")}</MenuV2.GroupLabel>
+                <MenuV2.RadioGroup
+                  value={props.state.sort()}
+                  onChange={(value) => props.state.setSort(value as ChatSidebarSortMode)}
+                >
+                  <For each={CHAT_SIDEBAR_SORT_MODES}>
+                    {(sort) => <MenuV2.RadioItem value={sort}>{language.t(`chats.sort.${sort}`)}</MenuV2.RadioItem>}
+                  </For>
+                </MenuV2.RadioGroup>
+              </MenuV2.Group>
+              <MenuV2.Separator />
+              <MenuV2.Group>
+                <MenuV2.GroupLabel>{language.t("chats.density.label")}</MenuV2.GroupLabel>
+                <MenuV2.RadioGroup
+                  value={props.state.density()}
+                  onChange={(value) => props.state.setDensity(value as ChatSidebarDensity)}
+                >
+                  <MenuV2.RadioItem value="compact">{language.t("chats.density.compact")}</MenuV2.RadioItem>
+                  <MenuV2.RadioItem value="detailed">{language.t("chats.density.detailed")}</MenuV2.RadioItem>
+                </MenuV2.RadioGroup>
+              </MenuV2.Group>
+            </MenuV2.Content>
+          </MenuV2.Portal>
+        </MenuV2>
       </div>
 
       {/* ── Session tree ──────────────────────────────────────── */}
-      <ScrollView class="min-h-0 flex-1">
-        <Show when={oxpActivity.activities().length > 0}>
-          <section
-            class="flex flex-col border-b border-v2-border-border-muted pb-1.5"
-            data-component="chats-oxp-activity-group"
-          >
-            <div class="sticky top-0 z-10 flex h-[22px] items-center gap-1.5 bg-v2-background-bg-base/95 px-2 backdrop-blur-[6px]">
-              <span class="min-w-0 flex-1 truncate text-[10px] font-[620] uppercase leading-none tracking-[0.07em] text-v2-text-text-faint">
-                CHATGPT / OXP
-              </span>
-              <span class="shrink-0 text-[10px] tabular-nums text-v2-text-text-faint opacity-70">
-                {oxpActivity.activities().length}
-              </span>
-            </div>
-            <nav class="flex flex-col px-1">
-              <For each={visibleOxpActivities()}>
-                {(activity) => {
-                  const failures = () => Number(activity.failureCount) || 0
-                  const calls = () => Number(activity.callCount) || 0
-                  const selected = () => params.activityID === activity.id
-                  return (
-                    <button
-                      type="button"
-                      data-component="chats-oxp-activity-row"
-                      data-activity-id={activity.id}
-                      class="group/oxp flex min-h-[34px] min-w-0 items-center gap-2 rounded-[5px] px-2 text-left transition-colors hover:bg-v2-background-bg-layer-01 focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none"
-                      classList={{
-                        "bg-v2-background-bg-layer-02": selected(),
-                      }}
-                      onClick={() => navigate(`/oxp/activity/${activity.id}`)}
-                    >
-                      <span
-                        class="size-1.5 shrink-0 rounded-full bg-v2-icon-icon-muted"
-                        classList={{
-                          "opacity-100": failures() === 0,
-                          "bg-v2-state-fg-danger": failures() > 0,
-                        }}
-                      />
-                      <span class="flex min-w-0 flex-1 flex-col gap-[2px]">
-                        <span class="truncate text-[11px] font-[520] leading-[14px] text-v2-text-text-base">
-                          {activity.title ??
-                            activity.lastRootAlias ??
-                            "ChatGPT activity"}
-                        </span>
-                        <span class="truncate text-[9.5px] leading-[12px] tabular-nums text-v2-text-text-faint">
-                          {calls()} calls
-                          {failures() > 0 ? ` · ${failures()} failed` : ""}
-                          {" · "}
-                          {relativeStamp(activity.lastSeenAt, minuteNow())}
-                        </span>
-                      </span>
-                    </button>
-                  )
-                }}
-              </For>
-              <Show when={oxpActivity.activities().length > oxpLimit()}>
-                <button
-                  type="button"
-                  class="ms-5 flex h-6 items-center rounded-md px-1 text-start text-[10px] text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none"
-                  onClick={() =>
-                    setOxpLimit((current) =>
-                      Math.min(current + 10, oxpActivity.activities().length),
-                    )
-                  }
-                >
-                  Show {Math.min(10, oxpActivity.activities().length - oxpLimit())} more
-                </button>
-              </Show>
-              <Show
-                when={
-                  oxpActivity.activities().length <= oxpLimit() &&
-                  oxpActivity.hasMoreActivities()
-                }
-              >
-                <button
-                  type="button"
-                  disabled={oxpActivity.loadingMoreActivities()}
-                  class="ms-5 flex h-6 items-center rounded-md px-1 text-start text-[10px] text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none disabled:opacity-50"
-                  onClick={() => {
-                    void oxpActivity.loadOlderActivities().then(() => {
-                      setOxpLimit((current) => current + 10)
+      <ScrollView data-slot="tree-scroll" class="min-h-0 flex-1" viewportRef={setTreeScrollRoot}>
+        <div
+          ref={(element) => {
+            treeElement = element
+          }}
+          data-slot="tree"
+          role="tree"
+          aria-label={language.t("chats.title")}
+          data-virtual-total={treeVirtualBlocks().length}
+          data-virtual-mounted={treeVirtualRows().length}
+          data-virtual-layout="fixed-slots"
+          style={{ height: `${treeVirtualizer.getTotalSize()}px` }}
+          onKeyDown={handleTreeKeyDown}
+          onFocusIn={(event) => {
+            if (!(event.target instanceof Element)) return
+            const block = event.target.closest<HTMLElement>("[data-chat-sidebar-virtual-block]")
+            if (block?.dataset.blockKey) setFocusedTreeKey(block.dataset.blockKey)
+          }}
+        >
+          <For each={treeVirtualRows()}>
+            {(entry) => {
+              const block = entry.block
+              if (!block) return null
+              const virtualRow = entry.virtualRow
+              const sectionOwnerKey =
+                block.type === "session" ||
+                block.type === "cluster-head" ||
+                block.type === "cluster-member" ||
+                block.type === "more" ||
+                block.type === "less"
+                  ? block.sectionHeadKey
+                  : undefined
+              const clusterOwnerKey = block.type === "cluster-member" ? block.clusterHeadKey : undefined
+              const sticky = () =>
+                block.type === "section-head" && activeStickyTreeBlock() === virtualRow.index
+              const fixedHeight = () => sidebarFixedBlockHeight(block.type, props.state.density())
+              const offset = () => {
+                if (!sticky()) return virtualRow.start
+                // A pinned row is still absolutely positioned in the same
+                // coordinate system as every other virtual row.
+                const next = stickyMarkers().find((marker) => marker.index > virtualRow.index)
+                const nextStart = next ? treeVirtualizer.measurementsCache[next.index]?.start : undefined
+                return sidebarStickyBlockOffset(
+                  virtualRow.start,
+                  virtualRow.size,
+                  treeScrollOffset(),
+                  nextStart,
+                )
+              }
+              const wrap = (content: JSX.Element) => (
+                <div
+                  // Deterministic-height rows use the authoritative fixed
+                  // slot size, not an early/zero ResizeObserver measurement.
+                  // Only intrinsically sized sections require DOM measurement.
+                  ref={(element) => {
+                    if (fixedHeight() !== undefined) return
+                    // Solid's ref runs before reactive attributes and sometimes
+                    // before descendants are attached. A synchronous size read
+                    // can record 0px and collapse every following row.
+                    element.setAttribute("data-index", String(virtualRow.index))
+                    queueMicrotask(() => {
+                      if (!element.isConnected || element.dataset.index !== String(virtualRow.index)) return
+                      treeVirtualizer.measureElement(element)
                     })
                   }}
+                  role="none"
+                  data-chat-sidebar-virtual-block
+                  data-block-key={block.key}
+                  data-kind={block.type}
+                  data-index={virtualRow.index}
+                  data-sticky={sticky() || undefined}
+                  data-section-owner-key={sectionOwnerKey}
+                  data-cluster-owner-key={clusterOwnerKey}
+                  style={{
+                    position: "absolute",
+                    top: "0px",
+                    height: fixedHeight() !== undefined ? `${fixedHeight()}px` : undefined,
+                    overflow: fixedHeight() !== undefined ? "clip" : undefined,
+                    "z-index": sticky() ? 20 : undefined,
+                    transform: `translateY(${offset()}px)`,
+                  }}
                 >
-                  {oxpActivity.loadingMoreActivities()
-                    ? "Loading older activity…"
-                    : "Load older activity"}
-                </button>
-              </Show>
-            </nav>
-          </section>
-        </Show>
+                  {content}
+                </div>
+              )
 
-        <Show
-          when={(groups() ?? []).length > 0}
-          fallback={
-            <div class="flex flex-col items-center gap-2 px-4 py-10 text-center">
-              <IconV2 name="chats" size="small" class="size-5 text-v2-icon-icon-muted opacity-60" />
-              <span class="text-[11px] leading-none text-v2-text-text-faint">{language.t("chats.empty")}</span>
-            </div>
-          }
-        >
-          <div class="flex flex-col pb-2">
-            <For each={stableGroups()}>
-              {(group, index) => (
-                <section class="flex flex-col pt-1.5 first:pt-0">
+              if (block.type === "oxp") {
+                return wrap(
+                  <ChatSidebarOxpSection
+                    collapsed={props.state.isGroupCollapsed("oxp")}
+                    onToggle={() => props.state.toggleGroup("oxp")}
+                    selectedActivityID={params.activityID}
+                    minuteNow={minuteNow}
+                    onOpen={(activityID) => navigate(`/oxp/activity/${activityID}`)}
+                  />,
+                )
+              }
+
+              if (block.type === "empty") {
+                return wrap(
+                  <div data-slot="empty">
+                    <IconV2 name="chats" size="small" class="size-5 text-v2-icon-icon-muted opacity-60" />
+                    <span>{language.t("chats.empty")}</span>
+                  </div>,
+                )
+              }
+
+              if (block.type === "section-head") {
+                const section = block.section.get
+                return wrap(
+                  <section data-slot="section" data-section={block.section.key}>
+                    <SectionHead section={section} />
+                  </section>,
+                )
+              }
+
+              if (block.type === "session") {
+                const item = block.item.get()
+                if (item.type !== "session") return null
+                const section = block.section.get
+                const directory = () => {
+                  const key = section().projectKey
+                  return key ? (projectHeads().get(key)?.directory ?? "") : ""
+                }
+                return wrap(
+                  <div data-slot="virtual-section-row">
+                    {renderRow(() => {
+                      const current = block.item.get()
+                      return current.type === "session" ? current.session : item.session
+                    }, { directory })}
+                  </div>,
+                )
+              }
+
+              if (block.type === "cluster-head") {
+                const section = block.section.get
+                const directory = () => {
+                  const key = section().projectKey
+                  return key ? (projectHeads().get(key)?.directory ?? "") : ""
+                }
+                return wrap(
+                  <div data-slot="virtual-section-row">
+                    <ClusterNode
+                      item={block.item.get as () => ChatSidebarClusterItem}
+                      directory={directory}
+                      renderMembers={false}
+                    />
+                  </div>,
+                )
+              }
+
+              if (block.type === "cluster-member") {
+                const section = block.section.get
+                const directory = () => {
+                  const key = section().projectKey
+                  return key ? (projectHeads().get(key)?.directory ?? "") : ""
+                }
+                const label = () => {
+                  const item = block.item.get()
+                  if (item.type !== "cluster") return undefined
+                  const indexed = item.members[block.memberIndex]
+                  if (indexed?.id === block.memberID) return item.labels[block.memberIndex]
+                  const index = item.members.findIndex((member) => member.id === block.memberID)
+                  return index >= 0 ? item.labels[index] : undefined
+                }
+                const item = block.item.get()
+                const isLast =
+                  item.type === "cluster" &&
+                  block.memberIndex === item.members.length - 1 &&
+                  item.members[block.memberIndex]?.id === block.memberID
+                return wrap(
+                  <div data-slot="virtual-cluster-member" data-last={isLast || undefined}>
+                    {renderRow(block.member, {
+                      directory,
+                      label,
+                      member: true,
+                      inGroupId: item.type === "cluster" ? item.group.id : undefined,
+                    })}
+                  </div>,
+                )
+              }
+
+              if (block.type === "more") {
+                const section = block.section.get
+                return wrap(
+                  <div data-slot="virtual-section-row">
+                    <button type="button" data-slot="more" onClick={() => showMoreInSection(section())}>
+                      {language.plural("chats.showMoreCount", section().total - section().sessionCount)}
+                    </button>
+                  </div>,
+                )
+              }
+
+              if (block.type === "less") {
+                const section = block.section.get
+                return wrap(
+                  <div data-slot="virtual-section-row">
+                    <button type="button" data-slot="more" onClick={() => showLessInSection(section())}>
+                      {language.t("chats.showLess")}
+                    </button>
+                  </div>,
+                )
+              }
+
+              return wrap(
+                <section data-slot="section" data-component="chats-archived-group">
                   <button
                     type="button"
-                    onClick={() => toggleExpanded(group.key)}
-                    aria-expanded={isExpanded(group.key)}
-                    aria-controls={`chats-group-${index()}`}
-                    class="group/head sticky top-0 z-10 flex h-[22px] shrink-0 items-center gap-1.5 border-y border-transparent bg-v2-background-bg-base/95 px-2 text-left backdrop-blur-[6px] transition-colors hover:border-y-v2-border-border-muted/40 hover:bg-v2-background-bg-layer-01 focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none"
+                    data-slot="section-head"
+                    onClick={() => props.state.toggleArchived()}
+                    aria-expanded={props.state.isArchivedExpanded()}
+                    aria-controls="chats-group-archived"
+                    aria-label={`${language.t("chats.archived.group")}, ${language.plural("chats.archived.count", archivedState.rows.length)}`}
                   >
-                    <IconV2
-                      name="chevron-down"
-                      size="small"
-                      class={`size-3 shrink-0 text-v2-icon-icon-muted transition-transform duration-150 ${
-                        isExpanded(group.key) ? "" : "-rotate-90"
-                      }`}
-                    />
-                    <Show when={group.project}>
-                      {(project) => (
-                        <ProjectAvatar
-                          class="shrink-0 !size-3.25"
-                          fallback={displayName(project())}
-                          src={getProjectAvatarSource(project().id, project().icon)}
-                          variant={getProjectAvatarVariant(project().icon?.color)}
-                        />
-                      )}
-                    </Show>
-                    <span class="min-w-0 flex-1 truncate text-[10px] font-[560] uppercase leading-none tracking-[0.06em] text-v2-text-text-faint transition-colors group-hover/head:text-v2-text-text-muted">
-                      {group.label}
+                    <IconV2 name="chevron-down" size="small" data-slot="section-chevron" />
+                    <span data-slot="section-icon">
+                      <IconV2 name="archive" size="small" />
                     </span>
-                    <Show when={group.directory}>
-                      <span class="min-w-0 max-w-[45%] shrink truncate text-[9px] leading-none text-v2-text-text-faint opacity-60">
-                        {group.directory}
-                      </span>
-                    </Show>
-                    <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70">
-                      {group.total}
-                    </span>
-                    <Show when={group.directory}>
-                      <span
-                        role="button"
-                        tabIndex={0}
-                        data-chat-tooltip-text={language.t("command.session.new")}
-                        data-chat-tooltip-placement="top"
-                        class="inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-v2-text-text-faint hover:bg-v2-background-bg-layer-03 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
-                        aria-label={language.t("command.session.new")}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          event.preventDefault()
-                          navigateToNewSession(group.directory)
-                        }}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === " ") {
-                            event.stopPropagation()
-                            event.preventDefault()
-                            navigateToNewSession(group.directory)
-                          }
-                        }}
-                      >
-                        <IconV2 name="plus" size="small" />
-                      </span>
-                    </Show>
+                    <span data-slot="section-label">{language.t("chats.archived.group")}</span>
+                    <span data-slot="section-spacer" />
+                    <span data-slot="section-count">{archivedState.rows.length}</span>
                   </button>
-
-                  {/* Root Sessions are the primary sidebar rows. SessionGroup
-                      topology (subagents, delegations, plugin/manual groups,
-                      Swarms, special agents) is inspectable through the rich
-                      Session preview instead of an inline expandable tree —
-                      see session-preview/session-preview-model.ts. */}
-                  <Show when={isExpanded(group.key)}>
-                    <nav id={`chats-group-${index()}`} class="flex flex-col gap-px px-1 pb-1.5 pt-0.5">
-                      <For each={group.sessions}>
-                        {(session) => (
-                          <ChatRow
-                            session={session}
-                            directory={group.directory}
-                            animateWorkingIndicator={!group.directory}
-                            observeVisibility={observeRowVisibility}
-                            relatedCount={sessionGroups.groupForSession(session.id)?.sessionIds.length}
-                            inGroupId={sessionGroups.groupForSession(session.id)?.id}
-                            selected={activeSessionId() === session.id}
-                            minuteNow={minuteNow}
-                            runtimeLease={leaseRowRuntime}
-                            pending={pendingSessionId() === session.id}
-                            onPending={(id) => {
-                              if (params.id !== id) setPendingSessionId(id)
-                            }}
-                            archiveSession={() => archiveSession(session)}
-                            prefetchSession={() => prefetchSession(session)}
-                            onChangeModel={openModelPicker}
-                            onNewSessionInProject={() => navigateToNewSession(session.directory || group.directory)}
-                            onOpenProjectInExplorer={() => {
-                              const directory = session.directory || group.directory
-                              if (directory) void platform.revealPath?.(directory)
-                            }}
-                            onCopyProjectPath={() => {
-                              const directory = session.directory || group.directory
-                              if (directory) void navigator.clipboard.writeText(directory)
-                            }}
-                            onForkConversation={() => {
-                              void import("@/components/dialog-fork").then(({ DialogFork }) =>
-                                dialog.show(() => <DialogFork sessionID={session.id} />),
-                              )
-                            }}
-                          />
-                        )}
-                      </For>
-                      <Show when={group.total > group.sessions.length}>
-                        <button
-                          type="button"
-                          class="ms-[26px] flex h-6 items-center rounded-md pe-2 text-start text-[10px] leading-none text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-muted focus-visible:outline-none"
-                          onClick={() => {
-                            if (!group.directory) {
-                              // Recents has no single directory to page in —
-                              // the extra rows are already held in memory, so
-                              // revealing them is pure client state.
-                              props.state.showMoreRecent()
-                              return
-                            }
-                            const [, setStore] = serverSync().child(group.directory, { bootstrap: false })
-                            setStore("limit", (prev) => (prev ?? 5) + 5)
-                            void serverSync().project.loadSessions(group.directory, {
-                              projectID: group.project?.id,
-                            })
-                          }}
+                  <Show when={props.state.isArchivedExpanded()}>
+                    <Suspense
+                      fallback={
+                        <div
+                          class="flex flex-col gap-px px-2 py-1"
+                          aria-busy="true"
+                          aria-label={language.t("chats.archived.loading")}
                         >
-                          {language.plural("chats.showMoreCount", group.total - group.sessions.length)}
-                        </button>
-                      </Show>
-                      <Show
-                        when={
-                          group.directory
-                            ? (serverSync().child(group.directory, { bootstrap: false })[0].limit ?? 5) > 5
-                            : props.state.recentLimit() > CHAT_SIDEBAR_RECENT_LIMIT_MIN
-                        }
-                      >
-                        <button
-                          type="button"
-                          class="ms-[26px] flex h-6 items-center rounded-md pe-2 text-start text-[10px] leading-none text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-muted focus-visible:outline-none"
-                          onClick={() => {
-                            if (!group.directory) {
-                              props.state.showLessRecent()
-                              return
-                            }
-                            const [store] = serverSync().child(group.directory, { bootstrap: false })
-                            void serverSync().project.loadSessions(group.directory, {
-                              shrinkTo: Math.max(5, (store.limit ?? 5) - 5),
-                              projectID: group.project?.id,
-                            })
-                          }}
-                        >
-                          {language.t("chats.showLess")}
-                        </button>
-                      </Show>
-                    </nav>
+                          <For each={[0, 1]}>
+                            {() => <div class="h-[22px] rounded-[5px] bg-v2-background-bg-layer-02 animate-pulse" />}
+                          </For>
+                        </div>
+                      }
+                    >
+                      <ChatSidebarArchivedBody
+                        rows={archivedState.rows}
+                        loading={archivedState.loading}
+                        error={archivedState.error}
+                        more={archivedState.more}
+                        limit={props.state.archivedLimit()}
+                        minuteNow={minuteNow}
+                        activeSessionId={activeSessionId() ?? undefined}
+                        pendingSessionId={pendingSessionId() ?? undefined}
+                        onPending={(id) => {
+                          if (params.id !== id) setPendingSessionId(id)
+                        }}
+                        onRetry={() => void fetchArchived()}
+                        onUnarchive={unarchiveSession}
+                        onShowMore={showMoreArchived}
+                        onShowLess={props.state.showLessArchived}
+                      />
+                    </Suspense>
                   </Show>
-                </section>
-              )}
-            </For>
-          </div>
-        </Show>
-
-        {/* ── Archived group ──────────────────────────────────────
-            Sits after every project group, separated by a hairline. Rendered
-            outside the active-groups <Show> so it stays reachable even when
-            no active chats exist. Collapsed by default; expansion and the
-            row limit persist independently of Recent/project groups. */}
-        <section
-          class="flex flex-col border-t border-v2-border-border-muted pb-2 pt-1.5"
-          data-component="chats-archived-group"
-        >
-          <button
-            type="button"
-            onClick={() => props.state.toggleArchived()}
-            aria-expanded={props.state.isArchivedExpanded()}
-            aria-controls="chats-group-archived"
-            aria-label={`${language.t("chats.archived.group")}, ${language.plural("chats.archived.count", archivedState.rows.length)}`}
-            class="group/head sticky top-0 z-10 flex h-6 shrink-0 items-center gap-1.5 bg-v2-background-bg-base px-2.5 text-left transition-colors hover:bg-v2-background-bg-layer-01 focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none"
-          >
-            <IconV2
-              name="chevron-down"
-              size="small"
-              class={`size-3 shrink-0 text-v2-icon-icon-muted transition-transform duration-150 ${
-                props.state.isArchivedExpanded() ? "" : "-rotate-90"
-              }`}
-            />
-            <IconV2 name="archive" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
-            <span class="min-w-0 flex-1 truncate text-[10px] font-[560] uppercase leading-none tracking-[0.06em] text-v2-text-text-faint transition-colors group-hover/head:text-v2-text-text-muted">
-              {language.t("chats.archived.group")}
-            </span>
-            <span
-              data-chat-tooltip-text={language.plural("chats.archived.count", archivedState.rows.length)}
-              data-chat-tooltip-placement="top"
-              class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70"
-            >
-              {archivedState.rows.length}
-            </span>
-          </button>
-
-          <Show when={props.state.isArchivedExpanded()}>
-            <Suspense
-              fallback={
-                <div
-                  class="flex flex-col gap-px px-2 py-1"
-                  aria-busy="true"
-                  aria-label={language.t("chats.archived.loading")}
-                >
-                  <For each={[0, 1]}>
-                    {() => <div class="h-[26px] rounded-md bg-v2-background-bg-layer-02 animate-pulse" />}
-                  </For>
-                </div>
-              }
-            >
-              <ChatSidebarArchivedBody
-                rows={archivedState.rows}
-                loading={archivedState.loading}
-                error={archivedState.error}
-                more={archivedState.more}
-                limit={props.state.archivedLimit()}
-                minuteNow={minuteNow}
-                activeSessionId={activeSessionId() ?? undefined}
-                pendingSessionId={pendingSessionId() ?? undefined}
-                onPending={(id) => {
-                  if (params.id !== id) setPendingSessionId(id)
-                }}
-                onRetry={() => void fetchArchived()}
-                onUnarchive={unarchiveSession}
-                onShowMore={showMoreArchived}
-                onShowLess={props.state.showLessArchived}
-              />
-            </Suspense>
-          </Show>
-        </section>
+                </section>,
+              )
+            }}
+          </For>
+        </div>
       </ScrollView>
 
-      {/* ── Footer summary ────────────────────────────────────── */}
+      {/* ── Status bar ────────────────────────────────────────── */}
       <Show when={totalSessions() > 0}>
-        <div class="flex h-[22px] shrink-0 items-center justify-between border-t border-v2-border-border-muted/70 bg-v2-background-bg-layer-01/40 px-2.5 text-[9.5px] font-[500] leading-none tracking-[0.02em] text-v2-text-text-faint">
-          <span class="tabular-nums">{language.plural("chats.footer.sessions", totalSessions())}</span>
+        <div data-slot="statusbar">
+          <span data-slot="status-item">{language.plural("chats.footer.sessions", totalSessions())}</span>
+          <span data-slot="status-spacer" />
+          <Show when={waitingCount() > 0}>
+            <span data-slot="status-item">
+              <span data-slot="dot" data-tone="attention" />
+              {language.plural("chats.footer.waiting", waitingCount())}
+            </span>
+          </Show>
           <Show when={workingCount() > 0}>
-            <span class="tabular-nums">{language.plural("chats.footer.active", workingCount())}</span>
+            <span data-slot="status-item">
+              <span data-slot="dot" data-tone="working" />
+              {language.plural("chats.footer.active", workingCount())}
+            </span>
           </Show>
         </div>
       </Show>
@@ -2074,71 +3302,71 @@ export function ChatSidebarPane(props: {
         {(request) => <SessionModelPicker {...request} onClose={() => setModelPicker(null)} />}
       </Show>
       <Portal>
-        <Show when={sharedTooltip()}>
-          {(intent) => (
-            <Show when={sharedTooltipPosition()}>
-              {(position) => (
-                <div
-                  ref={(element) => {
-                    sharedTooltipElement = element
-                    queueSharedTooltipPosition()
-                  }}
-                  id={sharedTooltipID}
-                  role="tooltip"
-                  data-component="tooltip-v2"
-                  data-chat-sidebar-shared-tooltip
-                  class={intent().sessionID ? "!p-0 overflow-hidden" : undefined}
-                  style={
-                    {
-                      position: "fixed",
-                      left: `${position().x}px`,
-                      top: `${position().y}px`,
-                      // The rich Session preview is interactive (row clicks,
-                      // context menu, keyboard); plain-text tooltips stay
-                      // decorative and click-through.
-                      "pointer-events": intent().sessionID ? "auto" : "none",
-                      "z-index": 1000,
-                      "max-width": "calc(100vw - 30px)",
-                      "max-height": "calc(100vh - 30px)",
-                    } as JSX.CSSProperties
-                  }
-                  onPointerEnter={() => {
-                    if (!intent().sessionID) return
-                    sharedTooltipCardHovered = true
-                    if (tooltipCloseGraceTimer !== undefined) {
-                      clearTimeout(tooltipCloseGraceTimer)
-                      tooltipCloseGraceTimer = undefined
-                    }
-                  }}
-                  onPointerLeave={() => {
-                    if (!intent().sessionID) return
-                    sharedTooltipCardHovered = false
-                    requestAnimationFrame(() => {
-                      if (sharedTooltipCardHovered || sharedTooltipCardContextMenuOpen()) return
-                      if (sharedTooltip()?.anchor?.matches(":hover")) return
-                      closeSharedTooltip()
-                    })
-                  }}
-                >
-                  <Show when={intent().sessionID} fallback={sharedTooltipText()}>
-                    {(sessionID) => (
-                      <SessionPreviewCard
-                        data={sharedTooltipData() ?? {}}
-                        relationships={sharedTooltipRelationships}
-                        currentSessionID={sessionID()}
-                        server={paneServerKey()}
-                        serverCtx={paneServerCtx}
-                        active={() => sharedTooltip()?.sessionID === sessionID()}
-                        onOpenSession={() => closeSharedTooltip()}
-                        onRowContextMenuOpenChange={setSharedTooltipCardContextMenuOpen}
-                        maxHeight={sharedTooltipMaxHeight}
-                      />
-                    )}
-                  </Show>
-                </div>
-              )}
+        <Show when={tooltipSurfaceRequested()}>
+          <div
+            ref={(element) => {
+              sharedTooltipElement = element
+              queueSharedTooltipPosition()
+            }}
+            id={sharedTooltipID}
+            role="tooltip"
+            data-component="tooltip-v2"
+            data-chat-sidebar-shared-tooltip
+            data-session-id={sharedTooltip()?.sessionID}
+            class={sharedTooltip()?.sessionID ? "!p-0 overflow-hidden" : undefined}
+            style={{
+              position: "fixed",
+              left: `${sharedTooltipPosition()?.x ?? 0}px`,
+              top: `${sharedTooltipPosition()?.y ?? 0}px`,
+              display: sharedTooltip() && sharedTooltipPosition() ? "block" : "none",
+              "pointer-events": sharedTooltip()?.sessionID ? "auto" : "none",
+              "z-index": 1000,
+              "max-width": "calc(100vw - 30px)",
+              "max-height": "calc(100vh - 30px)",
+            } as JSX.CSSProperties}
+            onPointerEnter={() => {
+              if (!sharedTooltip()?.sessionID) return
+              sharedTooltipCardHovered = true
+              if (tooltipCloseGraceTimer !== undefined) {
+                clearTimeout(tooltipCloseGraceTimer)
+                tooltipCloseGraceTimer = undefined
+              }
+            }}
+            onPointerLeave={() => {
+              if (!sharedTooltip()?.sessionID) return
+              sharedTooltipCardHovered = false
+              requestAnimationFrame(() => {
+                if (sharedTooltipCardHovered || sharedTooltipCardContextMenuOpen()) return
+                if (sharedTooltip()?.anchor?.matches(":hover")) return
+                closeSharedTooltip()
+              })
+            }}
+          >
+            {/* Only one rich card instance in the entire sidebar lifetime.
+                It is lazy-created on the first session hover, then reused for
+                every other session without recreating its virtualizer. */}
+            <Show when={richPreviewRequested()}>
+              <div style={{ display: sharedTooltip()?.sessionID ? "block" : "none" }}>
+                <Suspense fallback={null}>
+                  <SessionPreviewCard
+                    data={sharedTooltipData() ?? {}}
+                    relationships={sharedTooltipRelationships}
+                    currentSessionID={sharedTooltip()?.sessionID}
+                    previewKey={sharedTooltip()?.sessionID}
+                    server={paneServerKey()}
+                    serverCtx={paneServerCtx}
+                    active={() => !!sharedTooltip()?.sessionID}
+                    onOpenSession={() => closeSharedTooltip()}
+                    onRowContextMenuOpenChange={setSharedTooltipCardContextMenuOpen}
+                    maxHeight={sharedTooltipMaxHeight}
+                  />
+                </Suspense>
+              </div>
             </Show>
-          )}
+            <Show when={!!sharedTooltip() && !sharedTooltip()?.sessionID}>
+              {sharedTooltipText()}
+            </Show>
+          </div>
         </Show>
       </Portal>
     </div>
@@ -2147,7 +3375,9 @@ export function ChatSidebarPane(props: {
 
 function ChatRow(props: {
   session: Session
-  directory: string
+  /** Display label override — folded group members drop the shared group prefix. */
+  label?: string
+  density: ChatSidebarDensity
   /** Cheap O(1) related-session count from the compact SessionGroup
    * membership index (subagents/delegations/plugin/manual/Swarm) — the
    * topology itself is only expandable through the rich Session preview. */
@@ -2156,6 +3386,7 @@ function ChatRow(props: {
    * menu's "remove from group" affordance (unrelated to relatedCount). */
   inGroupId?: string
   animateWorkingIndicator?: boolean
+  indicatorBudget: ReturnType<typeof createChatSidebarIndicatorBudget>
   observeVisibility: (element: Element, update: (visible: boolean) => void) => () => void
   selected?: boolean
   minuteNow: () => number
@@ -2172,14 +3403,14 @@ function ChatRow(props: {
 }): JSX.Element {
   const language = useLanguage()
   const lease = props.runtimeLease(props.session)
+  const tabs = useTabs()
   const runtime = lease.runtime
   onCleanup(lease.release)
+  // A session metadata refresh changes the row's immutable projection without
+  // changing identity. Keep the shared runtime fallback current in place.
+  createEffect(() => lease.update(props.session))
 
-  const title = () => sessionTitle(props.session.title)
-  // A group may legitimately contain sessions from more than one project.
-  // Always route/actions against the member's own directory; the containing
-  // project group is only a fallback for legacy rows that lack one.
-  const currentDir = props.session.directory || props.directory || ""
+  const title = () => props.label ?? sessionTitle(props.session.title)
   const isWorking = runtime.isWorking
   const unseenCount = runtime.unseenCount
   const hasError = runtime.hasError
@@ -2194,285 +3425,279 @@ function ChatRow(props: {
   const modelInfo = runtime.modelInfo
   const modelLabel = runtime.modelLabel
   const live = runtime.live
+  const compact = () => props.density === "compact"
   const [rowVisible, setRowVisible] = createSignal(false)
   // Timer text is useful only while a row is on screen. Keep hidden rows out of
   // the shared 1 Hz clock's reactive subscriber set; they recompute immediately
   // when IntersectionObserver reports them visible again.
-  const rowLive = () => (rowVisible() ? live() : undefined)
+  // A memo so the several liveReadout reads share one telemetryLive() evaluation
+  // per tick; hidden rows depend only on rowVisible and never touch the clock.
+  const rowLive = createMemo(() => (rowVisible() ? live() : undefined))
+  // Pulse is rationed pane-wide (see createChatSidebarIndicatorBudget); rows that
+  // do not win a slot render the same dot statically.
+  const [pulseGranted, setPulseGranted] = createSignal(false)
+  const wantsPulse = createMemo(
+    () => props.animateWorkingIndicator === true && rowVisible() && isWorking() && !props.pending,
+  )
+  createEffect(() => {
+    if (!wantsPulse()) return
+    const release = props.indicatorBudget.acquire(setPulseGranted)
+    onCleanup(() => {
+      release()
+      setPulseGranted(false)
+    })
+  })
   let stopObserving: (() => void) | undefined
   onCleanup(() => stopObserving?.())
 
-  const slug = () => base64Encode(currentDir || props.session.directory || "")
+  const dotTone = () =>
+    hasError() ? "error" : needsAttention() ? "attention" : unseenCount() > 0 ? "unread" : "idle"
+
   const warm = () => props.prefetchSession()
   const serverKey = runtime.serverKey
-  const navigate = useNavigate()
+  // Navigate through the same canonical server-scoped tab controller as Home.
+  const linkHref = () => {
+    const server = serverKey()
+    return server ? sessionHref(server, props.session.id) : "#"
+  }
   const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number }>()
   const handleOpen = (opts?: { background?: boolean }) => {
-    const dir = currentDir || props.session.directory || ""
-    if (!dir || !props.session.id) return
     const server = serverKey()
-    if (!server) return
-    if (opts?.background) {
-      void import("@/context/tabs").then(({ useTabs }) => {
-        try {
-          const tabs = useTabs()
-          tabs.addSessionTab({ server, sessionId: props.session.id })
-        } catch {}
-      })
-      return
-    }
+    if (!server || !props.session.id) return
+    const tab = tabs.addSessionTab({ server, sessionId: props.session.id })
+    if (opts?.background) return
     props.onPending?.(props.session.id)
-    navigate(`/${slug()}/session/${props.session.id}`)
+    tabs.select(tab)
   }
+
+  // Live phase readout. Plain expression children compile to tracked getters,
+  // so only text nodes update on each 1 Hz tick; the Switch swaps between
+  // waiting / generating / tools / thinking states instead of showing 0s.
+  const liveReadout = () => (
+    <Switch>
+      <Match when={hasPermissions() || hasQuestions()}>
+        <span data-slot="live" data-tone="warning">
+          <IconV2 name="hourglass" size="small" />
+          <strong>{language.t("chats.timer.waiting")}</strong>
+          <Show when={!compact() && (rowLive()?.turnSeconds ?? 0) > 1}>
+            <span>{formatDuration(rowLive()!.turnSeconds)}</span>
+          </Show>
+        </span>
+      </Match>
+      <Match when={(rowLive()?.rate ?? null) !== null}>
+        <span data-slot="live" data-tone="accent">
+          <span>{language.t("chats.metric.rate", { rate: rowLive()?.rate?.toFixed(0) ?? "0" })}</span>
+          <strong>{formatDuration(rowLive()?.turnSeconds ?? 0)}</strong>
+        </span>
+      </Match>
+      <Match when={(rowLive()?.turnSeconds ?? 0) > 1}>
+        <span data-slot="live">
+          <IconV2 name="layers" size="small" />
+          <Show when={!compact()}>
+            <span>{language.t("chats.timer.tools")}</span>
+          </Show>
+          <strong>{formatDuration(rowLive()!.turnSeconds)}</strong>
+        </span>
+      </Match>
+      <Match when={true}>
+        <span data-slot="live" data-tone="faint">
+          <IconV2 name="hourglass" size="small" />
+          <span>{language.t("chats.timer.thinking")}</span>
+        </span>
+      </Match>
+    </Switch>
+  )
 
   return (
     <>
       <div
-          ref={(element) => {
-            stopObserving?.()
-            stopObserving = props.observeVisibility(element, setRowVisible)
-          }}
-          data-chat-tooltip-session={props.session.id}
-          data-chat-tooltip-placement="right"
-          class="group/session relative min-w-0 rounded-[5px] transition-[background-color,box-shadow] duration-100 hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 has-[.active]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] has-[data-selected]:bg-v2-background-bg-layer-02 has-[data-selected]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
-          onContextMenu={(event) => {
+        ref={(element) => {
+          stopObserving?.()
+          stopObserving = props.observeVisibility(element, setRowVisible)
+        }}
+        data-slot="row"
+        data-density={props.density}
+        data-selected={props.selected ? "" : undefined}
+        data-chat-tooltip-session={props.session.id}
+        data-chat-tooltip-placement="right"
+        role="treeitem"
+        onContextMenu={(event) => {
+          event.preventDefault()
+          setContextMenu({ x: event.clientX, y: event.clientY })
+        }}
+      >
+        <A
+          href={linkHref()}
+          data-slot="row-link"
+          data-tree-item
+          data-selected={props.selected ? "" : undefined}
+          aria-current={props.selected ? "page" : undefined}
+          onPointerDown={warm}
+          onFocus={warm}
+          onClick={(event: MouseEvent) => {
+            if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button === 1) return
             event.preventDefault()
-            setContextMenu({ x: event.clientX, y: event.clientY })
+            handleOpen()
           }}
         >
-          <A
-            href={`/${slug()}/session/${props.session.id}`}
-            class="relative flex w-full min-w-0 flex-col gap-[2px] rounded-[5px] py-[4px] pe-1.5 ps-1.5 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[3px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-e-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:shadow-[0_0_6px_var(--v2-background-bg-accent)] [&.active]:before:content-[''] data-[selected]:text-v2-text-text-base data-[selected]:before:absolute data-[selected]:before:inset-y-[3px] data-[selected]:before:start-0 data-[selected]:before:w-[2px] data-[selected]:before:rounded-e-full data-[selected]:before:bg-v2-background-bg-accent data-[selected]:before:shadow-[0_0_6px_var(--v2-background-bg-accent)] data-[selected]:before:content-['']"
-            data-selected={props.selected ? "" : undefined}
-            aria-current={props.selected ? "page" : undefined}
-            onPointerDown={warm}
-            onFocus={warm}
-            onClick={(event: MouseEvent) => {
-              if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button === 1) return
-              props.onPending?.(props.session.id)
-            }}
-          >
-            {/* Line 1 — status, title, attention, hover actions */}
-            <div class="flex min-w-0 items-center gap-1.5">
-              <span class="flex size-3 shrink-0 items-center justify-center">
-                <Show
-                  when={props.pending}
-                  fallback={
-                    <Show
-                      when={isWorking()}
-                      fallback={
-                        <Show
-                          when={needsAttention() || hasError() || unseenCount() > 0}
-                          fallback={
-                            <span class="size-1.5 rounded-full border border-v2-border-border-strong group-hover/session:border-v2-icon-icon-muted" />
-                          }
-                        >
-                          <span
-                            class={`size-1.5 rounded-full ${
-                              hasError()
-                                ? "bg-v2-state-fg-danger"
-                                : needsAttention()
-                                  ? "bg-v2-state-fg-warning"
-                                  : "bg-v2-background-bg-accent"
-                            }`}
-                          />
-                        </Show>
-                      }
-                    >
-                      <DenseWorkingIndicator
-                        class="text-v2-icon-icon-base"
-                        animated={chatSidebarWorkingIndicatorAnimated(
-                          props.animateWorkingIndicator === true,
-                          true,
-                          rowVisible(),
-                        )}
-                      />
-                    </Show>
-                  }
-                >
-                  <LoaderV2 class="size-3" aria-hidden="true" />
-                </Show>
+          {/* Line 1 — status, title, attention, trailing time/actions */}
+          <span data-slot="row-line">
+            <span data-slot="row-status">
+              <Show
+                when={props.pending}
+                fallback={
+                  <Show when={isWorking()} fallback={<span data-slot="dot" data-tone={dotTone()} />}>
+                    <DenseWorkingIndicator
+                      class="text-v2-icon-icon-base"
+                      animated={chatSidebarWorkingIndicatorAnimated(
+                        props.animateWorkingIndicator === true,
+                        true,
+                        pulseGranted(),
+                      )}
+                    />
+                  </Show>
+                }
+              >
+                <LoaderV2 class="size-3" aria-hidden="true" />
+              </Show>
+            </span>
+
+            <span data-slot="row-title">{title()}</span>
+
+            <Show when={(props.relatedCount ?? 0) > 1}>
+              <span
+                data-slot="badge"
+                data-chat-tooltip-text={language.plural(
+                  "sessionGroup.sessions",
+                  Math.max((props.relatedCount ?? 1) - 1, 0),
+                )}
+                data-chat-tooltip-placement="top"
+              >
+                <IconV2 name="branch" size="small" />
+                {Math.max((props.relatedCount ?? 1) - 1, 0)}
               </span>
+            </Show>
+            <Show when={hasPermissions()}>
+              <span
+                data-slot="badge"
+                data-tone="warning"
+                data-chat-tooltip-text={language.t("chats.badge.permission")}
+                data-chat-tooltip-placement="top"
+              >
+                <IconV2 name="shield" size="small" />
+                {pendingPermissionCount()}
+              </span>
+            </Show>
+            <Show when={hasQuestions()}>
+              <span
+                data-slot="badge"
+                data-tone="info"
+                data-chat-tooltip-text={language.t("chats.badge.question")}
+                data-chat-tooltip-placement="top"
+              >
+                <IconV2 name="help" size="small" />
+                {pendingQuestionCount()}
+              </span>
+            </Show>
 
-              <span class="min-w-0 flex-1 truncate text-[11.5px] font-[460] leading-[15px] tracking-[-0.01em] group-has-[data-selected]/session:font-[560]">{title()}</span>
-
-              <Show when={(props.relatedCount ?? 0) > 1}>
-                <span
-                  data-chat-tooltip-text={language.plural("sessionGroup.sessions", Math.max((props.relatedCount ?? 1) - 1, 0))}
-                  data-chat-tooltip-placement="top"
-                  class="flex shrink-0 items-center gap-0.5 rounded-[4px] bg-v2-background-bg-layer-02 px-1 py-[1px] text-[9px] font-[520] leading-none tabular-nums text-v2-text-text-faint"
-                >
-                  <IconV2 name="branch" size="small" class="size-2.5 opacity-70" />
-                  {Math.max((props.relatedCount ?? 1) - 1, 0)}
-                </span>
+            <span data-slot="row-trail">
+              <Show
+                when={compact() && isWorking()}
+                fallback={
+                  <>
+                    <span data-slot="row-time">{relativeLabel(props.session, props.minuteNow())}</span>
+                    <button
+                      type="button"
+                      data-slot="row-archive"
+                      aria-label={language.t("common.archive")}
+                      data-chat-tooltip-text={language.t("common.archive")}
+                      data-chat-tooltip-placement="top"
+                      onClick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        void props.archiveSession()
+                      }}
+                    >
+                      <IconV2 name="archive" size="small" class="size-3" />
+                    </button>
+                  </>
+                }
+              >
+                {liveReadout()}
               </Show>
+            </span>
+          </span>
 
-              <Show when={hasPermissions()}>
-                <span
-                  data-chat-tooltip-text={language.t("chats.badge.permission")}
-                  data-chat-tooltip-placement="top"
-                  class="flex shrink-0 items-center gap-0.5 rounded bg-v2-state-bg-warning px-1 py-[1px] text-[9px] font-[560] leading-none tabular-nums text-v2-state-fg-warning"
-                >
-                  <IconV2 name="shield" size="small" class="size-2.5" />
-                  {pendingPermissionCount()}
-                </span>
-              </Show>
-              <Show when={hasQuestions()}>
-                <span
-                  data-chat-tooltip-text={language.t("chats.badge.question")}
-                  data-chat-tooltip-placement="top"
-                  class="flex shrink-0 items-center gap-0.5 rounded bg-v2-state-bg-info px-1 py-[1px] text-[9px] font-[560] leading-none tabular-nums text-v2-state-fg-info"
-                >
-                  <IconV2 name="help" size="small" class="size-2.5" />
-                  {pendingQuestionCount()}
-                </span>
-              </Show>
-
-              {/* Archive replaces the timestamp on hover so the row never reflows */}
-              <div class="flex shrink-0 items-center">
-                <span class="text-[10px] leading-none tabular-nums text-v2-text-text-muted group-hover/session:hidden">
-                  {relativeLabel(props.session, props.minuteNow())}
-                </span>
-                <button
-                  type="button"
-                  aria-label={language.t("common.archive")}
-                  data-chat-tooltip-text={language.t("common.archive")}
-                  data-chat-tooltip-placement="top"
-                  class="hidden size-4 items-center justify-center rounded text-v2-icon-icon-muted transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-icon-icon-base group-hover/session:flex"
-                  onClick={(event) => {
-                    event.preventDefault()
-                    event.stopPropagation()
-                    void props.archiveSession()
-                  }}
-                >
-                  <IconV2 name="archive" size="small" class="size-3" />
-                </button>
-              </div>
-            </div>
-
-            {/* Line 2 — left metrics (truncate) + right timer (pinned, never squeezed) */}
-            <div class="flex min-w-0 items-center gap-1.5 ps-[18px] opacity-[0.92] transition-opacity group-hover/session:opacity-100">
-              <div class="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+          {/* Line 2 (detailed density) — metrics left, live/accumulated timer right */}
+          <Show when={!compact()}>
+            <span data-slot="row-meta">
+              <span data-slot="row-metrics">
                 <Show when={contextPercent() !== null}>
                   <span
+                    data-slot="metric"
+                    data-tone={contextTone(contextPercent()!)}
                     data-chat-tooltip-text={language.t("chats.metric.context")}
                     data-chat-tooltip-placement="top"
-                    class="flex shrink-0 items-center gap-1"
                   >
-                    <span class="h-[3px] w-6 overflow-hidden rounded-full bg-v2-background-bg-layer-03">
-                      <span
-                        class={`block h-full rounded-full transition-[width] duration-500 ${contextTone(contextPercent()!).bar}`}
-                        style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }}
-                      />
+                    <span data-slot="meter" data-tone={contextTone(contextPercent()!)}>
+                      <span style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }} />
                     </span>
-                    <span class={`text-[10px] leading-none tabular-nums ${contextTone(contextPercent()!).text}`}>
-                      {contextPercent()}%
-                    </span>
+                    {contextPercent()}%
                   </span>
                 </Show>
-
                 <Show when={(totals()?.cost ?? 0) > 0}>
-                  <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint">
-                    {formatCost(totals()!.cost)}
-                  </span>
+                  <span data-slot="metric">{formatCost(totals()!.cost)}</span>
                 </Show>
-
                 <Show when={totals()?.cacheHitPercent !== null && totals()?.cacheHitPercent !== undefined}>
                   <span
+                    data-slot="metric"
                     data-chat-tooltip-text={language.t("context.tooltip.cacheHit")}
                     data-chat-tooltip-placement="top"
-                    class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70"
                   >
-                    <IconV2 name="cache" size="small" class="size-2.5 opacity-70" />
-                    <span>{totals()!.cacheHitPercent}%</span>
+                    <IconV2 name="cache" size="small" />
+                    {totals()!.cacheHitPercent}%
                   </span>
                 </Show>
-
                 <Show when={modelInfo()}>
                   {(info) => (
-                    <span class="min-w-0 flex-1 truncate text-[10px] leading-none text-v2-text-text-faint opacity-70">
+                    <span data-slot="metric" data-grow>
                       {modelLabel()}
                       <Show when={info().variant}>{(variant) => ` · ${variant()}`}</Show>
                     </span>
                   )}
                 </Show>
-
                 <Show when={isAutoAccepting()}>
                   <span
+                    data-slot="metric"
+                    data-tone="info"
                     data-chat-tooltip-text={language.t("chats.badge.autoAccept")}
                     data-chat-tooltip-placement="top"
-                    class="flex shrink-0 items-center rounded-[3.5px] bg-v2-state-bg-info px-0.5 py-[1px] text-[9px] font-[560] leading-none text-v2-state-fg-info"
                   >
-                    <IconV2 name="shield-check" size="small" class="size-2.5" />
+                    <IconV2 name="shield-check" size="small" />
                   </span>
                 </Show>
-              </div>
+              </span>
 
               <Show
                 when={isWorking()}
                 fallback={
                   <Show when={(totals()?.generatedSeconds ?? 0) + (totals()?.toolSeconds ?? 0) > 1}>
                     <span
+                      data-slot="metric"
                       data-chat-tooltip-text={language.t("chats.timer.accumulated")}
                       data-chat-tooltip-placement="top"
-                      class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70"
                     >
                       {formatDuration((totals()!.generatedSeconds ?? 0) + (totals()!.toolSeconds ?? 0))}
                     </span>
                   </Show>
                 }
               >
-                {/* Keyed off isWorking, not live(): live() returns a fresh object
-                 every tick, and a keyed <Show> callback would tear down and
-                 recreate the whole tooltip+spans subtree each second. Plain
-                 expression children compile to tracked getters, so only the
-                 text nodes update in place each tick. Inner Switch swaps
-                 between generating / tools / waiting premium states instead of
-                 showing 0s. */}
-                <span
-                  data-chat-tooltip-placement="top"
-                  class="flex shrink-0"
-                >
-                  <Switch>
-                    <Match when={hasPermissions() || hasQuestions()}>
-                      <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-state-fg-warning">
-                        <IconV2 name="hourglass" size="small" class="size-3 animate-pulse" />
-                        <span class="font-[560]">{language.t("chats.timer.waiting")}</span>
-                        <Show when={(rowLive()?.turnSeconds ?? 0) > 1}>
-                          <span class="font-[560] opacity-70">{formatDuration(rowLive()!.turnSeconds)}</span>
-                        </Show>
-                      </span>
-                    </Match>
-                    <Match when={(rowLive()?.rate ?? null) !== null}>
-                      <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums">
-                        <span class="text-v2-text-text-accent opacity-80">
-                          {language.t("chats.metric.rate", { rate: rowLive()?.rate?.toFixed(0) ?? "0" })}
-                        </span>
-                        <span class="font-[560] text-v2-text-text-accent">
-                          {formatDuration(rowLive()?.turnSeconds ?? 0)}
-                        </span>
-                      </span>
-                    </Match>
-                    <Match when={(rowLive()?.turnSeconds ?? 0) > 1}>
-                      <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-text-text-muted">
-                        <IconV2 name="layers" size="small" class="size-2.5 opacity-70" />
-                        <span>{language.t("chats.timer.tools")}</span>
-                        <span class="opacity-40">·</span>
-                        <span class="font-[560] opacity-80">{formatDuration(rowLive()!.turnSeconds)}</span>
-                      </span>
-                    </Match>
-                    <Match when={true}>
-                      <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-text-text-faint">
-                        <IconV2 name="hourglass" size="small" class="size-3 animate-pulse opacity-70" />
-                        <span>{language.t("chats.timer.thinking")}</span>
-                      </span>
-                    </Match>
-                  </Switch>
-                </span>
+                {liveReadout()}
               </Show>
-            </div>
-          </A>
-        </div>
+            </span>
+          </Show>
+        </A>
+      </div>
       <Show when={contextMenu()} keyed>
         {(cursor) => (
           <Suspense fallback={null}>
