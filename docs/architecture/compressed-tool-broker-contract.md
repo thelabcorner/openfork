@@ -90,9 +90,15 @@ These surfaces are compressed/multiplexed, but their permanent outer schema alre
 | `swarm_create` | one direct creation intent | Complete creation schema is provider-visible; broad Swarm administration remains lazy |
 | `swarm_member` | one direct managed-worker intent family | Complete worker-intent schema is provider-visible and authority is derived from caller Session |
 
-### Code Mode `execute`
+### Provider `code` orchestration
 
-Code Mode is OpenFork's default MCP composition strategy. It compresses MCP calls behind `execute`, using a token-budgeted inline catalog plus `$codemode.search` when the complete catalog does not fit. Exact selected signatures are therefore available to the generated program without the opaque nested-`args` contract problem addressed here. Code Mode remains a separate orchestration protocol; do not retrofit `BrokerContract` handshakes into its generated tool calls.
+OpenFork's static `code` tool is a separate orchestration protocol. Provider-level
+`code.search` discovers compact host-issued refs and `code.describe` returns one
+exact callable contract; confined programs then use `call(ref, input)`. The host
+capability inventory/gateway owns identity, schema, authorization, cancellation, and
+leaf execution. Do not retrofit `BrokerContract` handshakes into these generated
+program calls: exact capability refs and contracts are already owned by the Code
+discovery/gateway path.
 
 ## Construction invariant
 
