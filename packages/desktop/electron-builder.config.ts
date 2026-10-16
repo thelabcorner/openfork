@@ -76,6 +76,7 @@ const getBase = (appId: string): Configuration => ({
     "!resources/openfork-cli*",
     "!resources/opencode-cli*",
     "!resources/tunnel/**/*",
+      "!resources/cloudflared/**/*",
     "!resources/worktree-store/**/*",
   ],
   extraResources: [
@@ -111,6 +112,12 @@ const getBase = (appId: string): Configuration => ({
       // outside app.asar, together with its release license/SBOM sidecars.
       from: "resources/tunnel/",
       to: "tunnel/",
+    },
+    {
+      // OXP's independent Cloudflare transport binary is checksum-pinned and
+      // executed outside app.asar.
+      from: "resources/cloudflared/",
+      to: "cloudflared/",
     },
     {
       // The pinned worktree-store sidecar is a real filesystem executable tree

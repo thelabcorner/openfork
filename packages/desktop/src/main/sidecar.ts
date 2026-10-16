@@ -20,6 +20,8 @@ import {
   type RuntimeHttpListener,
   type RuntimeHttpListenOptions,
 } from "./oxp/runtime-http-transition"
+import { OxpRuntimeStateProjection } from "./oxp/runtime-state-projection"
+import type { SidecarOxpState } from "./sidecar-protocol"
 
 enableCompileCache()
 
@@ -56,6 +58,7 @@ let httpBackend: RuntimeHttpBackendOwner | undefined
 let oxpHost: OxpHostModule | undefined
 let runtimeRefresh: RuntimeRefreshCoordinator | undefined
 let oxpRestore: Promise<OxpHostState> | undefined
+const oxpStateProjection = new OxpRuntimeStateProjection()
 
 autopsyMark("sidecar-module-eval") // STARTUP-AUTOPSY (utility process module graph loaded)
 
@@ -84,6 +87,18 @@ parentPort.on("message", (event) => {
   void start(command)
 })
 
+/**
+ * OXP transactional runtime refresh is disabled.
+ *
+ * Both startup recovery and trial rollback restore the durable accepted
+ * checkpoint over the built dist/node artifact. While the accepted checkpoint
+ * trails the working tree, that silently overwrites fresh builds on every
+ * sidecar start and on every unarmed/deadline rollback, so a rebuilt tool
+ * never reaches the running backend. The implementation and its tests remain;
+ * flip this to true to re-enable the full flow.
+ */
+const RUNTIME_REFRESH_ENABLED: boolean = false
+
 async function start(command: StartCommand) {
   try {
     autopsyMark("sidecar-start-cmd") // STARTUP-AUTOPSY
@@ -96,7 +111,7 @@ async function start(command: StartCommand) {
       command.userDataPath,
       "oxp-runtime-refresh",
     )
-    if (runtimeArtifactUrl) {
+    if (RUNTIME_REFRESH_ENABLED && runtimeArtifactUrl) {
       await recoverAcceptedRuntime(
         runtimeArtifactUrl,
         runtimeCheckpointRoot,
@@ -123,13 +138,20 @@ async function start(command: StartCommand) {
       (next) => probeHttpRuntime(next, command.password),
     )
 
-    runtimeRefresh = await RuntimeRefreshCoordinator.create(backend, {
-      publish: (state, publication) =>
+    runtimeRefresh = RUNTIME_REFRESH_ENABLED ? await RuntimeRefreshCoordinator.create(backend, {
+      publish: (state, publication) => {
+        const owner = currentOxpHost()
+        if (!owner) throw new Error("OXP runtime publication has no active host")
+        const projected = projectOxpState(owner, state)
+        if (!projected) {
+          throw new Error("OXP runtime publication was stale or no longer owns the endpoint")
+        }
         parentPort.postMessage(
           publication?.trialID
-            ? { type: "oxp-runtime-trial", trialID: publication.trialID, state }
-            : { type: "oxp-state", state },
-        ),
+            ? { type: "oxp-runtime-trial", trialID: publication.trialID, state: projected }
+            : { type: "oxp-state", state: projected },
+        )
+      },
       probe: probeOxpRuntime,
       backendTransition: httpBackend,
       artifactUrl: runtimeArtifactUrl || undefined,
@@ -141,7 +163,7 @@ async function start(command: StartCommand) {
         else if (level === "warn") console.warn(message, metadata ?? {})
         else console.log(message, metadata ?? {})
       },
-    })
+    }) : undefined
 
     autopsyMark("sidecar-listening") // STARTUP-AUTOPSY
     parentPort.postMessage({ type: "ready" })
@@ -154,7 +176,10 @@ async function start(command: StartCommand) {
     if (!host) throw new Error("OXP host unavailable after backend import")
     oxpRestore = host.restore()
     void oxpRestore
-      .then((state: OxpHostState) => parentPort.postMessage({ type: "oxp-state", state }))
+      .then((state: OxpHostState) => {
+        const projected = projectOxpState(host, state)
+        if (projected) parentPort.postMessage({ type: "oxp-state", state: projected })
+      })
       .catch((_error: unknown) => {
         // Host errors can originate after a secret loopback URL has been
         // allocated. Keep this optional-startup diagnostic generic rather than
@@ -186,7 +211,8 @@ async function publishOxpState() {
   const host = currentOxpHost()
   if (!host) return
   try {
-    parentPort.postMessage({ type: "oxp-state", state: await host.getState() })
+    const projected = projectOxpState(host, await host.getState())
+    if (projected) parentPort.postMessage({ type: "oxp-state", state: projected })
   } catch {
     // OXP is optional. Ordinary sidecar readiness remains independent.
   }
@@ -210,7 +236,11 @@ async function handleOxp(id: number, request: OxpSidecarRequest) {
     const host = currentOxpHost()
     if (!host) throw new Error("OXP host is not ready")
     if (request.action === "list-worker-agents") {
-      const catalog = await host.listWorkerAgents(request.rootID)
+      let catalog = await host.listWorkerAgents(request.rootID)
+      const activeHost = currentOxpHost()
+      if (activeHost && activeHost !== host) {
+        catalog = await activeHost.listWorkerAgents(request.rootID)
+      }
       parentPort.postMessage({
         type: "oxp-agent-catalog-response",
         id,
@@ -239,8 +269,10 @@ async function handleOxp(id: number, request: OxpSidecarRequest) {
           return host.importLegacyConfig(request.plan)
       }
     })()
-    parentPort.postMessage({ type: "oxp-response", id, ok: true, state })
-    parentPort.postMessage({ type: "oxp-state", state })
+    const projected = projectOxpState(host, state)
+    if (!projected) throw new Error("OXP runtime changed while handling the request; retry")
+    parentPort.postMessage({ type: "oxp-response", id, ok: true, state: projected })
+    parentPort.postMessage({ type: "oxp-state", state: projected })
   } catch (error) {
     const serialized = serializeError(error)
     const message = redactOxpControlError(serialized.message)
@@ -255,6 +287,17 @@ async function handleOxp(id: number, request: OxpSidecarRequest) {
 
 function currentOxpHost() {
   return runtimeRefresh?.host ?? oxpHost
+}
+
+function projectOxpState(
+  owner: OxpHostModule,
+  state: OxpHostState | SidecarOxpState,
+) {
+  return oxpStateProjection.project(
+    owner,
+    currentOxpHost(),
+    state as SidecarOxpState,
+  )
 }
 
 async function probeOxpRuntime(state: OxpHostState) {

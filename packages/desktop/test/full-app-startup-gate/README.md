@@ -11,7 +11,9 @@ The gate begins after a known server has been selected and is ready: it supplies
 that server directly and disables `ConnectionGate`'s redundant health wait. It
 does not claim to measure desktop bootstrap, server selection, or health-probe
 startup. Its cold boundary is the first production app mount for that server,
-with a fresh Electron profile and an existing project directory.
+with a fresh Electron profile and an existing project directory. The fixture
+uses the same `html`, `body`, and `#root` sizing as the desktop renderer entry
+so virtualized session content receives a real window viewport.
 
 ## Ownership path
 
@@ -36,20 +38,30 @@ event/index path without changing the current route or creating a UI tab.
 ## Scenarios and negative invariants
 
 The cold profile is isolated to a fixture-owned directory and starts with one
-known project and no session tabs. Before any session creation or explicit detail
-route, the production Home must make zero implicit-location or Tier 0
-`InstanceStore.load` calls, including failed global-root requests with omitted
-or empty location. The fixture disables auto-share, so the only expected
-`InstanceStore.load` creation is the first explicit `prompt_async` execution in
-the known workspace; any other load fails the owner assertion. A session created through the local test sidecar while Home remains
-mounted must appear in the Home list while the URL stays `/` and the tab store
-remains empty.
+known project and no session tabs. The gate first opens the production
+`/new-session` draft action from empty Home and separately records route mount,
+visible editable composer, focus, `/config` request start/completion, and route
+settlement. It holds the directory provider-catalog response at the real sidecar
+fetch boundary and requires the composer to become usable while that response is
+still pending. This distinguishes composer readiness from optional catalog work
+and from config-read latency without fabricating a provider result. It then
+returns to Home. Before
+any explicit prompt route, the production app must make zero implicit-location
+or Tier 0/1 `InstanceStore.load` calls, including failed global-root requests
+with omitted or empty location. The fixture disables auto-share, so the only
+expected `InstanceStore.load` creation is the first explicit `prompt_async`
+execution in the known workspace; any other load fails the owner assertion. A
+session created through the local test sidecar while Home remains mounted must
+appear in the Home list while the URL stays `/` and the tab store remains empty.
 
 The gate then exercises one, three, and six concurrently working sessions. One
 session is opened in the actual detail route; the remainder stay untabbed and
-must remain status-only. It records roots-query count by directory, history and
-part reads, server-scoped SSE opens, session-root owners, optional usage/catalog
-calls, and every authoritative `InstanceStore.load` attribution. The required
+must remain status-only. The Home-row click must execute the real lazy
+`SessionPage`, render the streamed tail, and avoid history reloads or
+dynamic-import/renderer errors. It records roots-query count by directory,
+history and part reads, server-scoped SSE opens, session-root owners, optional
+usage/catalog calls, and every authoritative `InstanceStore.load` attribution.
+The required
 invariants are:
 
 - cold Home and project discovery make zero implicit-location or Tier 0 instance
@@ -86,3 +98,31 @@ does not establish cold Markdown layout cost (covered separately), arbitrary
 project-count scaling, or packaged-build behavior. The test must emit an
 inspectable failure if any required production surface cannot mount; a partial
 SDK/context mount is not a passing fallback.
+
+For the adversarial V1 history-open case, run the same gate with
+`OPENFORK_FULL_APP_GATE_LARGE_HISTORY_PARTS=80000`. After the real sidecar has
+migrated its fixture database and Home has observed the newly created session,
+the fixture-only Electron IPC inserts one user message and 80,000 short parts in
+one SQLite transaction. It then measures the ordinary Home-row click and
+production paginated history request. The recovery row then opens the explicit
+V1 detail reader, fetches and renders two successive pages, and holds a third
+page across Close before releasing its response. This mode asserts the initial
+64-part response and 79,936 omissions; each detail page contains at most 16
+parts, 1,024 code points per slice, and 128 KiB on the wire; no keyed full
+message or legacy part fetch; a usable composer; and unchanged 64-part shared
+history and omission metadata after the late response. The detail page is gone
+after Close, and renderer/console errors remain empty. The insertion timing is
+reported separately from detail-open timing. This is a test database fixture,
+not a production mutation path; it exercises the real V1 SQLite page query,
+HTTP response, client-store normalization, and visible timeline.
+
+The default gate also overlaps a real `GET /usage/summary` with opening a cold
+session. A test-only transform recognizes the aliased `usage_record` summary
+query in the production `scanDb` SQLite adapter and holds it after statement
+admission but before the native worker request. While that scan remains held,
+the gate selects a session in a project not previously materialized during the
+app lifetime and requires the detail route, composer, session interest, and
+initial history response to become ready. It verifies the summary remains
+pending until the barrier is released and then returns 200. This proves
+independence at the actual scan-statement admission seam; it does not simulate
+the CPU cost of scanning a large populated usage table.

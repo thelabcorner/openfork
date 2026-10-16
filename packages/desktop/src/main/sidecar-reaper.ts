@@ -11,6 +11,32 @@ export type SidecarProcessSnapshot = {
   commandLine: string
 }
 
+/** CIM returns a DateTime object, not the DMTF string required by ManagementDateTimeConverter. */
+export function windowsSidecarInspectionScript(pid: number): string | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return
+  return [
+    `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction SilentlyContinue`,
+    "if ($null -eq $p) { exit 3 }",
+    "[PSCustomObject]@{ ProcessId=$p.ProcessId; ParentProcessId=$p.ParentProcessId; CreationDate=$p.CreationDate.ToUniversalTime().ToString('o'); ExecutablePath=$p.ExecutablePath; CommandLine=$p.CommandLine } | ConvertTo-Json -Compress",
+  ].join("; ")
+}
+
+/** Reject a stale, exited PID before paying for Windows CIM initialization.
+ * Only ESRCH proves absence; EPERM/other errors are inconclusive and must
+ * continue to the full incarnation/ownership verification below. */
+export function previousSidecarPidMayExist(
+  pid: number,
+  check: (pid: number) => void = (value) => process.kill(value, 0),
+): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    check(pid)
+    return true
+  } catch (error) {
+    return (error as { code?: unknown } | null)?.code !== "ESRCH"
+  }
+}
+
 /** Fail closed unless handshake generation, PID incarnation and executable all agree. */
 export function validatePreviousSidecar(
   handshake: DevHandshake | undefined,
@@ -56,14 +82,17 @@ export async function reapPreviousSidecar(
     log("previous sidecar retained; safe process-tree primitive unavailable", { pid: handshake.sidecarPID, instanceID: handshake.instanceID })
     return { reaped: false, reason: "safe-tree-termination-unavailable" }
   }
-  const script = [
-    `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${handshake.sidecarPID}' -ErrorAction SilentlyContinue`,
-    "if ($null -eq $p) { exit 3 }",
-    "[PSCustomObject]@{ ProcessId=$p.ProcessId; ParentProcessId=$p.ParentProcessId; CreationDate=([Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate)).ToUniversalTime().ToString('o'); ExecutablePath=$p.ExecutablePath; CommandLine=$p.CommandLine } | ConvertTo-Json -Compress",
-  ].join("; ")
+  const script = windowsSidecarInspectionScript(handshake.sidecarPID)
+  if (!script) return { reaped: false, reason: "invalid-sidecar-pid" }
+  // A dead PID needs no CIM inspection. Unknown/surviving PIDs retain both
+  // full incarnation proofs before any termination is permitted.
+  if (!previousSidecarPidMayExist(handshake.sidecarPID)) {
+    return { reaped: false, reason: "process-not-running" }
+  }
   let snapshot: SidecarProcessSnapshot
   try {
-    const result = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 5000 })
+    // Cold CIM initialization can exceed five seconds on a busy Windows host.
+    const result = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 20_000 })
     const row = JSON.parse(result.stdout) as {
       ProcessId: number
       ParentProcessId: number
@@ -88,7 +117,7 @@ export async function reapPreviousSidecar(
   }
   // Re-read incarnation immediately before taskkill; /T reaps descendants as
   // well as the verified utility process, unlike a PID-only kill by itself.
-  const second = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 5000 }).catch(() => undefined)
+  const second = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 20_000 }).catch(() => undefined)
   if (!second) return { reaped: false, reason: "process-changed-before-termination" }
   let again: SidecarProcessSnapshot | undefined
   try {

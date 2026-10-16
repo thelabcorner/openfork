@@ -14,7 +14,7 @@
  */
 import { randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
-import { dirname, join } from "node:path"
+import { delimiter, dirname, join } from "node:path"
 
 const runID = process.env.OPENCODE_DEV_RUN_ID?.trim() || randomUUID()
 const root = join(import.meta.dir, "..")
@@ -132,9 +132,20 @@ const concurrently = (() => {
 })()
 if (!concurrently) throw new Error("concurrently is not installed — run `bun install` at the repo root")
 
+// The dev entrypoint may itself have been launched through an absolute
+// bun.cmd path. In that case the shim's directory is not necessarily on PATH,
+// but concurrently starts both commands by name (`bun ...`). Give every child
+// the directory containing the actual Bun executable.
+const childEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== "path")) as NodeJS.ProcessEnv
+const inheritedPath = process.env.PATH ?? process.env.Path
+childEnv[process.platform === "win32" ? "Path" : "PATH"] = [dirname(process.execPath), inheritedPath]
+  .filter(Boolean)
+  .join(delimiter)
+childEnv.OPENCODE_DEV_RUN_ID = runID
+
 const child = Bun.spawn(
   [
-    "bun",
+    process.execPath,
     concurrently,
     "-n",
     "desktop,pwa",
@@ -149,7 +160,7 @@ const child = Bun.spawn(
   ],
   {
     cwd: root,
-    env: { ...process.env, OPENCODE_DEV_RUN_ID: runID },
+    env: childEnv,
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",

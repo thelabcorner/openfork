@@ -457,7 +457,26 @@ test("engine startAnnotation resolves a real result for a pick with no replaceme
   expect(result).not.toBe(null)
   expect(result?.screenshot).toBe(null)
   expect(guest.sent.filter((c) => c === ANNOTATION_CAPTURED_CHANNEL).length).toBe(1)
+  expect(engine.arbiter.controller(requested.tabId)).toBe("none")
+  expect(engine.registry.get(requested.tabId)?.controller).toBe("none")
   engine.api.cancelAnnotation(requested.tabId)
+})
+
+test("superseded annotation completion cannot release its successor's human-control lock", async () => {
+  const { engine, requestTab } = makeEngine()
+  const requested = requestTab()
+  const guest = makeFakeWebContents(36, "webview")
+  guest.hostWebContents = registry.get(0)
+  engine.api.registerWebview(requested.tabId, 36, 0, requested.lifecycleGeneration)
+
+  const first = engine.api.startAnnotation(requested.tabId)
+  expect(engine.arbiter.controller(requested.tabId)).toBe("human")
+  const second = engine.api.startAnnotation(requested.tabId)
+  expect(await first).toBeNull()
+  expect(engine.arbiter.controller(requested.tabId)).toBe("human")
+  guest.emitPicked(validPayload())
+  expect(await second).not.toBeNull()
+  expect(engine.arbiter.controller(requested.tabId)).toBe("none")
 })
 
 test("engine: forced guest replacement mid-session cancels the pick with zero screenshot acks", async () => {

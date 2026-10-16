@@ -115,6 +115,8 @@ export class BrowserEngine {
   private readonly hostEpoch = 1
   private readonly pendingActivation = new Set<string>()
   private readonly guestStateEventTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /** Only the live annotation may release its human-control pin. */
+  private readonly annotationControlTokens = new Map<string, symbol>()
   private started = false
   constructor(options: BrowserEngineOptions) {
     this.options = options
@@ -155,6 +157,7 @@ export class BrowserEngine {
         const tab = this.registry.get(runtimeTabId)
         if (tab) this.tabLifecycle.markDetached(runtimeTabId, tab.lifecycleGeneration)
         this.arbiter.reset(runtimeTabId)
+        this.annotationControlTokens.delete(runtimeTabId)
         this.sessions.detach(webContentsId).catch(() => undefined)
         this.annotation.cancel(runtimeTabId)
         this.visualWebview.cancel(runtimeTabId, "Browser guest went away")
@@ -187,6 +190,7 @@ export class BrowserEngine {
         // Once the lifecycle is closed, that later renderer unregister is
         // intentionally stale and therefore cannot be relied on for cleanup.
         this.arbiter.preempt(tabId)
+        this.annotationControlTokens.delete(tabId)
         if (tab.webContentsId != null) this.sessions.detach(tab.webContentsId).catch(() => undefined)
         this.pendingActivation.delete(tabId)
         this.annotation.cancel(tabId)
@@ -297,6 +301,7 @@ export class BrowserEngine {
     for (const timer of this.guestStateEventTimers.values()) clearTimeout(timer)
     this.guestStateEventTimers.clear()
     for (const tab of this.registry.list()) this.annotation.cancel(tab.runtimeTabId)
+    this.annotationControlTokens.clear()
     this.visualWebview.stop()
     this.registry.teardown()
     this.tabLifecycle.clear()
@@ -385,16 +390,9 @@ export class BrowserEngine {
     }
     return this.operations.dispatch(tabId, operation, context)
   }
-  private visualRendererContext(input: VisualProjectContext, timeoutMs = 15_000): BrowserDispatchContext {
+  private visualRendererDirectory(input: VisualProjectContext): string {
     if (!input?.sessionId || !input?.directory) throw new Error("Visual workflow requires an active project session")
-    return {
-      requestId: `desktop-ui-visual-${randomUUID()}`,
-      sessionId: input.sessionId,
-      windowId: this.options.windowId,
-      directory: input.directory,
-      messageId: "desktop-ui-visual",
-      timeoutMs,
-    }
+    return input.directory
   }
   /** Renderer-facing API (window.api.browser). */
   readonly api: BrowserRenderApi = {
@@ -571,6 +569,8 @@ export class BrowserEngine {
       // immediately, and pin the controller to human for the session.
       this.visualWebview.cancel(tabId, "Human took control of the browser tab")
       this.arbiter.acquireHumanControl(tabId)
+      const token = Symbol("browser-annotation-control")
+      this.annotationControlTokens.set(tabId, token)
       tab.controller = this.arbiter.controller(tabId)
       this.registry.sync(tabId)
       return this.annotation.start(tabId, tab.webContents, tab.colorScheme, {
@@ -581,10 +581,22 @@ export class BrowserEngine {
           const v = this.registry.get(id)?.viewport
           return v ? { width: v.width, height: v.height } : undefined
         },
+      }).finally(() => {
+        // The previous annotation can settle while a replacement has already
+        // acquired this tab. Only the current one may release human control.
+        if (this.annotationControlTokens.get(tabId) !== token) return
+        this.annotationControlTokens.delete(tabId)
+        this.arbiter.releaseHumanControl(tabId)
+        const current = this.registry.get(tabId)
+        if (current) {
+          current.controller = this.arbiter.controller(tabId)
+          this.registry.sync(tabId)
+        }
       })
     },
     cancelAnnotation: (tabId) => {
       this.annotation.cancel(tabId)
+      this.annotationControlTokens.delete(tabId)
       // Release the human control taken for the session (the arbiter opened it
       // on start; release unconditionally rather than via setControllerFor,
       // which would refuse to clobber a human window). A newer live-input
@@ -597,15 +609,15 @@ export class BrowserEngine {
       }
     },
     visualHistory: async (context, input = {}) =>
-      this.visual.history(this.visualRendererContext(context, input.timeoutMs ?? 10_000), input),
+      this.visual.historyForTrustedRenderer(this.visualRendererDirectory(context), input),
     visualArtifact: async (context, input) =>
-      this.visual.artifact(this.visualRendererContext(context, input.timeoutMs ?? 10_000), input),
+      this.visual.artifactForTrustedRenderer(this.visualRendererDirectory(context), input),
     visualArtifactPreview: async (context, input) => {
-      const preview = await this.visual.artifactPreview(this.visualRendererContext(context, input.timeoutMs ?? 15_000), input)
+      const preview = await this.visual.artifactPreviewForTrustedRenderer(this.visualRendererDirectory(context), input)
       return preview ? { descriptor: preview.descriptor, bytes: new Uint8Array(preview.bytes), sha256: preview.sha256 } : null
     },
     visualApproveRun: async (context, runId, expected) =>
-      this.visual.approveRun(this.visualRendererContext(context, 15_000), runId, expected),
+      this.visual.approveRunForTrustedRenderer(this.visualRendererDirectory(context), runId, expected),
   }
   /** User-authority close (D9): preempt the arbiter + detach the CDP session so
    * an in-flight agent op aborts (never hangs), then destroy and emit tab.closed. */
@@ -623,6 +635,7 @@ export class BrowserEngine {
     }
     if (!this.tabLifecycle.beginClose(tabId, tab.lifecycleGeneration)) return []
     this.arbiter.preempt(tabId)
+    this.annotationControlTokens.delete(tabId)
     this.sessions.detach(tab.webContentsId ?? -1).catch(() => undefined)
     this.pendingActivation.delete(tabId)
     this.annotation.cancel(tabId)

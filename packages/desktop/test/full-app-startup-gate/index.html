@@ -1,5 +1,33 @@
 <!doctype html>
-<html>
-  <head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /></head>
-  <body><div id="root"></div><script type="module" src="/main.tsx"></script></body>
+<html lang="en" style="background-color: var(--background-base)">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body class="antialiased overscroll-none text-12-regular overflow-hidden">
+    <div id="root" class="flex flex-col h-dvh"></div>
+    <script>
+      const moduleEvaluationStack = []
+      window.__fullAppGateModuleEvaluations = []
+      window.__fullAppGateModuleMark = (phase, id) => {
+        if (phase === "start") {
+          moduleEvaluationStack.push({ id, startedAt: performance.now() })
+          return
+        }
+        const active = moduleEvaluationStack.pop()
+        if (!active || active.id !== id) return
+        window.__fullAppGateModuleEvaluations.push({ id, startedAt: active.startedAt, durationMs: performance.now() - active.startedAt })
+      }
+    </script>
+    <script type="module" src="/main.tsx"></script>
+  </body>
 </html>

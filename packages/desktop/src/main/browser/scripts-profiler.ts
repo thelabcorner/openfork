@@ -1,12 +1,12 @@
 import { PROFILER_MAX_COMMITS, PROFILER_MAX_COMPONENTS, PROFILER_MAX_FIBERS_PER_COMMIT, PROFILER_MAX_PROPS } from "./types"
 
 // React profiler in-page scripts (premium-UX amendment §3, T3-inspired).
-// Mechanism: ensure __REACT_DEVTOOLS_GLOBAL_HOOK__ exists (install a minimal
-// hook when absent), subscribe onCommitFiberRoot, record per-commit timestamps
-// plus a BOUNDED fiber walk (render counts per component name via alternate
-// deltas; props diff for a named component, capped). On stop, aggregate into a
-// wire ProfilerResult. Non-React page -> { noReact: true } so the host throws
-// BrowserNotAReactAppError.
+// Mechanism: require a page-level React DevTools hook that already has a
+// renderer connected, subscribe to its commitFiberRoot event, record per-commit
+// timestamps plus a BOUNDED fiber walk (render counts per component name via
+// alternate deltas; props diff for a named component, capped). Installing a
+// synthetic hook after the app loaded is too late: React only injects its
+// renderer during initialization. On stop, aggregate into a wire ProfilerResult.
 //
 // Honesty: commit TIMING comes from the DevTools commit listener (real);
 // per-component RENDER COUNTS come from fiber-walk deltas (approximation —
@@ -14,32 +14,20 @@ import { PROFILER_MAX_COMMITS, PROFILER_MAX_COMPONENTS, PROFILER_MAX_FIBERS_PER_
 
 export const PROFILER_STATE_KEY = "__opencode_browser_profiler__"
 
-/** Install the DevTools global hook when absent (React 16.5+ contract). */
-export function installReactHookScript() {
+/** Report the page-level DevTools hook and whether React has connected a renderer. */
+export function reactDevtoolsStatusScript() {
   return `(() => {
-    if (window.__REACT_DEVTOOLS_GLOBAL_HOOK__) return { installed: false, present: true };
-    const listeners = new Map();
-    const renderers = new Map();
-    const hook = {
-      renderers,
-      supportsFiber: true,
-      inject(renderer) {
-        const id = renderers.size + 1;
-        renderers.set(id, renderer);
-        return id;
-      },
-      on(event, fn) { const set = listeners.get(event) || new Set(); set.add(fn); listeners.set(event, set); },
-      off(event, fn) { const set = listeners.get(event); if (set) set.delete(fn); },
-      emit(event, ...args) { const set = listeners.get(event); if (set) for (const fn of set) fn(...args); },
-      sub(event, fn) { this.on(event, fn); return () => this.off(event, fn); },
-      unsub(event, fn) { this.off(event, fn); },
-      checkDCE() {},
-      getFiberRoots(id) { return new Set(); },
-      onCommitFiberRoot: null,
-      onCommitFiberUnmount: null,
+    const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+    const renderers = hook && hook.renderers;
+    const rendererCount = renderers && typeof renderers.size === 'number' ? renderers.size : 0;
+    const listenerApi = !!hook && typeof hook.on === 'function' && typeof hook.off === 'function';
+    return {
+      hookPresent: !!hook,
+      supportsFiber: !!hook && hook.supportsFiber === true,
+      rendererCount,
+      listenerApi,
+      connected: !!hook && hook.supportsFiber === true && rendererCount > 0 && listenerApi,
     };
-    Object.defineProperty(window, '__REACT_DEVTOOLS_GLOBAL_HOOK__', { value: hook, configurable: true });
-    return { installed: true, present: false };
   })()`
 }
 
@@ -48,7 +36,8 @@ export function profilerStartScript(component?: string) {
   const target = component ? JSON.stringify(component) : "null"
   return `(() => {
     const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-    if (!hook || !hook.supportsFiber) return { noReact: true };
+    if (!hook || !hook.supportsFiber) return { noDevtools: true };
+    if (!hook.renderers || typeof hook.renderers.size !== 'number' || hook.renderers.size === 0 || typeof hook.on !== 'function' || typeof hook.off !== 'function') return { noDevtools: true };
     if (window[${JSON.stringify(PROFILER_STATE_KEY)}]) return { already: true };
     const state = {
       commits: [],
@@ -79,8 +68,12 @@ export function profilerStartScript(component?: string) {
       }
       if (visited >= ${PROFILER_MAX_FIBERS_PER_COMMIT}) state.truncated = true;
     };
-    state.onCommit = (rendererID, root) => {
+    state.onCommit = (rendererIDOrEvent, rootArg) => {
       if (state.commits.length >= ${PROFILER_MAX_COMMITS}) { state.truncated = true; return; }
+      // React DevTools versions have emitted either positional arguments or a
+      // single event payload through the hook event bus. Normalize both forms.
+      const root = rootArg || rendererIDOrEvent?.root || rendererIDOrEvent?.fiberRoot || rendererIDOrEvent;
+      if (!root || !root.current) return;
       state.commits.push({ at: performance.now(), root });
       try { walk(root.current); } catch (e) { /* fiber walk is best-effort */ }
     };

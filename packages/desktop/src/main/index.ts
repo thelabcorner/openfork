@@ -32,6 +32,7 @@ import {
 } from "./server"
 import { createMobileHandshake } from "./mobile-handshake"
 import { reapPreviousSidecar } from "./sidecar-reaper"
+import { createSidecarReadiness } from "./sidecar-readiness"
 import { createSidecarStatus } from "./sidecar-status"
 import { setupAutoUpdater, showUpdaterDialog } from "./updater"
 import { safeWebContentsURL } from "./window-state"
@@ -76,7 +77,8 @@ const jsCallStackFeature = "DocumentPolicyIncludeJSCallStacksInCrashReports"
 const rendererHeapLimitMb = 16 * 1024
 let logger: ReturnType<typeof initLogging>
 let server: SidecarListener | null = null
-let readyData: ServerReadyData | null = null
+const sidecarReadiness = createSidecarReadiness<ServerReadyData>()
+let sidecarShutdownRequested = false
 let browserEngine: BrowserEngine | null = null
 const pendingDeepLinks: string[] = []
 const sidecarStatus = createSidecarStatus()
@@ -179,8 +181,9 @@ const main = Effect.gen(function* () {
   )
   let stopSidecarsInFlight: Promise<void> | undefined
   let sidecarsTeardownFinished = false
-  const stopSidecars = () =>
-    (stopSidecarsInFlight ??= (async () => {
+  const stopSidecars = () => {
+    sidecarShutdownRequested = true
+    return (stopSidecarsInFlight ??= (async () => {
       handshake.revoke()
       let firstError: unknown
       try {
@@ -202,6 +205,7 @@ const main = Effect.gen(function* () {
     })().finally(() => {
       sidecarsTeardownFinished = true
     }))
+  }
   const relaunch = () => {
     setAppQuitting()
     void stopSidecars().finally(() => {
@@ -333,12 +337,13 @@ const main = Effect.gen(function* () {
       function* () {
         logger.log("awaiting server ready")
         const res = yield* Deferred.await(serverReady)
+        if (sidecarReadiness.get() !== res) throw new Error("The local OpenFork runtime is no longer running")
         logger.log("server ready", { url: res.url })
         return res
       },
       (e) => Effect.runPromise(e),
     ),
-    getSidecarURL: () => readyData?.url ?? null,
+    getSidecarURL: () => sidecarReadiness.get()?.url ?? null,
     rendererTrust,
     consumeInitialDeepLinks: () => pendingDeepLinks.splice(0),
     getDefaultServerUrl: () => getDefaultServerUrl(),
@@ -368,10 +373,12 @@ const main = Effect.gen(function* () {
   // Constructed once; start() (host hello) happens after the sidecar is up.
   browserEngine = new BrowserEngine({
     windowId: app.isPackaged ? APP_IDS[CHANNEL] : "dev",
-    sidecarProvider: () =>
-      readyData
-        ? { url: readyData.url, username: readyData.username ?? "opencode", password: readyData.password ?? "" }
-        : null,
+    sidecarProvider: () => {
+      const ready = sidecarReadiness.get()
+      return ready
+        ? { url: ready.url, username: ready.username ?? "opencode", password: ready.password ?? "" }
+        : null
+    },
     broadcast: (channel, payload) => {
       for (const win of BrowserWindow.getAllWindows()) {
         if (win.isDestroyed() || win.webContents.isDestroyed()) continue
@@ -437,6 +444,7 @@ const main = Effect.gen(function* () {
     .catch((error) => logger.warn("failed to clean scoped store files", error))
   if (windows.length) createMenu(menuDeps)
   const loadingTask = yield* Effect.gen(function* () {
+    const sidecarGeneration = sidecarReadiness.begin()
     logger.log("sidecar connection started", { version: SIDECAR_VERSION })
     sidecarStatus.set({ state: "starting", consecutiveFailures: 0, checkedAt: new Date().toISOString() })
     const prior = handshake.previous()
@@ -454,7 +462,10 @@ const main = Effect.gen(function* () {
       logger.log("spawning v2 sidecar")
       const sidecar = yield* Effect.promise(() => startBackgroundCli(logger))
       sidecarStatus.set({ state: "healthy", consecutiveFailures: 0, checkedAt: new Date().toISOString() })
-      readyData = { url: sidecar.url, username: sidecar.username, password: sidecar.password }
+      const readiness = { url: sidecar.url, username: sidecar.username, password: sidecar.password }
+      if (!sidecarReadiness.publish(sidecarGeneration, readiness)) {
+        throw new Error("The local OpenFork runtime exited before initialization completed")
+      }
       // The v2 daemon may predate this launch, so it never received our
       // OPENCODE_INSTANCE_ID. Pin to the identity it actually reports; if it
       // cannot report one, publish nothing rather than an unverifiable claim.
@@ -466,7 +477,7 @@ const main = Effect.gen(function* () {
         username: sidecar.username ?? "opencode",
         password: sidecar.password ?? "",
       })
-      yield* Deferred.succeed(serverReady, readyData)
+      yield* Deferred.succeed(serverReady, readiness)
       if (process.platform === "win32") {
         void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
       }
@@ -547,10 +558,16 @@ const main = Effect.gen(function* () {
               }
             },
             onExit: (code) => {
-              sidecarStatus.set({ state: "stopped", consecutiveFailures: 0, checkedAt: new Date().toISOString() })
-              writeLog("utility", "sidecar exited", { code }, "warn")
+              if (!sidecarReadiness.invalidate(sidecarGeneration)) return
+              server = null
+              handshake.revoke()
+              if (!sidecarShutdownRequested) {
+                sidecarStatus.set({ state: "stopped", consecutiveFailures: 0, checkedAt: new Date().toISOString() })
+                writeLog("utility", "sidecar exited", { code }, "warn")
+              }
             },
             onLiveness: (state, details) => {
+              if (state === "stopped" && sidecarShutdownRequested) return
               sidecarStatus.set({ state, ...details })
               writeLog("utility", `sidecar liveness ${state}`, details, state === "suspected-hang" ? "error" : "info")
             },
@@ -599,7 +616,10 @@ const main = Effect.gen(function* () {
     void oxpController.attachSidecar(oxp).catch(() =>
       writeLog("oxp", "failed to attach OXP sidecar bridge", undefined, "warn"),
     )
-    readyData = { url, username: "opencode", password }
+    const readiness = { url, username: "opencode", password }
+    if (!sidecarReadiness.publish(sidecarGeneration, readiness)) {
+      throw new Error("The local OpenFork runtime exited before initialization completed")
+    }
     const sidecarIdentity = spawnResult!.identity
     const sidecarPID = sidecarIdentity.pid
     if (typeof sidecarPID === "number" && Number.isSafeInteger(sidecarPID) && sidecarPID > 0) {
@@ -618,7 +638,7 @@ const main = Effect.gen(function* () {
     }
     // Off the critical path: nothing the desktop does depends on this token.
     void handshake.ensureAgentToken(url, { username: "opencode", password })
-    yield* Deferred.succeed(serverReady, readyData)
+    yield* Deferred.succeed(serverReady, readiness)
     if (process.platform === "win32") {
       void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
     }

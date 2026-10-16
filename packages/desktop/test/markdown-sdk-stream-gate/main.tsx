@@ -107,8 +107,7 @@ function Host() {
         while (performance.now() < cursorDeadline && !textFor(session, ids[0]!).includes(`cursor-tail-${ids[0]}`)) await frame()
 
         // A protocol gap must latch the active session and repair from HTTP.
-        // The first authoritative repair intentionally fails; the running
-        // timeline must retry and converge on its own.
+        // The timeline must retry and converge without navigation.
         const repairID = ids[0]!
         await session.sync(repairID, { force: true, activate: true })
         await fetch(`${controlURL}gate/control`, {

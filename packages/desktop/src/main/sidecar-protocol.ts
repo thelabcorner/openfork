@@ -2,6 +2,8 @@ export type SidecarOxpGrant = {
   read: boolean
   write: boolean
   process: boolean
+  /** Added compatibly: older resident sidecars omit this and therefore mean false. */
+  code?: boolean
   git: boolean
   integrations: boolean
   browser: boolean
@@ -254,6 +256,7 @@ const grantKeys = new Set<keyof SidecarOxpGrant>([
   "read",
   "write",
   "process",
+  "code",
   "git",
   "integrations",
   "browser",
@@ -306,8 +309,13 @@ export function parseSidecarLegacyImport(value: unknown): SidecarLegacyImport | 
 }
 
 export function isSidecarOxpGrant(value: unknown): value is SidecarOxpGrant {
-  if (!isRecord(value) || Object.keys(value).length !== grantKeys.size) return false
-  return [...grantKeys].every((key) => key in value && isGrantValue(key, value[key]))
+  if (!isRecord(value)) return false
+  if (Object.keys(value).some((key) => !grantKeys.has(key as keyof SidecarOxpGrant))) return false
+  return [...grantKeys].every((key) =>
+    key === "code"
+      ? value.code === undefined || isGrantValue(key, value.code)
+      : key in value && isGrantValue(key, value[key]),
+  )
 }
 
 export function isSidecarOxpState(value: unknown): value is SidecarOxpState {

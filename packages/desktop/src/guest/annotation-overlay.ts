@@ -83,6 +83,7 @@ let theme: "light" | "dark" = "light"
 let tool: AnnotationTool = "select"
 let host: HTMLDivElement | undefined
 let shadow: ShadowRoot | undefined
+let interactionSurface: HTMLDivElement | undefined
 let outlineLayer: HTMLDivElement | undefined
 let drawSvg: SVGSVGElement | undefined
 let toolbarEl: HTMLDivElement | undefined
@@ -95,6 +96,8 @@ let chromeHidden = false
 let rafHandle = 0
 let domObserver: MutationObserver | undefined
 let pageHideHandler: (() => void) | undefined
+let visibilityHandler: (() => void) | undefined
+let activePointerId: number | null = null
 
 const selected = new Map<string, SelectedTarget>()
 const regions: AnnotationRegion[] = []
@@ -109,19 +112,51 @@ let marqueeRect: AnnotationRect | null = null
 let drawing: { points: Array<{ x: number; y: number }> } | null = null
 
 function isAnnotationNode(node: Element): boolean {
-  return node.closest(`[${OVERLAY_ATTRIBUTE}]`) !== null || node.hasAttribute(OVERLAY_ATTRIBUTE)
+  // Element.closest() stops at a shadow boundary. The overlay itself uses a
+  // *closed* root and inspected pages can have arbitrary nested open roots.
+  // Walk the composed ancestry so neither the chrome nor any descendants
+  // become selectable, even if they are passed to us from another hit tester.
+  let current: Node | null = node
+  for (let depth = 0; current && depth < 64; depth++) {
+    if (current === host || current === shadow) return true
+    if (current instanceof Element && current.hasAttribute(OVERLAY_ATTRIBUTE)) return true
+    current = current.parentNode ?? (current instanceof ShadowRoot ? current.host : null)
+  }
+  return false
 }
 
-/** Hit-test the TOP document only. The isolated preload world is per-document,
- * so an iframe carries its own guest world and owns its own annotation
- * session; descending here would double-capture and corrupt offsets.
- * documentElement/body are skipped — selecting the body is always a bug. */
+/** Hit-test only the top document, entering accessible OPEN shadow roots.
+ * Closed roots are opaque and return their host; iframes are never descended
+ * into (cross-origin isolation and frame-local coordinate ownership). */
 function pickFromPoint(clientX: number, clientY: number): HoverTarget | null {
-  for (const candidate of document.elementsFromPoint(clientX, clientY)) {
-    if (!(candidate instanceof Element)) continue
-    if (isAnnotationNode(candidate)) continue
-    if (candidate === document.documentElement || candidate === document.body) continue
-    return { el: candidate, offset: { x: 0, y: 0 } }
+  // The transparent interaction shield normally receives all pointer input.
+  // Suspend it ONLY for the synchronous elementsFromPoint read, restoring it
+  // before the pointer event returns to the browser event pipeline.
+  if (interactionSurface) interactionSurface.style.pointerEvents = "none"
+  try {
+    let candidates: Element[] = document.elementsFromPoint(clientX, clientY)
+    for (let depth = 0; depth < 16; depth++) {
+      const candidate = candidates.find((el) =>
+        !isAnnotationNode(el) && el !== document.documentElement && el !== document.body)
+      if (!candidate) return null
+      if (candidate.shadowRoot) {
+        const inside = candidate.shadowRoot.elementsFromPoint(clientX, clientY)
+          .filter((el) => !isAnnotationNode(el))
+        if (inside.length > 0 && inside[0] !== candidate) {
+          candidates = inside
+          continue
+        }
+      }
+      // A decorative span or icon inside a button/link is usually not the
+      // intended target. Prefer its nearest semantic interactive ancestor,
+      // but do not climb across a shadow root or into generic layout wrappers.
+      const interactive = candidate.closest(
+        'button, a[href], input, textarea, select, summary, label, [role="button"], [role="link"], [contenteditable="true"]',
+      )
+      return { el: interactive ?? candidate, offset: { x: 0, y: 0 } }
+    }
+  } finally {
+    if (interactionSurface) interactionSurface.style.pointerEvents = "auto"
   }
   return null
 }
@@ -131,11 +166,14 @@ type FrameCandidate = { el: Element; offset: FrameOffset }
 /** Candidate collection for marquee hit testing — everything in the top
  * document whose center falls inside the drag rect, in the same coordinate
  * space the renderer will use (top-viewport). */
-function collectFrameCandidates(doc: Document, offset: FrameOffset, out: FrameCandidate[]): void {
+function collectFrameCandidates(doc: Document | ShadowRoot, offset: FrameOffset, out: FrameCandidate[]): void {
   for (const el of doc.querySelectorAll("*")) {
     if (isAnnotationNode(el)) continue
-    if (el === doc.documentElement || el === doc.body) continue
+    if (el === document.documentElement || el === document.body) continue
     out.push({ el, offset })
+    // querySelectorAll does not penetrate Shadow DOM. Explicitly enter only
+    // open roots; closed roots are represented by the host itself.
+    if (el.shadowRoot) collectFrameCandidates(el.shadowRoot, offset, out)
   }
 }
 
@@ -143,7 +181,7 @@ function collectFrameCandidates(doc: Document, offset: FrameOffset, out: FrameCa
  * nth-child path capped at 6 ancestors. No claim to global uniqueness; it's a
  * best-effort human-readable locator, not a targeting mechanism (agent tools
  * use their own ref/selector synthesis, unrelated to this). */
-function computeSelector(el: Element): string {
+function computeLocalSelector(el: Element): string {
   if (el.id) return `#${CSS.escape(el.id)}`
   const testId = el.getAttribute("data-testid")
   if (testId) return `[data-testid="${CSS.escape(testId)}"]`
@@ -169,6 +207,16 @@ function computeSelector(el: Element): string {
     depth++
   }
   return parts.join(" > ")
+}
+
+function computeSelector(el: Element, shadowDepth = 0): string {
+  const local = computeLocalSelector(el)
+  const root = el.getRootNode()
+  // A bare #id inside an open shadow tree is not a usable document selector.
+  // Preserve each host boundary using the common shadow-piercing '>>>' syntax.
+  // This is descriptive context, not a promise that querySelector accepts it.
+  if (!(root instanceof ShadowRoot) || shadowDepth >= 8 || isAnnotationNode(root.host)) return local
+  return `${computeSelector(root.host, shadowDepth + 1)} >>> ${local}`
 }
 
 function boundedHtmlPreview(el: Element): string {
@@ -301,13 +349,29 @@ function ensureHost() {
   // surface (closed shadow root keeps focus internal).
   host.setAttribute("role", "dialog")
   host.setAttribute("aria-label", "Browser annotation")
-  host.setAttribute("aria-modal", "false")
+  host.setAttribute("aria-modal", "true")
   document.documentElement.appendChild(host)
   shadow = host.attachShadow({ mode: "closed" })
+  // Even events legitimately targeting toolbar fields must not bubble into
+  // the inspected document's delegated handlers. Unlike the page-shield
+  // capture handlers, this runs AFTER the chrome's own controls handle them.
+  for (const kind of ["pointerdown", "pointermove", "pointerup", "click", "dblclick", "contextmenu", "keydown", "keyup", "input", "change"] as const) {
+    shadow.addEventListener(kind, (event) => event.stopPropagation())
+  }
 
   const style = document.createElement("style")
   style.textContent = STYLE_SHEET
   shadow.appendChild(style)
+
+  // Intercept pointer targeting at the compositor level. Merely calling
+  // preventDefault on window.pointerdown leaves click/auxclick/bubbling
+  // handlers free to activate the live page; this shield prevents the live
+  // page from being the hit target in the first place.
+  interactionSurface = document.createElement("div")
+  interactionSurface.className = "interaction-surface"
+  interactionSurface.setAttribute(OVERLAY_ATTRIBUTE, "")
+  interactionSurface.style.pointerEvents = "auto"
+  shadow.appendChild(interactionSurface)
 
   outlineLayer = document.createElement("div")
   outlineLayer.className = "outline-layer"
@@ -330,6 +394,10 @@ function ensureHost() {
   }
 
   buildToolbar()
+  // Move keyboard focus away from the live site while annotation is active.
+  // In particular a previously focused text input must not keep receiving
+  // typed characters while the user thinks they are editing annotations.
+  toolbarEl?.querySelector("button")?.focus()
 }
 
 function teardownHost() {
@@ -342,9 +410,12 @@ function teardownHost() {
     window.removeEventListener("visibilitychange", pageHideHandler, true)
     pageHideHandler = undefined
   }
+  if (visibilityHandler) window.removeEventListener("visibilitychange", visibilityHandler, true)
+  visibilityHandler = undefined
   host?.remove()
   host = undefined
   shadow = undefined
+  interactionSurface = undefined
   outlineLayer = undefined
   drawSvg = undefined
   toolbarEl = undefined
@@ -364,6 +435,11 @@ function startAnnotation() {
   window.addEventListener("pointerdown", onPointerDown, true)
   window.addEventListener("pointermove", onPointerMove, true)
   window.addEventListener("pointerup", onPointerUp, true)
+  window.addEventListener("pointercancel", onPointerCancel, true)
+  for (const kind of ["click", "auxclick", "dblclick", "contextmenu", "dragstart", "drop", "touchstart", "touchmove", "touchend"] as const) {
+    window.addEventListener(kind, onSuppressPageEvent, true)
+  }
+  window.addEventListener("wheel", onShieldWheel, { capture: true, passive: true })
   window.addEventListener("keydown", onKeyDown, true)
   window.addEventListener("scroll", scheduleRender, true)
   window.addEventListener("resize", scheduleRender, true)
@@ -373,9 +449,10 @@ function startAnnotation() {
     if (active) cancelAnnotation()
   }
   window.addEventListener("pagehide", pageHideHandler, true)
-  window.addEventListener("visibilitychange", () => {
+  visibilityHandler = () => {
     if (document.visibilityState === "hidden" && active) cancelAnnotation()
-  }, true)
+  }
+  window.addEventListener("visibilitychange", visibilityHandler, true)
   scheduleRender()
 }
 
@@ -391,11 +468,17 @@ function restoreAndTeardown() {
   marqueeStart = null
   marqueeRect = null
   drawing = null
+  activePointerId = null
   hover = null
   active = false
   window.removeEventListener("pointerdown", onPointerDown, true)
   window.removeEventListener("pointermove", onPointerMove, true)
   window.removeEventListener("pointerup", onPointerUp, true)
+  window.removeEventListener("pointercancel", onPointerCancel, true)
+  for (const kind of ["click", "auxclick", "dblclick", "contextmenu", "dragstart", "drop", "touchstart", "touchmove", "touchend"] as const) {
+    window.removeEventListener(kind, onSuppressPageEvent, true)
+  }
+  window.removeEventListener("wheel", onShieldWheel, true)
   window.removeEventListener("keydown", onKeyDown, true)
   window.removeEventListener("scroll", scheduleRender, true)
   window.removeEventListener("resize", scheduleRender, true)
@@ -417,12 +500,46 @@ function restoreBaseline(target: SelectedTarget) {
 
 // ── pointer/keyboard handling ───────────────────────────────────────────
 
+/** A closed shadow tree intentionally hides internal nodes from composedPath()
+ * at the window capture listener. Resolve chrome hits against our retained
+ * private ShadowRoot, never document.elementsFromPoint (which returns host). */
+function isChromeEvent(event: Event): boolean {
+  const point = event as PointerEvent
+  if (typeof point.clientX !== "number" || typeof point.clientY !== "number") {
+    return !!shadow?.activeElement && shadow.activeElement !== interactionSurface
+  }
+  const hit = shadow?.elementFromPoint(point.clientX, point.clientY)
+  if (!hit) return false
+  return [toolbarEl, commentBarEl, stylePanelEl].some((element) => element === hit || element?.contains(hit))
+}
+
+function suppressPageEvent(event: Event) {
+  if (event.cancelable) event.preventDefault()
+  event.stopImmediatePropagation()
+}
+
+function onSuppressPageEvent(event: Event) {
+  if (!active || isChromeEvent(event)) return
+  suppressPageEvent(event)
+}
+
+/** Wheel is intentionally allowed to scroll the underlying document while
+ * annotating, but not delivered to application wheel handlers. This lets a
+ * person inspect below-the-fold content without activating page controls. */
+function onShieldWheel(event: WheelEvent) {
+  if (!active || isChromeEvent(event)) return
+  event.stopImmediatePropagation()
+}
+
 function onPointerDown(event: PointerEvent) {
-  if (!active) return
+  if (!active || isChromeEvent(event)) return
+  suppressPageEvent(event)
+  if (!event.isPrimary || event.button !== 0) return
+  activePointerId = event.pointerId
+  interactionSurface?.setPointerCapture?.(event.pointerId)
   const picked = pickFromPoint(event.clientX, event.clientY)
   if (tool === "select") {
     if (!picked) return
-    event.preventDefault()
     toggleSelect(picked, event.shiftKey)
     return
   }
@@ -437,13 +554,19 @@ function onPointerDown(event: PointerEvent) {
   }
   if (tool === "erase") {
     if (!picked) return
-    event.preventDefault()
     eraseAt(event.clientX, event.clientY)
+    scheduleRender()
   }
 }
 
 function onPointerMove(event: PointerEvent) {
   if (!active) return
+  if (isChromeEvent(event) && activePointerId !== event.pointerId) {
+    if (hover) { hover = null; scheduleRender() }
+    return
+  }
+  suppressPageEvent(event)
+  if (activePointerId !== null && activePointerId !== event.pointerId) return
   if (tool === "select" || tool === "erase") {
     hover = pickFromPoint(event.clientX, event.clientY)
     scheduleRender()
@@ -467,6 +590,11 @@ function onPointerMove(event: PointerEvent) {
 
 function onPointerUp(event: PointerEvent) {
   if (!active) return
+  if (isChromeEvent(event) && activePointerId !== event.pointerId) return
+  suppressPageEvent(event)
+  if (activePointerId !== event.pointerId) return
+  if (interactionSurface?.hasPointerCapture?.(event.pointerId)) interactionSurface.releasePointerCapture(event.pointerId)
+  activePointerId = null
   if (tool === "marquee" && marqueeStart && marqueeRect) {
     finishMarquee(marqueeRect)
     marqueeStart = null
@@ -482,12 +610,28 @@ function onPointerUp(event: PointerEvent) {
   void event
 }
 
+function onPointerCancel(event: PointerEvent) {
+  if (!active || (activePointerId !== null && event.pointerId !== activePointerId)) return
+  if (isChromeEvent(event) && activePointerId !== event.pointerId) return
+  suppressPageEvent(event)
+  activePointerId = null
+  marqueeStart = null
+  marqueeRect = null
+  drawing = null
+  scheduleRender()
+}
+
 /** Enter=attach, Cmd/Ctrl+Enter=send, Shift+Enter=newline (no submit), IME
  * composition never submits. stopImmediatePropagation so the inspected
  * page's own keybindings never consume the shortcut. */
 function onKeyDown(event: KeyboardEvent) {
   if (!active) return
-  const commentFocused = document.activeElement === host || shadow?.activeElement === commentEl
+  const focused = shadow?.activeElement
+  const commentFocused = focused === commentEl
+  const editing = focused instanceof HTMLInputElement ||
+    focused instanceof HTMLTextAreaElement ||
+    focused instanceof HTMLSelectElement ||
+    (focused instanceof HTMLElement && focused.isContentEditable)
 
   if (event.key === "Escape") {
     event.preventDefault()
@@ -534,12 +678,20 @@ function onKeyDown(event: KeyboardEvent) {
   // "r"/"d"/"e" in a comment doesn't switch tools (the Field/Enter block above
   // already handled Enter). V/R/D/E only act when the chrome, not the textarea,
   // has focus.
-  if (!commentFocused) {
-    if (event.key === "v" || event.key === "V") setTool("select")
-    else if (event.key === "r" || event.key === "R") setTool("marquee")
-    else if (event.key === "d" || event.key === "D") setTool("draw")
-    else if (event.key === "e" || event.key === "E") setTool("erase")
+  if (!editing && !event.ctrlKey && !event.altKey && !event.metaKey) {
+    const shortcut = ({ v: "select", r: "marquee", d: "draw", e: "erase" } as const)[event.key.toLowerCase() as "v" | "r" | "d" | "e"]
+    if (shortcut) {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      setTool(shortcut)
+      return
+    }
   }
+  // If focus escaped into the inspected page, annotation mode still owns the
+  // keyboard. Do not let arbitrary page shortcuts, Enter or input mutate it.
+  // The retained closed root lets legitimate chrome fields retain their
+  // native keyboard interactions.
+  if (!isChromeEvent(event)) suppressPageEvent(event)
 }
 
 // ── select / marquee / draw / erase operations ──────────────────────────
@@ -624,7 +776,9 @@ function boundsOf(points: Array<{ x: number; y: number }>, strokeWidth: number):
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
 }
 
-const STROKE_COLOR = "#f97316"
+// Zinc ink belongs to the same neutral system as the host. The guest preload
+// cannot import the app's CSS bundle, so these are explicit zinc equivalents.
+const STROKE_COLOR = "#a1a1aa"
 const STROKE_WIDTH = 3
 
 function finishDraw(points: Array<{ x: number; y: number }>) {
@@ -1008,7 +1162,7 @@ const STYLE_FIELDS: Array<{ property: StyleProperty; label: string; kind: "text"
 
 function renderStylePanel() {
   if (!stylePanelEl) return
-  const visible = selected.size > 0
+  const visible = selected.size > 0 && !chromeHidden
   stylePanelEl.style.display = visible ? "flex" : "none"
   if (!visible) return
   if (stylePanelEl.childElementCount > 0) return // built once per selection; inputs are uncontrolled
@@ -1054,45 +1208,58 @@ function renderStylePanel() {
 }
 
 const STYLE_SHEET = `
-  :host { all: initial; }
-  .outline-layer, .draw-layer { position: fixed; inset: 0; pointer-events: none; }
+  :host {
+    all: initial; color-scheme: light;
+    --annotation-bg: #fafafa; --annotation-fg: #18181b;
+    --annotation-border: #d4d4d8; --annotation-muted: #71717a;
+    --annotation-hover: #e4e4e7; --annotation-input: #f4f4f5;
+    --annotation-accent: #27272a; --annotation-accent-fg: #fafafa;
+    --annotation-halo: #fff;
+  }
+  :host(.dark) {
+    color-scheme: dark;
+    --annotation-bg: #18181b; --annotation-fg: #f4f4f5;
+    --annotation-border: #3f3f46; --annotation-muted: #a1a1aa;
+    --annotation-hover: #3f3f46; --annotation-input: #27272a;
+    --annotation-accent: #e4e4e7; --annotation-accent-fg: #18181b;
+    --annotation-halo: #09090b;
+  }
+  .interaction-surface { position: fixed; inset: 0; z-index: 0; background: transparent; touch-action: none; cursor: crosshair; }
+  .outline-layer, .draw-layer { position: fixed; inset: 0; z-index: 1; pointer-events: none; }
   .draw-layer { width: 100%; height: 100%; }
+  .draw-layer path { filter: drop-shadow(0 0 1px #09090b); }
   .box { position: fixed; pointer-events: none; border-radius: 2px; box-sizing: border-box; }
-  .box.hover { border: 1.5px dashed rgba(249, 115, 22, 0.6); }
-  .box.selected { border: 2px solid #f97316; background: rgba(249, 115, 22, 0.08); }
-  .box.region { border: 2px dashed #f97316; background: rgba(249, 115, 22, 0.05); }
-  .box.marquee { border: 1.5px solid #3b82f6; background: rgba(59, 130, 246, 0.08); }
+  .box.hover { border: 1.5px dashed var(--annotation-accent); box-shadow: 0 0 0 1px var(--annotation-halo); }
+  .box.selected { border: 2px solid var(--annotation-accent); box-shadow: 0 0 0 1px var(--annotation-halo); }
+  .box.region { border: 2px dashed var(--annotation-accent); box-shadow: 0 0 0 1px var(--annotation-halo); }
+  .box.marquee { border: 1.5px solid var(--annotation-accent); background: rgba(161, 161, 170, 0.09); }
 
   .toolbar, .comment-bar, .style-panel {
     position: fixed;
-    font: 500 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: #18181b;
-    color: #f4f4f5;
-    border: 1px solid #3f3f46;
-    border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-    z-index: 1;
-  }
-  :host(.dark) .toolbar, :host(.dark) .comment-bar, :host(.dark) .style-panel {
-    background: #09090b;
-    border-color: #27272a;
+    font: 500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--annotation-bg);
+    color: var(--annotation-fg);
+    border: 1px solid var(--annotation-border);
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25), 0 1px 2px rgba(0,0,0,0.10);
+    z-index: 2;
   }
 
-  .toolbar { top: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; padding: 6px 8px; }
-  .tool-group { display: flex; gap: 4px; }
-  .toolbar button, .comment-bar button, .style-panel button { font: inherit; color: inherit; background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 5px 9px; cursor: pointer; }
-  .toolbar button:hover, .comment-bar button:hover { background: rgba(255,255,255,0.08); }
-  .toolbar button.active { background: #f97316; color: #18181b; }
-  .toolbar button.cancel { margin-left: 8px; }
-  .comment-bar button.primary { background: #f97316; color: #18181b; }
+  .toolbar { top: 10px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 4px; padding: 4px 5px; max-width: calc(100vw - 24px); }
+  .tool-group { display: flex; gap: 2px; }
+  .toolbar button, .comment-bar button, .style-panel button { font: inherit; color: inherit; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 7px; cursor: pointer; white-space: nowrap; }
+  .toolbar button:hover, .comment-bar button:hover, .style-panel button:hover { background: var(--annotation-hover); }
+  .toolbar button.active { background: var(--annotation-accent); color: var(--annotation-accent-fg); }
+  .toolbar button.cancel { margin-left: 4px; border-left-color: var(--annotation-border); }
+  .comment-bar button.primary { background: var(--annotation-accent); color: var(--annotation-accent-fg); }
 
-  .comment-bar { bottom: 16px; left: 50%; transform: translateX(-50%); display: flex; align-items: flex-end; gap: 6px; padding: 6px; width: min(520px, 80vw); }
-  .comment-bar textarea { flex: 1; resize: none; background: rgba(255,255,255,0.06); border: 1px solid #3f3f46; border-radius: 6px; color: inherit; font: inherit; padding: 6px 8px; max-height: 96px; }
+  .comment-bar { bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: flex-end; gap: 4px; padding: 5px; width: min(520px, calc(100vw - 24px)); box-sizing: border-box; }
+  .comment-bar textarea { flex: 1; min-width: 0; resize: none; background: var(--annotation-input); border: 1px solid var(--annotation-border); border-radius: 4px; color: inherit; font: inherit; padding: 5px 7px; max-height: 96px; }
 
-  .style-panel { top: 12px; right: 12px; display: flex; flex-direction: column; gap: 6px; padding: 8px; width: 176px; }
+  .style-panel { top: 48px; right: 10px; display: flex; flex-direction: column; gap: 5px; padding: 7px; width: 176px; max-height: calc(100vh - 116px); overflow-y: auto; box-sizing: border-box; }
   .style-panel .row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
-  .style-panel label { flex: 1; color: #a1a1aa; }
-  .style-panel input[type="text"] { width: 72px; background: rgba(255,255,255,0.06); border: 1px solid #3f3f46; border-radius: 4px; color: inherit; font: inherit; padding: 3px 6px; }
+  .style-panel label { flex: 1; color: var(--annotation-muted); }
+  .style-panel input[type="text"] { width: 72px; background: var(--annotation-input); border: 1px solid var(--annotation-border); border-radius: 4px; color: inherit; font: inherit; padding: 3px 6px; }
   .style-panel input[type="color"] { width: 28px; height: 20px; border: none; background: none; padding: 0; }
 
   /* Compact label chip — component name when known, else tag name. Rendered on
@@ -1106,16 +1273,16 @@ const STYLE_SHEET = `
     line-height: 1.4;
     padding: 1px 6px;
     border-radius: 4px;
-    background: #f97316;
-    color: #18181b;
+    background: var(--annotation-accent);
+    color: var(--annotation-accent-fg);
     white-space: nowrap;
     max-width: 320px;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .box.hover .chip { background: rgba(249, 115, 22, 0.85); }
+  .box.hover .chip { background: var(--annotation-accent); }
   /* Selection uses a NUMBERED chip (outline PLUS number — never color alone). */
-  .box.selected .chip { background: #18181b; color: #f4f4f5; border: 1px solid #f97316; }
+  .box.selected .chip { background: var(--annotation-bg); color: var(--annotation-fg); border: 1px solid var(--annotation-accent); }
 
   /* Visible focus rings that survive BOTH light and dark page backgrounds:
   a high-contrast double ring (light outer halo + dark inner) so the focused

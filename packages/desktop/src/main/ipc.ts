@@ -12,6 +12,7 @@ import { runDesktopMenuAction } from "./desktop-menu-actions"
 import { setForceFocus } from "./debug"
 import { assertAttachmentBudget, createPickedFileAuthorizations } from "./attachment-picker"
 import { getStore, removeStoreFileIfEmpty } from "./store"
+import { createStoreWriteQueue } from "./store-write-queue"
 import {
   getPinchZoomEnabled,
   getWindowID,
@@ -32,6 +33,7 @@ import type { HostOwner, VisualApprovalExpectation } from "./browser/contracts"
 import type { SidecarLivenessState } from "./sidecar-status"
 import { expandHomePath, firstExistingPath } from "./path-resolution"
 import { createSidecarControlTransport } from "./sidecar-control-transport"
+import { createSidecarRequestLifetimes } from "./sidecar-request-lifetime"
 import { sidecarControlLane, type SidecarControlFetchInput } from "@opencode-ai/app/sidecar-control-request"
 const pickerFilters = (ext?: string[]) => {
   if (!ext || ext.length === 0) return undefined
@@ -96,6 +98,10 @@ export function registerIpcHandlers(deps: Deps) {
   let drafts: ReturnType<typeof createDesktopDraftStore> | undefined
   const draftStore = () => (drafts ??= createDesktopDraftStore(join(app.getPath("userData"), "drafts.sqlite")))
   const updaterSubscriptions = createUpdaterSubscriptions()
+  const storeWrites = createStoreWriteQueue({
+    set: (name, key, value) => getStore(name).setDeferred(key, value),
+    flush: (name) => getStore(name).flush(),
+  })
   const sidecarStatusSubscriptions = new Map<number, () => void>()
   const sidecarControlSession = electronSession.fromPartition("openfork-control-transport-v1", { cache: false })
   const sidecarAdmissionSession = electronSession.fromPartition("openfork-admission-transport-v1", { cache: false })
@@ -108,8 +114,9 @@ export function registerIpcHandlers(deps: Deps) {
     string,
     { senderID: number; controller: AbortController; lane: "urgent" | "admission" }
   >()
+  const sidecarRequestLifetimes = createSidecarRequestLifetimes()
   app.once("will-quit", () => {
-    for (const request of sidecarControlRequests.values()) request.controller.abort()
+    sidecarRequestLifetimes.clear()
     sidecarControlRequests.clear()
   })
   app.once("will-quit", updaterSubscriptions.clear)
@@ -118,6 +125,7 @@ export function registerIpcHandlers(deps: Deps) {
     sidecarStatusSubscriptions.clear()
   })
   app.on("before-quit", () => drafts?.flush())
+  app.on("before-quit", () => storeWrites.flushAll())
   app.once("will-quit", () => drafts?.close())
   app.on("browser-window-created", (_event, win) => win.on("session-end", () => drafts?.flush()))
   ipcMain.handle("kill-sidecar", () => deps.killSidecar())
@@ -155,14 +163,13 @@ export function registerIpcHandlers(deps: Deps) {
       if (laneCount >= (lane === "urgent" ? 16 : 48) || senderCount >= (lane === "urgent" ? 8 : 6))
         throw new Error("Too many active sidecar control requests")
       const controller = new AbortController()
-      const onDestroyed = () => controller.abort()
       const state = { senderID: event.sender.id, controller, lane }
       sidecarControlRequests.set(key, state)
-      event.sender.once("destroyed", onDestroyed)
+      const release = sidecarRequestLifetimes.retain(event.sender, controller)
       try {
         return await sidecarControlFetch(input, controller.signal)
       } finally {
-        event.sender.removeListener("destroyed", onDestroyed)
+        release()
         if (sidecarControlRequests.get(key) === state) sidecarControlRequests.delete(key)
       }
     },
@@ -315,13 +322,15 @@ export function registerIpcHandlers(deps: Deps) {
     }
   })
   ipcMain.handle("store-set", (_event: IpcMainInvokeEvent, name: string, key: string, value: string) => {
-    getStore(name).set(key, value)
+    return storeWrites.enqueue(name, key, value)
   })
   ipcMain.handle("store-delete", (_event: IpcMainInvokeEvent, name: string, key: string) => {
+    storeWrites.flush(name)
     getStore(name).delete(key)
     void removeStoreFileIfEmpty(name)
   })
   ipcMain.handle("store-clear", (_event: IpcMainInvokeEvent, name: string) => {
+    storeWrites.flush(name)
     getStore(name).clear()
     void removeStoreFileIfEmpty(name)
   })

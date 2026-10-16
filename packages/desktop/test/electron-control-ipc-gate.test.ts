@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path"
 import { promisify } from "node:util"
 import { expect, test } from "bun:test"
 
-test("actual Electron IPC reserves urgent control while six admissions wait", async () => {
+test("actual Electron IPC completes interest, create, and abort while six admissions wait", async () => {
   const directory = await mkdtemp(join(import.meta.dir, ".electron-ipc-gate-"))
   try {
     const build = await Bun.build({
@@ -40,6 +40,8 @@ process.on('uncaughtException',fail); try{require('./electron-control-ipc-gate.c
     expect(evidence.heldAdmissionsAtCompletion, JSON.stringify(evidence)).toBe(6)
     expect(evidence.untrustedRejected).toBe(true)
     expect(evidence.createCompletionMs).toBeGreaterThan(0)
+    expect(evidence.abortRequests).toBe(1)
+    expect(evidence.abortCompletionMs).toBeLessThan(2000)
     console.log("Electron IPC evidence:", evidence)
   } finally { await rm(directory, { recursive: true, force: true }) }
 }, 90000)
