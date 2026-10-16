@@ -508,6 +508,54 @@ describe("OpenAI Chat route", () => {
     }),
   )
 
+  it.effect("preserves video input as a video_url rather than an image_url", () =>
+    Effect.gen(function* () {
+      const prepared = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
+        LLM.request({
+          model,
+          messages: [Message.user([
+            { type: "media", mediaType: "video/mp4", data: "AAECAw==" },
+            { type: "text", text: "Inspect frames around 2s" },
+          ])],
+        }),
+      )
+      expect(prepared.body.messages).toEqual([
+        {
+          role: "user",
+          content: [
+            { type: "video_url", video_url: { url: "data:video/mp4;base64,AAECAw==" } },
+            { type: "text", text: "Inspect frames around 2s" },
+          ],
+        },
+      ])
+    }),
+  )
+
+  it.effect("rejects mismatched video MIME/base64", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.prepare(LLM.request({
+        model,
+        messages: [Message.user({ type: "media", mediaType: "video/webm", data: "data:video/mp4;base64,AAEC" })],
+      })).pipe(Effect.flip)
+      expect(error.message).toContain("does not match")
+    }),
+  )
+
+  it.effect("preserves audio input as documented MiMo input_audio data URL", () =>
+    Effect.gen(function* () {
+      const prepared = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
+        LLM.request({
+          model,
+          messages: [Message.user({ type: "media", mediaType: "audio/wav", data: "AAECAw==" })],
+        }),
+      )
+      expect(prepared.body.messages).toEqual([{
+        role: "user",
+        content: [{ type: "input_audio", input_audio: { data: "data:audio/wav;base64,AAECAw==" } }],
+      }])
+    }),
+  )
+
   it.effect("lowers reasoning-only assistant history", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
@@ -519,6 +567,37 @@ describe("OpenAI Chat route", () => {
       )
 
       expect(prepared.body.messages).toEqual([{ role: "assistant", content: null, reasoning_content: "hidden" }])
+    }),
+  )
+
+  it.effect("replays reasoning using the configured provider field (upstream protocol parity)", () =>
+    Effect.gen(function* () {
+      for (const field of ["reasoning_content", "reasoning", "reasoning_text"] as const) {
+        const configured = Model.update(model, { compatibility: { reasoningField: field } })
+        const prepared = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
+          LLM.request({ model: configured, messages: [Message.assistant({ type: "reasoning", text: "hidden" })] }),
+        )
+        expect(prepared.body.messages).toEqual([{ role: "assistant", content: null, [field]: "hidden" }])
+      }
+    }),
+  )
+
+  it.effect("preserves old AI SDK reasoning fields nested under providerOptions", () =>
+    Effect.gen(function* () {
+      const configured = Model.update(model, { compatibility: { reasoningField: "reasoning_text" } })
+      const prepared = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
+        LLM.request({
+          model: configured,
+          messages: [Message.make({
+            role: "assistant",
+            content: [{ type: "text", text: "completed" }],
+            native: { providerOptions: { openaiCompatible: { reasoning_text: "history thinking" } } },
+          })],
+        }),
+      )
+      expect(prepared.body.messages).toEqual([
+        { role: "assistant", content: "completed", reasoning_text: "history thinking" },
+      ])
     }),
   )
 
@@ -573,6 +652,28 @@ describe("OpenAI Chat route", () => {
     }),
   )
 
+  it.effect("reads usage from choice.usage when top-level usage is absent (Moonshot)", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(
+        deltaChunk({ role: "assistant", content: "Hi" }),
+        {
+          choices: [
+            {
+              delta: {},
+              finish_reason: "stop",
+              usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+            },
+          ],
+        },
+      )
+      const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+
+      expect(response.usage?.inputTokens).toBe(3)
+      expect(response.usage?.outputTokens).toBe(1)
+      expect(response.usage?.totalTokens).toBe(4)
+    }),
+  )
+
   it.effect("parses OpenAI-compatible reasoning content deltas", () =>
     Effect.gen(function* () {
       const body = sseEvents(
@@ -596,6 +697,54 @@ describe("OpenAI Chat route", () => {
         { type: "step-finish", index: 0, reason: "stop" },
         { type: "finish", reason: "stop" },
       ])
+    }),
+  )
+
+  it.effect("preserves alternate OpenAI-compatible reasoning fields (upstream parity)", () =>
+    Effect.gen(function* () {
+      for (const field of ["reasoning_content", "reasoning", "reasoning_text"] as const) {
+        const body = sseEvents(
+          { choices: [{ delta: { [field]: "actual thinking" } }] },
+          { choices: [{ delta: { content: "Answer" } }] },
+          { choices: [{ delta: {}, finish_reason: "stop" }] },
+        )
+        const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+        expect(response.reasoning).toBe("actual thinking")
+        expect(response.text).toBe("Answer")
+        expect(response.events.filter((event) => event.type === "reasoning-delta")).toMatchObject([
+          { type: "reasoning-delta", id: "reasoning-0", text: "actual thinking" },
+        ])
+      }
+    }),
+  )
+
+  it.effect("does not duplicate reasoning when a gateway sends several aliases", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(
+        { choices: [{ delta: {
+          reasoning_content: "canonical",
+          reasoning: "duplicate",
+          reasoning_text: "duplicate again",
+        } }] },
+        { choices: [{ delta: { content: "Answer" } }] },
+        { choices: [{ delta: {}, finish_reason: "stop" }] },
+      )
+      const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+      expect(response.reasoning).toBe("canonical")
+      expect(response.events.filter((event) => event.type === "reasoning-delta")).toHaveLength(1)
+    }),
+  )
+
+  it.effect("retains literal unavailable reasoning as provider data for provenance", () =>
+    Effect.gen(function* () {
+      const body = sseEvents(
+        { choices: [{ delta: { reasoning_content: "No reasoning available.<|start|>" } }] },
+        { choices: [{ delta: { content: "Still working." } }] },
+        { choices: [{ delta: {}, finish_reason: "stop" }] },
+      )
+      const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+      expect(response.reasoning).toBe("No reasoning available.<|start|>")
+      expect(response.text).toBe("Still working.")
     }),
   )
 
@@ -647,10 +796,18 @@ describe("OpenAI Chat route", () => {
       const input = LLM.updateRequest(request, {
         tools: [{ name: "lookup", description: "Lookup data", inputSchema: { type: "object" } }],
       })
+      // A consumer that intentionally takes a prefix may stop without a
+      // terminal event; fully draining a truncated stream must FAIL instead.
       const events = Array.from(
-        yield* LLMClient.stream(input).pipe(Stream.runCollect, Effect.provide(fixedResponse(body))),
+        yield* LLMClient.stream(input).pipe(Stream.take(4), Stream.runCollect, Effect.provide(fixedResponse(body))),
+      )
+      const streamError = yield* LLMClient.stream(input).pipe(
+        Stream.runCollect,
+        Effect.provide(fixedResponse(body)),
+        Effect.flip,
       )
       const error = yield* LLMClient.generate(input).pipe(Effect.provide(fixedResponse(body)), Effect.flip)
+      expect(streamError.message).toContain("Provider stream ended without a terminal finish event")
 
       expect(events).toEqual([
         { type: "step-start", index: 0 },

@@ -25,6 +25,8 @@ import { ToolStream } from "./utils/tool-stream"
 
 const ADAPTER = "openai-chat"
 const IMAGE_MIMES = new Set<string>(ProviderShared.IMAGE_MIMES)
+const VIDEO_MIMES = new Set<string>(ProviderShared.VIDEO_MIMES)
+const AUDIO_MIMES = new Set<string>(ProviderShared.AUDIO_MIMES)
 export const DEFAULT_BASE_URL = "https://api.openai.com/v1"
 export const PATH = "/chat/completions"
 
@@ -68,6 +70,14 @@ const OpenAIChatUserContent = Schema.Union([
     type: Schema.Literal("image_url"),
     image_url: Schema.Struct({ url: Schema.String }),
   }),
+  Schema.Struct({
+    type: Schema.Literal("video_url"),
+    video_url: Schema.Struct({ url: Schema.String }),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("input_audio"),
+    input_audio: Schema.Struct({ data: Schema.String }),
+  }),
 ])
 
 const OpenAIChatMessage = Schema.Union([
@@ -84,6 +94,8 @@ const OpenAIChatMessage = Schema.Union([
     content: Schema.NullOr(Schema.String),
     tool_calls: optionalArray(OpenAIChatAssistantToolCall),
     reasoning_content: Schema.optional(Schema.String),
+    reasoning: Schema.optional(Schema.String),
+    reasoning_text: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     role: Schema.Literal("tool"),
@@ -161,12 +173,19 @@ type OpenAIChatToolCallDelta = Schema.Schema.Type<typeof OpenAIChatToolCallDelta
 const OpenAIChatDelta = Schema.Struct({
   content: optionalNull(Schema.String),
   reasoning_content: optionalNull(Schema.String),
+  // OpenAI-compatible providers disagree on the reasoning delta key. Mirror
+  // upstream OpenCode: decode each common spelling, without changing outbound
+  // request schemas or inferring reasoning from token usage.
+  reasoning: optionalNull(Schema.String),
+  reasoning_text: optionalNull(Schema.String),
   tool_calls: optionalNull(Schema.Array(OpenAIChatToolCallDelta)),
 })
 
 const OpenAIChatChoice = Schema.Struct({
   delta: optionalNull(OpenAIChatDelta),
   finish_reason: optionalNull(Schema.String),
+  // Moonshot streams usage on `choice.usage` instead of top-level `usage`.
+  usage: optionalNull(OpenAIChatUsage),
 })
 
 const OpenAIChatEvent = Schema.Struct({
@@ -219,12 +238,29 @@ const lowerToolCall = (part: ToolCallPart): OpenAIChatAssistantToolCall => ({
 })
 
 const lowerMedia = Effect.fn("OpenAIChat.lowerMedia")(function* (part: MediaPart) {
+  const mime = part.mediaType.toLowerCase()
+  if (VIDEO_MIMES.has(mime)) {
+    const media = yield* ProviderShared.validateMedia("OpenAI Chat", part, VIDEO_MIMES)
+    return { type: "video_url" as const, video_url: { url: media.dataUrl } }
+  }
+  if (AUDIO_MIMES.has(mime)) {
+    const media = yield* ProviderShared.validateMedia("OpenAI Chat", part, AUDIO_MIMES)
+    return { type: "input_audio" as const, input_audio: { data: media.dataUrl } }
+  }
   const media = yield* ProviderShared.validateMedia("OpenAI Chat", part, IMAGE_MIMES)
   return { type: "image_url" as const, image_url: { url: media.dataUrl } }
 })
 
-const openAICompatibleReasoningContent = (native: unknown) =>
-  isRecord(native) && typeof native.reasoning_content === "string" ? native.reasoning_content : undefined
+const openAICompatibleReasoningContent = (native: unknown, field: "reasoning_content" | "reasoning" | "reasoning_text") => {
+  if (!isRecord(native)) return undefined
+  const direct = native[field]
+  if (typeof direct === "string") return direct
+  const legacy = native.openaiCompatible
+  if (isRecord(legacy) && typeof legacy[field] === "string") return legacy[field]
+  // V1 AI SDK model messages store these fields under providerOptions.
+  const wrapped = isRecord(native.providerOptions) ? native.providerOptions.openaiCompatible : undefined
+  return isRecord(wrapped) && typeof wrapped[field] === "string" ? wrapped[field] : undefined
+}
 
 const lowerUserMessage = Effect.fn("OpenAIChat.lowerUserMessage")(function* (
   request: LLMRequest,
@@ -253,6 +289,7 @@ const lowerUserMessage = Effect.fn("OpenAIChat.lowerUserMessage")(function* (
 
 const lowerAssistantMessage = Effect.fn("OpenAIChat.lowerAssistantMessage")(function* (
   message: OpenAIChatRequestMessage,
+  field: "reasoning_content" | "reasoning" | "reasoning_text",
 ) {
   const content: TextPart[] = []
   const reasoning: ReasoningPart[] = []
@@ -277,10 +314,10 @@ const lowerAssistantMessage = Effect.fn("OpenAIChat.lowerAssistantMessage")(func
     role: "assistant" as const,
     content: content.length === 0 ? null : ProviderShared.joinText(content),
     tool_calls: toolCalls.length === 0 ? undefined : toolCalls,
-    reasoning_content:
+    [field]:
       reasoning.length > 0
         ? reasoning.map((part) => part.text).join("")
-        : openAICompatibleReasoningContent(message.native?.openaiCompatible),
+        : openAICompatibleReasoningContent(message.native, field),
   }
 })
 
@@ -326,7 +363,8 @@ const lowerMessage = Effect.fn("OpenAIChat.lowerMessage")(function* (
   message: OpenAIChatRequestMessage,
 ) {
   if (message.role === "user") return [yield* lowerUserMessage(request, message)]
-  if (message.role === "assistant") return [yield* lowerAssistantMessage(message)]
+  if (message.role === "assistant")
+    return [yield* lowerAssistantMessage(message, request.model.compatibility?.reasoningField ?? "reasoning_content")]
   return (yield* lowerToolMessages(request, message)).messages
 })
 
@@ -467,8 +505,11 @@ const mapUsage = (usage: OpenAIChatEvent["usage"]): Usage | undefined => {
 const step = (state: ParserState, event: OpenAIChatEvent) =>
   Effect.gen(function* () {
     const events: LLMEvent[] = []
-    const usage = mapUsage(event.usage) ?? state.usage
     const choice = event.choices[0]
+    // Moonshot streams usage on `choice.usage` instead of top-level `usage`.
+    const choiceUsage =
+      choice !== undefined && typeof choice.usage === "object" && choice.usage !== null ? choice.usage : undefined
+    const usage = mapUsage(event.usage) ?? (choiceUsage ? mapUsage(choiceUsage) : undefined) ?? state.usage
     const finishReason = choice?.finish_reason ? mapFinishReason(choice.finish_reason) : state.finishReason
     const delta = choice?.delta
     const toolDeltas = delta?.tool_calls ?? []
@@ -476,8 +517,11 @@ const step = (state: ParserState, event: OpenAIChatEvent) =>
 
     let lifecycle = state.lifecycle
 
-    if (delta?.reasoning_content)
-      lifecycle = Lifecycle.reasoningDelta(lifecycle, events, "reasoning-0", delta.reasoning_content)
+    // One reasoning chunk may include aliases for the same bytes. Choose the
+    // first non-empty field in stable precedence order; never concatenate them.
+    const reasoning = [delta?.reasoning_content, delta?.reasoning, delta?.reasoning_text]
+      .find((value): value is string => typeof value === "string" && value.length > 0)
+    if (reasoning) lifecycle = Lifecycle.reasoningDelta(lifecycle, events, "reasoning-0", reasoning)
 
     if (delta?.content) {
       lifecycle = Lifecycle.reasoningEnd(lifecycle, events, "reasoning-0")

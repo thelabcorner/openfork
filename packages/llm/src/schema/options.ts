@@ -168,6 +168,9 @@ export type ModelToolSchemaCompatibility = Schema.Schema.Type<typeof ModelToolSc
 
 export class ModelCompatibility extends Schema.Class<ModelCompatibility>("LLM.ModelCompatibility")({
   toolSchema: Schema.optional(ModelToolSchemaCompatibility),
+  // The provider-native Chat Completions reasoning key on history replay.
+  // Never infer it from returned token usage or hidden model IDs.
+  reasoningField: Schema.optional(Schema.Literals(["reasoning_content", "reasoning", "reasoning_text"])),
 }) {}
 
 export namespace ModelCompatibility {

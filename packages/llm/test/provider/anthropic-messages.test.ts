@@ -57,6 +57,72 @@ describe("Anthropic Messages route", () => {
     }),
   )
 
+  it.effect("sends interleaved-thinking beta header and beta endpoint for native Anthropic", () =>
+    Effect.gen(function* () {
+      let url = ""
+      let beta: string | null = null
+      let version: string | null = null
+      yield* LLMClient.generate(request).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.gen(function* () {
+              const web = yield* HttpClientRequest.toWeb(input.request).pipe(Effect.orDie)
+              url = web.url
+              beta = web.headers.get("anthropic-beta")
+              version = web.headers.get("anthropic-version")
+              return input.respond(
+                sseEvents(
+                  { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+                  { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+                  { type: "content_block_stop", index: 0 },
+                  { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+                  { type: "message_stop" },
+                ),
+                { headers: { "content-type": "text/event-stream" } },
+              )
+            }),
+          ),
+        ),
+      )
+
+      expect(url).toContain("/messages?beta=true")
+      expect(version).toBe("2023-06-01")
+      expect(beta?.split(",") ?? []).toContain("interleaved-thinking-2025-05-14")
+    }),
+  )
+
+  it.effect("keeps plain endpoint for derived non-Anthropic routes", () =>
+    Effect.gen(function* () {
+      const proxied = AnthropicMessages.route
+        .with({ provider: "gateway" as never })
+        .with({ endpoint: { baseURL: "https://gateway.test/v1/" }, auth: Auth.header("x-api-key", "test") })
+        .model({ id: "claude-sonnet-4-5" })
+      let url = ""
+      yield* LLMClient.generate(LLM.request({ id: "req_proxy", model: proxied, prompt: "Hi." })).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.gen(function* () {
+              const web = yield* HttpClientRequest.toWeb(input.request).pipe(Effect.orDie)
+              url = web.url
+              return input.respond(
+                sseEvents(
+                  { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+                  { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+                  { type: "content_block_stop", index: 0 },
+                  { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+                  { type: "message_stop" },
+                ),
+                { headers: { "content-type": "text/event-stream" } },
+              )
+            }),
+          ),
+        ),
+      )
+
+      expect(url).not.toContain("beta=true")
+    }),
+  )
+
   it.effect("lowers chronological system updates natively for Claude Opus 4.8 with cache hints", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(

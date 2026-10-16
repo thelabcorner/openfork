@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer"
-import { Effect, Schema, Stream } from "effect"
+import { Effect, Option, Schema, Stream } from "effect"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { Headers, HttpClientRequest } from "effect/unstable/http"
 import {
@@ -23,6 +23,44 @@ const isJson = Schema.is(Schema.Json)
 export const JsonObject = Schema.Record(Schema.String, Schema.Unknown)
 export const optionalArray = <const S extends Schema.Top>(schema: S) => Schema.optional(Schema.Array(schema))
 export const optionalNull = <const S extends Schema.Top>(schema: S) => Schema.optional(Schema.NullOr(schema))
+
+/**
+ * Lenient optional key: decodes when present and valid, silently drops the
+ * key when the provider sends an unknown shape instead of failing the whole
+ * body. Ported from upstream `ai` shared toolkit for forward-compatible
+ * provider enums/blocks.
+ */
+export const lenient = <const S extends Schema.Top>(schema: S) =>
+  Schema.optionalKey(
+    Schema.UndefinedOr(schema).pipe(Schema.catchDecoding(() => Effect.succeed(Option.some(undefined)))),
+  )
+
+/** Provider-defined string enum: known values for autocomplete, any string accepted at runtime. */
+export const knownString = <Known extends string>() =>
+  Schema.declare<Known | (string & {})>((value): value is Known | (string & {}) => typeof value === "string", {
+    expected: "string",
+  })
+
+export const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64
+
+/**
+ * Clamp a caller-supplied prompt-cache isolation key to the provider limit
+ * (OpenAI: 64 chars; DeepSeek/Zai inherit it via OpenAI-compatible APIs).
+ * Unicode-aware slicing so we never split a surrogate pair.
+ */
+export const clampPromptCacheKey = (value: string): string => {
+  const chars = Array.from(value)
+  if (chars.length <= OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH) return value
+  return chars.slice(0, OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH).join("")
+}
+
+/**
+ * Fit a thinking budget inside half the output window: providers reject
+ * thinking budgets that consume the whole completion budget. Ported from
+ * upstream `ai` shared toolkit.
+ */
+export const fitThinkingBudget = (budget: number, maxTokens: number | undefined, minimum = 1) =>
+  maxTokens === undefined || budget <= maxTokens / 2 ? budget : Math.max(minimum, Math.floor(maxTokens / 2))
 
 /**
  * Streaming tool-call accumulator. Adapters that build a tool call across
@@ -156,8 +194,8 @@ export const parseToolInput = (route: string, name: string, raw: string) =>
   parseJson(route, raw || "{}", `Invalid JSON input for ${route} tool call ${name}`)
 
 export const IMAGE_MIMES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const
-export const VIDEO_MIMES = ["video/mp4", "video/webm", "video/quicktime"] as const
-export const AUDIO_MIMES = ["audio/wav", "audio/mp3", "audio/aiff", "audio/aac", "audio/ogg", "audio/flac"] as const
+export const VIDEO_MIMES = ["video/mp4", "video/webm", "video/quicktime", "video/x-msvideo", "video/x-ms-wmv"] as const
+export const AUDIO_MIMES = ["audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/mp4", "audio/aiff", "audio/aac", "audio/ogg", "audio/flac"] as const
 export const MEDIA_MIMES = [...IMAGE_MIMES, ...VIDEO_MIMES, ...AUDIO_MIMES] as const
 export const MAX_MEDIA_ENCODED_BYTES = 28 * 1024 * 1024
 export const MAX_MEDIA_DECODED_BYTES = 20 * 1024 * 1024

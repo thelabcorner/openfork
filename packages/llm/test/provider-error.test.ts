@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { isContextOverflow } from "../src"
+import { isContextOverflow, isStaleReasoning } from "../src"
 
 describe("provider error classification", () => {
   test("classifies provider token limit messages as context overflow", () => {
@@ -26,5 +26,20 @@ describe("provider error classification", () => {
     ]
 
     expect(messages.some(isContextOverflow)).toBe(false)
+  })
+
+  test("classifies caller-bound encrypted reasoning failures", () => {
+    const messages = [
+      "reasoning `encrypted_content` was not issued to this caller",
+      "invalid_encrypted_content",
+      "Encrypted content could not be verified",
+      "Encrypted content could not be decrypted or parsed",
+      "Referenced reasoning item 'rs_123' was not found",
+      "Referenced reasoning item 'rs_123' has expired",
+      "Item 'rs_123' of type 'reasoning' was provided without its required following item.",
+    ]
+
+    expect(messages.every(isStaleReasoning)).toBe(true)
+    expect(isStaleReasoning("Output token rate limit exceeded. Please retry after a brief wait.")).toBe(false)
   })
 })

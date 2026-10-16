@@ -402,7 +402,34 @@ const compileWith = (runtime: TransportRuntime) =>
 const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest) =>
   Stream.unwrap(
     Effect.gen(function* () {
-      return (yield* compileWith(runtime)(request)).stream
+      const compiled = yield* compileWith(runtime)(request)
+      // Provider transports can naturally close after partial text, reasoning,
+      // tool arguments or usage without a terminal model finish. Treat that
+      // EOF as a protocol failure for ALL native provider streaming clients,
+      // not just generate() or the V1 SessionProcessor. A consumer that
+      // intentionally stops early never reaches the final check.
+      // The latch is subscription-local, never shared across concurrent turns.
+      let terminated = false
+      return compiled.stream.pipe(
+        Stream.map((event) => {
+          // A provider-error event is also an explicit terminal disposition;
+          // do not replace its specific cause with a synthetic EOF failure.
+          if (event.type === "finish" || event.type === "provider-error") terminated = true
+          return event
+        }),
+        Stream.concat(
+          Stream.fromEffectDrain(
+            Effect.suspend(() =>
+              terminated
+                ? Effect.void
+                : ProviderShared.eventError(
+                    `${request.model.provider}/${request.model.route.id}`,
+                    "Provider stream ended without a terminal finish event",
+                  ),
+            ),
+          ),
+        ),
+      )
     }),
   )
 
