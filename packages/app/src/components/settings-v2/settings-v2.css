@@ -1160,6 +1160,15 @@
   color: var(--v2-state-fg-danger);
 }
 
+.settings-v2-pair-qr-hint {
+  max-width: 320px;
+  margin-top: 16px;
+  color: var(--v2-text-text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+}
+
 .settings-v2-pair-status {
   display: flex;
   flex-direction: column;
@@ -1514,6 +1523,59 @@
 
 .settings-v2-oxp-key-control .settings-v2-oxp-field-actions {
   width: 100%;
+}
+
+.settings-v2-oxp-cloudflare-section > .settings-v2-oxp-section-heading > [data-component="tag"] {
+  flex-shrink: 0;
+}
+
+.settings-v2-oxp-cloudflare-controls {
+  display: flex;
+  width: min(420px, 100%);
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.settings-v2-oxp-cloudflare-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settings-v2-oxp-cloudflare-detail {
+  max-width: 100%;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--v2-text-text-muted);
+  overflow-wrap: anywhere;
+  text-align: end;
+}
+
+.settings-v2-oxp-cloudflare-url {
+  display: flex;
+  width: min(420px, 100%);
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-v2-oxp-cloudflare-url code {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-family: var(--font-family-mono);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--v2-text-text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-v2-oxp-cloudflare-url button {
+  flex-shrink: 0;
 }
 
 .settings-v2-oxp-clear-key {

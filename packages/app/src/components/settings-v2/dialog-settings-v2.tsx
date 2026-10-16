@@ -18,13 +18,18 @@ import { useLayout } from "@/context/layout"
 import { useTabs } from "@/context/tabs"
 import { useServerSync } from "@/context/server-sync"
 import { normalizeSettingsTab, useSettingsNavigation, type SettingsTab } from "./navigation"
+import { normalizeSettingsSection, settingsSectionQuery, type SettingsSection } from "./sections"
+import { SettingsSubnav } from "./subnav"
 
 const SettingsSpecialAgentsV2 = lazy(() => import("./special-agents"))
 const SettingsWakaTimeV2 = lazy(() => import("./wakatime"))
+const SettingsTelegramV2 = lazy(() => import("./telegram"))
 
 type SettingsViewProps = {
   tab: Accessor<SettingsTab>
   setTab: (value: SettingsTab) => void
+  section: Accessor<SettingsSection | undefined>
+  setSection: (value: SettingsSection) => void
   directory: Accessor<string | undefined>
   sessionID?: string
   onClose?: () => void
@@ -61,18 +66,24 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
                 <TabsV2.SectionTitle>{language.t("settings.section.desktop")}</TabsV2.SectionTitle>
                 <div class="flex flex-col gap-1.5 w-full">
                   <TabsV2.Trigger value="general">
-                    <Icon name="sliders" />
-                    {language.t("settings.tab.general")}
-                  </TabsV2.Trigger>
+                     <Icon name="sliders" />
+                     {language.t("settings.tab.general")}
+                     <span class="settings-v2-parent-chevron" aria-hidden="true">⌄</span>
+                   </TabsV2.Trigger>
+                   <SettingsSubnav tab="general" parentLabel={language.t("settings.tab.general")}
+                     activeTab={props.tab} section={props.section} setSection={props.setSection} />
                   <TabsV2.Trigger value="shortcuts">
                     <Icon name="keyboard" />
                     {language.t("settings.tab.shortcuts")}
                   </TabsV2.Trigger>
                   <Show when={platform.oxp}>
                     <TabsV2.Trigger value="oxp">
-                      <Icon name="link" />
-                      {language.t("settings.oxp.nav")}
-                    </TabsV2.Trigger>
+                       <Icon name="link" />
+                       {language.t("settings.oxp.nav")}
+                       <span class="settings-v2-parent-chevron" aria-hidden="true">⌄</span>
+                     </TabsV2.Trigger>
+                     <SettingsSubnav tab="oxp" parentLabel={language.t("settings.oxp.nav")}
+                       activeTab={props.tab} section={props.section} setSection={props.setSection} />
                   </Show>
                 </div>
               </div>
@@ -100,6 +111,13 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
                     <Icon name="code" />
                     {language.t("settings.wakatime.nav")}
                   </TabsV2.Trigger>
+                  <TabsV2.Trigger value="telegram">
+                     <Icon name="bubble-5" />
+                     Telegram
+                     <span class="settings-v2-parent-chevron" aria-hidden="true">⌄</span>
+                   </TabsV2.Trigger>
+                   <SettingsSubnav tab="telegram" parentLabel="Telegram"
+                     activeTab={props.tab} section={props.section} setSection={props.setSection} />
                   <TabsV2.Trigger value="devices">
                     <Icon name="shield" />
                     {language.t("settings.devices.title")}
@@ -115,13 +133,13 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
         </div>
       </TabsV2.List>
       <TabsV2.Content value="general" class="settings-v2-panel">
-        <SettingsGeneralV2 sessionID={props.sessionID} />
+        <SettingsGeneralV2 sessionID={props.sessionID} section={props.section} />
       </TabsV2.Content>
       <TabsV2.Content value="shortcuts" class="settings-v2-panel">
         <SettingsKeybinds v2 />
       </TabsV2.Content>
       <TabsV2.Content value="oxp" class="settings-v2-panel">
-        <SettingsOxpV2 />
+        <SettingsOxpV2 section={props.section} />
       </TabsV2.Content>
       <TabsV2.Content value="servers" class="settings-v2-panel">
         <SettingsServersV2 />
@@ -144,6 +162,11 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
           <SettingsWakaTimeV2 />
         </Show>
       </TabsV2.Content>
+      <TabsV2.Content value="telegram" class="settings-v2-panel">
+        <Show when={props.tab() === "telegram"}>
+          <SettingsTelegramV2 section={props.section} />
+        </Show>
+      </TabsV2.Content>
       <TabsV2.Content value="devices" class="settings-v2-panel">
         <SettingsDevicesV2 />
       </TabsV2.Content>
@@ -159,7 +182,15 @@ export const DialogSettings: Component<{
   const layout = useLayout()
   const tabs = useTabs()
   const serverSync = useServerSync()
-  const [tab, setTab] = createSignal<SettingsTab>(normalizeSettingsTab(props.defaultValue))
+  const [tab, setActiveTab] = createSignal<SettingsTab>(normalizeSettingsTab(props.defaultValue))
+  const [section, setActiveSection] = createSignal<SettingsSection | undefined>(normalizeSettingsSection(tab(), undefined))
+  const setTab = (value: SettingsTab) => {
+    setActiveTab(value)
+    setActiveSection(normalizeSettingsSection(value, undefined))
+  }
+  const setSection = (value: SettingsSection) => {
+    if (normalizeSettingsSection(tab(), value) === value) setActiveSection(value)
+  }
   const directory = createMemo(() => {
     const route = layout.route()
     if (route.type === "dir-new-sesssion") return route.dir
@@ -180,6 +211,8 @@ export const DialogSettings: Component<{
       <SettingsView
         tab={tab}
         setTab={setTab}
+        section={section}
+        setSection={setSection}
         directory={directory}
         sessionID={props.sessionID}
         onProviderBack={showProviders}
@@ -193,14 +226,20 @@ export const SettingsRouteSurface: Component = () => {
   const navigation = useSettingsNavigation()
   const location = useLocation()
   const navigate = useNavigate()
-  const [search] = useSearchParams<{ tab?: string; directory?: string; session?: string }>()
+  const [search] = useSearchParams<{ tab?: string; section?: string; directory?: string; session?: string }>()
   const tab = createMemo(() => normalizeSettingsTab(search.tab))
+  const section = createMemo(() => normalizeSettingsSection(tab(), search.section))
   const directory = createMemo(() => search.directory)
   let root: HTMLDivElement | undefined
 
   const setTab = (value: SettingsTab) => {
-    const query = new URLSearchParams(location.search)
-    query.set("tab", value)
+    const query = settingsSectionQuery(location.search, value)
+    navigate(`/settings?${query}`, { replace: true, state: location.state })
+  }
+
+  const setSection = (value: SettingsSection) => {
+    if (normalizeSettingsSection(tab(), value) !== value) return
+    const query = settingsSectionQuery(location.search, tab(), value)
     navigate(`/settings?${query}`, { replace: true, state: location.state })
   }
 
@@ -226,6 +265,8 @@ export const SettingsRouteSurface: Component = () => {
       <SettingsView
         tab={tab}
         setTab={setTab}
+        section={section}
+        setSection={setSection}
         directory={directory}
         sessionID={search.session}
         onClose={navigation.close}

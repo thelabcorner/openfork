@@ -2,6 +2,7 @@ import { createStore, reconcile } from "solid-js/store"
 import { batch, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { persisted } from "@/utils/persist"
+import { normalizePromptCorrectionRule, normalizePromptCorrectionRules } from "@/utils/prompt-correction-policy"
 import { usePlatform } from "@/context/platform"
 
 export interface NotificationSettings {
@@ -31,6 +32,20 @@ export interface PromptRevisionSettings {
   prompt?: string
   autoBeforeSend?: boolean
   autoSendAfterRevision?: boolean
+}
+
+export interface ModelSelectorBehaviorSettings {
+  autoInterruptOnModelSelectorChange?: boolean
+  autoUpdateModelSelectorOnGeneratingMismatch?: boolean
+}
+
+export function normalizeModelSelectorBehaviorSettings(
+  value: ModelSelectorBehaviorSettings | undefined,
+): Required<ModelSelectorBehaviorSettings> {
+  return {
+    autoInterruptOnModelSelectorChange: value?.autoInterruptOnModelSelectorChange === true,
+    autoUpdateModelSelectorOnGeneratingMismatch: value?.autoUpdateModelSelectorOnGeneratingMismatch === true,
+  }
 }
 
 /**
@@ -101,6 +116,19 @@ export interface Settings {
     shouldDisplayTabsToast?: boolean
     titleGeneration?: TitleGenerationSettings
     promptRevision?: PromptRevisionSettings
+    /** First-party composer only. Absent/false is off (opt-in). */
+    promptAutocorrection?: boolean
+    /** English, local WASM worker. Always independently opt-in. */
+    promptGrammarHarper?: boolean
+    /** Separate consent: conservative, immediate, reversible inline fixes. */
+    promptGrammarAutoApply?: boolean
+    promptGrammarIgnoredWords?: string[]
+    /** Vetted dictionary entries the user explicitly exempts (case insensitive). */
+    promptAutocorrectionIgnore?: string[]
+    /** Explicit user-authored word-to-word replacements; never project-controlled. */
+    promptAutocorrectionCustom?: Record<string, string>
+    autoInterruptOnModelSelectorChange?: boolean
+    autoUpdateModelSelectorOnGeneratingMismatch?: boolean
     auditor?: AuditorSettings
     spadAuditor?: SpadAuditorSettings
     compaction?: CompactionSettings
@@ -542,9 +570,58 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         setTitleGeneration(value: TitleGenerationSettings | undefined) {
           setStore("general", "titleGeneration", value)
         },
+        promptGrammarIgnoredWords: withFallback(() => store.general?.promptGrammarIgnoredWords, [] as string[]),
+        setPromptGrammarIgnoredWords(value: string | string[]) {
+          const words = (Array.isArray(value) ? value : value.split(/[\s,;]+/))
+            .map((item) => item.trim().toLowerCase())
+            .filter((item) => /^[a-z]{2,40}$/.test(item))
+          const unique = [...new Set(words)].slice(0, 256)
+          setStore("general", "promptGrammarIgnoredWords", unique.length ? unique : undefined)
+        },
+        promptGrammarAutoApply: withFallback(() => store.general?.promptGrammarAutoApply === true, false),
+        setPromptGrammarAutoApply(value: boolean) {
+          setStore("general", "promptGrammarAutoApply", value || undefined)
+        },
+        promptGrammarHarper: withFallback(() => store.general?.promptGrammarHarper === true, false),
+        setPromptGrammarHarper(value: boolean) {
+          setStore("general", "promptGrammarHarper", value || undefined)
+        },
+        promptAutocorrection: withFallback(() => store.general?.promptAutocorrection === true, false),
+        setPromptAutocorrection(value: boolean) {
+          setStore("general", "promptAutocorrection", value || undefined)
+        },
+        promptAutocorrectionIgnore: withFallback(() => store.general?.promptAutocorrectionIgnore, [] as string[]),
+        setPromptAutocorrectionIgnore(value: string | string[]) {
+          const entries = (Array.isArray(value) ? value : value.split(/[\s,;]+/))
+            .map((item) => item.trim().toLowerCase())
+            .filter((item) => /^[a-z]{2,40}$/.test(item))
+          const unique = [...new Set(entries)].slice(0, 128)
+          setStore("general", "promptAutocorrectionIgnore", unique.length ? unique : undefined)
+        },
+        promptAutocorrectionCustom: () => normalizePromptCorrectionRules(store.general?.promptAutocorrectionCustom),
+        setPromptAutocorrectionCustom(value: string) {
+          const entries = value.split(/[,;\n]+/).slice(0, 64).flatMap((pair) => {
+            const match = /^\s*([a-z]{2,40})\s*(?:=|→)\s*([a-z]{2,40})\s*$/i.exec(pair)
+            if (!match) return []
+            const normalized = normalizePromptCorrectionRule(match[1], match[2])
+            return normalized ? [[normalized.from, normalized.to] as const] : []
+          })
+          const unique = Object.fromEntries(entries)
+          setStore("general", "promptAutocorrectionCustom", entries.length ? unique : undefined)
+        },
         promptRevision: withFallback(() => normalizePromptRevisionSettings(store.general?.promptRevision), undefined),
         setPromptRevision(value: PromptRevisionSettings | undefined) {
           setStore("general", "promptRevision", normalizePromptRevisionSettings(value))
+        },
+        autoInterruptOnModelSelectorChange: () =>
+          normalizeModelSelectorBehaviorSettings(store.general).autoInterruptOnModelSelectorChange,
+        setAutoInterruptOnModelSelectorChange(value: boolean) {
+          setStore("general", "autoInterruptOnModelSelectorChange", value || undefined)
+        },
+        autoUpdateModelSelectorOnGeneratingMismatch: () =>
+          normalizeModelSelectorBehaviorSettings(store.general).autoUpdateModelSelectorOnGeneratingMismatch,
+        setAutoUpdateModelSelectorOnGeneratingMismatch(value: boolean) {
+          setStore("general", "autoUpdateModelSelectorOnGeneratingMismatch", value || undefined)
         },
         auditor: withFallback(() => store.general?.auditor, undefined),
         setAuditor(value: AuditorSettings | undefined) {

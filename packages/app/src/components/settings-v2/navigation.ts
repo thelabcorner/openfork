@@ -3,21 +3,10 @@ import { useLayout } from "@/context/layout"
 import { useServer } from "@/context/server"
 import { useServerSync } from "@/context/server-sync"
 import { useTabs } from "@/context/tabs"
-
-export const settingsTabs = ["general", "shortcuts", "oxp", "servers", "providers", "models", "special-agents", "wakatime", "devices"] as const
-export type SettingsTab = (typeof settingsTabs)[number]
-
-const settingsTabSet = new Set<string>(settingsTabs)
-
-export function normalizeSettingsTab(value: string | undefined): SettingsTab {
-  return value && settingsTabSet.has(value) ? (value as SettingsTab) : "general"
-}
-
-export function safeSettingsReturn(value: string | null | undefined) {
-  if (!value?.startsWith("/") || value.startsWith("//")) return "/"
-  if (value === "/settings" || value.startsWith("/settings?")) return "/"
-  return value
-}
+import { settingsSectionQuery, type SettingsSection } from "./sections"
+import { safeSettingsReturn, type SettingsTab } from "./navigation-model"
+export { normalizeSettingsTab, safeSettingsReturn, settingsTabs } from "./navigation-model"
+export type { SettingsTab } from "./navigation-model"
 
 export function useSettingsNavigation() {
   const location = useLocation<{ settings?: boolean }>()
@@ -30,10 +19,9 @@ export function useSettingsNavigation() {
   const currentPath = () => `${location.pathname}${location.search}${location.hash}`
 
   return {
-    open(tab: SettingsTab = "general") {
+    open(tab: SettingsTab = "general", section?: SettingsSection) {
       const route = layout.route()
-      const query = new URLSearchParams(route.type === "settings" ? location.search : "")
-      query.set("tab", tab)
+      const query = settingsSectionQuery(route.type === "settings" ? location.search : "", tab, section)
 
       if (route.type !== "settings") {
         query.set("from", currentPath())

@@ -30,7 +30,7 @@ function shortID(value: string | undefined) {
 function hasEffectiveAuthority(peer: OfxpSettingsPeerOverview | undefined, now = Date.now()) {
   if (!peer || peer.info.rekeyState !== "stable") return false
   if (peer.info.grantExpiresAt !== undefined && peer.info.grantExpiresAt <= now) return false
-  const global = peer.grant.messaging || peer.grant.integrations || peer.grant.browser
+  const global = peer.grant.messaging || peer.grant.integrations || peer.grant.browser || (peer.grant.code ?? false)
   const rooted =
     peer.roots.length > 0 &&
     (peer.grant.read ||

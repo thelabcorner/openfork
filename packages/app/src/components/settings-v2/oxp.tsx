@@ -6,7 +6,7 @@ import { Spinner } from "@opencode-ai/ui/spinner"
 import { SelectV2 } from "@opencode-ai/ui/v2/select-v2"
 import { Switch } from "@opencode-ai/ui/v2/switch-v2"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
-import { For, Show, createMemo, onCleanup, onMount } from "solid-js"
+import { For, Show, createMemo, onCleanup, onMount, type Accessor } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
@@ -23,6 +23,8 @@ import { SettingsListV2 } from "./parts/list"
 import { SettingsModelPickerV2 } from "./parts/model-picker"
 import { SettingsRowV2 } from "./parts/row"
 import "./settings-v2.css"
+import { sectionsForTab, type SettingsSection } from "./sections"
+import { useSettingsSectionScroll } from "./section-scroll"
 
 type BusyAction =
   | "enabled"
@@ -31,6 +33,8 @@ type BusyAction =
   | "tunnel-id"
   | "openai-key"
   | "openai-key-reset"
+  | "cloudflare-settings"
+  | "cloudflare-connection"
   | "migration"
   | "worker-default-model"
   | "worker-agent-catalog"
@@ -42,6 +46,7 @@ type BusyAction =
 
 const activeAugmentationRows = [
   ["read", "settings.oxp.capability.read.title", "settings.oxp.capability.read.description"],
+  ["code", "settings.oxp.capability.code.title", "settings.oxp.capability.code.description"],
   ["automation", "settings.oxp.capability.automation.title", "settings.oxp.capability.automation.description"],
   ["write", "settings.oxp.capability.write.title", "settings.oxp.capability.write.description"],
   ["process", "settings.oxp.capability.process.title", "settings.oxp.capability.process.description"],
@@ -73,16 +78,23 @@ function formatWhen(language: ReturnType<typeof useLanguage>, value: number | un
   return new Intl.DateTimeFormat(language.intl(), { dateStyle: "medium", timeStyle: "short" }).format(value)
 }
 
-export const SettingsOxpV2 = () => {
+export const SettingsOxpV2 = (props: { section?: Accessor<SettingsSection | undefined> }) => {
   const language = useLanguage()
   const platform = usePlatform()
   const api = isOxpPlatform(platform.oxp) ? platform.oxp : undefined
+  const activeSection = () => props.section?.() ?? "connection"
+  const headerRef = useSettingsSectionScroll(activeSection)
+  const sectionTitle = () => {
+    const entry = sectionsForTab("oxp").find((item) => item.id === activeSection())
+    return entry?.labelKey ? language.t(entry.labelKey) : entry?.label ?? language.t("settings.oxp.nav")
+  }
   const [store, setStore] = createStore<{
     state?: OxpDesktopState
     loading: boolean
     error?: string
     busy?: BusyAction
     tunnelID: string
+    cloudflareHostname: string
     editingRootID?: string
     rootAlias: string
     agentRootID: string
@@ -90,6 +102,7 @@ export const SettingsOxpV2 = () => {
   }>({
     loading: true,
     tunnelID: "",
+    cloudflareHostname: "",
     rootAlias: "",
     agentRootID: "",
   })
@@ -97,6 +110,8 @@ export const SettingsOxpV2 = () => {
   let unsubscribe: (() => void) | undefined
   let tunnelInput: HTMLInputElement | undefined
   let apiKeyInput: HTMLInputElement | undefined
+  let cloudflareTokenInput: HTMLInputElement | undefined
+  let cloudflareHostnameInput: HTMLInputElement | undefined
 
   const apply = (next: OxpDesktopState) => {
     if (disposed) return
@@ -104,6 +119,7 @@ export const SettingsOxpV2 = () => {
     setStore("state", next)
     setStore("error", undefined)
     if (document.activeElement !== tunnelInput) setStore("tunnelID", next.tunnel.tunnelID)
+    if (document.activeElement !== cloudflareHostnameInput) setStore("cloudflareHostname", next.cloudflare.hostname)
     if (
       store.agentRootID &&
       !next.roots.some((root) => root.id === store.agentRootID)
@@ -176,6 +192,10 @@ export const SettingsOxpV2 = () => {
   const state = () => store.state
   const connectionActive = createMemo(() => {
     const value = state()?.tunnel.state
+    return value === "starting" || value === "connected" || value === "offline"
+  })
+  const cloudflareActive = createMemo(() => {
+    const value = state()?.cloudflare.state
     return value === "starting" || value === "connected" || value === "offline"
   })
   const capabilityCount = createMemo(() => {
@@ -343,6 +363,22 @@ export const SettingsOxpV2 = () => {
     void run("tunnel-id", () => api.setTunnelID(value))
   }
 
+  const saveCloudflare = () => {
+    if (!api || !cloudflareTokenInput || store.busy) return
+    const hostname = store.cloudflareHostname.trim()
+    const token = cloudflareTokenInput.value.trim()
+    if (hostname === state()?.cloudflare.hostname && !token) return
+    void run("cloudflare-settings", async () => {
+      if (hostname !== state()?.cloudflare.hostname) await api.setCloudflareHostname(hostname)
+      if (token) await api.setCloudflareTunnelToken(token)
+      return api.getState()
+    }).then((saved) => {
+      if (!saved) return
+      if (cloudflareTokenInput?.value === token) cloudflareTokenInput.value = ""
+      showToast({ variant: "success", icon: "check", title: language.t("settings.oxp.cloudflare.saved") })
+    })
+  }
+
   const saveApiKey = () => {
     if (!api || !apiKeyInput) return
     const secureStorage = state()?.secureStorage
@@ -428,11 +464,13 @@ export const SettingsOxpV2 = () => {
 
   return (
     <>
-      <div class="settings-v2-tab-header settings-v2-oxp-header">
+      <div ref={headerRef} class="settings-v2-tab-header settings-v2-subsection-header settings-v2-oxp-header">
         <div class="settings-v2-tab-header-row">
           <div class="settings-v2-oxp-title-group">
-            <h2 class="settings-v2-tab-title">{language.t("settings.oxp.title")}</h2>
-            <Tag variant="accent">{language.t("settings.oxp.badge")}</Tag>
+            <div class="settings-v2-oxp-title-stack">
+              <div class="settings-v2-subsection-parent">{language.t("settings.oxp.nav")} · {language.t("settings.oxp.badge")}</div>
+              <h2 class="settings-v2-tab-title">{sectionTitle()}</h2>
+            </div>
           </div>
           <Show when={state()}>
             {(current) => (
@@ -447,14 +485,17 @@ export const SettingsOxpV2 = () => {
             )}
           </Show>
         </div>
-        <p class="settings-v2-oxp-intro">{language.t("settings.oxp.description")}</p>
+        <Show when={activeSection() === "connection"}>
+          <p class="settings-v2-oxp-intro">{language.t("settings.oxp.description")}</p>
+        </Show>
       </div>
 
-      <div class="settings-v2-tab-body settings-v2-oxp">
+      <div class="settings-v2-tab-body settings-v2-subsection-body settings-v2-oxp">
         <Show when={!store.loading} fallback={<div class="settings-v2-oxp-loading"><Spinner class="size-4" />{language.t("common.loading")}</div>}>
           <Show when={state()} fallback={<div class="settings-v2-oxp-error"><Icon name="warning" />{store.error ?? language.t("settings.oxp.loadFailed")}</div>}>
             {(current) => (
               <>
+                <Show when={activeSection() === "connection"}>
                 <section class="settings-v2-oxp-hero" data-state={current().tunnel.state}>
                   <div class="settings-v2-oxp-hero-main">
                     <div class="settings-v2-oxp-status-mark" aria-hidden="true">
@@ -489,6 +530,8 @@ export const SettingsOxpV2 = () => {
                   </div>
                 </section>
 
+                </Show>
+                <Show when={activeSection() === "folders"}>
                 <div class="settings-v2-section">
                   <div class="settings-v2-oxp-section-heading">
                     <div>
@@ -593,6 +636,8 @@ export const SettingsOxpV2 = () => {
                   </Show>
                 </div>
 
+                </Show>
+                <Show when={activeSection() === "permissions"}>
                 <div class="settings-v2-section">
                   <div class="settings-v2-oxp-section-heading">
                     <div>
@@ -615,6 +660,8 @@ export const SettingsOxpV2 = () => {
                   </SettingsListV2>
                 </div>
 
+                </Show>
+                <Show when={activeSection() === "migration"}>
                 <div class="settings-v2-section">
                   <div class="settings-v2-oxp-section-heading">
                     <div>
@@ -675,6 +722,8 @@ export const SettingsOxpV2 = () => {
                   </SettingsListV2>
                 </div>
 
+                </Show>
+                <Show when={activeSection() === "agents"}>
                 <div class="settings-v2-section">
                   <div class="settings-v2-oxp-section-heading">
                     <div>
@@ -775,6 +824,8 @@ export const SettingsOxpV2 = () => {
                   </SettingsListV2>
                 </div>
 
+                </Show>
+                <Show when={activeSection() === "connection"}>
                 <div class="settings-v2-section">
                   <div class="settings-v2-oxp-section-heading">
                     <div>
@@ -865,6 +916,114 @@ export const SettingsOxpV2 = () => {
                   </SettingsListV2>
                 </div>
 
+                <div class="settings-v2-section settings-v2-oxp-cloudflare-section">
+                  <div class="settings-v2-oxp-section-heading">
+                    <div>
+                      <h3 class="settings-v2-section-title">{language.t("settings.oxp.cloudflare.title")}</h3>
+                      <p>{language.t("settings.oxp.cloudflare.description")}</p>
+                    </div>
+                    <Tag>{connectionLabel(language, current().cloudflare.state)}</Tag>
+                  </div>
+                  <SettingsListV2>
+                    <SettingsRowV2
+                      title={language.t("settings.oxp.cloudflare.hostname.title")}
+                      description={language.t("settings.oxp.cloudflare.hostname.description")}
+                    >
+                      <div class="settings-v2-oxp-field-actions">
+                        <TextInputV2
+                          ref={cloudflareHostnameInput}
+                          type="text"
+                          appearance="base"
+                          value={store.cloudflareHostname}
+                          onInput={(event) => setStore("cloudflareHostname", event.currentTarget.value)}
+                          onKeyDown={(event) => event.key === "Enter" && saveCloudflare()}
+                          placeholder={language.t("settings.oxp.cloudflare.hostnamePlaceholder")}
+                          spellcheck={false}
+                          autocorrect="off"
+                          autocapitalize="off"
+                          autocomplete="off"
+                          aria-label={language.t("settings.oxp.cloudflare.hostname.title")}
+                        />
+                      </div>
+                    </SettingsRowV2>
+                    <SettingsRowV2
+                      title={language.t("settings.oxp.cloudflare.tokenTitle")}
+                      description={language.t("settings.oxp.cloudflare.token.description")}
+                    >
+                      <div class="settings-v2-oxp-key-control">
+                        <TextInputV2
+                          ref={cloudflareTokenInput}
+                          type="password"
+                          appearance="base"
+                          placeholder={current().cloudflare.tunnelTokenPresent ? language.t("settings.oxp.cloudflare.tokenSaved") : language.t("settings.oxp.cloudflare.tokenPlaceholder")}
+                          disabled={!current().secureStorage.available || current().secureStorage.credentialState === "unreadable"}
+                          autocomplete="off"
+                          spellcheck={false}
+                          aria-label={language.t("settings.oxp.cloudflare.tokenTitle")}
+                          onKeyDown={(event) => event.key === "Enter" && saveCloudflare()}
+                        />
+                        <Show when={current().cloudflare.tunnelTokenPresent}>
+                          <button
+                            class="settings-v2-oxp-clear-key"
+                            type="button"
+                            disabled={!!store.busy}
+                            onClick={() => api && void run("cloudflare-settings", () => api.setCloudflareTunnelToken(""))}
+                          >
+                            {language.t("settings.oxp.cloudflare.clearToken")}
+                          </button>
+                        </Show>
+                      </div>
+                    </SettingsRowV2>
+                    <SettingsRowV2
+                      title={language.t("settings.oxp.cloudflare.connection.title")}
+                      description={language.t("settings.oxp.cloudflare.connection.description")}
+                    >
+                      <div class="settings-v2-oxp-cloudflare-controls">
+                        <div class="settings-v2-oxp-cloudflare-actions">
+                          <ButtonV2 size="small" variant="outline" disabled={!!store.busy} onClick={saveCloudflare}>
+                            {language.t("settings.oxp.cloudflare.save")}
+                          </ButtonV2>
+                          <ButtonV2
+                            size="small"
+                            variant={cloudflareActive() ? "outline" : "contrast"}
+                            disabled={!!store.busy || (!cloudflareActive() && (!current().enabled || !current().cloudflare.hostname || !current().cloudflare.tunnelTokenPresent))}
+                            onClick={() => api && void run("cloudflare-connection", () => cloudflareActive() ? api.disconnectCloudflare() : api.connectCloudflare())}
+                          >
+                            {cloudflareActive() ? language.t("settings.oxp.cloudflare.disconnect") : language.t("settings.oxp.cloudflare.connect")}
+                          </ButtonV2>
+                        </div>
+                        <Show when={current().cloudflare.detail}>
+                          {(detail) => <span class="settings-v2-oxp-cloudflare-detail" role="status">{detail()}</span>}
+                        </Show>
+                      </div>
+                    </SettingsRowV2>
+                    <Show when={current().cloudflare.endpointUrl}>
+                      {(url) => (
+                        <SettingsRowV2
+                          title={language.t("settings.oxp.cloudflare.url.title")}
+                          description={language.t("settings.oxp.cloudflare.url.description")}
+                        >
+                          <div class="settings-v2-oxp-cloudflare-url">
+                            <code title={url()}>{url()}</code>
+                            <ButtonV2
+                              size="small"
+                              variant="outline"
+                              disabled={!!store.busy}
+                              onClick={() => void navigator.clipboard.writeText(url())
+                                .then(() => showToast({ variant: "success", icon: "check", title: language.t("settings.oxp.cloudflare.copiedUrl") }))
+                                .catch(() => showToast({ variant: "error", title: language.t("settings.oxp.actionFailed") }))}
+                            >
+                              {language.t("settings.oxp.cloudflare.copyUrl")}
+                            </ButtonV2>
+                          </div>
+                        </SettingsRowV2>
+                      )}
+                    </Show>
+                  </SettingsListV2>
+                </div>
+
+                </Show>
+                <Show when={activeSection() === "background"}>
                 <div class="settings-v2-section">
                   <div class="settings-v2-oxp-section-heading">
                     <div>
@@ -887,6 +1046,8 @@ export const SettingsOxpV2 = () => {
                   </SettingsListV2>
                 </div>
 
+                </Show>
+                <Show when={activeSection() === "activity"}>
                 <div class="settings-v2-section">
                   <div class="settings-v2-oxp-section-heading">
                     <div>
@@ -931,6 +1092,7 @@ export const SettingsOxpV2 = () => {
                     <div><span>{language.t("settings.oxp.activity.failures")}</span><strong>{current().metrics.failures.toLocaleString()}</strong></div>
                   </div>
                 </div>
+                </Show>
               </>
             )}
           </Show>

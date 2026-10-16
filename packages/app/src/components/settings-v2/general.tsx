@@ -11,7 +11,11 @@ import { usePlatform } from "@/context/platform"
 import { useUpdaterAction } from "../updater-action"
 import { useSettings } from "@/context/settings"
 import { useSettingsNavigation } from "./navigation"
+import { sectionsForTab, type SettingsSection } from "./sections"
+import { useSettingsSectionScroll } from "./section-scroll"
+import type { Accessor } from "solid-js"
 import { useServerSDK } from "@/context/server-sdk"
+import { useServerSync } from "@/context/server-sync"
 import { showToast } from "@/utils/toast"
 import { ExternalLink } from "../external-link"
 import { SettingsListV2 } from "./parts/list"
@@ -278,11 +282,13 @@ const LanguageSetting = () => {
 
 export const SettingsGeneralV2: Component<{
   sessionID?: string
+  section?: Accessor<SettingsSection | undefined>
 }> = (props) => {
   const language = useLanguage()
   const platform = usePlatform()
   const dialog = useDialog()
   const settings = useSettings()
+  const serverSync = useServerSync()
   const settingsNavigation = useSettingsNavigation()
   const mobile = createMediaQuery("(max-width: 767px)")
   const updater = useUpdaterAction()
@@ -291,6 +297,29 @@ export const SettingsGeneralV2: Component<{
   const appearance = createAppearanceSettingsController()
   const sounds = createSoundSettingsController()
   const desktop = createMemo(() => platform.platform === "desktop")
+  const activeSection = () => props.section?.() ?? "basics"
+  const headerRef = useSettingsSectionScroll(activeSection)
+  const sectionTitle = () => {
+    const entry = sectionsForTab("general").find((item) => item.id === activeSection())
+    return entry?.labelKey ? language.t(entry.labelKey) : entry?.label ?? language.t("settings.tab.general")
+  }
+  const usageLimitRecovery = () => serverSync().data.config.usage_limit_recovery
+  const setUsageLimitRecovery = (patch: { auto_resume?: boolean; snooze_until_reset?: boolean }) => {
+    void serverSync()
+      .updateConfig({
+        usage_limit_recovery: {
+          ...usageLimitRecovery(),
+          ...patch,
+        },
+      })
+      .catch((error) =>
+        showToast({
+          title: language.t("settings.general.row.usageLimitRecovery.error"),
+          description: error instanceof Error ? error.message : String(error),
+          variant: "error",
+        }),
+      )
+  }
 
   const [pinchZoom, { mutate: setPinchZoom }] = createResource(
     () => desktop() && "getPinchZoomEnabled" in platform,
@@ -339,6 +368,109 @@ export const SettingsGeneralV2: Component<{
         <PermissionScopeSetting controller={permissionScope} />
 
         <SettingsRowV2
+          title={language.t("settings.general.row.promptGrammarHarper.title")}
+          description={language.t("settings.general.row.promptGrammarHarper.description")}
+        >
+          <div data-action="settings-prompt-grammar-harper">
+            <Switch
+              checked={settings.general.promptGrammarHarper()}
+              onChange={(checked) => settings.general.setPromptGrammarHarper(checked)}
+            />
+          </div>
+        </SettingsRowV2>
+
+        <Show when={settings.general.promptGrammarHarper()}>
+          <SettingsRowV2
+            title={language.t("settings.general.row.promptGrammarAutoApply.title")}
+            description={language.t("settings.general.row.promptGrammarAutoApply.description")}
+          >
+            <div data-action="settings-prompt-grammar-autofix">
+              <Switch checked={settings.general.promptGrammarAutoApply()}
+                onChange={(checked) => settings.general.setPromptGrammarAutoApply(checked)} />
+            </div>
+          </SettingsRowV2>
+          <SettingsRowV2
+            title={language.t("settings.general.row.promptGrammarIgnoredWords.title")}
+            description={language.t("settings.general.row.promptGrammarIgnoredWords.description")}
+          >
+            <div class="w-full sm:w-[245px]">
+              <TextInputV2
+                data-action="settings-prompt-grammar-ignored"
+                aria-label={language.t("settings.general.row.promptGrammarIgnoredWords.title")}
+                type="text"
+                appearance="base"
+                value={settings.general.promptGrammarIgnoredWords().join(", ")}
+                onChange={(event) => settings.general.setPromptGrammarIgnoredWords(event.currentTarget.value)}
+                placeholder={language.t("settings.general.row.promptGrammarIgnoredWords.placeholder")}
+                spellcheck={false}
+                autocorrect="off"
+                autocapitalize="off"
+                autocomplete="off"
+              />
+            </div>
+          </SettingsRowV2>
+        </Show>
+
+        <SettingsRowV2
+          title={language.t("settings.general.row.promptAutocorrection.title")}
+          description={language.t("settings.general.row.promptAutocorrection.description")}
+        >
+          <div data-action="settings-prompt-autocorrection">
+            <Switch
+              checked={settings.general.promptAutocorrection()}
+              onChange={(checked) => settings.general.setPromptAutocorrection(checked)}
+            />
+          </div>
+        </SettingsRowV2>
+
+        <Show when={settings.general.promptAutocorrection()}>
+          <SettingsRowV2
+            title={language.t("settings.general.row.promptAutocorrectionIgnore.title")}
+            description={language.t("settings.general.row.promptAutocorrectionIgnore.description")}
+          >
+            <div class="w-full sm:w-[245px]">
+              <TextInputV2
+                data-action="settings-prompt-autocorrection-ignore"
+                aria-label={language.t("settings.general.row.promptAutocorrectionIgnore.title")}
+                type="text"
+                appearance="base"
+                value={settings.general.promptAutocorrectionIgnore().join(", ")}
+                onChange={(event) => settings.general.setPromptAutocorrectionIgnore(event.currentTarget.value)}
+                placeholder={language.t("settings.general.row.promptAutocorrectionIgnore.placeholder")}
+                spellcheck={false}
+                autocorrect="off"
+                autocapitalize="off"
+                autocomplete="off"
+              />
+            </div>
+          </SettingsRowV2>
+        </Show>
+
+        <Show when={settings.general.promptAutocorrection()}>
+          <SettingsRowV2
+            title={language.t("settings.general.row.promptAutocorrectionCustom.title")}
+            description={language.t("settings.general.row.promptAutocorrectionCustom.description")}
+          >
+            <div class="w-full sm:w-[245px]">
+              <TextInputV2
+                data-action="settings-prompt-autocorrection-custom"
+                aria-label={language.t("settings.general.row.promptAutocorrectionCustom.title")}
+                type="text"
+                appearance="base"
+                value={Object.entries(settings.general.promptAutocorrectionCustom())
+                  .map(([from, to]) => from + "=" + to).join(", ")}
+                onChange={(event) => settings.general.setPromptAutocorrectionCustom(event.currentTarget.value)}
+                placeholder={language.t("settings.general.row.promptAutocorrectionCustom.placeholder")}
+                spellcheck={false}
+                autocorrect="off"
+                autocapitalize="off"
+                autocomplete="off"
+              />
+            </div>
+          </SettingsRowV2>
+        </Show>
+
+        <SettingsRowV2
           title={language.t("settings.general.row.autoAcceptPermissionsDefault.title")}
           description={language.t("settings.general.row.autoAcceptPermissionsDefault.description")}
         >
@@ -346,6 +478,54 @@ export const SettingsGeneralV2: Component<{
             <Switch
               checked={settings.general.autoAcceptPermissionsDefault()}
               onChange={(checked) => settings.general.setAutoAcceptPermissionsDefault(checked)}
+            />
+          </div>
+        </SettingsRowV2>
+
+        <SettingsRowV2
+          title={language.t("settings.general.row.autoInterruptOnModelSelectorChange.title")}
+          description={language.t("settings.general.row.autoInterruptOnModelSelectorChange.description")}
+        >
+          <div data-action="settings-auto-interrupt-on-model-selector-change">
+            <Switch
+              checked={settings.general.autoInterruptOnModelSelectorChange()}
+              onChange={(checked) => settings.general.setAutoInterruptOnModelSelectorChange(checked)}
+            />
+          </div>
+        </SettingsRowV2>
+
+        <SettingsRowV2
+          title={language.t("settings.general.row.autoUpdateModelSelectorOnGeneratingMismatch.title")}
+          description={language.t("settings.general.row.autoUpdateModelSelectorOnGeneratingMismatch.description")}
+        >
+          <div data-action="settings-auto-update-model-selector-on-generating-mismatch">
+            <Switch
+              checked={settings.general.autoUpdateModelSelectorOnGeneratingMismatch()}
+              onChange={(checked) => settings.general.setAutoUpdateModelSelectorOnGeneratingMismatch(checked)}
+            />
+          </div>
+        </SettingsRowV2>
+
+        <SettingsRowV2
+          title={language.t("settings.general.row.usageLimitRecovery.autoResume.title")}
+          description={language.t("settings.general.row.usageLimitRecovery.autoResume.description")}
+        >
+          <div data-action="settings-usage-limit-auto-resume">
+            <Switch
+              checked={usageLimitRecovery()?.auto_resume === true}
+              onChange={(checked) => setUsageLimitRecovery({ auto_resume: checked })}
+            />
+          </div>
+        </SettingsRowV2>
+
+        <SettingsRowV2
+          title={language.t("settings.general.row.usageLimitRecovery.snooze.title")}
+          description={language.t("settings.general.row.usageLimitRecovery.snooze.description")}
+        >
+          <div data-action="settings-usage-limit-snooze">
+            <Switch
+              checked={usageLimitRecovery()?.snooze_until_reset === true}
+              onChange={(checked) => setUsageLimitRecovery({ snooze_until_reset: checked })}
             />
           </div>
         </SettingsRowV2>
@@ -662,36 +842,32 @@ export const SettingsGeneralV2: Component<{
 
   return (
     <>
-      <div class="settings-v2-tab-header">
-        <h2 class="settings-v2-tab-title">{language.t("settings.tab.general")}</h2>
+      <div ref={headerRef} class="settings-v2-tab-header settings-v2-subsection-header">
+        <span class="settings-v2-subsection-parent">{language.t("settings.tab.general")}</span>
+        <h2 class="settings-v2-tab-title">{sectionTitle()}</h2>
       </div>
 
-      <div class="settings-v2-tab-body">
-        <Show when={settings.general.layoutTransitionAvailable()}>
-          <InterfaceSection />
+      <div class="settings-v2-tab-body settings-v2-subsection-body">
+        <Show when={activeSection() === "basics"}>
+          <Show when={settings.general.layoutTransitionAvailable()}><InterfaceSection /></Show>
+          <Show when={settings.general.newInterfaceNoticeVisible()}><InterfaceNoticeSection /></Show>
+          <GeneralSection />
         </Show>
-
-        <Show when={settings.general.newInterfaceNoticeVisible()}>
-          <InterfaceNoticeSection />
+        <Show when={activeSection() === "appearance"}><AppearanceSection controller={appearance} /></Show>
+        <Show when={activeSection() === "notifications"}><NotificationsSection /></Show>
+        <Show when={activeSection() === "sounds"}><SoundsSection controller={sounds} /></Show>
+        <Show when={activeSection() === "updates"}>
+          <Show when={desktop()} fallback={<p class="settings-v2-section-unavailable">Updates are managed by the desktop app.</p>}>
+            <UpdatesSection />
+          </Show>
         </Show>
-
-        <GeneralSection />
-
-        <AppearanceSection controller={appearance} />
-
-        <NotificationsSection />
-
-        <SoundsSection controller={sounds} />
-
-        <Show when={desktop()}>
-          <UpdatesSection />
+        <Show when={activeSection() === "display"}>
+          <Show when={desktop()} fallback={<p class="settings-v2-section-unavailable">Desktop display options are unavailable on this platform.</p>}>
+            <DisplaySection />
+          </Show>
         </Show>
-
-        <DisplaySection />
-
-        <AdvancedSection />
-
-        <DangerZoneSection />
+        <Show when={activeSection() === "advanced"}><AdvancedSection /></Show>
+        <Show when={activeSection() === "danger-zone"}><DangerZoneSection /></Show>
       </div>
     </>
   )

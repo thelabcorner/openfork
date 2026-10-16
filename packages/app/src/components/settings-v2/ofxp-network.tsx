@@ -65,6 +65,7 @@ const emptyGrant = (): OfxpGrant => ({
   write: false,
   git: false,
   process: false,
+  code: false,
   integrations: false,
   browser: false,
   filesReceive: false,
@@ -79,6 +80,7 @@ const emptyGrant = (): OfxpGrant => ({
 
 const grantRows = [
   ["read", "settings.ofxp.capability.read.title", "settings.ofxp.capability.read.description"],
+  ["code", "settings.ofxp.capability.code.title", "settings.ofxp.capability.code.description"],
   ["write", "settings.ofxp.capability.write.title", "settings.ofxp.capability.write.description"],
   ["git", "settings.ofxp.capability.git.title", "settings.ofxp.capability.git.description"],
   ["process", "settings.ofxp.capability.process.title", "settings.ofxp.capability.process.description"],
@@ -144,6 +146,7 @@ function enabledGrantCount(grant: OfxpGrant) {
     grant.write,
     grant.git,
     grant.process,
+    grant.code ?? false,
     grant.integrations,
     grant.browser,
     grant.filesReceive,
@@ -158,7 +161,7 @@ function enabledGrantCount(grant: OfxpGrant) {
 }
 
 function hasGlobalGrant(grant: OfxpGrant) {
-  return grant.messaging || grant.integrations || grant.browser
+  return grant.messaging || grant.integrations || grant.browser || (grant.code ?? false)
 }
 
 function hasRootScopedGrant(grant: OfxpGrant) {
