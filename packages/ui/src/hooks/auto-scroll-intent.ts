@@ -10,8 +10,13 @@ export function classifyAutoScroll(input: {
   escapeThreshold: number
   isProgrammatic: boolean
   programmaticCorrection?: boolean
+  /** Explicit input ownership from an external scroll coordinator. */
+  hasUserScrollGesture?: boolean
 }): AutoScrollIntent {
   if (input.isProgrammatic && (input.delta >= -1 || input.programmaticCorrection)) return "prog"
+  // Browser clamping and virtual row remeasurement also change scrollTop.
+  // Geometry alone must not override an authoritative absence of user input.
+  if (input.hasUserScrollGesture === false) return "hold"
 
   // Balanced: small micro-jitter at the very bottom should not tear follow.
   // Require either a decisive flick (< -1.5) anywhere, or a modest uptick

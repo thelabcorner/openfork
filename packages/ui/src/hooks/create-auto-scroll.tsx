@@ -16,6 +16,8 @@ export interface AutoScrollOptions {
   bottomThreshold?: number
   /** Set when another scroll coordinator owns content-follow writes. */
   scrollOwner?: "self" | "external"
+  /** The external coordinator owns wheel/touch/key/scrollbar gesture intent. */
+  hasScrollGesture?: () => boolean
 }
 
 export function createAutoScroll(options: AutoScrollOptions) {
@@ -190,6 +192,7 @@ export function createAutoScroll(options: AutoScrollOptions) {
       escapeThreshold: escapeThreshold(),
       isProgrammatic: programmatic,
       programmaticCorrection: programmatic && programmaticCorrection,
+      hasUserScrollGesture: options.hasScrollGesture?.(),
     })
 
     if (intent === "prog") {

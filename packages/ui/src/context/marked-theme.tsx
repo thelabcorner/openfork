@@ -1,12 +1,41 @@
 import type { ThemeRegistrationResolved } from "@pierre/diffs"
 
+const codeSyntax = {
+  foreground: "var(--syntax-code-foreground, var(--text-base))",
+  comment: "var(--syntax-code-comment, var(--syntax-comment))",
+  regexp: "var(--syntax-code-regexp, var(--syntax-regexp))",
+  keyword: "var(--syntax-code-keyword, var(--syntax-keyword))",
+  string: "var(--syntax-code-string, var(--syntax-string))",
+  primitive: "var(--syntax-code-primitive, var(--syntax-primitive))",
+  operator: "var(--syntax-code-operator, var(--syntax-operator))",
+  variable: "var(--syntax-code-variable, var(--syntax-variable))",
+  property: "var(--syntax-code-property, var(--syntax-property))",
+  type: "var(--syntax-code-type, var(--syntax-type))",
+  constant: "var(--syntax-code-constant, var(--syntax-constant))",
+  punctuation: "var(--syntax-code-punctuation, var(--syntax-punctuation))",
+  object: "var(--syntax-code-object, var(--syntax-code-variable, var(--syntax-object)))",
+  function: "var(--syntax-code-function, var(--syntax-function, var(--syntax-primitive)))",
+  method: "var(--syntax-code-method, var(--syntax-code-function, var(--syntax-method, var(--syntax-function, var(--syntax-primitive)))))",
+  parameter: "var(--syntax-code-parameter, var(--syntax-parameter, var(--syntax-variable)))",
+  number: "var(--syntax-code-number, var(--syntax-code-constant, var(--syntax-number, var(--syntax-constant))))",
+  decorator: "var(--syntax-code-decorator, var(--syntax-code-type, var(--syntax-decorator, var(--syntax-type))))",
+  tag: "var(--syntax-code-tag, var(--syntax-code-keyword, var(--syntax-tag, var(--syntax-keyword))))",
+  attribute: "var(--syntax-code-attribute, var(--syntax-code-property, var(--syntax-attribute, var(--syntax-property))))",
+  builtin: "var(--syntax-code-builtin, var(--syntax-code-primitive, var(--syntax-builtin, var(--syntax-primitive))))",
+  namespace: "var(--syntax-code-namespace, var(--syntax-code-type, var(--syntax-namespace, var(--syntax-type))))",
+  label: "var(--syntax-code-label, var(--syntax-code-info, var(--syntax-label, var(--syntax-info))))",
+  info: "var(--syntax-code-info, var(--syntax-info))",
+  warning: "var(--syntax-code-warning, var(--syntax-warning))",
+  critical: "var(--syntax-code-critical, var(--syntax-critical))",
+} as const
+
 export const OpenCodeTheme = {
   name: "OpenCode",
   bg: "var(--color-background-stronger)",
-  fg: "var(--text-base)",
+  fg: codeSyntax.foreground,
   colors: {
     "editor.background": "var(--color-background-stronger)",
-    "editor.foreground": "var(--text-base)",
+    "editor.foreground": codeSyntax.foreground,
     "gitDecoration.addedResourceForeground": "var(--syntax-diff-add)",
     "gitDecoration.deletedResourceForeground": "var(--syntax-diff-delete)",
     "gitDecoration.modifiedResourceForeground": "var(--syntax-diff-unknown)",
@@ -39,65 +68,82 @@ export const OpenCodeTheme = {
     {
       scope: ["comment", "punctuation.definition.comment", "string.comment"],
       settings: {
-        foreground: "var(--syntax-comment)",
+        foreground: codeSyntax.comment,
       },
     },
     {
       scope: ["entity.other.attribute-name"],
       settings: {
-        foreground: "var(--syntax-property)", // maybe attribute
-      },
-    },
-    {
-      scope: ["constant", "entity.name.constant", "variable.other.constant", "variable.language", "entity"],
-      settings: {
-        foreground: "var(--syntax-constant)",
-      },
-    },
-    {
-      scope: ["entity.name", "meta.export.default", "meta.definition.variable"],
-      settings: {
-        foreground: "var(--syntax-type)",
-      },
-    },
-    {
-      scope: ["meta.object.member"],
-      settings: {
-        foreground: "var(--syntax-primitive)",
+        foreground: codeSyntax.attribute,
       },
     },
     {
       scope: [
-        "variable.parameter.function",
-        "meta.jsx.children",
-        "meta.block",
-        "meta.tag.attributes",
-        "entity.name.constant",
-        "meta.embedded.expression",
-        "meta.template.expression",
-        "string.other.begin.yaml",
-        "string.other.end.yaml",
+        "meta.decorator",
+        "meta.annotation",
+        "entity.name.function.decorator",
+        "entity.name.type.annotation",
+        "punctuation.decorator",
+        "storage.type.annotation",
       ],
       settings: {
-        foreground: "var(--syntax-punctuation)",
+        foreground: codeSyntax.decorator,
       },
     },
     {
-      scope: ["entity.name.function", "support.type.primitive"],
+      scope: ["constant.numeric"],
       settings: {
-        foreground: "var(--syntax-primitive)",
+        foreground: codeSyntax.number,
       },
     },
     {
-      scope: ["support.class.component"],
+      scope: ["constant.language", "constant.other", "entity.name.constant"],
       settings: {
-        foreground: "var(--syntax-type)",
+        foreground: codeSyntax.constant,
+      },
+    },
+    {
+      scope: [
+        "entity.name.type",
+        "entity.name.class",
+        "entity.name.struct",
+        "entity.name.interface",
+        "entity.name.enum",
+        "support.type",
+        "support.class",
+      ],
+      settings: {
+        foreground: codeSyntax.type,
+      },
+    },
+    {
+      scope: ["meta.object.member", "variable.other.property", "variable.other.object.property"],
+      settings: {
+        foreground: codeSyntax.property,
+      },
+    },
+    {
+      scope: ["variable.parameter", "variable.parameter.function"],
+      settings: {
+        foreground: codeSyntax.parameter,
+      },
+    },
+    {
+      scope: ["entity.name.function", "entity.name.function.member", "variable.function"],
+      settings: {
+        foreground: codeSyntax.function,
+      },
+    },
+    {
+      scope: ["support.class.component", "support.type.primitive"],
+      settings: {
+        foreground: codeSyntax.type,
       },
     },
     {
       scope: "keyword",
       settings: {
-        foreground: "var(--syntax-keyword)",
+        foreground: codeSyntax.keyword,
       },
     },
     {
@@ -105,23 +151,22 @@ export const OpenCodeTheme = {
         "keyword.operator",
         "storage.type.function.arrow",
         "punctuation.separator.key-value.css",
-        "entity.name.tag.yaml",
         "punctuation.separator.key-value.mapping.yaml",
       ],
       settings: {
-        foreground: "var(--syntax-operator)",
+        foreground: codeSyntax.operator,
       },
     },
     {
       scope: ["storage", "storage.type"],
       settings: {
-        foreground: "var(--syntax-keyword)",
+        foreground: codeSyntax.keyword,
       },
     },
     {
       scope: ["storage.modifier.package", "storage.modifier.import", "storage.type.java"],
       settings: {
-        foreground: "var(--syntax-primitive)",
+        foreground: codeSyntax.keyword,
       },
     },
     {
@@ -129,40 +174,56 @@ export const OpenCodeTheme = {
         "string",
         "punctuation.definition.string",
         "string punctuation.section.embedded source",
-        "entity.name.tag",
       ],
       settings: {
-        foreground: "var(--syntax-string)",
+        foreground: codeSyntax.string,
       },
     },
     {
-      scope: "support",
+      scope: ["entity.name.tag", "punctuation.definition.tag"],
       settings: {
-        foreground: "var(--syntax-primitive)",
+        foreground: codeSyntax.tag,
       },
     },
     {
-      scope: ["support.type.object.module", "variable.other.object", "support.type.property-name.css"],
+      scope: ["support.function", "support.function.builtin", "support.variable.magic"],
       settings: {
-        foreground: "var(--syntax-object)",
+        foreground: codeSyntax.builtin,
       },
     },
     {
-      scope: "meta.property-name",
+      scope: ["support.type.object.module", "entity.name.namespace", "entity.name.module"],
       settings: {
-        foreground: "var(--syntax-property)",
+        foreground: codeSyntax.namespace,
+      },
+    },
+    {
+      scope: ["variable.other.object"],
+      settings: {
+        foreground: codeSyntax.object,
+      },
+    },
+    {
+      scope: [
+        "meta.property-name",
+        "support.type.property-name",
+        "support.type.property-name.css",
+        "entity.name.tag.yaml",
+      ],
+      settings: {
+        foreground: codeSyntax.property,
       },
     },
     {
       scope: "variable",
       settings: {
-        foreground: "var(--syntax-variable)",
+        foreground: codeSyntax.variable,
       },
     },
     {
       scope: "variable.other",
       settings: {
-        foreground: "var(--syntax-variable)",
+        foreground: codeSyntax.variable,
       },
     },
     {
@@ -172,32 +233,29 @@ export const OpenCodeTheme = {
         "invalid.unimplemented",
         "invalid.deprecated",
         "message.error",
-        "markup.deleted",
-        "meta.diff.header.from-file",
-        "punctuation.definition.deleted",
         "brackethighlighter.unmatched",
         "token.error-token",
       ],
       settings: {
-        foreground: "var(--syntax-critical)",
+        foreground: codeSyntax.critical,
       },
     },
     {
       scope: "carriage-return",
       settings: {
-        foreground: "var(--syntax-keyword)",
+        foreground: codeSyntax.keyword,
       },
     },
     {
       scope: "string source",
       settings: {
-        foreground: "var(--syntax-variable)",
+        foreground: codeSyntax.variable,
       },
     },
     {
       scope: "string variable",
       settings: {
-        foreground: "var(--syntax-constant)",
+        foreground: codeSyntax.constant,
       },
     },
     {
@@ -211,44 +269,44 @@ export const OpenCodeTheme = {
         "string.regexp constant.character.escape",
       ],
       settings: {
-        foreground: "var(--syntax-regexp)",
+        foreground: codeSyntax.regexp,
       },
     },
     {
-      scope: "support.constant",
+      scope: ["constant.character.escape", "constant.character.entity"],
       settings: {
-        foreground: "var(--syntax-primitive)",
+        foreground: codeSyntax.decorator,
       },
     },
     {
-      scope: "support.variable",
+      scope: ["support.constant", "support.variable", "variable.language"],
       settings: {
-        foreground: "var(--syntax-variable)",
+        foreground: codeSyntax.builtin,
       },
     },
     {
       scope: "meta.module-reference",
       settings: {
-        foreground: "var(--syntax-info)",
+        foreground: codeSyntax.namespace,
       },
     },
     {
       scope: "punctuation.definition.list.begin.markdown",
       settings: {
-        foreground: "var(--syntax-punctuation)",
+        foreground: codeSyntax.punctuation,
       },
     },
     {
       scope: ["markup.heading", "markup.heading entity.name"],
       settings: {
         fontStyle: "bold",
-        foreground: "var(--syntax-info)",
+        foreground: codeSyntax.info,
       },
     },
     {
       scope: "markup.quote",
       settings: {
-        foreground: "var(--syntax-info)",
+        foreground: codeSyntax.info,
       },
     },
     {
@@ -266,50 +324,59 @@ export const OpenCodeTheme = {
       },
     },
     {
-      scope: [
-        "markup.raw",
-        "markup.inserted",
-        "meta.diff.header.to-file",
-        "punctuation.definition.inserted",
-        "markup.changed",
-        "punctuation.definition.changed",
-        "markup.ignored",
-        "markup.untracked",
-      ],
+      scope: "markup.raw",
       settings: {
-        foreground: "var(--text-base)",
+        foreground: codeSyntax.foreground,
+      },
+    },
+    {
+      scope: ["markup.inserted", "meta.diff.header.to-file", "punctuation.definition.inserted"],
+      settings: {
+        foreground: "var(--syntax-diff-add)",
+      },
+    },
+    {
+      scope: ["markup.deleted", "meta.diff.header.from-file", "punctuation.definition.deleted"],
+      settings: {
+        foreground: "var(--syntax-diff-delete)",
+      },
+    },
+    {
+      scope: ["markup.changed", "punctuation.definition.changed", "markup.ignored", "markup.untracked"],
+      settings: {
+        foreground: "var(--syntax-diff-unknown)",
       },
     },
     {
       scope: "meta.diff.range",
       settings: {
         fontStyle: "bold",
-        foreground: "var(--syntax-unknown)",
+        foreground: codeSyntax.info,
       },
     },
     {
       scope: "meta.diff.header",
       settings: {
-        foreground: "var(--syntax-unknown)",
+        foreground: codeSyntax.info,
       },
     },
     {
       scope: "meta.separator",
       settings: {
         fontStyle: "bold",
-        foreground: "var(--syntax-unknown)",
+        foreground: codeSyntax.punctuation,
       },
     },
     {
       scope: "meta.output",
       settings: {
-        foreground: "var(--syntax-unknown)",
+        foreground: codeSyntax.foreground,
       },
     },
     {
       scope: "meta.export.default",
       settings: {
-        foreground: "var(--syntax-unknown)",
+        foreground: codeSyntax.keyword,
       },
     },
     {
@@ -322,51 +389,54 @@ export const OpenCodeTheme = {
         "brackethighlighter.quote",
       ],
       settings: {
-        foreground: "var(--syntax-unknown)",
+        foreground: codeSyntax.punctuation,
       },
     },
     {
       scope: ["constant.other.reference.link", "string.other.link"],
       settings: {
         fontStyle: "underline",
-        foreground: "var(--syntax-unknown)",
+        foreground: codeSyntax.info,
       },
     },
     {
       scope: "token.info-token",
       settings: {
-        foreground: "var(--syntax-info)",
+        foreground: codeSyntax.info,
       },
     },
     {
       scope: "token.warn-token",
       settings: {
-        foreground: "var(--syntax-warning)",
+        foreground: codeSyntax.warning,
       },
     },
     {
       scope: "token.debug-token",
       settings: {
-        foreground: "var(--syntax-info)",
+        foreground: codeSyntax.info,
       },
     },
   ],
   semanticTokenColors: {
-    comment: "var(--syntax-comment)",
-    string: "var(--syntax-string)",
-    number: "var(--syntax-constant)",
-    regexp: "var(--syntax-regexp)",
-    keyword: "var(--syntax-keyword)",
-    variable: "var(--syntax-variable)",
-    parameter: "var(--syntax-variable)",
-    property: "var(--syntax-property)",
-    function: "var(--syntax-primitive)",
-    method: "var(--syntax-primitive)",
-    type: "var(--syntax-type)",
-    class: "var(--syntax-type)",
-    namespace: "var(--syntax-type)",
-    enumMember: "var(--syntax-primitive)",
-    "variable.constant": "var(--syntax-constant)",
-    "variable.defaultLibrary": "var(--syntax-unknown)",
+    comment: codeSyntax.comment,
+    string: codeSyntax.string,
+    number: codeSyntax.number,
+    regexp: codeSyntax.regexp,
+    keyword: codeSyntax.keyword,
+    variable: codeSyntax.variable,
+    parameter: codeSyntax.parameter,
+    property: codeSyntax.property,
+    function: codeSyntax.function,
+    method: codeSyntax.method,
+    type: codeSyntax.type,
+    class: codeSyntax.type,
+    interface: codeSyntax.type,
+    enum: codeSyntax.type,
+    namespace: codeSyntax.namespace,
+    decorator: codeSyntax.decorator,
+    enumMember: codeSyntax.constant,
+    "variable.constant": codeSyntax.constant,
+    "variable.defaultLibrary": codeSyntax.builtin,
   },
 } as unknown as ThemeRegistrationResolved

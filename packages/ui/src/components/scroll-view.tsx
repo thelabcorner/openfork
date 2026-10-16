@@ -30,6 +30,8 @@ export interface ScrollViewProps extends ComponentProps<"div"> {
   thumbContainer?: HTMLElement | Accessor<HTMLElement | undefined>
   /** Element whose hover reveals the thumb. Defaults to the ScrollView root when unset. */
   thumbHoverTarget?: HTMLElement | Accessor<HTMLElement | undefined>
+  /** Attribute custom thumb dragging to its owning scroll coordinator. */
+  onThumbScrollIntent?: () => void
 }
 
 export const scrollKey = (event: Pick<KeyboardEvent, "key" | "altKey" | "ctrlKey" | "metaKey" | "shiftKey">) => {
@@ -132,6 +134,7 @@ export function ScrollView(props: ScrollViewProps) {
       "thumbVisibility",
       "thumbContainer",
       "thumbHoverTarget",
+      "onThumbScrollIntent",
       "style",
     ],
     [
@@ -258,6 +261,7 @@ export function ScrollView(props: ScrollViewProps) {
   })
 
   const onThumbPointerDown = (e: PointerEvent) => {
+    local.onThumbScrollIntent?.()
     e.preventDefault()
     e.stopPropagation()
     setState("isDragging", true)
@@ -267,6 +271,7 @@ export function ScrollView(props: ScrollViewProps) {
     thumbRef.setPointerCapture(e.pointerId)
 
     const onPointerMove = (e: PointerEvent) => {
+      local.onThumbScrollIntent?.()
       const { scrollHeight, clientHeight } = viewportRef
       viewportRef.scrollTop = scrollTopFromThumbPointer({
         pointer: e.clientY,

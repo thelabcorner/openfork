@@ -430,6 +430,54 @@ export function resolveThemeVariant(variant: ThemeVariant, isDark: boolean): Res
     tokens[key] = value
   }
 
+  const syntaxAliases = [
+    ["syntax-function", "syntax-primitive"],
+    ["syntax-method", "syntax-function"],
+    ["syntax-parameter", "syntax-variable"],
+    ["syntax-number", "syntax-constant"],
+    ["syntax-decorator", "syntax-type"],
+    ["syntax-tag", "syntax-keyword"],
+    ["syntax-attribute", "syntax-property"],
+    ["syntax-builtin", "syntax-primitive"],
+    ["syntax-namespace", "syntax-type"],
+    ["syntax-label", "syntax-info"],
+  ] as const
+  for (const [key, fallback] of syntaxAliases) {
+    if (!(key in overrides)) tokens[key] = tokens[fallback]
+  }
+
+  const syntaxCodeAliases = [
+    ["syntax-code-foreground", "text-base"],
+    ["syntax-code-comment", "syntax-comment"],
+    ["syntax-code-regexp", "syntax-regexp"],
+    ["syntax-code-keyword", "syntax-keyword"],
+    ["syntax-code-string", "syntax-string"],
+    ["syntax-code-primitive", "syntax-primitive"],
+    ["syntax-code-operator", "syntax-operator"],
+    ["syntax-code-variable", "syntax-variable"],
+    ["syntax-code-property", "syntax-property"],
+    ["syntax-code-type", "syntax-type"],
+    ["syntax-code-constant", "syntax-constant"],
+    ["syntax-code-punctuation", "syntax-punctuation"],
+    ["syntax-code-object", "syntax-code-variable"],
+    ["syntax-code-function", "syntax-function"],
+    ["syntax-code-method", "syntax-code-function"],
+    ["syntax-code-parameter", "syntax-parameter"],
+    ["syntax-code-number", "syntax-code-constant"],
+    ["syntax-code-decorator", "syntax-code-type"],
+    ["syntax-code-tag", "syntax-code-keyword"],
+    ["syntax-code-attribute", "syntax-code-property"],
+    ["syntax-code-builtin", "syntax-code-primitive"],
+    ["syntax-code-namespace", "syntax-code-type"],
+    ["syntax-code-info", "syntax-info"],
+    ["syntax-code-label", "syntax-code-info"],
+    ["syntax-code-warning", "syntax-warning"],
+    ["syntax-code-critical", "syntax-critical"],
+  ] as const
+  for (const [key, fallback] of syntaxCodeAliases) {
+    if (!(key in overrides)) tokens[key] = tokens[fallback]
+  }
+
   if (colors.compact && "text-weak" in overrides && !("text-weaker" in overrides)) {
     const weak = tokens["text-weak"]
     if (weak.startsWith("#")) {

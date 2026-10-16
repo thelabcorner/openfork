@@ -1,12 +1,15 @@
-import { createContext, createMemo, Show, useContext, type ParentProps, type Accessor } from "solid-js"
+import { createMemo, Show, useContext, type ParentProps, type Accessor } from "solid-js"
+import { createStableContext } from "./stable-context"
 
 export function createSimpleContext<T, Props extends Record<string, any>>(
   input: {
     name: string
+    /** Stable, globally unique identity for providers that may outlive HMR. */
+    hmrKey?: string
     init: ((input: Props) => T) | (() => T)
   } & (T extends { ready: unknown } ? { gate: boolean } : { gate?: boolean }),
 ) {
-  const ctx = createContext<T>()
+  const ctx = createStableContext<T>(input.hmrKey)
 
   return {
     provider: (props: ParentProps<Props>) => {

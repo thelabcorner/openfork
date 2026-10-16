@@ -29,6 +29,12 @@ describe("isProgrammaticScroll", () => {
 })
 
 describe("classifyAutoScroll", () => {
+  test("content shrink and unmarked virtualizer corrections cannot manufacture user intent", () => {
+    expect(classifyAutoScroll({ ...thresholds, distance: 80, delta: -240, isProgrammatic: false, hasUserScrollGesture: false })).toBe("hold")
+    expect(classifyAutoScroll({ ...thresholds, distance: 0, delta: -240, isProgrammatic: false, hasUserScrollGesture: false })).toBe("hold")
+    expect(classifyAutoScroll({ ...thresholds, distance: 80, delta: -240, isProgrammatic: false, hasUserScrollGesture: true })).toBe("escape")
+    expect(classifyAutoScroll({ ...thresholds, distance: 0, delta: 240, isProgrammatic: true, hasUserScrollGesture: false })).toBe("prog")
+  })
   test("treats programmatic frames as prog unless the user is moving up decisively", () => {
     expect(classifyAutoScroll({ ...thresholds, distance: 0, delta: 0, isProgrammatic: true })).toBe("prog")
     expect(classifyAutoScroll({ ...thresholds, distance: 4, delta: -2, isProgrammatic: true })).toBe("escape")
