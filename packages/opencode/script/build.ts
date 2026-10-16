@@ -3,7 +3,7 @@
 import { $ } from "bun"
 import path from "path"
 import { fileURLToPath } from "url"
-import { chmod, rm, writeFile } from "node:fs/promises"
+import { chmod, copyFile, link, rm, writeFile } from "node:fs/promises"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 import { validateChunkDbCapability } from "./chunkdb-capability"
 
@@ -20,16 +20,24 @@ import {
   LEGACY_PRODUCT_EXECUTABLE,
   PRODUCT_EXECUTABLE,
   PRODUCT_REPOSITORY,
-  PRODUCT_SLUG,
 } from "@opencode-ai/core/brand"
+// The CLI release matrix has exactly one authority. `script/release-assets.ts`
+// derives the expected published archive inventory from the same CLI_TARGETS
+// and the same target-name helpers used below, so a release can never publish a
+// name the inventory gate does not require (or the reverse).
+import { CLI_TARGETS, bunCompileTarget, cliTargetSlug } from "./release-assets.ts"
 import pkg from "../package.json"
 import manifest from "../../../keep-manifest.json"
-import { T3_CODE_COMPAT_EXECUTABLE, T3_CODE_COMPAT_PROFILE } from "../src/compat/t3code"
+import { T3_CODE_COMPAT_EXECUTABLE, T3_CODE_COMPAT_PROFILE, T3_CODE_OPEN_CODE_COMPATIBILITY_VERSION } from "../src/compat/t3code"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
 const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
+// Optional release admission gate: the lightweight --version smoke cannot
+// detect broken SQLite worker entrypoints or ACP session bootstrap. Run the
+// existing real packaged ACP fixture only when explicitly requested.
+const verifyPackagedAcp = process.argv.includes("--verify-packaged-acp")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
 
@@ -65,68 +73,7 @@ const createEmbeddedWebUIBundle = async () => {
 const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle()
 const treeSitterWorker = await Bun.file(fileURLToPath(import.meta.resolve("@opentui/core/parser.worker"))).text()
 
-const allTargets: {
-  os: string
-  arch: "arm64" | "x64"
-  abi?: "musl"
-  avx2?: false
-}[] = [
-  {
-    os: "linux",
-    arch: "arm64",
-  },
-  {
-    os: "linux",
-    arch: "x64",
-  },
-  {
-    os: "linux",
-    arch: "x64",
-    avx2: false,
-  },
-  {
-    os: "linux",
-    arch: "arm64",
-    abi: "musl",
-  },
-  {
-    os: "linux",
-    arch: "x64",
-    abi: "musl",
-  },
-  {
-    os: "linux",
-    arch: "x64",
-    abi: "musl",
-    avx2: false,
-  },
-  {
-    os: "darwin",
-    arch: "arm64",
-  },
-  {
-    os: "darwin",
-    arch: "x64",
-  },
-  {
-    os: "darwin",
-    arch: "x64",
-    avx2: false,
-  },
-  {
-    os: "win32",
-    arch: "arm64",
-  },
-  {
-    os: "win32",
-    arch: "x64",
-  },
-  {
-    os: "win32",
-    arch: "x64",
-    avx2: false,
-  },
-]
+const allTargets = CLI_TARGETS
 
 const targets = singleFlag
   ? allTargets.filter((item) => {
@@ -149,7 +96,10 @@ const targets = singleFlag
     })
   : allTargets
 
-const distDir = path.join(dir, "dist")
+// Allow isolated local verification builds to write outside the shared package
+// dist tree. Release builds keep the historical default unless explicitly set.
+const distDir = path.resolve(process.env.OPENFORK_BUILD_OUTPUT_DIR ?? path.join(dir, "dist"))
+let packagedAcpVerified = false
 
 const binaries: Record<string, string> = {}
 if (!skipInstall) {
@@ -158,25 +108,20 @@ if (!skipInstall) {
   await $`bun install --os="*" --cpu="*" @ff-labs/fff-bun@${pkg.dependencies["@ff-labs/fff-bun"]}`
 }
 for (const item of targets) {
-  const targetParts = [
-    // Bun names its Windows compile target "windows", not "win32".
-    item.os === "win32" ? "windows" : item.os,
-    item.arch,
-    item.avx2 === false ? "baseline" : undefined,
-    item.abi === undefined ? undefined : item.abi,
-  ]
-    .filter(Boolean)
-  const name = [PRODUCT_SLUG, ...targetParts].join("-")
-  const bunTarget = ["bun", ...targetParts].join("-")
+  const name = cliTargetSlug(item)
+  const bunTarget = bunCompileTarget(item)
   console.log(`building ${name}`)
   // Clean only the target we are about to replace. `dist/node` may be serving a
   // live Electron sidecar, and unrelated historical/cross-platform output may
   // legitimately be locked by another process. A single-target build must not
   // fail because some other dist subtree cannot be removed.
   await rm(path.join(distDir, name), { recursive: true, force: true })
-  await $`mkdir -p dist/${name}/bin`
+  const targetDir = path.join(distDir, name)
+  const binDir = path.join(targetDir, "bin")
+  await $`mkdir -p ${binDir}`
 
   const workerPath = "./src/cli/tui/worker.ts"
+  const sqliteWorkerPath = "../core/src/database/sqlite-bun-worker.ts"
   const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
 
@@ -189,13 +134,19 @@ for (const item of targets) {
     minify: true,
     sourcemap: sourcemapsFlag ? "linked" : "none",
     splitting: true,
+    // Bun 1.4's compiled virtual FS must expose secondary worker entrypoints
+    // at the basename used by new Worker(new URL("./sqlite-bun-worker.ts",
+    // import.meta.url)). Without this, the compiled Windows CLI fails to
+    // resolve B:/~BUN/root/sqlite-bun-worker.ts at runtime even when the
+    // worker was explicitly included in entrypoints.
+    naming: { entry: "[name].[ext]" },
     compile: {
       autoloadBunfig: false,
       autoloadDotenv: false,
       autoloadTsconfig: true,
       autoloadPackageJson: true,
       target: bunTarget as any,
-      outfile: `dist/${name}/bin/${PRODUCT_EXECUTABLE}`,
+      outfile: path.join(binDir, PRODUCT_EXECUTABLE),
       execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
       windows: {},
     },
@@ -206,6 +157,7 @@ for (const item of targets) {
     entrypoints: [
       "./src/index.ts",
       workerPath,
+      sqliteWorkerPath,
       treeSitterWorkerPath,
       ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
     ],
@@ -216,7 +168,9 @@ for (const item of targets) {
       OPENCODE_UPSTREAM_COMPAT_VERSION: JSON.stringify(upstreamCompatVersion),
       OPENCODE_MODELS_DEV: generated.modelsData,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
-      OPENCODE_WORKER_PATH: workerPath,
+      // TUI is likewise a secondary entrypoint; naming flattens its virtual
+      // path to worker.js, so the runtime worker locator must match.
+      OPENCODE_WORKER_PATH: JSON.stringify("./worker.js"),
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
       ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),
@@ -227,7 +181,7 @@ for (const item of targets) {
   // command as a transparent forwarding compatibility surface so existing
   // OpenFork scripts do not silently enter a consumer-specific profile.
   const compatibilityPath = path.join(
-    "dist",
+    distDir,
     name,
     "bin",
     item.os === "win32" ? `${LEGACY_PRODUCT_EXECUTABLE}.cmd` : LEGACY_PRODUCT_EXECUTABLE,
@@ -240,7 +194,7 @@ for (const item of targets) {
   if (item.os !== "win32") await chmod(compatibilityPath, 0o755)
 
   const devLauncherPath = path.join(
-    "dist",
+    distDir,
     name,
     "bin",
     item.os === "win32" ? "opencode-dev.cmd" : "opencode-dev",
@@ -256,7 +210,7 @@ for (const item of targets) {
   // configurable OpenCode binaryPath, so this consumer-specific compatibility
   // profile does not need to leak into canonical or historical OpenFork entrypoints.
   const t3CodeCompatibilityPath = path.join(
-    "dist",
+    distDir,
     name,
     "bin",
     item.os === "win32" ? `${T3_CODE_COMPAT_EXECUTABLE}.cmd` : T3_CODE_COMPAT_EXECUTABLE,
@@ -268,16 +222,29 @@ for (const item of targets) {
   await writeFile(t3CodeCompatibilityPath, t3CodeCompatibilityLauncher)
   if (item.os !== "win32") await chmod(t3CodeCompatibilityPath, 0o755)
 
+  // Windows managed clients can invoke the native executable directly rather
+  // than using a batch shell. Only this invoked basename activates the T3
+  // compatibility profile; canonical openfork.exe retains its product identity.
+  if (item.os === "win32") {
+    const source = path.join(binDir, `${PRODUCT_EXECUTABLE}.exe`)
+    const alias = path.join(binDir, `${T3_CODE_COMPAT_EXECUTABLE}.exe`)
+    try {
+      await link(source, alias)
+    } catch {
+      await copyFile(source, alias)
+    }
+  }
+
   // Embedding the bundle invalidates the linker's ad-hoc signature, and macOS 27+
   // SIGKILLs binaries with invalid pages. Re-sign ad-hoc; release CI re-signs with Developer ID.
   if (item.os === "darwin" && process.platform === "darwin") {
-    await $`codesign --force --sign - ${path.join("dist", name, "bin", PRODUCT_EXECUTABLE)}`
+    await $`codesign --force --sign - ${path.join(binDir, PRODUCT_EXECUTABLE)}`
   }
 
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
     const binaryPath = path.join(
-      "dist",
+      distDir,
       name,
       "bin",
       item.os === "win32" ? `${PRODUCT_EXECUTABLE}.exe` : PRODUCT_EXECUTABLE,
@@ -286,16 +253,74 @@ for (const item of targets) {
     try {
       const versionOutput = await $`${binaryPath} --version`.text()
       console.log(`Smoke test passed: ${versionOutput.trim()}`)
+      if (item.os === "win32") {
+        const alias = path.join(binDir, `${T3_CODE_COMPAT_EXECUTABLE}.exe`)
+        const compatVersion = (await $`${alias} --version`.text()).trim()
+        if (compatVersion !== T3_CODE_OPEN_CODE_COMPATIBILITY_VERSION) {
+          throw new Error(`T3 executable alias version mismatch: ${compatVersion}`)
+        }
+        console.log(`T3 alias version passed: ${compatVersion}`)
+      }
       const chunkDb = await validateChunkDbCapability(path.resolve(binaryPath))
       console.log(`ChunkDB capability smoke passed: user_version ${chunkDb.userVersion}`)
+      if (verifyPackagedAcp) {
+        // The cert runs the *compiled* executable, speaks real ACP, exercises
+        // the async SQLite worker and V1 session lifecycle, and uses its own
+        // disposable database and local mock provider. --binary prevents a
+        // nested recursive build; nonzero verdict fails the packaging gate.
+        const command = [
+          "bun", "run", "script/sqlite-acp-cert-20261011/smoke-cert.ts",
+          "--binary", path.resolve(binaryPath),
+          "--driver", "default", "--stdout-json",
+        ]
+        const child = Bun.spawn(command, {
+          cwd: dir, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+        })
+        const deadline = setTimeout(() => child.kill(), 120_000)
+        let code: number
+        let output: string
+        let errors: string
+        try {
+          ;[code, output, errors] = await Promise.all([
+            child.exited,
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+          ])
+        } finally {
+          clearTimeout(deadline)
+        }
+        const report = (() => {
+          try {
+            return JSON.parse(output) as {
+              verdict?: string
+              checks?: { name: string; status: string }[]
+            }
+          } catch {
+            throw new Error(`Packaged ACP certification did not emit JSON: ${output.slice(-1200)}`)
+          }
+        })()
+        const checks = report.checks ?? []
+        const required = [
+          "initialize.protocolVersion", "session/new.sessionId",
+          "session/list.membership", "lock-release.external-write",
+          "cancel.prompt.cancelled", "session/close", "exit.code",
+          "protocol.clean-stdout", "db.integrity", "fixture.released",
+        ]
+        if (code !== 0 || report.verdict !== "pass" ||
+            required.some((name) => !checks.some((check) => check.name === name && check.status === "pass"))) {
+          throw new Error(`Packaged ACP certification failed for ${name}: exit=${code} verdict=${report.verdict ?? "missing"} checks=${JSON.stringify(checks.filter((check) => check.status !== "pass"))} stderr=${errors.slice(-1200)}`)
+        }
+        packagedAcpVerified = true
+        console.log(`Packaged ACP certification passed: ${checks.length} checks, real SQLite worker and V1 session lifecycle`)
+      }
     } catch (e) {
       console.error(`Smoke test failed for ${name}:`, e)
       process.exit(1)
     }
   }
 
-  await $`rm -rf ./dist/${name}/bin/tui`
-  await Bun.file(`dist/${name}/package.json`).write(
+  await rm(path.join(binDir, "tui"), { recursive: true, force: true })
+  await Bun.file(path.join(targetDir, "package.json")).write(
     JSON.stringify(
       {
         name,
@@ -312,16 +337,20 @@ for (const item of targets) {
   binaries[name] = Script.version
 }
 
+if (verifyPackagedAcp && !packagedAcpVerified) {
+  throw new Error("--verify-packaged-acp requested, but no native executable was certified")
+}
+
 if (Script.release) {
   for (const key of Object.keys(binaries)) {
     if (key.includes("linux")) {
-      await $`tar -czf ../../${key}.tar.gz *`.cwd(`dist/${key}/bin`)
+      await $`tar -czf ${path.join(distDir, `${key}.tar.gz`)} *`.cwd(path.join(distDir, key, "bin"))
     } else {
-      await $`zip -r ../../${key}.zip *`.cwd(`dist/${key}/bin`)
+      await $`zip -r ${path.join(distDir, `${key}.zip`)} *`.cwd(path.join(distDir, key, "bin"))
     }
   }
   const repository = process.env.GH_REPO ?? PRODUCT_REPOSITORY
-  await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz --clobber --repo ${repository}`
+  await $`gh release upload v${Script.version} ${path.join(distDir, "*.zip")} ${path.join(distDir, "*.tar.gz")} --clobber --repo ${repository}`
 }
 
 export { binaries }

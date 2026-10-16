@@ -49,6 +49,11 @@ try {
       entrypoints: ["./src/node.ts"],
       outdir: "./dist/node",
       format: "esm",
+      // Runtime refresh transactionally owns exactly dist/node/node.js, not a
+      // multi-file chunk graph. Bun inlines dynamically imported active OXP
+      // modules into this one artifact with splitting disabled while retaining
+      // deferred evaluation. Never split the sidecar into sibling JS chunks.
+      splitting: false,
       sourcemap: "linked",
       external: ["jsonc-parser", "@lydell/node-pty"],
       // Claude first-party: @anthropic-ai/claude-agent-sdk is optionalDependency (package.json) but
@@ -110,11 +115,25 @@ async function acquireBuildLock() {
       }
       const match = /^(?:build|trial|startup):(\d+)(?::|$)/.exec(owner)
       const pid = match ? Number(match[1]) : undefined
-      if (pid !== undefined && processAlive(pid)) return false
+      if (pid !== undefined && processAlive(pid) && !(await expiredRuntimeTransaction(owner))) return false
       await fs.rm(artifactLockFile, { force: true }).catch(() => undefined)
     }
   }
   return false
+}
+
+// Refresh trials normally terminate within their acceptance window. A crashed
+// transaction can leave its lock behind while the long-lived Electron PID is
+// still alive, so PID existence alone cannot establish that the transaction
+// still owns the artifact directory. Allow a generous recovery margin.
+async function expiredRuntimeTransaction(owner: string) {
+  if (!owner.startsWith("trial:") && !owner.startsWith("startup:")) return false
+  try {
+    const info = await fs.stat(artifactLockFile)
+    return Date.now() - info.mtimeMs > 2 * 60_000
+  } catch {
+    return true
+  }
 }
 
 async function releaseBuildLock() {
@@ -145,7 +164,15 @@ async function isFresh() {
 
 async function buildOrThrow(options: Parameters<typeof Bun.build>[0]) {
   const result = await Bun.build(options)
-  if (result.success) return result
+  if (result.success) {
+    if (options.entrypoints?.length === 1 && options.entrypoints[0] === "./src/node.ts") {
+      const jsOutputs = result.outputs.filter((output) => output.path.endsWith(".js"))
+      if (jsOutputs.length !== 1 || path.basename(jsOutputs[0]!.path) !== "node.js") {
+        throw new Error("Node sidecar must remain a single node.js artifact for transactional OXP runtime refresh")
+      }
+    }
+    return result
+  }
   for (const log of result.logs) console.error(log)
   throw new Error("Node sidecar build failed")
 }
