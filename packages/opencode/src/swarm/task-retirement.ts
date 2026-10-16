@@ -26,12 +26,13 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Sw
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db } = yield* Database.Service
+    const { db, readDb } = yield* Database.Service
     const events = yield* EventV2.Service
     const swarm = yield* SwarmV2.Service
     const execution = yield* SessionExecutionOwner.Service
     const retention = yield* SwarmRuntimeRetention.Service
     const started = yield* Ref.make(false)
+    const retiringCursor = yield* Ref.make<Swarm.TaskID | undefined>(undefined)
     const startLock = Semaphore.makeUnsafe(1)
 
     const settleOperational = Effect.fn("SwarmTaskRetirement.settle")(function* (
@@ -85,7 +86,7 @@ export const layer = Layer.effect(
       // An unrecognized or absent reason keeps today's operational settlement.
       if (reason === undefined || !antiReplayRetireReasons.has(reason)) return undefined
       if (input?.completedSeq === undefined) return undefined
-      const hazards = yield* SessionRecovery.executionHazards(db, target.token.sessionID)
+      const hazards = yield* SessionRecovery.executionHazards(readDb, target.token.sessionID)
       if (hazards.currentTool || hazards.legacyTool) {
         yield* Effect.logWarning("Swarm retirement keeps a completed assignment fenced by unresolved execution effects", {
           taskID: target.token.taskID,
@@ -190,7 +191,7 @@ export const layer = Layer.effect(
         yield* execution.requestInterrupt(target.token.sessionID, "handoff")
       }
 
-      const recovery = yield* SessionRecovery.recoverDeadOwnerIfQuiescent(db, execution, target.token.sessionID)
+       const recovery = yield* SessionRecovery.recoverDeadOwnerIfQuiescent(readDb, execution, target.token.sessionID, events)
       if (recovery.state === "recovered" || recovery.state === "idle") {
         // `recovered` is only reachable when the dead owner had NO unresolved
         // tool effects, so this cannot weaken effect-unknown safety: a fenced
@@ -198,7 +199,13 @@ export const layer = Layer.effect(
         yield* settleRun
         return
       }
-      if (recovery.state === "effect-unknown") {
+       if (recovery.state === "transcript-unverifiable") {
+         yield* Effect.logWarning("Swarm child transcript remains fenced pending operator recovery", {
+           sessionID: target.token.sessionID, generation: recovery.token.generation, reason: recovery.reason,
+         })
+         return
+       }
+       if (recovery.state === "effect-unknown") {
         // Do not seal the unresolved tool rows yet. Until OS containment or an
         // explicit operator acknowledgement exists, those rows are the durable
         // evidence preventing a later recovery process from mistaking the
@@ -244,9 +251,26 @@ export const layer = Layer.effect(
         { concurrency: SwarmRuntimePolicy.RETIREMENT_CONCURRENCY, discard: true },
       )
 
-      const retiring = yield* swarm.retiringTargets({
+      const cursor = yield* Ref.get(retiringCursor)
+      let retiring = yield* swarm.retiringTargets({
         limit: SwarmRuntimePolicy.RETIREMENT_BATCH,
+        ...(cursor === undefined ? {} : { afterTaskID: cursor }),
       })
+      // A blocked retirement must not permanently monopolize the bounded batch.
+      // Advance a keyset cursor across probes and wrap only after the tail. The
+      // cursor is latency state, not authority: every target is re-read from the
+      // durable retiring lease set before reconciliation.
+      if (retiring.length === 0 && cursor !== undefined) {
+        yield* Ref.set(retiringCursor, undefined)
+        retiring = yield* swarm.retiringTargets({ limit: SwarmRuntimePolicy.RETIREMENT_BATCH })
+      }
+      if (retiring.length > 0) {
+        const last = retiring[retiring.length - 1]!
+        yield* Ref.set(
+          retiringCursor,
+          retiring.length < SwarmRuntimePolicy.RETIREMENT_BATCH ? undefined : last.token.taskID,
+        )
+      }
       yield* Effect.forEach(
         retiring,
         (target) =>

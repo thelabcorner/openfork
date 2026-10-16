@@ -14,6 +14,7 @@ import { RuntimeOwner } from "@opencode-ai/core/runtime-owner"
 import { RuntimeOwnerTable } from "@opencode-ai/core/runtime-owner.sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
 import { SessionExecutionOwnerTable } from "@opencode-ai/core/session/execution-owner.sql"
@@ -22,7 +23,7 @@ import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionMessageProjection } from "@opencode-ai/core/session/message-projection"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionRecovery } from "@opencode-ai/core/session/recovery"
-import { SessionMessageTable, SessionMessageToolOverlayTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { PartTable, SessionMessageTable, SessionMessageToolOverlayTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SwarmSessionProjector } from "@opencode-ai/core/swarm-session-projector"
 import { SwarmTable, SwarmTaskLeaseTable, SwarmTaskRunTable, SwarmTaskTable } from "@opencode-ai/core/swarm/sql"
@@ -32,6 +33,7 @@ import { Agent as AgentModel } from "@opencode-ai/schema/agent"
 import { SessionTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
 import { Swarm } from "@opencode-ai/schema/swarm"
 import { SwarmContainment } from "@/swarm/containment"
+import { SessionID } from "@/session/schema"
 import { SwarmRuntimeRetention } from "@/swarm/runtime-retention"
 import { SwarmTaskRetirement } from "@/swarm/task-retirement"
 import { testEffect } from "../lib/effect"
@@ -331,6 +333,88 @@ const swarmRowFor = (id: Swarm.ID) =>
   )
 
 describe("Swarm operator containment", () => {
+  it.effect("automatic recovery fences unresolved effects until explicit containment", () =>
+    Effect.gen(function* () {
+      const state = yield* setupFenced
+      const sessionID = SessionID.make(workerSessionID)
+       expect((yield* SessionRecovery.recoverDeadOwnerIfQuiescent(state.db, state.execution, sessionID, state.events)).state).toBe("effect-unknown")
+      expect((yield* state.execution.snapshot(workerSessionID)).ownerID).toBe(deadRuntimeID)
+      expect(yield* SessionRecovery.executionHazards(state.db, workerSessionID)).toEqual({ currentTool: true, legacyTool: false })
+      yield* state.containment.acknowledge({ taskID: state.task.id, generation: state.claim.token.generation })
+       expect((yield* SessionRecovery.recoverDeadOwnerIfQuiescent(state.db, state.execution, sessionID, state.events)).state).toBe("idle")
+    }),
+  )
+
+  it.effect("parks an unknown task before removing the hazards that fence unattended redispatch", () =>
+    Effect.gen(function* () {
+      const state = yield* setupFenced
+      const original = state.swarm.settleTask
+      let checked = false
+      Object.defineProperty(state.swarm, "settleTask", { configurable: true, value: (input: Parameters<typeof original>[0]) =>
+        Effect.gen(function* () {
+          if (input.settlement.type === "contained_unknown") {
+            checked = true
+            expect((yield* state.execution.snapshot(workerSessionID)).ownerID).toBe(deadRuntimeID)
+            expect(yield* SessionRecovery.executionHazards(state.db, workerSessionID)).toEqual({ currentTool: true, legacyTool: false })
+          }
+          return yield* original(input)
+        }),
+      })
+      yield* state.containment.acknowledge({ taskID: state.task.id, generation: state.claim.token.generation }).pipe(
+        Effect.ensuring(Effect.sync(() => Object.defineProperty(state.swarm, "settleTask", { configurable: true, value: original }))),
+      )
+      expect(checked).toBe(true)
+      expect(yield* taskRowFor(state)).toEqual({ status: "review_pending", retry: 0 })
+      expect(yield* state.swarm.readyAssignments({ now: 60, limit: 16 })).toEqual([])
+      expect((yield* state.execution.snapshot(workerSessionID)).ownerID).toBeUndefined()
+    }),
+  )
+
+  it.effect("recovers an orphaned member without a task lease and preserves its binding", () =>
+    Effect.gen(function* () {
+      const state = yield* setupFenced
+      const member = (yield* state.swarm.get(state.info.id)).members.find((item) => item.sessionID === workerSessionID)!
+      yield* state.db.delete(SwarmTaskLeaseTable).where(eq(SwarmTaskLeaseTable.task_id, state.task.id)).run().pipe(Effect.orDie)
+      const result = yield* state.containment.acknowledgeSession({ swarmID: state.info.id, memberID: member.id })
+      expect(result).toEqual({ state: "contained", sessionID: workerSessionID, sealed: 1 })
+      expect(yield* state.execution.snapshot(workerSessionID)).not.toHaveProperty("ownerID")
+      expect(yield* SessionRecovery.executionHazards(state.db, workerSessionID)).toEqual({ currentTool: false, legacyTool: false })
+      const after = (yield* state.swarm.get(state.info.id)).members.find((item) => item.id === member.id)!
+      expect(after.sessionID).toBe(member.sessionID)
+      expect(after.bindingGeneration).toBe(member.bindingGeneration)
+      expect(yield* toolSuccessEvents(state)).toBe(0)
+      expect(yield* state.containment.acknowledgeSession({ swarmID: state.info.id, memberID: member.id })).toEqual({ state: "idle" })
+    }),
+  )
+
+  it.effect("routes task-owned recovery through retirement rather than releasing its session fence", () =>
+    Effect.gen(function* () {
+      const state = yield* setupFenced
+      const member = (yield* state.swarm.get(state.info.id)).members.find((item) => item.sessionID === workerSessionID)!
+      expect(yield* state.containment.acknowledgeSession({ swarmID: state.info.id, memberID: member.id })).toEqual({
+        state: "task-owned", taskID: state.task.id, leaseGeneration: state.claim.token.generation,
+      })
+      expect((yield* state.execution.snapshot(workerSessionID)).ownerID).toBe(deadRuntimeID)
+      expect(yield* SessionRecovery.executionHazards(state.db, workerSessionID)).toEqual({ currentTool: true, legacyTool: false })
+    }),
+  )
+
+  it.effect("does not bypass task-owned recovery when only the runtime owner ID appears live", () =>
+    Effect.gen(function* () {
+      const state = yield* setupFenced
+      const member = (yield* state.swarm.get(state.info.id)).members.find((item) => item.sessionID === workerSessionID)!
+      yield* state.db.update(SessionExecutionOwnerTable).set({ owner_id: currentRuntimeID, recovery_owner_id: null, recovery_started_at: null })
+        .where(eq(SessionExecutionOwnerTable.session_id, workerSessionID)).run().pipe(Effect.orDie)
+      // A current-runtime owner ID is not proof that the worker is executing.
+      // Regardless of apparent PID liveness, a bound lease must be handled
+      // through task retirement, never sealed by the member-only endpoint.
+      const result = yield* state.containment.acknowledgeSession({ swarmID: state.info.id, memberID: member.id })
+      expect(result.state).toBe("task-owned")
+      expect((yield* state.execution.snapshot(workerSessionID)).ownerID).toBe(currentRuntimeID)
+      expect(yield* SessionRecovery.executionHazards(state.db, workerSessionID)).toEqual({ currentTool: true, legacyTool: false })
+    }),
+  )
+
   it.effect("surfaces a retiring lease fenced by unresolved effects without resolving it", () =>
     Effect.gen(function* () {
       const state = yield* setupFenced
@@ -353,6 +437,70 @@ describe("Swarm operator containment", () => {
       expect((yield* overlayFor(state))?.settlement_event_id).toBeNull()
       expect(yield* leaseFor(state)).toMatchObject({ state: "retiring" })
       expect(yield* runFor(state)).toMatchObject({ status: "running" })
+    }),
+  )
+
+  it.effect("operator overview reports fenced task effects for a project without a coordinator session", () =>
+    Effect.gen(function* () {
+      const state = yield* setupFenced
+      const overview = yield* state.containment.operatorOverview({ projectID, limit: 16 })
+      expect(overview.effects).toHaveLength(1)
+      expect(overview.effects[0]).toMatchObject({
+        swarmID: state.info.id,
+        taskID: state.task.id,
+        leaseGeneration: state.claim.token.generation,
+        sessionID: workerSessionID,
+        hazards: { currentTool: true, legacyTool: false },
+      })
+      expect(overview.reviewBacklog).toHaveLength(0)
+      expect(overview.boundSessions).toHaveLength(0)
+      expect(overview.truncated).toEqual({ effects: false, reviewBacklog: false, boundSessions: false, swarms: false })
+
+      // Once an operator reaches the coordinator-less review exit, the same
+      // overview shows the parked task and no remaining execution fence.
+      yield* state.containment.acknowledge({ taskID: state.task.id, generation: state.claim.token.generation })
+      const parked = yield* state.containment.operatorOverview({ projectID, limit: 16 })
+      const task = (yield* state.swarm.get(state.info.id)).tasks.find((item) => item.id === state.task.id)!
+      expect(parked.effects).toHaveLength(0)
+      expect(parked.reviewBacklog).toEqual([
+        {
+          swarmID: state.info.id,
+          taskID: state.task.id,
+          title: "uncertain tool",
+          status: "review_pending",
+          leaseGeneration: task.leaseGeneration,
+        },
+      ])
+    }),
+  )
+
+  it.effect("operator overview lists a proven-dead bound Session only when no lease owns the fence", () =>
+    Effect.gen(function* () {
+      const state = yield* setupFenced
+      const member = (yield* state.swarm.get(state.info.id)).members.find((item) => item.sessionID === workerSessionID)!
+
+      // While the task lease exists the limbo is task-owned: it must not be
+      // listed as a Session to recover.
+      const scoped = yield* state.containment.operatorOverview({ projectID, swarmID: state.info.id, limit: 16 })
+      expect(scoped.effects).toHaveLength(1)
+      expect(scoped.boundSessions).toHaveLength(0)
+
+      yield* state.db.delete(SwarmTaskLeaseTable).where(eq(SwarmTaskLeaseTable.task_id, state.task.id)).run().pipe(Effect.orDie)
+      const orphaned = yield* state.containment.operatorOverview({ projectID, swarmID: state.info.id, limit: 16 })
+      expect(orphaned.effects).toHaveLength(0)
+      expect(orphaned.boundSessions).toHaveLength(1)
+      expect(orphaned.boundSessions[0]).toMatchObject({
+        memberID: member.id,
+        memberName: "worker",
+        sessionID: workerSessionID,
+        sessionGeneration: 7,
+        deadOwnerID: deadRuntimeID,
+        hazards: { currentTool: true, legacyTool: false },
+      })
+
+      yield* state.containment.acknowledgeSession({ swarmID: state.info.id, memberID: member.id })
+      const after = yield* state.containment.operatorOverview({ projectID, swarmID: state.info.id, limit: 16 })
+      expect(after.boundSessions).toHaveLength(0)
     }),
   )
 
@@ -407,6 +555,103 @@ describe("Swarm operator containment", () => {
       // re-dispatched. Only `review_pending` is present, never `ready`.
       const ready = yield* state.swarm.readyAssignments({ now: 47, limit: 16 })
       expect(ready.some((assignment) => assignment.task.id === state.task.id)).toBe(false)
+    }),
+  )
+
+  it.effect("acknowledgement seals a retained V1 tool hazard before releasing the recovery fence", () =>
+    Effect.gen(function* () {
+      const state = yield* setupFenced
+
+      // Retire the normalized/current hazard first, then add a legacy-only V1
+      // ToolPart. This reproduces the production failure where recovery remains
+      // fenced with hazards.currentTool=false / hazards.legacyTool=true.
+      expect(yield* SessionRecovery.failInterruptedTools(state.db, state.events, workerSessionID)).toEqual({
+        candidates: 1,
+        settled: 1,
+      })
+
+      const messageID = SessionV1.MessageID.make("msg_swarm_containment_legacy")
+      const partID = SessionV1.PartID.make("prt_swarm_containment_legacy")
+      yield* state.events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID: workerSessionID,
+        info: SessionV1.Assistant.make({
+          id: messageID,
+          sessionID: workerSessionID,
+          role: "assistant",
+          time: { created: 47 },
+          parentID: SessionV1.MessageID.make("msg_swarm_containment_legacy_parent"),
+          modelID: "test-model" as never,
+          providerID: "test" as never,
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/swarm/containment", root: "/swarm/containment" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        }),
+      })
+      yield* state.events.publish(SessionV1.Event.PartUpdated, {
+        sessionID: workerSessionID,
+        time: 48,
+        part: SessionV1.ToolPart.make({
+          id: partID,
+          messageID,
+          sessionID: workerSessionID,
+          type: "tool",
+          callID: "call-legacy-containment",
+          tool: "bash",
+          state: {
+            status: "running",
+            input: { command: "touch legacy-outcome-unknown" },
+            metadata: { phase: "spawned" },
+            time: { start: 48 },
+          },
+        }),
+      })
+
+      expect(yield* SessionRecovery.executionHazards(state.db, workerSessionID)).toEqual({
+        currentTool: false,
+        legacyTool: true,
+      })
+      expect(yield* state.containment.unresolved()).toEqual([
+        expect.objectContaining({
+          taskID: state.task.id,
+          hazards: { currentTool: false, legacyTool: true },
+        }),
+      ])
+      expect(yield* state.containment.unresolved({ taskID: state.task.id })).toHaveLength(1)
+
+      const result = yield* state.containment.acknowledge({
+        taskID: state.task.id,
+        generation: state.claim.token.generation,
+        now: 49,
+      })
+      expect(result).toMatchObject({
+        state: "contained",
+        taskID: state.task.id,
+        runID: state.runID,
+        sealed: 1,
+      })
+      expect(yield* SessionRecovery.executionHazards(state.db, workerSessionID)).toEqual({
+        currentTool: false,
+        legacyTool: false,
+      })
+
+      const part = yield* state.db.select().from(PartTable).where(eq(PartTable.id, partID)).get().pipe(Effect.orDie)
+      expect(part?.data).toMatchObject({
+        type: "tool",
+        callID: "call-legacy-containment",
+        state: {
+          status: "error",
+          error: "Tool execution interrupted (external effect unknown)",
+          metadata: { phase: "spawned", interrupted: true },
+        },
+      })
+
+      const released = yield* state.execution.snapshot(workerSessionID)
+      expect(released.ownerID).toBeUndefined()
+      expect(released.recoveryOwnerID).toBeUndefined()
+      expect(yield* runFor(state)).toMatchObject({ status: "unsettled" })
+      expect(yield* taskRowFor(state)).toEqual({ status: "review_pending", retry: 0 })
     }),
   )
 
@@ -562,13 +807,26 @@ describe("Swarm operator containment", () => {
       })
       yield* base.swarm.requestTaskRetirement({ token: claim.token, reason: "lease_owner_lost", now: 15 })
 
-      const settled = yield* base.swarm.settleTask({
-        token: claim.token,
-        settlement: { type: "superseded", detail: "retired after lease_owner_lost" },
-        now: 16,
-      })
-      expect(settled.task.status).toBe("ready")
-      expect(settled.task.semanticRetryCount).toBe(0)
+      // SwarmTaskRetirement owns unattended closure and subscribes to the
+      // retirement event. Do not race it with a second direct settleTask call:
+      // wait for the level-triggered drain to prove the actual production path
+      // converges back to ready.
+      yield* base.retirement.poke()
+      yield* waitFor(
+        base.db
+          .select({ status: SwarmTaskTable.status, retry: SwarmTaskTable.semantic_retry_count })
+          .from(SwarmTaskTable)
+          .where(eq(SwarmTaskTable.id, task.id))
+          .get()
+          .pipe(Effect.orDie, Effect.map((row) => row?.status === "ready")),
+      )
+      const settled = yield* base.db
+        .select({ status: SwarmTaskTable.status, retry: SwarmTaskTable.semantic_retry_count })
+        .from(SwarmTaskTable)
+        .where(eq(SwarmTaskTable.id, task.id))
+        .get()
+        .pipe(Effect.orDie)
+      expect(settled).toEqual({ status: "ready", retry: 0 })
     }),
   )
 })

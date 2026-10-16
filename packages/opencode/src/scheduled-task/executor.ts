@@ -524,6 +524,7 @@ export const layer = Layer.effect(
                 messageID,
                 agent: profile.agent,
                 abort: controller.signal,
+                retention: "none",
                 extra: { bypassCwdCheck: true, model: profile.providerModel },
                 messages: [],
                 metadata: () => Effect.void,

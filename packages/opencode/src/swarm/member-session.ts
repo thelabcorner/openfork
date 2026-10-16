@@ -7,6 +7,7 @@ import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionExecutionBoundary } from "@opencode-ai/core/session/execution-boundary"
 import { MessageTable, SessionInputTable } from "@opencode-ai/core/session/sql"
 import { SessionID } from "@opencode-ai/schema/session-id"
+import { Agent } from "@opencode-ai/schema/agent"
 import { Swarm as SwarmModel } from "@opencode-ai/schema/swarm"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SwarmSchema } from "@opencode-ai/core/swarm/schema"
@@ -370,8 +371,12 @@ export const layer = Layer.effect(
         // than permission to mutate the binding behind Core's fence.
         return yield* fail(target, `Bound Session is missing: ${target.member.sessionID}`)
       }
-      const profile = target.member.desiredProfile
-      if (!profile) return yield* fail(target, "Managed worker has no desired execution profile.")
+      const storedProfile = target.member.desiredProfile
+      if (!storedProfile) return yield* fail(target, "Managed worker has no desired execution profile.")
+      // Older persisted Swarms may still carry the creator-selected agent mode.
+      // Agent mode is role-owned, so normalize it at the materialization
+      // boundary while preserving the member's independent model selection.
+      const profile = { ...storedProfile, agent: Agent.ID.make("swarm-m") }
       // A legacy profile value this runtime cannot map onto the closed
       // ModelRequirement vocabulary is not permission to run anyway. Refusing
       // here is the fail-closed half of the compatibility boundary: honoring it

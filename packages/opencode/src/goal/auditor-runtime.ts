@@ -41,16 +41,25 @@ const capability = (model: Provider.Model) => ({
   apiID: model.api?.id,
 })
 
-const usageRoute = (route?: ProviderRouteResolution.RouteAttribution) =>
+type MaintenanceRoute =
+  | { readonly routeKind: "public" }
+  | { readonly routeKind: "account"; readonly accountID: string }
+
+const usageRoute = (route?: ProviderRouteResolution.RouteAttribution): MaintenanceRoute | undefined =>
   route?.routeKind === "account"
-    ? ({ routeKind: "account", accountID: route.accountID! } as const)
+    ? { routeKind: "account", accountID: route.accountID! }
     : route?.routeKind === "public"
-      ? ({ routeKind: "public" } as const)
+      ? { routeKind: "public" }
       : undefined
 
-const routedRef = (ref: ModelV2.Ref, route?: ProviderRouteResolution.RouteAttribution) =>
+const transientUsageRoute = (routed: Provider.TransientRoutedModel): MaintenanceRoute =>
+  routed.route.route.kind === "account"
+    ? { routeKind: "account", accountID: routed.route.route.accountID }
+    : { routeKind: "public" }
+
+const routedRef = (ref: ModelV2.Ref, route?: MaintenanceRoute) =>
   route?.routeKind === "account"
-    ? ModelV2.Ref.make({ ...ref, accountID: route.accountID! })
+    ? ModelV2.Ref.make({ ...ref, accountID: route.accountID })
     : route?.routeKind === "public"
       ? ModelV2.Ref.make({
           providerID: ref.providerID,
@@ -100,9 +109,13 @@ export const makeRuntime = (
       if (attempted.has(key)) continue
       attempted.add(key)
       let model: Provider.Model | undefined
-      let selectedRoute: ProviderRouteResolution.RouteAttribution | undefined
+      let selectedRoute: MaintenanceRoute | undefined
 
-      if (parentRoute?.route.providerID === candidate.providerID) {
+      const restrictedParentPublic =
+        parentRoute?.route.providerID === candidate.providerID &&
+        parentRoute.route.routeKind === "public" &&
+        Provider.isHostedZenProvider(candidate.providerID)
+      if (parentRoute?.route.providerID === candidate.providerID && !restrictedParentPublic) {
         if (
           candidate.accountID &&
           (parentRoute.route.routeKind !== "account" || parentRoute.route.accountID !== candidate.accountID)
@@ -115,47 +128,53 @@ export const makeRuntime = (
             providerID: candidate.providerID,
             modelID: candidate.id,
             route: parentRoute.route,
+            executionPurpose: "special-agent",
           })
           .pipe(Effect.option)
         if (inherited._tag === "None") continue
         model = inherited.value.model
-        selectedRoute = inherited.value.route.attribution
-      } else if (parentRoute) {
-        // candidates() returns only the configured model when one exists, so a
-        // different provider here is a true explicit maintenance override.
-        if (!input.configured) continue
-        const routed = yield* provider
-          .resolveRoutedModel({
-            sessionID: parentRoute.sessionID,
+        selectedRoute = usageRoute(inherited.value.route.attribution)
+        if (Provider.isHostedZenProvider(candidate.providerID) && selectedRoute?.routeKind !== "account") continue
+      } else {
+        // A configured cross-provider auditor model is an explicit maintenance
+        // override, but it still must not create a second durable route on the
+        // parent Session. Likewise, legacy/no-parent-route audits must not fall
+        // back to ambient hosted auth. Resolve one non-persistent route and only
+        // use direct provider lookup when the route owner positively declines.
+        if (parentRoute && !input.configured && !restrictedParentPublic) continue
+        const transient = yield* provider
+          .resolveTransientRoutedModel({
             providerID: candidate.providerID,
             modelID: candidate.id,
-            ...(candidate.accountID ? { accountID: candidate.accountID } : {}),
+            ...(candidate.accountID
+              ? { accountID: candidate.accountID }
+              : { routeIntent: { kind: "auto" as const } }),
+            executionPurpose: "special-agent",
           })
           .pipe(Effect.option)
-        if (routed._tag === "None") continue
-        if (routed.value) {
-          model = routed.value.model
-          selectedRoute = routed.value.route.attribution
+        if (transient._tag === "None") continue
+        if (transient.value) {
+          model = transient.value.model
+          selectedRoute = transientUsageRoute(transient.value)
+          if (Provider.isHostedZenProvider(candidate.providerID) && selectedRoute.routeKind !== "account") continue
         } else {
+          // A hosted provider always has an authoritative route owner. Carry the
+          // route owner's refusal into a fail-closed skip instead of spending an
+          // ambient hosted credential through a bare catalog lookup.
+          if (Provider.isHostedZenProvider(candidate.providerID)) continue
           const direct = yield* provider
             .getModel(candidate.providerID, candidate.id, candidate.accountID)
             .pipe(Effect.option)
           if (direct._tag === "None") continue
           model = direct.value
         }
-      } else {
-        const direct = yield* provider
-          .getModel(candidate.providerID, candidate.id, candidate.accountID)
-          .pipe(Effect.option)
-        if (direct._tag === "None") continue
-        model = direct.value
       }
 
       const ref = routedRef(candidate, selectedRoute)
       return {
         ref,
         value: model,
-        ...(selectedRoute ? { route: usageRoute(selectedRoute) } : {}),
+        ...(selectedRoute ? { route: selectedRoute } : {}),
         capability: capability(model),
         outputLimit: model.limit.output,
       } satisfies GoalAuditor.ResolvedModel
@@ -163,7 +182,10 @@ export const makeRuntime = (
 
     if (input.configured) {
       return yield* new GoalAuditor.RuntimeUnavailableError({
-        message: `Configured Goal auditor model is unavailable: ${input.configured.providerID}/${input.configured.id}`,
+        message: `Configured Goal auditor model is unavailable: ${input.configured.providerID}/${input.configured.id}` +
+          (Provider.isHostedZenProvider(input.configured.providerID)
+            ? ". OpenFork special agents require an eligible account-backed hosted model; upstream Public/free tier cannot be used."
+            : ""),
       })
     }
 
@@ -175,14 +197,35 @@ export const makeRuntime = (
           (error) => new GoalAuditor.RuntimeUnavailableError({ message: `No Goal auditor model is available: ${error.message}` }),
         ),
       )
-      const fallback = yield* provider.getModel(fallbackRef.providerID, fallbackRef.modelID).pipe(
-        Effect.mapError(
-          (error) => new GoalAuditor.RuntimeUnavailableError({ message: `No Goal auditor model is available: ${error.message}` }),
-        ),
-      )
+      const fallbackRouted = yield* provider
+        .resolveTransientRoutedModel({
+          providerID: fallbackRef.providerID,
+          modelID: fallbackRef.modelID,
+          routeIntent: { kind: "auto" },
+          executionPurpose: "special-agent",
+        })
+        .pipe(
+          Effect.mapError(
+            (error) => new GoalAuditor.RuntimeUnavailableError({ message: `No Goal auditor model is available: ${error.message}` }),
+          ),
+        )
+      if (Provider.isHostedZenProvider(fallbackRef.providerID) &&
+          (!fallbackRouted || fallbackRouted.route.route.kind !== "account")) {
+        return yield* new GoalAuditor.RuntimeUnavailableError({
+          message: `No Goal auditor model is available: ${fallbackRef.providerID}/${fallbackRef.modelID} has no eligible account-backed route; upstream Public/free tier is unavailable to OpenFork special agents.`,
+        })
+      }
+      const fallback = fallbackRouted?.model ??
+        (yield* provider.getModel(fallbackRef.providerID, fallbackRef.modelID).pipe(
+          Effect.mapError(
+            (error) => new GoalAuditor.RuntimeUnavailableError({ message: `No Goal auditor model is available: ${error.message}` }),
+          ),
+        ))
+      const route = fallbackRouted ? transientUsageRoute(fallbackRouted) : undefined
       return {
-        ref: { providerID: fallbackRef.providerID, id: fallbackRef.modelID },
+        ref: routedRef({ providerID: fallbackRef.providerID, id: fallbackRef.modelID }, route),
         value: fallback,
+        ...(route ? { route } : {}),
         capability: capability(fallback),
         outputLimit: fallback.limit.output,
       } satisfies GoalAuditor.ResolvedModel
@@ -190,7 +233,10 @@ export const makeRuntime = (
 
     const inherited = input.workerModel ?? input.session?.model
     return yield* new GoalAuditor.RuntimeUnavailableError({
-      message: `Worker model is unavailable to the Goal auditor: ${inherited!.providerID}/${inherited!.id}`,
+      message: `Worker model is unavailable to the Goal auditor: ${inherited!.providerID}/${inherited!.id}` +
+        (Provider.isHostedZenProvider(inherited!.providerID)
+          ? ". No account-backed route is eligible; the parent Public/free tier cannot execute OpenFork special agents. Configure an eligible Goal Auditor model."
+          : ""),
     })
   }),
 

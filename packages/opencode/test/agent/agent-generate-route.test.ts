@@ -105,6 +105,8 @@ const usageLayer = Layer.succeed(
   UsageAnalytics.Service,
   UsageAnalytics.Service.of({
     summary: () => Effect.die("unused"),
+    inspect: () => Effect.die("unused"),
+    workload: () => Effect.die("unused"),
     modelProfile: () => Effect.die("unused"),
     pricingCatalog: () => Effect.die("unused"),
     sessionContext: () => Effect.die("unused"),

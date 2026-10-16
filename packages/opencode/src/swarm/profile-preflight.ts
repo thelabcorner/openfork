@@ -99,6 +99,11 @@ export const layer = Layer.effect(
     const check = Effect.fn("SwarmProfilePreflight.check")(function* (input: CheckInput) {
       const profile = input.profile
       return yield* Effect.gen(function* () {
+        if (profile.agent !== "swarm-m") {
+          return yield* new SwarmSchema.ValidationError({
+            reason: `Managed Swarm workers must use the swarm-m agent mode; received ${profile.agent}. Agent mode is fixed by Swarm role and is independent of provider/model selection.`,
+          })
+        }
         const instance = yield* InstanceRef
         if (!instance) {
           return yield* new SwarmSchema.ValidationError({
