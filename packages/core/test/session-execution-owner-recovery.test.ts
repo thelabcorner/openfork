@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect } from "bun:test"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { Effect, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -24,8 +24,18 @@ let proof: RuntimeOwner.LocalDeathProof = "alive-or-unknown"
 let recoveryProof: RuntimeOwner.LocalDeathProof = "alive-or-unknown"
 let retains = 0
 let releases = 0
+const deathProofCalls = new Map<RuntimeOwner.ID, number>()
 
 const snapshots = new Map<RuntimeOwner.ID, RuntimeOwner.Snapshot>()
+const activationRegistryKey = Symbol.for("openfork.session-execution-owner.activations.v1")
+type ActivationRegistry = {
+  activations: Map<string, { sessionID: string; ownerID: RuntimeOwner.ID; generation: number }>
+  acquisitions: Map<string, Set<string>>
+}
+
+function activationRegistry() {
+  return (globalThis as unknown as Record<symbol, unknown>)[activationRegistryKey] as ActivationRegistry | undefined
+}
 
 const fakeRuntime = RuntimeOwner.Service.of({
     id: recoveryOwnerID,
@@ -44,7 +54,10 @@ const fakeRuntime = RuntimeOwner.Service.of({
     }),
     snapshot: (id) => Effect.succeed(snapshots.get(id)),
     proveLocalDeath: (id) =>
-      Effect.succeed(id === foreignRecoveryOwnerID ? recoveryProof : proof),
+      Effect.sync(() => {
+        deathProofCalls.set(id, (deathProofCalls.get(id) ?? 0) + 1)
+        return id === foreignRecoveryOwnerID ? recoveryProof : proof
+      }),
   })
 const fakeRuntimeLayer = Layer.succeed(RuntimeOwner.Service, fakeRuntime)
 
@@ -63,7 +76,10 @@ beforeEach(() => {
   recoveryProof = "alive-or-unknown"
   retains = 0
   releases = 0
+  deathProofCalls.clear()
   snapshots.clear()
+  activationRegistry()?.activations.clear()
+  activationRegistry()?.acquisitions.clear()
   snapshots.set(oldOwnerID, {
     id: oldOwnerID,
     pid: 111,
@@ -162,7 +178,49 @@ const row = (db: Effect.Success<typeof setup>["db"]) =>
     .pipe(Effect.orDie)
 
 describe("SessionExecutionOwner recovery", () => {
-  it.effect("startup clears a stale, proven-dead lease without changing its generation and drops its owner row", () =>
+  it.effect("startup refuses to release a dead generation with an unsealed current assistant step", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "dead"
+      yield* state.db.run(sql`INSERT INTO session_message
+        (id, session_id, type, seq, time_created, time_updated, data)
+        VALUES ('msg_startup_pending_current', ${sessionID}, 'assistant', 1, 150, 150, '{}')`)
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(0)
+      expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, generation: 7, acquired_at: 100 })
+      expect([...(yield* state.owner.listWorking())]).toEqual([[sessionID, { type: "interrupted" }]])
+    }),
+  )
+
+  it.effect("startup refuses to release a dead generation with an unsealed V1 assistant turn", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "dead"
+      yield* state.db.run(sql`INSERT INTO message
+        (id, session_id, time_created, time_updated, data)
+        VALUES ('msg_startup_pending_v1', ${sessionID}, 150, 150, '{"role":"assistant"}')`)
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(0)
+      expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, generation: 7, acquired_at: 100 })
+      expect([...(yield* state.owner.listWorking())]).toEqual([[sessionID, { type: "interrupted" }]])
+    }),
+  )
+
+  it.effect("startup never assumes timestamps alone prove the generation was transcript-empty", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "dead"
+      // A producer may commit an assistant before obtaining the execution
+      // lease. Even created_at before acquired_at cannot prove safety.
+      yield* state.db.run(sql`INSERT INTO message
+        (id, session_id, time_created, time_updated, data)
+        VALUES ('msg_admitted_before_owner', ${sessionID}, 50, 50, '{"role":"assistant"}')`)
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(0)
+      expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, generation: 7 })
+    }),
+  )
+
+  it.effect("startup clears a transcript-empty stale proven-dead lease without changing generation", () =>
     Effect.gen(function* () {
       const state = yield* setup
       proof = "dead"
@@ -182,6 +240,37 @@ describe("SessionExecutionOwner recovery", () => {
     }),
   )
 
+  it.effect("startup garbage collection treats recovery_owner_id as a strong runtime-owner reference", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      const now = Date.now()
+      snapshots.set(oldOwnerID, { ...snapshots.get(oldOwnerID)!, heartbeatAt: now })
+      yield* state.db
+        .update(RuntimeOwnerTable)
+        .set({ heartbeat_at: now })
+        .where(eq(RuntimeOwnerTable.id, oldOwnerID))
+        .run()
+        .pipe(Effect.orDie)
+      yield* state.db
+        .update(SessionExecutionOwnerTable)
+        .set({ recovery_owner_id: foreignRecoveryOwnerID, recovery_started_at: 150 })
+        .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+      recoveryProof = "dead"
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(0)
+      expect(yield* row(state.db)).toMatchObject({
+        owner_id: oldOwnerID,
+        recovery_owner_id: foreignRecoveryOwnerID,
+      })
+      expect(
+        yield* state.db.select().from(RuntimeOwnerTable).where(eq(RuntimeOwnerTable.id, foreignRecoveryOwnerID)).get(),
+      ).toBeDefined()
+      expect(deathProofCalls.get(foreignRecoveryOwnerID) ?? 0).toBe(0)
+    }),
+  )
+
   it.effect("startup preserves a stale-but-live execution lease", () =>
     Effect.gen(function* () {
       const state = yield* setup
@@ -190,7 +279,121 @@ describe("SessionExecutionOwner recovery", () => {
       expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(0)
       expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, generation: 7 })
       const working = yield* state.owner.listWorking()
-      expect([...working]).toHaveLength(1)
+      // Process-not-proven-dead is not proof of executing Session. Preserve
+      // its generation fence but never project placebo busy to the UI.
+      expect([...working]).toEqual([[sessionID, { type: "interrupted" }]])
+    }),
+  )
+
+  it.effect("projects a proven-dead retained lease as interrupted rather than busy", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "dead"
+
+      // This models a lease discovered after startup reconciliation, including
+      // the effect-unknown case where the durable generation must remain fenced.
+      const working = yield* state.owner.listWorking()
+      expect([...working]).toEqual([[sessionID, { type: "interrupted" }]])
+      const addressed = yield* state.owner.listWorkingForSessionIDs([sessionID])
+      expect([...addressed]).toEqual([[sessionID, { type: "interrupted" }]])
+      const empty = yield* state.owner.listWorkingForSessionIDs([])
+      expect([...empty]).toEqual([])
+      const byDirectory = yield* state.owner.listWorkingByDirectory("/project")
+      expect([...byDirectory]).toEqual([[sessionID, { type: "interrupted" }]])
+      expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, generation: 7 })
+    }),
+  )
+
+  it.effect("does not report a same-process lease as busy after its local activation vanished", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "alive-or-unknown"
+      yield* state.db
+        .update(SessionExecutionOwnerTable)
+        .set({ owner_id: recoveryOwnerID })
+        .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+
+      const working = yield* state.owner.listWorking()
+      expect([...working]).toEqual([[sessionID, { type: "interrupted" }]])
+    }),
+  )
+
+  it.effect("uses exact process-shared activation for a same-PID foreign module owner", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      const startedAt = Math.trunc(Date.now() - process.uptime() * 1_000)
+      const owner = {
+        id: oldOwnerID,
+        pid: process.pid,
+        startedAt,
+        heartbeatAt: Date.now(),
+        controlEpoch: 0,
+      }
+      snapshots.set(oldOwnerID, owner)
+      yield* state.db
+        .update(RuntimeOwnerTable)
+        .set({ pid: owner.pid, started_at: owner.startedAt, heartbeat_at: owner.heartbeatAt })
+        .where(eq(RuntimeOwnerTable.id, oldOwnerID))
+        .run()
+        .pipe(Effect.orDie)
+
+      const registry = activationRegistry()
+      if (!registry) return yield* Effect.die("expected process activation registry")
+      registry.activations.set(sessionID, { sessionID, ownerID: oldOwnerID, generation: 7 })
+      expect([...(yield* state.owner.listWorking())]).toEqual([[sessionID, { type: "busy" }]])
+      expect(yield* state.owner.tryClaimRecovery(sessionID, { verifyDeathNow: true })).toMatchObject({
+        state: "blocked",
+        proof: "alive-or-unknown",
+      })
+
+      registry.activations.delete(sessionID)
+      expect([...(yield* state.owner.listWorking())]).toEqual([[sessionID, { type: "interrupted" }]])
+      expect(yield* state.owner.tryClaimRecovery(sessionID, { verifyDeathNow: true })).toMatchObject({
+        state: "claimed",
+        token: { ownerID: oldOwnerID, generation: 7 },
+      })
+    }),
+  )
+
+  it.effect("lets explicit recovery claim a same-process orphan after its activation vanished", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      yield* state.db
+        .update(SessionExecutionOwnerTable)
+        .set({ owner_id: recoveryOwnerID })
+        .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+
+      const claim = yield* state.owner.tryClaimRecovery(sessionID, { verifyDeathNow: true })
+      expect(claim.state).toBe("claimed")
+      if (claim.state !== "claimed") return
+      expect(claim.token).toMatchObject({ sessionID, ownerID: recoveryOwnerID, generation: 7 })
+      expect(yield* state.owner.completeRecovery(claim.token)).toBe("released")
+      expect(yield* row(state.db)).toMatchObject({ owner_id: null, generation: 7 })
+    }),
+  )
+
+  it.effect("does not let explicit recovery claim a same-process generation with a live activation", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      yield* state.db
+        .update(SessionExecutionOwnerTable)
+        .set({ owner_id: null })
+        .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+      const acquired = yield* state.owner.tryAcquireLocal(sessionID)
+      expect(acquired.state).toBe("acquired")
+      if (acquired.state !== "acquired") return
+
+      expect(yield* state.owner.tryClaimRecovery(sessionID, { verifyDeathNow: true })).toMatchObject({
+        state: "blocked",
+        proof: "alive-or-unknown",
+      })
+      yield* state.owner.release(acquired.token)
     }),
   )
 

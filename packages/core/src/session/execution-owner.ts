@@ -1,8 +1,9 @@
 export * as SessionExecutionOwner from "./execution-owner"
 
-import { and, asc, eq, gt, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm"
-import { Context, Effect, Layer, Semaphore } from "effect"
+import { and, asc, eq, gt, inArray, isNotNull, isNull, lt, lte, ne, notExists, or, sql } from "drizzle-orm"
+import { Context, Duration, Effect, Exit, Layer, Semaphore } from "effect"
 import { Database } from "../database/database"
+import { retrySqliteBusyCause } from "../database/sqlite-busy"
 import { KeyedMutex } from "../effect/keyed-mutex"
 import {
   existingDirectoryKey,
@@ -13,13 +14,23 @@ import {
 import { DirectoryMaintenanceGuardTable } from "../directory-maintenance-guard.sql"
 import { DirectoryActivityLeaseTable } from "../directory-activity-lease.sql"
 import { makeGlobalNode } from "../effect/app-node"
-import { RuntimeOwner } from "../runtime-owner"
+import { belongsToCurrentProcess, RuntimeOwner } from "../runtime-owner"
 import { RuntimeOwnerTable } from "../runtime-owner.sql"
 import { SessionExecutionOwnerTable } from "./execution-owner.sql"
 import { SessionSchema } from "./schema"
-import { PartTable, SessionInputTable, SessionMessageTable, SessionMessageToolOverlayTable, SessionTable } from "./sql"
+import { SessionLegacyToolIndex } from "./legacy-tool-index"
+import { SessionInputTable, SessionMessageTable, SessionMessageToolOverlayTable, SessionTable } from "./sql"
 
 export type InterruptReason = "operator" | "pause" | "handoff" | "shutdown" | "recovery"
+
+// The underlying SQLite adapter retries ONLY a failed BEGIN IMMEDIATE, before
+// any callback runs. Never retry the entire transaction: ambiguous COMMITs
+// and ownership-generation increments must not be replayed.
+function withNativeBeginRetry(db: Database.Interface["db"]) {
+  const transaction: typeof db.transaction = (work, options) =>
+    db.transaction(work, options)
+  return { transaction }
+}
 
 export interface Token {
   readonly sessionID: SessionSchema.ID
@@ -32,6 +43,35 @@ export interface RecoveryToken {
   readonly ownerID: RuntimeOwner.ID
   readonly generation: number
   readonly recoveryOwnerID: RuntimeOwner.ID
+}
+
+type ProcessActivationRegistry = {
+  readonly activations: Map<string, Token>
+  readonly acquisitions: Map<string, Set<string>>
+}
+
+const PROCESS_ACTIVATION_REGISTRY = Symbol.for("openfork.session-execution-owner.activations.v1")
+
+function processActivationRegistry(): ProcessActivationRegistry {
+  const root = globalThis as typeof globalThis & { [key: symbol]: unknown }
+  let registry = root[PROCESS_ACTIVATION_REGISTRY] as ProcessActivationRegistry | undefined
+  if (!registry) {
+    registry = { activations: new Map(), acquisitions: new Map() }
+    root[PROCESS_ACTIVATION_REGISTRY] = registry
+  }
+  return registry
+}
+
+function beginProcessAcquisition(registry: ProcessActivationRegistry, sessionID: string, ownerID: string) {
+  const owners = registry.acquisitions.get(sessionID) ?? new Set<string>()
+  owners.add(ownerID)
+  registry.acquisitions.set(sessionID, owners)
+}
+
+function endProcessAcquisition(registry: ProcessActivationRegistry, sessionID: string, ownerID: string) {
+  const owners = registry.acquisitions.get(sessionID)
+  owners?.delete(ownerID)
+  if (owners?.size === 0) registry.acquisitions.delete(sessionID)
 }
 
 export interface Snapshot {
@@ -97,9 +137,15 @@ export interface Interface {
    */
   readonly release: (token: Token) => Effect.Effect<ExactReleaseResult>
   readonly snapshot: (sessionID: SessionSchema.ID) => Effect.Effect<Snapshot>
+  /** Bounded, bootstrap-free WAL snapshots with shared RuntimeOwner evidence. */
+  readonly snapshotMany: (sessionIDs: readonly SessionSchema.ID[]) => Effect.Effect<ReadonlyMap<SessionSchema.ID, Snapshot>>
   /** Global, storage-backed working-session projection; never enters a Location. */
-  readonly listWorking: () => Effect.Effect<ReadonlyMap<SessionSchema.ID, { readonly type: "busy" }>>
-  readonly listWorkingByDirectory: (directory: string) => Effect.Effect<ReadonlyMap<SessionSchema.ID, { readonly type: "busy" }>>
+  readonly listWorking: () => Effect.Effect<ReadonlyMap<SessionSchema.ID, { readonly type: "busy" | "interrupted" }>>
+  /** Intersect a bounded batch of addressed Sessions with the working projection. */
+  readonly listWorkingForSessionIDs: (
+    sessionIDs: readonly SessionSchema.ID[],
+  ) => Effect.Effect<ReadonlyMap<SessionSchema.ID, { readonly type: "busy" | "interrupted" }>>
+  readonly listWorkingByDirectory: (directory: string) => Effect.Effect<ReadonlyMap<SessionSchema.ID, { readonly type: "busy" | "interrupted" }>>
   /** Intersect known non-idle status candidates with one durable directory. */
   readonly listSessionIDsByDirectory: (
     directory: string,
@@ -126,7 +172,10 @@ export interface Interface {
    * This API deliberately does NOT clear execution ownership; containment and
    * uncertain-effect reconciliation remain separate prerequisites.
    */
-  readonly tryClaimRecovery: (sessionID: SessionSchema.ID) => Effect.Effect<RecoveryClaimResult>
+  readonly tryClaimRecovery: (
+    sessionID: SessionSchema.ID,
+    options?: { readonly verifyDeathNow?: boolean },
+  ) => Effect.Effect<RecoveryClaimResult>
   /**
    * Completes recovery only for the exact dead-owner generation and exact
    * recovery owner that proved quiescence. Pending SessionInput is preserved;
@@ -271,61 +320,58 @@ export const reconcileDeadOwnersAtStartup = Effect.fn("SessionExecutionOwner.rec
               .all()
               .pipe(Effect.orDie)).map((row) => row.sessionID),
       )
-      const sessionsWithLegacyTools = new Set<string>(
-        candidateIDs.length === 0
-          ? []
-          : (yield* readDb
-              .selectDistinct({ sessionID: PartTable.session_id })
-              .from(PartTable)
-              .where(
-                and(
-                  inArray(PartTable.session_id, candidateIDs),
-                  sql`json_extract(${PartTable.data}, '$.type') = 'tool'`,
-                  sql`json_extract(${PartTable.data}, '$.state.status') IN ('pending', 'running')`,
-                ),
-              )
-              .all()
-              .pipe(Effect.orDie)).map((row) => row.sessionID),
-      )
+      const sessionsWithLegacyTools = yield* SessionLegacyToolIndex.unsettledSessions(readDb, candidateIDs)
 
       for (const row of candidates) {
         if (sessionsWithCurrentTools.has(row.session_id) || sessionsWithLegacyTools.has(row.session_id)) continue
+        // Startup has no event projector/recovery claim with which to close an
+        // abandoned assistant turn. It may clear only a *transcript-empty
+        // Session*. A time_created/acquired_at comparison is not sufficient
+        // proof: a host may durably create a message before acquiring the
+        // execution lease, then crash midway through its step. A session with
+        // ANY historical messages must pass through the canonical EventV2
+        // recovery path on next admission or explicit operator Stop.
+        //
+        // The negative proofs below are repeated as SQL NOT EXISTS predicates
+        // inside the writer's exact CAS, so a message committed between a
+        // preflight scan and the release statement cannot be overlooked.
+        if (row.acquired_at === null) continue
         const ownerID = row.owner_id as RuntimeOwner.ID
 
         const ownerCondition =
           row.recovery_owner_id === null
             ? isNull(SessionExecutionOwnerTable.recovery_owner_id)
             : eq(SessionExecutionOwnerTable.recovery_owner_id, row.recovery_owner_id)
-        const cleared = yield* db
-          .transaction(
-            (tx) =>
-              tx
-                .update(SessionExecutionOwnerTable)
-                .set({
-                  owner_id: null,
-                  acquired_at: null,
-                  // The generation is being abandoned; its execution-end fact is
-                  // no longer attributable to anything still owned.
-                  interrupt_generation: null,
-                  interrupt_reason: null,
-                  interrupt_requested_at: null,
-                  recovery_owner_id: null,
-                  recovery_started_at: null,
-                })
-                .where(
-                  and(
-                    eq(SessionExecutionOwnerTable.session_id, row.session_id),
-                    eq(SessionExecutionOwnerTable.owner_id, ownerID),
-                    eq(SessionExecutionOwnerTable.generation, row.generation),
-                    ownerCondition,
-                  ),
-                )
-              .returning({ sessionID: SessionExecutionOwnerTable.session_id })
-              .get()
-              .pipe(Effect.orDie),
-            { behavior: "immediate" },
-          )
-          .pipe(Effect.orDie)
+        // One UPDATE with owner/generation/recovery fences is already atomic.
+        // A BEGIN IMMEDIATE wrapper added a separate writer-lock wait and a
+        // second failure point for no extra isolation.
+        const cleared = yield* retrySqliteBusyCause(() =>
+          db.update(SessionExecutionOwnerTable)
+            .set({
+              owner_id: null,
+              acquired_at: null,
+              interrupt_generation: null,
+              interrupt_reason: null,
+              interrupt_requested_at: null,
+              recovery_owner_id: null,
+              recovery_started_at: null,
+            })
+            .where(and(
+              eq(SessionExecutionOwnerTable.session_id, row.session_id),
+              eq(SessionExecutionOwnerTable.owner_id, ownerID),
+              eq(SessionExecutionOwnerTable.generation, row.generation),
+              ownerCondition,
+              sql`NOT EXISTS (
+                SELECT 1 FROM session_message AS pending_generation_message
+                WHERE pending_generation_message.session_id = ${row.session_id}
+              )`,
+              sql`NOT EXISTS (
+                SELECT 1 FROM message AS pending_generation_v1
+                WHERE pending_generation_v1.session_id = ${row.session_id}
+              )`,
+            ))
+            .returning({ sessionID: SessionExecutionOwnerTable.session_id })
+            .get(), { maxElapsedMs: 2_000 }).pipe(Effect.orDie)
         if (cleared) reclaimed++
       }
       if (page.length === 128) yield* Effect.yieldNow
@@ -358,7 +404,10 @@ const collectDeadRuntimeOwners = Effect.fn("SessionExecutionOwner.collectDeadRun
       const ownerIDs = owners.map((owner) => owner.id)
       const referencedOwnerIDs = new Set<string>([
         ...(yield* readDb
-          .selectDistinct({ ownerID: SessionExecutionOwnerTable.owner_id })
+          .selectDistinct({
+            ownerID: SessionExecutionOwnerTable.owner_id,
+            recoveryOwnerID: SessionExecutionOwnerTable.recovery_owner_id,
+          })
           .from(SessionExecutionOwnerTable)
           .where(
             or(
@@ -367,7 +416,9 @@ const collectDeadRuntimeOwners = Effect.fn("SessionExecutionOwner.collectDeadRun
             ),
           )
           .all()
-          .pipe(Effect.orDie)).flatMap((row) => [row.ownerID].filter((value): value is string => value !== null)),
+          .pipe(Effect.orDie)).flatMap((row) =>
+          [row.ownerID, row.recoveryOwnerID].filter((value): value is string => value !== null),
+        ),
         ...(yield* readDb
           .selectDistinct({ ownerID: DirectoryMaintenanceGuardTable.owner_id })
           .from(DirectoryMaintenanceGuardTable)
@@ -385,59 +436,32 @@ const collectDeadRuntimeOwners = Effect.fn("SessionExecutionOwner.collectDeadRun
         if (referencedOwnerIDs.has(owner.id)) continue
         if (Date.now() - owner.heartbeat_at < RUNTIME_OWNER_STALE_AFTER_MS) continue
         if ((yield* runtime.proveLocalDeath(owner.id as RuntimeOwner.ID)) !== "dead") continue
-        yield* db
-          .transaction(
-            (tx) =>
-              Effect.gen(function* () {
-                // The reference scan above uses the read connection and is only
-                // an optimization. Re-check under the writer reservation so a
-                // concurrent owner reference cannot race this delete into a
-                // foreign-key failure.
-                const referenced =
-                  (yield* tx
-                    .select({ ownerID: SessionExecutionOwnerTable.owner_id })
-                    .from(SessionExecutionOwnerTable)
-                    .where(
-                      or(
-                        eq(SessionExecutionOwnerTable.owner_id, owner.id),
-                        eq(SessionExecutionOwnerTable.recovery_owner_id, owner.id),
-                      ),
-                    )
-                    .limit(1)
-                    .get()
-                    .pipe(Effect.orDie)) !== undefined ||
-                  (yield* tx
-                    .select({ ownerID: DirectoryMaintenanceGuardTable.owner_id })
-                    .from(DirectoryMaintenanceGuardTable)
-                    .where(eq(DirectoryMaintenanceGuardTable.owner_id, owner.id))
-                    .limit(1)
-                    .get()
-                    .pipe(Effect.orDie)) !== undefined ||
-                  (yield* tx
-                    .select({ ownerID: DirectoryActivityLeaseTable.owner_id })
-                    .from(DirectoryActivityLeaseTable)
-                    .where(eq(DirectoryActivityLeaseTable.owner_id, owner.id))
-                    .limit(1)
-                    .get()
-                    .pipe(Effect.orDie)) !== undefined
-                if (referenced) return
-
-                yield* tx
-                  .delete(RuntimeOwnerTable)
-                  .where(
-                    and(
-                      eq(RuntimeOwnerTable.id, owner.id),
-                      eq(RuntimeOwnerTable.pid, owner.pid),
-                      eq(RuntimeOwnerTable.started_at, owner.started_at),
-                      eq(RuntimeOwnerTable.heartbeat_at, owner.heartbeat_at),
-                    ),
-                  )
-                  .run()
-                  .pipe(Effect.orDie)
-              }),
-            { behavior: "immediate" },
-          )
-          .pipe(Effect.orDie)
+        // The preflight read is only a fast filter. A single autocommit DELETE
+        // checks every reference in the same writer statement, so a concurrent
+        // lease/guard insertion cannot race a separate read into an FK error.
+        // Avoid BEGIN IMMEDIATE + three round trips per dead incarnation; that
+        // sequence previously held startup behind a 15-second BEGIN retry.
+        yield* retrySqliteBusyCause(() =>
+          db.delete(RuntimeOwnerTable)
+            .where(and(
+              eq(RuntimeOwnerTable.id, owner.id),
+              eq(RuntimeOwnerTable.pid, owner.pid),
+              eq(RuntimeOwnerTable.started_at, owner.started_at),
+              eq(RuntimeOwnerTable.heartbeat_at, owner.heartbeat_at),
+              notExists(db.select({ id: SessionExecutionOwnerTable.session_id })
+                .from(SessionExecutionOwnerTable)
+                .where(or(
+                  eq(SessionExecutionOwnerTable.owner_id, owner.id),
+                  eq(SessionExecutionOwnerTable.recovery_owner_id, owner.id),
+                ))),
+              notExists(db.select({ id: DirectoryMaintenanceGuardTable.guard_id })
+                .from(DirectoryMaintenanceGuardTable)
+                .where(eq(DirectoryMaintenanceGuardTable.owner_id, owner.id))),
+              notExists(db.select({ id: DirectoryActivityLeaseTable.directory })
+                .from(DirectoryActivityLeaseTable)
+                .where(eq(DirectoryActivityLeaseTable.owner_id, owner.id))),
+            ))
+            .run(), { maxElapsedMs: 2_000 }).pipe(Effect.orDie)
       }
       if (owners.length === 128) yield* Effect.yieldNow
     }
@@ -447,13 +471,22 @@ const collectDeadRuntimeOwners = Effect.fn("SessionExecutionOwner.collectDeadRun
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db, readDb } = yield* Database.Service
+    const { db, readDb, scanDb, controlDb } = yield* Database.Service
+    // All exact Session owner generations and interrupt CAS operations are
+    // control-plane work. Keep them off BOTH the foreground primary permit
+    // and the interactive history reader, which independently experienced
+    // multi-minute stalled SELECTs. The dedicated SQLite worker is still a
+    // normal WAL writer with IMMEDIATE/conditioned transactions.
+    const control = controlDb ? yield* controlDb() : db
+    const controlReader = controlDb ? control : readDb
     const runtime = yield* RuntimeOwner.Service
     const retentions = new Map<string, RuntimeOwner.Retention>()
     const recoveryRetentions = new Map<string, RuntimeOwner.Retention>()
     const recoveryLock = Semaphore.makeUnsafe(1)
     const activationLocks = KeyedMutex.makeUnsafe<SessionSchema.ID>()
+    const processActivations = processActivationRegistry()
     const activations = new Map<SessionSchema.ID, Token>()
+    const localAcquisitions = new Set<SessionSchema.ID>()
     const tokenKey = (token: Token) => token.sessionID + ":" + token.generation
     const recoveryTokenKey = (token: RecoveryToken) =>
       token.sessionID + ":" + token.generation + ":" + token.ownerID + ":" + token.recoveryOwnerID
@@ -472,7 +505,7 @@ const layer = Layer.effect(
     // owner state. Otherwise release it exactly once.
     const reconcileAcquireExitRetention = Effect.fn("SessionExecutionOwner.reconcileAcquireExitRetention")(
       function* (sessionID: SessionSchema.ID, retention: RuntimeOwner.Retention) {
-        const row = yield* readDb
+        const row = yield* controlReader
           .select()
           .from(SessionExecutionOwnerTable)
           .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
@@ -486,6 +519,11 @@ const layer = Layer.effect(
             return
           }
           retentions.set(key, retention)
+          // A raw tryAcquire interrupted between durable commit and local
+          // publication is still live in this service graph. Record its exact
+          // generation so same-process retirement cannot steal it.
+          activations.set(sessionID, token)
+          processActivations.activations.set(sessionID, token)
           return
         }
         yield* retention.release
@@ -496,6 +534,10 @@ const layer = Layer.effect(
       const active = activations.get(token.sessionID)
       if (active?.ownerID === token.ownerID && active.generation === token.generation) {
         activations.delete(token.sessionID)
+      }
+      const processActive = processActivations.activations.get(token.sessionID)
+      if (processActive?.ownerID === token.ownerID && processActive.generation === token.generation) {
+        processActivations.activations.delete(token.sessionID)
       }
     })
 
@@ -509,7 +551,7 @@ const layer = Layer.effect(
     })
 
     const snapshot = Effect.fn("SessionExecutionOwner.snapshot")(function* (sessionID: SessionSchema.ID) {
-      const row = yield* readDb
+      const row = yield* controlReader
         .select()
         .from(SessionExecutionOwnerTable)
         .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
@@ -517,6 +559,43 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (row) return yield* hydrateSnapshot(row)
       return { sessionID, generation: 0 } satisfies Snapshot
+    })
+
+    const snapshotMany = Effect.fn("SessionExecutionOwner.snapshotMany")(function* (
+      sessionIDs: readonly SessionSchema.ID[],
+    ) {
+      const unique = [...new Set(sessionIDs)]
+      const result = new Map<SessionSchema.ID, Snapshot>()
+      if (unique.length === 0) return result
+      // One WAL statement per bounded page gets both the generation fence and
+      // live-owner heartbeat. No Location, provider graph, Instance, or per-row
+      // RuntimeOwner.snapshot calls. An absent owner row is still generation 0.
+      for (let offset = 0; offset < unique.length; offset += 400) {
+        const ids = unique.slice(offset, offset + 400)
+        const rows = yield* controlReader
+          .select({ execution: SessionExecutionOwnerTable, runtime: RuntimeOwnerTable })
+          .from(SessionExecutionOwnerTable)
+          .leftJoin(RuntimeOwnerTable, eq(SessionExecutionOwnerTable.owner_id, RuntimeOwnerTable.id))
+          .where(inArray(SessionExecutionOwnerTable.session_id, ids))
+          .all()
+          .pipe(Effect.orDie)
+        for (const row of rows) {
+          const runtimeSnapshot: RuntimeOwner.Snapshot | undefined = row.runtime
+            ? {
+                id: row.runtime.id as RuntimeOwner.ID,
+                pid: row.runtime.pid,
+                startedAt: row.runtime.started_at,
+                heartbeatAt: row.runtime.heartbeat_at,
+                controlEpoch: row.runtime.control_epoch,
+              }
+            : undefined
+          result.set(SessionSchema.ID.make(row.execution.session_id), snapshotOf(row.execution, runtimeSnapshot))
+        }
+        for (const id of ids) {
+          if (!result.has(id)) result.set(id, { sessionID: id, generation: 0 })
+        }
+      }
+      return result
     })
 
 
@@ -540,16 +619,44 @@ const layer = Layer.effect(
       yield* retention.release
     })
 
-    yield* reconcileDeadOwnersAtStartup(db, readDb, runtime)
+    // A large legacy part history can make recovery scans expensive, and
+    // another desktop/ACP host or ChunkDB sealer may hold the WAL writer.
+    // Startup must never fail simply because best-effort dead-owner cleanup
+    // could not obtain that writer within its retry budget. All normal lease
+    // acquisition remains generation-fenced; a missed sweep leaves ownership
+    // blocked rather than guessing that a stale heartbeat implies death.
+    // Run the sweep on the background scan and control lanes, with bounded
+    // retries, instead of monopolizing the interactive reader and primary
+    // transaction lane before the server can even initialize.
+    yield* Effect.forkScoped(Effect.gen(function* () {
+      yield* Effect.sleep(Duration.seconds(2))
+      let failures = 0
+      for (;;) {
+        const outcome = yield* Effect.exit(Effect.gen(function* () {
+          const backgroundReader = scanDb ? yield* scanDb() : readDb
+          return yield* reconcileDeadOwnersAtStartup(control, backgroundReader, runtime)
+        }))
+        if (Exit.isSuccess(outcome)) {
+          if (outcome.value > 0) yield* Effect.logInfo("Reclaimed dead session owners", { count: outcome.value })
+          break
+        }
+        failures++
+        if (failures === 1 || failures % 5 === 0) {
+          yield* Effect.logWarning("Dead-owner startup reconciliation deferred", { attempts: failures })
+        }
+        yield* Effect.sleep(Duration.seconds(Math.min(60, 2 ** Math.min(failures, 6))))
+      }
+    }))
 
 
     const tryClaimRecovery = Effect.fn("SessionExecutionOwner.tryClaimRecovery")(function* (
       sessionID: SessionSchema.ID,
+      options?: { readonly verifyDeathNow?: boolean },
     ) {
       return yield* recoveryLock.withPermit(
         Effect.gen(function* () {
           const retention = yield* runtime.retain
-          const row = yield* readDb
+          const row = yield* controlReader
             .select()
             .from(SessionExecutionOwnerTable)
             .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
@@ -575,17 +682,20 @@ const layer = Layer.effect(
 
             const previousRecoveryOwnerID = row.recovery_owner_id as RuntimeOwner.ID
             const previousRecoveryRuntime = yield* runtime.snapshot(previousRecoveryOwnerID)
+            const sameProcess = previousRecoveryRuntime !== undefined && belongsToCurrentProcess(previousRecoveryRuntime)
             if (
               !previousRecoveryRuntime ||
-              Date.now() - previousRecoveryRuntime.heartbeatAt < RUNTIME_OWNER_STALE_AFTER_MS
+              (!sameProcess && !options?.verifyDeathNow && Date.now() - previousRecoveryRuntime.heartbeatAt < RUNTIME_OWNER_STALE_AFTER_MS)
             ) {
               yield* retention.release
               return { state: "busy" as const, snapshot: yield* hydrateSnapshot(row) }
             }
-            const recoveryProof = yield* runtime.proveLocalDeath(previousRecoveryOwnerID)
-            if (recoveryProof !== "dead") {
-              yield* retention.release
-              return { state: "busy" as const, snapshot: yield* hydrateSnapshot(row) }
+            if (!sameProcess) {
+              const recoveryProof = yield* runtime.proveLocalDeath(previousRecoveryOwnerID)
+              if (recoveryProof !== "dead") {
+                yield* retention.release
+                return { state: "busy" as const, snapshot: yield* hydrateSnapshot(row) }
+              }
             }
 
             // Recovery ownership is itself crash-recoverable, but only with an
@@ -593,7 +703,7 @@ const layer = Layer.effect(
             // previous recovery owner. This never clears or advances Session
             // execution authority.
             const reclaimedAt = Date.now()
-            const reclaimed = yield* db
+            const reclaimed = yield* withNativeBeginRetry(control)
               .transaction(
                 (tx) =>
                   tx
@@ -623,7 +733,7 @@ const layer = Layer.effect(
             }
 
             yield* retention.release
-            const current = yield* readDb
+            const current = yield* controlReader
               .select()
               .from(SessionExecutionOwnerTable)
               .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
@@ -639,24 +749,43 @@ const layer = Layer.effect(
             return { state: "busy" as const, snapshot: yield* hydrateSnapshot(current) }
           }
 
+          // Runtime module refresh can retire one service graph while this OS
+          // process remains alive. The process-shared exact activation registry
+          // distinguishes a still-running generation in another graph from a
+          // durable orphan left by the retired graph.
           const ownerRuntime = yield* runtime.snapshot(observed.ownerID)
-          if (!ownerRuntime || Date.now() - ownerRuntime.heartbeatAt < RUNTIME_OWNER_STALE_AFTER_MS) {
-            yield* retention.release
-            return {
-              state: "blocked" as const,
-              proof: "alive-or-unknown" as const,
-              snapshot: yield* hydrateSnapshot(row),
+          const activation = processActivations.activations.get(sessionID)
+          const acquiring = processActivations.acquisitions.get(sessionID)
+          const localExecutionGone =
+            ownerRuntime !== undefined &&
+            (observed.ownerID === runtime.id || belongsToCurrentProcess(ownerRuntime)) &&
+            !(activation?.ownerID === observed.ownerID && activation.generation === observed.generation) &&
+            !acquiring?.has(observed.ownerID)
+          if (!localExecutionGone) {
+            // Background reconciliation waits for missed heartbeats. An
+            // explicit Stop can check OS death immediately; a recent heartbeat
+            // must never make a dead executor uninterruptible for another 90s.
+            if (
+              !ownerRuntime ||
+              (!options?.verifyDeathNow && Date.now() - ownerRuntime.heartbeatAt < RUNTIME_OWNER_STALE_AFTER_MS)
+            ) {
+              yield* retention.release
+              return {
+                state: "blocked" as const,
+                proof: "alive-or-unknown" as const,
+                snapshot: yield* hydrateSnapshot(row),
+              }
+            }
+
+            const proof = yield* runtime.proveLocalDeath(observed.ownerID)
+            if (proof !== "dead") {
+              yield* retention.release
+              return { state: "blocked" as const, proof, snapshot: yield* hydrateSnapshot(row) }
             }
           }
 
-          const proof = yield* runtime.proveLocalDeath(observed.ownerID)
-          if (proof !== "dead") {
-            yield* retention.release
-            return { state: "blocked" as const, proof, snapshot: yield* hydrateSnapshot(row) }
-          }
-
           const startedAt = Date.now()
-          const claimed = yield* db
+          const claimed = yield* withNativeBeginRetry(control)
             .transaction(
               (tx) =>
                 tx
@@ -682,7 +811,7 @@ const layer = Layer.effect(
 
           if (!claimed) {
             yield* retention.release
-            const current = yield* readDb
+            const current = yield* controlReader
               .select()
               .from(SessionExecutionOwnerTable)
               .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
@@ -711,7 +840,7 @@ const layer = Layer.effect(
     })
 
     const abandonRecovery = Effect.fn("SessionExecutionOwner.abandonRecovery")(function* (token: RecoveryToken) {
-      const released = yield* db
+      const released = yield* withNativeBeginRetry(control)
         .transaction(
           (tx) =>
             tx
@@ -739,7 +868,7 @@ const layer = Layer.effect(
     })
 
     const completeRecovery = Effect.fn("SessionExecutionOwner.completeRecovery")(function* (token: RecoveryToken) {
-      const released = yield* db
+      const released = yield* withNativeBeginRetry(control)
         .transaction(
           (tx) =>
             tx
@@ -779,7 +908,7 @@ owner_id: null,
         runtime.retain,
         (retention) =>
           Effect.gen(function* () {
-            const result = yield* db
+            const result = yield* withNativeBeginRetry(control)
               .transaction(
                 (tx) =>
                   Effect.gen(function* () {
@@ -935,6 +1064,12 @@ owner_id: null,
             const token = tokenOf(result.row)
             if (!token) return yield* Effect.die("Acquired Session execution row is unexpectedly idle for " + sessionID)
             retentions.set(tokenKey(token), retention)
+            // A raw tryAcquire is just as live as tryAcquireLocal. Previously
+            // only the latter populated processActivations, so retirement
+            // could mistake the former's live owner for a retired module graph
+            // and recover/release its generation while tools were running.
+            activations.set(sessionID, token)
+            processActivations.activations.set(sessionID, token)
             transferred = true
             return { state: "acquired" as const, token }
           }),
@@ -949,40 +1084,49 @@ owner_id: null,
       return yield* activationLocks.withLock(sessionID)(
         Effect.uninterruptible(
           Effect.gen(function* () {
-            const active = activations.get(sessionID)
-            if (active) {
-              const current = yield* snapshot(sessionID)
-              if (current.ownerID === active.ownerID && current.generation === active.generation) {
+            localAcquisitions.add(sessionID)
+            beginProcessAcquisition(processActivations, sessionID, runtime.id)
+            return yield* Effect.gen(function* () {
+              const active = processActivations.activations.get(sessionID)
+              if (active) {
+                const current = yield* snapshot(sessionID)
+                if (current.ownerID === active.ownerID && current.generation === active.generation) {
+                  return { state: "busy" as const, snapshot: current }
+                }
+                // A registered executor remains authoritative even if the
+                // durable row changed unexpectedly. Never admit a second
+                // generation while that executor may still have effects.
                 return { state: "busy" as const, snapshot: current }
               }
-              activations.delete(sessionID)
-            }
 
-            let acquired = yield* tryAcquire(sessionID)
-            if (acquired.state === "busy" && acquired.snapshot.ownerID === runtime.id) {
-              yield* Effect.logWarning("Recovering orphaned local Session execution owner", {
-                sessionID,
-                generation: acquired.snapshot.generation,
-                acquiredAt: acquired.snapshot.acquiredAt,
-                interruptRequestedAt: acquired.snapshot.interruptRequestedAt,
-              })
-              yield* release({
-                sessionID,
-                ownerID: runtime.id,
-                generation: acquired.snapshot.generation,
-              })
-              acquired = yield* tryAcquire(sessionID)
-            }
+              // NEVER release a busy durable generation merely because it
+              // belongs to the same process and is missing its activation
+              // marker. An unfinished tool could have escaped the failed
+              // Session executor. Recovery belongs to SessionRecovery:
+              // exact claim, negative tool-effect proof, then CAS release.
+              // Callers that cannot establish quiescence remain fenced.
+              const acquired = yield* tryAcquire(sessionID)
 
-            if (acquired.state === "acquired") activations.set(sessionID, acquired.token)
-            return acquired
+              if (acquired.state === "acquired") {
+                activations.set(sessionID, acquired.token)
+                processActivations.activations.set(sessionID, acquired.token)
+              }
+              return acquired
+            }).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  localAcquisitions.delete(sessionID)
+                  endProcessAcquisition(processActivations, sessionID, runtime.id)
+                }),
+              ),
+            )
           }),
         ),
       )
     })
 
     const releaseIfDrained = Effect.fn("SessionExecutionOwner.releaseIfDrained")(function* (token: Token) {
-      const result = yield* db
+      const result = yield* withNativeBeginRetry(control)
         .transaction(
           (tx) =>
             Effect.gen(function* () {
@@ -1056,7 +1200,7 @@ owner_id: null,
     })
 
     const release = Effect.fn("SessionExecutionOwner.release")(function* (token: Token) {
-      const released = yield* db
+      const released = yield* withNativeBeginRetry(control)
         .transaction(
           (tx) =>
             tx
@@ -1092,7 +1236,7 @@ owner_id: null,
       reason: InterruptReason,
       expectedGeneration?: number,
     ) {
-      return yield* db
+      const result = yield* withNativeBeginRetry(control)
         .transaction(
           (tx) =>
             Effect.gen(function* () {
@@ -1151,27 +1295,96 @@ owner_id: null,
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie)
+      yield* Effect.logInfo("session interrupt requested", {
+        "session.id": sessionID,
+        reason,
+        state: result.state,
+        ...(result.state === "requested" ? { interruptGeneration: result.interruptGeneration } : {}),
+      })
+      return result
+    })
+
+    const projectWorking = Effect.fnUntraced(function* (
+      rows: readonly { readonly sessionID: string; readonly ownerID: string | null; readonly generation: number }[],
+    ) {
+      // Projection is proof-based, not lease-based. One exact generation
+      // activation in the process-shared registry is evidence of local
+      // execution. Merely acquiring the per-Session lock, seeing a live PID,
+      // or reading an old heartbeat is NOT evidence of a running provider or
+      // tool. Foreign/unverified owners remain durably fenced, but must be
+      // presented as interrupted rather than a fabricated active spinner.
+      //
+      // One indexed SQL read + O(N) memory comparisons, no per-owner DB
+      // snapshots, OS PID probes, or Instance bootstrap in status reads.
+      const result = new Map<SessionSchema.ID, { readonly type: "busy" | "interrupted" }>()
+      for (const row of rows) {
+        if (!row.ownerID) continue
+        const sessionID = SessionSchema.ID.make(row.sessionID)
+        const activation = processActivations.activations.get(sessionID)
+        result.set(sessionID, {
+          type: activation?.ownerID === row.ownerID && activation.generation === row.generation
+            ? "busy"
+            : "interrupted",
+        })
+      }
+      return result
     })
 
     const listWorking = Effect.fn("SessionExecutionOwner.listWorking")(function* () {
       const rows = yield* readDb
-        .select({ sessionID: SessionExecutionOwnerTable.session_id })
+        .select({
+          sessionID: SessionExecutionOwnerTable.session_id,
+          ownerID: SessionExecutionOwnerTable.owner_id,
+          generation: SessionExecutionOwnerTable.generation,
+        })
         .from(SessionExecutionOwnerTable)
         .where(isNotNull(SessionExecutionOwnerTable.owner_id))
         .all()
         .pipe(Effect.orDie)
-      return new Map(rows.map((row) => [SessionSchema.ID.make(row.sessionID), { type: "busy" as const }]))
+      return yield* projectWorking(rows)
+    })
+
+    const listWorkingForSessionIDs = Effect.fn("SessionExecutionOwner.listWorkingForSessionIDs")(function* (
+      sessionIDs: readonly SessionSchema.ID[],
+    ) {
+      const ids = Array.from(new Set(sessionIDs))
+      if (ids.length === 0) return new Map<SessionSchema.ID, { readonly type: "busy" | "interrupted" }>()
+      const rows: Array<{ sessionID: string; ownerID: string | null; generation: number }> = []
+      for (let offset = 0; offset < ids.length; offset += 500) {
+        rows.push(
+          ...(yield* readDb
+            .select({
+              sessionID: SessionExecutionOwnerTable.session_id,
+              ownerID: SessionExecutionOwnerTable.owner_id,
+              generation: SessionExecutionOwnerTable.generation,
+            })
+            .from(SessionExecutionOwnerTable)
+            .where(
+              and(
+                inArray(SessionExecutionOwnerTable.session_id, ids.slice(offset, offset + 500)),
+                isNotNull(SessionExecutionOwnerTable.owner_id),
+              ),
+            )
+            .all()
+            .pipe(Effect.orDie)),
+        )
+      }
+      return yield* projectWorking(rows)
     })
 
     const listWorkingByDirectory = Effect.fn("SessionExecutionOwner.listWorkingByDirectory")(function* (directory: string) {
       const rows = yield* readDb
-        .select({ sessionID: SessionExecutionOwnerTable.session_id })
+        .select({
+          sessionID: SessionExecutionOwnerTable.session_id,
+          ownerID: SessionExecutionOwnerTable.owner_id,
+          generation: SessionExecutionOwnerTable.generation,
+        })
         .from(SessionExecutionOwnerTable)
         .innerJoin(SessionTable, eq(SessionTable.id, SessionExecutionOwnerTable.session_id))
         .where(and(eq(SessionTable.directory, directory), isNotNull(SessionExecutionOwnerTable.owner_id)))
         .all()
         .pipe(Effect.orDie)
-      return new Map(rows.map((row) => [SessionSchema.ID.make(row.sessionID), { type: "busy" as const }]))
+      return yield* projectWorking(rows)
     })
 
     const listSessionIDsByDirectory = Effect.fn("SessionExecutionOwner.listSessionIDsByDirectory")(function* (
@@ -1197,6 +1410,20 @@ owner_id: null,
       return rows.map((row) => SessionSchema.ID.make(row.sessionID))
     })
 
+    // A hot-refreshed graph no longer owns its tracked Session generations.
+    // Drop only exact registrations published by this graph; a replacement
+    // service may have registered a newer generation in the meantime.
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const token of activations.values()) {
+          const current = processActivations.activations.get(token.sessionID)
+          if (current?.ownerID === token.ownerID && current.generation === token.generation)
+            processActivations.activations.delete(token.sessionID)
+        }
+        activations.clear()
+      }),
+    )
+
     return Service.of({
       tryAcquire,
       tryAcquireLocal,
@@ -1204,7 +1431,9 @@ owner_id: null,
       releaseIfDrained,
       release,
       snapshot,
+      snapshotMany,
       listWorking,
+      listWorkingForSessionIDs,
       listWorkingByDirectory,
       listSessionIDsByDirectory,
       requestInterrupt,

@@ -2,9 +2,11 @@ export * as SessionTelemetry from "./telemetry"
 
 import type { LLMEvent } from "@opencode-ai/llm"
 import { SessionTelemetry as TelemetrySchema } from "@opencode-ai/schema/session-telemetry"
+import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 import { eq, inArray, sql } from "drizzle-orm"
 import { Context, Effect, Layer, Queue } from "effect"
 import { Database } from "../database/database"
+import { retrySqliteBusyCause } from "../database/sqlite-busy"
 import { makeGlobalNode } from "../effect/app-node"
 import { EventV2 } from "../event"
 import { SessionMessage } from "./message"
@@ -47,6 +49,7 @@ type MutableInfo = {
   model?: {
     providerID: string
     modelID: string
+    accountID?: string
     name?: string
     variant?: string
     contextLimit?: number
@@ -55,12 +58,14 @@ type MutableInfo = {
     model: {
       providerID: string
       modelID: string
+      accountID?: string
       name?: string
       variant?: string
       contextLimit?: number
     }
     tokens: TelemetrySchema.Tokens
   }
+  isCompaction?: boolean
   step?: MutableStep
   generatedMs: number
   toolMs: number
@@ -85,6 +90,8 @@ export type ProviderAttempt = {
   readonly assistantMessageID?: string
   readonly requestSentAt: number
   readonly observedEvents: number
+  /** Ephemeral claim state; lets later switch requests fail closed. */
+  readonly preempted?: boolean
   readonly streamedAt?: number
   readonly completedAt?: number
 }
@@ -100,9 +107,34 @@ export type BeginInput = {
   readonly model: {
     readonly providerID: string
     readonly modelID: string
+    readonly accountID?: string
     readonly name?: string
     readonly variant?: string
     readonly contextLimit?: number
+  }
+  readonly isCompaction?: boolean
+}
+
+/**
+ * Canonicalizes one live-generation model identity for the client projection.
+ * Producers may carry a per-account key pin as an account-qualified catalog id
+ * (`base@zen-…`); the committed routed account, an explicit selection account,
+ * and finally the qualified suffix supply `accountID` in priority order, so
+ * `modelID` never carries the pin and cannot compare as a different model
+ * against the account-neutral selector identity.
+ */
+export function telemetryModelIdentity(input: {
+  readonly providerID: string
+  readonly modelID: string
+  readonly routedAccountID?: string
+  readonly accountID?: string
+}) {
+  const parts = splitAccountModelID(input.modelID)
+  const accountID = input.routedAccountID ?? input.accountID ?? parts.accountID
+  return {
+    providerID: input.providerID,
+    modelID: parts.baseModelID,
+    ...(accountID === undefined ? {} : { accountID }),
   }
 }
 
@@ -160,6 +192,12 @@ export interface Interface {
     sessionID: string,
     assistantMessageID?: string,
   ) => Effect.Effect<ProviderExecutionClaim | undefined>
+  /** Exact live-attempt claim used by active model switching. */
+  readonly claimModelSwitchAttempt: (input: {
+    readonly sessionID: string
+    readonly assistantMessageID: string
+    readonly requestSentAt: number
+  }) => Effect.Effect<boolean>
   /**
    * Snapshot the process-global live set without touching durable history or
    * materializing a Location/Instance. This intentionally reports only
@@ -325,10 +363,7 @@ const layer = Layer.effect(
     // marks telemetry dirty; idle OpenCode pays no periodic timer cost.
     yield* Effect.forkScoped(
       Effect.forever(
-        Queue.take(wake).pipe(
-          Effect.andThen(Effect.sleep(`${FLUSH_DELAY_MS} millis`)),
-          Effect.andThen(flush()),
-        ),
+        Queue.take(wake).pipe(Effect.andThen(Effect.sleep(`${FLUSH_DELAY_MS} millis`)), Effect.andThen(flush())),
       ),
     )
 
@@ -458,6 +493,7 @@ const layer = Layer.effect(
       state.info.phaseStartedAt = timestamp
       state.phaseStartedMonotonic = monotonicAt
       state.info.updatedAt = timestamp
+      state.info.isCompaction = undefined
       state.info.step = undefined
       pruneStates(timestamp)
       yield* mark(state.info.sessionID)
@@ -490,6 +526,7 @@ const layer = Layer.effect(
       state.info.phaseStartedAt = at
       state.phaseStartedMonotonic = monotonicAt
       state.info.updatedAt = at
+      state.info.isCompaction = input.isCompaction === true ? true : undefined
       state.info.model = { ...input.model }
       state.info.step = {
         ...(input.assistantMessageID === undefined ? {} : { assistantMessageID: input.assistantMessageID }),
@@ -583,57 +620,64 @@ const layer = Layer.effect(
       step.cost = input.cost
       step.tokens = input.tokens
 
-      const stored = yield* db
-        .insert(SessionTelemetryTable)
-        .values({
-          session_id: id,
-          assistant_message_id: messageID(step.assistantMessageID),
-          provider_id: model?.providerID,
-          model_id: model?.modelID,
-          model_name: model?.name,
-          variant: model?.variant,
-          context_limit: model?.contextLimit,
-          request_sent_at: step.requestSentAt,
-          first_token_at: step.firstTokenAt,
-          streamed_at: step.streamedAt,
-          completed_at: step.completedAt,
-          cost_usd: input.cost,
-          tokens_input: input.tokens.input,
-          tokens_output: input.tokens.output,
-          tokens_reasoning: input.tokens.reasoning,
-          tokens_cache_read: input.tokens.cache.read,
-          tokens_cache_write: input.tokens.cache.write,
-          generated_ms: state.stepGeneratedMs,
-          tool_ms: state.stepToolMs,
-          updated_at: input.completedAt,
-        })
-        .onConflictDoUpdate({
-          target: SessionTelemetryTable.session_id,
-          set: {
-            assistant_message_id: messageID(step.assistantMessageID),
-            provider_id: model?.providerID,
-            model_id: model?.modelID,
-            model_name: model?.name,
-            variant: model?.variant,
-            context_limit: model?.contextLimit,
-            request_sent_at: step.requestSentAt,
-            first_token_at: step.firstTokenAt,
-            streamed_at: step.streamedAt,
-            completed_at: step.completedAt,
-            cost_usd: input.cost,
-            tokens_input: input.tokens.input,
-            tokens_output: input.tokens.output,
-            tokens_reasoning: input.tokens.reasoning,
-            tokens_cache_read: input.tokens.cache.read,
-            tokens_cache_write: input.tokens.cache.write,
-            generated_ms: sql`CASE WHEN ${SessionTelemetryTable.assistant_message_id} = excluded.assistant_message_id THEN ${SessionTelemetryTable.generated_ms} ELSE ${SessionTelemetryTable.generated_ms} + excluded.generated_ms END`,
-            tool_ms: sql`CASE WHEN ${SessionTelemetryTable.assistant_message_id} = excluded.assistant_message_id THEN ${SessionTelemetryTable.tool_ms} ELSE ${SessionTelemetryTable.tool_ms} + excluded.tool_ms END`,
-            updated_at: input.completedAt,
-          },
-        })
-        .returning({ generatedMs: SessionTelemetryTable.generated_ms, toolMs: SessionTelemetryTable.tool_ms })
-        .get()
-        .pipe(Effect.orDie)
+      // A second Desktop/ACP writer may briefly hold the WAL writer lock.
+      // Replay only this idempotent upsert, never settle's in-memory timing
+      // transitions (which would double-count the step on retry).
+      const stored = yield* retrySqliteBusyCause(
+        () =>
+          db
+            .insert(SessionTelemetryTable)
+            .values({
+              session_id: id,
+              assistant_message_id: messageID(step.assistantMessageID),
+              provider_id: model?.providerID,
+              model_id: model?.modelID,
+              model_name: model?.name,
+              variant: model?.variant,
+              context_limit: model?.contextLimit,
+              request_sent_at: step.requestSentAt,
+              first_token_at: step.firstTokenAt,
+              streamed_at: step.streamedAt,
+              completed_at: step.completedAt,
+              cost_usd: input.cost,
+              tokens_input: input.tokens.input,
+              tokens_output: input.tokens.output,
+              tokens_reasoning: input.tokens.reasoning,
+              tokens_cache_read: input.tokens.cache.read,
+              tokens_cache_write: input.tokens.cache.write,
+              generated_ms: state.stepGeneratedMs,
+              tool_ms: state.stepToolMs,
+              updated_at: input.completedAt,
+            })
+            .onConflictDoUpdate({
+              target: SessionTelemetryTable.session_id,
+              set: {
+                assistant_message_id: messageID(step.assistantMessageID),
+                provider_id: model?.providerID,
+                model_id: model?.modelID,
+                model_name: model?.name,
+                variant: model?.variant,
+                context_limit: model?.contextLimit,
+                request_sent_at: step.requestSentAt,
+                first_token_at: step.firstTokenAt,
+                streamed_at: step.streamedAt,
+                completed_at: step.completedAt,
+                cost_usd: input.cost,
+                tokens_input: input.tokens.input,
+                tokens_output: input.tokens.output,
+                tokens_reasoning: input.tokens.reasoning,
+                tokens_cache_read: input.tokens.cache.read,
+                tokens_cache_write: input.tokens.cache.write,
+                generated_ms: sql`CASE WHEN ${SessionTelemetryTable.assistant_message_id} = excluded.assistant_message_id THEN ${SessionTelemetryTable.generated_ms} ELSE ${SessionTelemetryTable.generated_ms} + excluded.generated_ms END`,
+                tool_ms: sql`CASE WHEN ${SessionTelemetryTable.assistant_message_id} = excluded.assistant_message_id THEN ${SessionTelemetryTable.tool_ms} ELSE ${SessionTelemetryTable.tool_ms} + excluded.tool_ms END`,
+                updated_at: input.completedAt,
+              },
+            })
+            .returning({ generatedMs: SessionTelemetryTable.generated_ms, toolMs: SessionTelemetryTable.tool_ms })
+            .get()
+            .pipe(Effect.orDie),
+        { maxElapsedMs: 15_000, delayMs: 25, maxDelayMs: 250 },
+      )
 
       state.stepGeneratedMs = 0
       state.stepToolMs = 0
@@ -646,7 +690,8 @@ const layer = Layer.effect(
       state.phaseStartedMonotonic = monotonicAt
       state.info.updatedAt = input.completedAt
       state.info.step = step
-      if (model) state.info.context = { model: { ...model }, tokens: { ...input.tokens, cache: { ...input.tokens.cache } } }
+      if (model)
+        state.info.context = { model: { ...model }, tokens: { ...input.tokens, cache: { ...input.tokens.cache } } }
       yield* mark(id)
     })
 
@@ -669,6 +714,7 @@ const layer = Layer.effect(
       closeAllTools(state, monotonicAt)
       state.info.phase = "idle"
       state.providerPreempted = false
+      state.info.isCompaction = undefined
       state.info.turnStartedAt = undefined
       state.turnStartedMonotonic = undefined
       state.info.phaseStartedAt = timestamp
@@ -691,6 +737,7 @@ const layer = Layer.effect(
         ...(step.assistantMessageID === undefined ? {} : { assistantMessageID: step.assistantMessageID }),
         requestSentAt: step.requestSentAt,
         observedEvents: state.providerEvents,
+        ...(state.providerPreempted ? { preempted: true } : {}),
         ...(step.streamedAt === undefined ? {} : { streamedAt: step.streamedAt }),
         ...(step.completedAt === undefined ? {} : { completedAt: step.completedAt }),
       } satisfies ProviderAttempt
@@ -735,6 +782,31 @@ const layer = Layer.effect(
       } satisfies ProviderExecutionClaim
     })
 
+    const claimModelSwitchAttempt = Effect.fnUntraced(function* (input: {
+      readonly sessionID: string
+      readonly assistantMessageID: string
+      readonly requestSentAt: number
+    }) {
+      const state = states.get(sessionID(input.sessionID))
+      const step = state?.info.step
+      if (
+        !state ||
+        !step ||
+        state.info.isCompaction === true ||
+        !["requesting", "reasoning", "generating"].includes(state.info.phase) ||
+        state.toolStarts.size > 0 ||
+        state.providerPreempted ||
+        step.assistantMessageID !== input.assistantMessageID ||
+        step.requestSentAt !== input.requestSentAt ||
+        step.streamedAt !== undefined ||
+        step.completedAt !== undefined
+      )
+        return false
+      state.providerPreempted = true
+      yield* mark(state.info.sessionID)
+      return true
+    })
+
     const active = Effect.sync(() => {
       const result = new Set<SessionSchema.ID>()
       for (const [id, state] of states) {
@@ -777,6 +849,7 @@ const layer = Layer.effect(
       fail,
       providerAttempt,
       claimUnprovenProviderExecution,
+      claimModelSwitchAttempt,
       active,
       snapshot,
     })

@@ -74,11 +74,13 @@ function harness(script: ReadonlyArray<ScriptedAcquire>) {
     tryAcquireLocal: acquire,
     localActivation: () => Effect.succeed(undefined),
     listWorking: () => Effect.succeed(new Map()),
+    listWorkingForSessionIDs: () => Effect.succeed(new Map()),
     listWorkingByDirectory: () => Effect.succeed(new Map()),
     listSessionIDsByDirectory: () => Effect.succeed([]),
     releaseIfDrained: () => Effect.die("releaseIfDrained must not be called while maintenance-blocked"),
     release: () => Effect.die("release must not be called while maintenance-blocked"),
     snapshot: () => Effect.succeed({ sessionID, generation: 7 }),
+    snapshotMany: (ids) => Effect.succeed(new Map(ids.map((id) => [id, { sessionID: id, generation: 7 }]))),
     requestInterrupt: () => Effect.succeed({ state: "idle" as const }),
     tryClaimRecovery: () =>
       Effect.sync(() => {

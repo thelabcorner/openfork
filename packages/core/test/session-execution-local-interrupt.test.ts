@@ -34,6 +34,7 @@ describe("SessionExecutionLocal interrupt ownership", () => {
     tryAcquireLocal: () => Effect.succeed({ state: "acquired" as const, token }),
     localActivation: () => Effect.succeed(token),
     listWorking: () => Effect.succeed(new Map()),
+    listWorkingForSessionIDs: () => Effect.succeed(new Map()),
     listWorkingByDirectory: () => Effect.succeed(new Map()),
     listSessionIDsByDirectory: () => Effect.succeed([]),
     releaseIfDrained: () =>
@@ -49,6 +50,7 @@ describe("SessionExecutionLocal interrupt ownership", () => {
         return "released" as const
       }),
     snapshot: () => Effect.succeed({ sessionID, generation: 1, ownerID: token.ownerID }),
+    snapshotMany: (ids) => Effect.succeed(new Map(ids.map((id) => [id, { sessionID: id, generation: 1, ownerID: token.ownerID }]))),
     requestInterrupt: () =>
       Effect.succeed({
         state: "requested" as const,

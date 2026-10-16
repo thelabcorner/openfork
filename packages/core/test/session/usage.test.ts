@@ -1,13 +1,23 @@
-import { describe, expect } from "bun:test"
-import { Effect } from "effect"
+import { afterAll, describe, expect } from "bun:test"
+import { Deferred, Effect, Fiber } from "effect"
+import { sql } from "drizzle-orm"
+import { join } from "node:path"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
+import { tmpdir } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionUsage.node, Database.node])))
+const file = await tmpdir()
+const fileTest = testEffect(AppNodeBuilder.build(
+  LayerNode.group([SessionUsage.node, Database.node]),
+  [[Database.node, Database.layerFromPath(join(file.path, "usage-scan-isolation.sqlite"))]],
+))
+afterAll(async () => { await file[Symbol.asyncDispose]().catch(() => {}) })
 
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
@@ -57,6 +67,42 @@ const seed = Effect.fn("seed")(function* (
 })
 
 describe("SessionUsage", () => {
+  fileTest.live("historical Go usage reads complete while the primary writer permit is held", () =>
+    Effect.gen(function* () {
+      const { db, readDb, scanDb } = yield* Database.Service
+      const usage = yield* SessionUsage.Service
+      const now = Date.now()
+      yield* seed([{ providerID: "opencode-go", cost: 0.5, createdMs: now - HOUR_MS }])
+      const scanner = yield* scanDb()
+      expect(scanner).not.toBe(db)
+      expect(scanner).not.toBe(readDb)
+
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const writer = yield* db.transaction((tx) => Effect.gen(function* () {
+        yield* tx.run(sql`UPDATE message SET time_updated = time_updated WHERE id = 'msg_test_0'`)
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(release)
+      }), { behavior: "immediate" }).pipe(Effect.forkScoped)
+      yield* Deferred.await(entered)
+
+      const history = yield* Effect.all([
+        usage.rows(now - 2 * HOUR_MS),
+        usage.windows(),
+      ], { concurrency: "unbounded" }).pipe(Effect.forkScoped)
+      const completedWithoutWriter = yield* Effect.race(
+        Fiber.await(history).pipe(Effect.as(true)),
+        Effect.sleep("350 millis").pipe(Effect.as(false)),
+      )
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(writer)
+      expect(completedWithoutWriter).toBe(true)
+      const [rows, windows] = yield* Fiber.join(history)
+      expect(rows).toHaveLength(1)
+      expect(windows).toHaveLength(3)
+    }),
+  )
+
   it.effect("sums Go-plan spend within each window and excludes other providers", () =>
     Effect.gen(function* () {
       const now = Date.now()

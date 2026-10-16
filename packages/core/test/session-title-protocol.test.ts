@@ -3,6 +3,8 @@ import { Effect } from "effect"
 import { LLMEvent } from "@opencode-ai/llm"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionTitle } from "@opencode-ai/core/session/title"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import {
   generatedTitleCompletion,
   insertSession,
@@ -111,6 +113,28 @@ describe("SessionTitle structured protocol", () => {
       expect((yield* session.get(sessionID)).title).toBe(baseline)
       expect(h.titleRequests).toHaveLength(2)
       expect(JSON.stringify(h.titleRequests[1]!.messages)).toContain("Protocol correction")
+    }),
+  )
+
+  it.live("does not silently use a different model when the user explicitly selects an unavailable title model", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      yield* insertUserMessage(sessionID, "debug routing")
+      const sessions = yield* SessionV2.Service
+      const title = yield* SessionTitle.Service
+      const baseline = yield* sessions.get(sessionID)
+      h.enqueueTitle(generatedTitleCompletion("Wrong model"))
+      const failed = yield* title.regenerate({
+          session: baseline,
+          model: {
+            providerID: ProviderV2.ID.make("missing-provider"),
+            id: ModelV2.ID.make("missing-model"),
+          },
+        }).pipe(Effect.as(false), Effect.catch(() => Effect.succeed(true)))
+      expect(failed).toBe(true)
+      expect(h.titleRequests).toHaveLength(0)
+      expect((yield* sessions.get(sessionID)).title).toBe(baseline.title)
     }),
   )
 })

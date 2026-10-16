@@ -144,7 +144,11 @@ export const makeHarness = (
       }),
     }),
   ]
-  const catalogModels = new Map<string, ModelV2.Info>()
+  // A real installation always has at least one catalog model when title
+  // generation succeeds. Seed the fake worker default so strict production
+  // capability filtering does not incorrectly fail unrelated title tests.
+  const defaultCatalogModel = catalogModel("fake", "fake-model")
+  const catalogModels = new Map<string, ModelV2.Info>([["fake/fake-model", defaultCatalogModel]])
   const catalogSmall = new Map<string, ModelV2.Info>()
   let streamGate: Deferred.Deferred<void> | undefined
   let streamStarted: Deferred.Deferred<void> | undefined
@@ -247,7 +251,7 @@ export const makeHarness = (
         get: (providerID, id) => Effect.succeed(catalogModels.get(`${providerID}/${id}`)),
         all: () => Effect.succeed([...catalogModels.values()]),
         available: () => Effect.succeed([...catalogModels.values()]),
-        default: () => Effect.succeed(undefined),
+        default: () => Effect.succeed(catalogModels.get("fake/fake-model")),
         small: (providerID) => Effect.succeed(catalogSmall.get(providerID)),
       },
     }),
@@ -380,7 +384,8 @@ export const makeHarness = (
       streamGate = undefined
       streamStarted = undefined
       currentSessionModel = sessionModel
-      catalogModels.clear()
+       catalogModels.clear()
+       catalogModels.set("fake/fake-model", defaultCatalogModel)
       catalogSmall.clear()
       for (const entry of configEntries) {
         if (entry.type !== "document") continue

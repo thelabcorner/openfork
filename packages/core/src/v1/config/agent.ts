@@ -66,7 +66,7 @@ const normalize = (agent: Schema.Schema.Type<typeof AgentSchema>): Schema.Schema
   }
 
   const permission: ConfigPermissionV1.Info = {}
-  for (const [tool, enabled] of Object.entries(agent.tools ?? {})) {
+  for (const [tool, enabled] of Object.entries(ConfigPermissionV1.normalizeLegacyKeys(agent.tools ?? {}))) {
     const action = enabled ? "allow" : "deny"
     if (tool === "write" || tool === "edit" || tool === "patch") {
       permission.edit = action

@@ -1,6 +1,6 @@
 export * as SessionSearch from "./search"
 
-import { eq, sql, type SQL } from "drizzle-orm"
+import { eq, inArray, sql, type SQL } from "drizzle-orm"
 import { Cause, Effect, Option, Schedule, Schema } from "effect"
 import { ProjectV2 } from "../project"
 import { Database } from "../database/database"
@@ -15,11 +15,16 @@ import {
   SearchBackfillTable,
   SessionMessageTable,
   SessionTable,
+  SessionToolRecallBackfillTable,
 } from "./sql"
 import { partSearchText, searchText, snippet } from "./search-text"
+import { SessionToolRecall } from "./tool-recall"
+import { SessionLegacyToolIndex } from "./legacy-tool-index"
+import { legacyPartKind, legacyPartOpaque } from "./legacy-part-query"
 
 export const DefaultSearchLimit = 50
 export const MaxSearchLimit = 100
+export type SearchRanking = "recent" | "relevance"
 const MaxQueryTerms = 8
 const MinTermLength = 2
 const BackfillChunk = 1000
@@ -27,7 +32,10 @@ const AutomaticBackfillEnv = "OPENCODE_SEARCH_BACKFILL"
 const BaseSearchBackfillID = 1
 /** Bump only when the persisted V2 search_text extractor semantics change. */
 export const CurrentSearchProjectionVersion = 2
-const PartSearchBackfillID = 1
+// Bump whenever the persisted V1 part search projection changes. Version 2
+// removes raw Code source/runtime input from part_fts and replaces it with a
+// bounded identity/lineage projection.
+const PartSearchBackfillID = 2
 
 export interface SearchScopeInput {
   readonly directory?: string
@@ -44,6 +52,8 @@ export interface SearchScopeInput {
 export interface SearchInput extends SearchScopeInput {
   readonly query: string
   readonly limit?: number
+  /** relevance preserves BM25 ordering; recent orders matching durable evidence newest-first. */
+  readonly ranking?: SearchRanking
 }
 
 export interface SearchMessageMatch {
@@ -183,16 +193,28 @@ export function matchQuery(query: string): string | undefined {
 export function search(db: Database, input: SearchInput): Effect.Effect<SearchResult, SearchError> {
   return Effect.gen(function* () {
     const startedAt = Date.now()
-    const limit = Math.min(input.limit ?? DefaultSearchLimit, MaxSearchLimit)
+    // SQLite interprets LIMIT -1 as *unbounded*. Reject that accidental
+    // escape hatch before constructing the FTS and title queries; the public
+    // bounded Session recall invariant must hold for every caller.
+    const rawLimit = input.limit ?? DefaultSearchLimit
+    const limit = Number.isFinite(rawLimit)
+      ? Math.max(1, Math.min(MaxSearchLimit, Math.trunc(rawLimit)))
+      : DefaultSearchLimit
+    const ranking = input.ranking ?? "relevance"
     const scope = scopeConditions(input)
     const scopeClause = scope.length > 0 ? sql` AND ${sql.join(scope, sql` AND `)}` : sql``
+    // A user searches for literal title text. Unescaped LIKE '%' and '_'
+    // previously matched arbitrary titles, inflating recall with false hits.
+    // ESCAPE '!' preserves SQLite's case-insensitive LIKE semantics while
+    // treating %, _, and ! in the input as literal characters.
+    const titlePattern = `%${input.query.replace(/[!%_]/g, "!$&")}%`
 
     const titleStartedAt = Date.now()
     const titleRows = yield* db
       .all<typeof SessionTable.$inferSelect>(sql`
         SELECT s.*
         FROM session s
-        WHERE s.title LIKE ${`%${input.query}%`}${scopeClause}
+        WHERE s.title LIKE ${titlePattern} ESCAPE '!'${scopeClause}
         ORDER BY s.time_created DESC, s.id DESC
         LIMIT ${limit}
       `)
@@ -210,25 +232,46 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
     // FTS matches with the scoped session_message rowids, so the rank sort
     // stays bounded by the scoped set. Without scope the rank sort runs over
     // all matches but never touches the wide message rows.
-    const ranked = scope.length > 0
-      ? sql`
-          SELECT session_message_fts.rowid, rank AS score
-          FROM session_message_fts
-          JOIN (
-            SELECT m.rowid
-            FROM session s
-            JOIN session_message m ON m.session_id = s.id
-            WHERE ${sql.join(scope, sql` AND `)}
-          ) scoped ON scoped.rowid = session_message_fts.rowid
-          WHERE session_message_fts MATCH ${match}
-          ORDER BY rank
-          LIMIT ${limit}`
-      : sql`
-          SELECT rowid, rank AS score
-          FROM session_message_fts
-          WHERE session_message_fts MATCH ${match}
-          ORDER BY rank
-          LIMIT ${limit}`
+    const ranked = ranking === "recent"
+      ? scope.length > 0
+        ? sql`
+            SELECT session_message_fts.rowid, 0 AS score
+            FROM session_message_fts
+            JOIN session_message m ON m.rowid = session_message_fts.rowid
+            JOIN session s ON s.id = m.session_id
+            WHERE session_message_fts MATCH ${match}
+              AND ${sql.join(scope, sql` AND `)}
+            ORDER BY m.time_created DESC, m.id DESC
+            LIMIT ${limit}`
+        : sql`
+            SELECT session_message_fts.rowid, 0 AS score
+            FROM session_message_fts
+            JOIN session_message m ON m.rowid = session_message_fts.rowid
+            WHERE session_message_fts MATCH ${match}
+            ORDER BY m.time_created DESC, m.id DESC
+            LIMIT ${limit}`
+      : scope.length > 0
+        ? sql`
+            SELECT session_message_fts.rowid, rank AS score
+            FROM session_message_fts
+            JOIN (
+              SELECT m.rowid
+              FROM session s
+              JOIN session_message m ON m.session_id = s.id
+              WHERE ${sql.join(scope, sql` AND `)}
+            ) scoped ON scoped.rowid = session_message_fts.rowid
+            WHERE session_message_fts MATCH ${match}
+            ORDER BY rank
+            LIMIT ${limit}`
+        : sql`
+            SELECT rowid, rank AS score
+            FROM session_message_fts
+            WHERE session_message_fts MATCH ${match}
+            ORDER BY rank
+            LIMIT ${limit}`
+    const messageOrder = ranking === "recent"
+      ? sql`m.time_created DESC, m.id DESC`
+      : sql`f.score`
     const messageStartedAt = Date.now()
     const messageRows = match
       ? yield* db
@@ -245,7 +288,7 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
             FROM (${ranked}) f
             JOIN session_message m ON m.rowid = f.rowid
             JOIN session s ON s.id = m.session_id
-            ORDER BY f.score
+            ORDER BY ${messageOrder}
           `)
           .pipe(
             Effect.mapError(
@@ -267,39 +310,49 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
     const selectivePartScope = Boolean(
       input.directory || input.workspaceID || input.project || input.parentID,
     ) || (input.directoryPrefixes !== undefined && input.directoryPrefixes.length > 0 && input.directoryPrefixes.length <= 8)
-    const rankedParts = selectivePartScope
+    const rankedParts = ranking === "recent"
       ? sql`
-          SELECT part_fts.rowid, rank AS score
-          FROM (
-            SELECT p.rowid
-            FROM session s
-            JOIN part p ON p.session_id = s.id
-            WHERE ${sql.join(scope, sql` AND `)}
-          ) scoped
-          CROSS JOIN part_fts
-          WHERE part_fts.rowid = scoped.rowid
-            AND part_fts MATCH ${match}
-          ORDER BY rank
-          LIMIT ${limit}`
-      : scope.length > 0
-      ? sql`
-          SELECT part_fts.rowid, rank AS score
+          SELECT part_fts.rowid, 0 AS score
           FROM part_fts
-          JOIN (
-            SELECT p.rowid
-            FROM session s
-            JOIN part p ON p.session_id = s.id
-            WHERE ${sql.join(scope, sql` AND `)}
-          ) scoped ON scoped.rowid = part_fts.rowid
+          JOIN part p ON p.rowid = part_fts.rowid
+          JOIN message m ON m.id = p.message_id
+          JOIN session s ON s.id = p.session_id
           WHERE part_fts MATCH ${match}
-          ORDER BY rank
+            ${scope.length > 0 ? sql`AND ${sql.join(scope, sql` AND `)}` : sql``}
+          ORDER BY m.time_created DESC, p.id DESC
           LIMIT ${limit}`
-      : sql`
-          SELECT rowid, rank AS score
-          FROM part_fts
-          WHERE part_fts MATCH ${match}
-          ORDER BY rank
-          LIMIT ${limit}`
+      : selectivePartScope
+        ? sql`
+            SELECT part_fts.rowid, rank AS score
+            FROM part_fts
+            CROSS JOIN part p ON p.rowid = part_fts.rowid
+            JOIN session s ON s.id = p.session_id
+            WHERE part_fts MATCH ${match}
+              AND ${sql.join(scope, sql` AND `)}
+            ORDER BY rank
+            LIMIT ${limit}`
+        : scope.length > 0
+        ? sql`
+            SELECT part_fts.rowid, rank AS score
+            FROM part_fts
+            JOIN (
+              SELECT p.rowid
+              FROM session s
+              JOIN part p ON p.session_id = s.id
+              WHERE ${sql.join(scope, sql` AND `)}
+            ) scoped ON scoped.rowid = part_fts.rowid
+            WHERE part_fts MATCH ${match}
+            ORDER BY rank
+            LIMIT ${limit}`
+        : sql`
+            SELECT rowid, rank AS score
+            FROM part_fts
+            WHERE part_fts MATCH ${match}
+            ORDER BY rank
+            LIMIT ${limit}`
+    const partOrder = ranking === "recent"
+      ? sql`m.time_created DESC, p.id DESC`
+      : sql`f.score`
     const partStartedAt = Date.now()
     const partRows = match
       ? yield* db
@@ -319,7 +372,7 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
             JOIN part p ON p.rowid = f.rowid
             JOIN message m ON m.id = p.message_id
             JOIN session s ON s.id = p.session_id
-            ORDER BY f.score
+            ORDER BY ${partOrder}
           `)
           .pipe(
             Effect.mapError(
@@ -345,31 +398,30 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
         matchedTerms: terms,
       })),
       messageMatches: mergeMatches(
-        [
-          ...messageRows.map((row) => ({
-            sessionID: SessionSchema.ID.make(row.session_id),
-            messageID: SessionMessage.ID.make(row.id),
-            sessionTitle: row.session_title,
-            directory: row.directory,
-            projectID: ProjectV2.ID.make(row.project_id),
-            time: { created: row.time_created },
-            type: row.type as SessionMessage.Type,
-            snippet: snippet(row.search_text, terms),
-            matchedTerms: terms,
-          })),
-          ...partRows.map((row) => ({
-            sessionID: SessionSchema.ID.make(row.session_id),
-            messageID: SessionMessage.ID.make(row.message_id),
-            sessionTitle: row.session_title,
-            directory: row.directory,
-            projectID: ProjectV2.ID.make(row.project_id),
-            time: { created: row.time_created },
-            type: (row.role === "assistant" ? "assistant" : "user") as SessionMessage.Type,
-            snippet: snippet(row.search_text, terms),
-            matchedTerms: terms,
-          })),
-        ],
+        messageRows.map((row) => ({
+          sessionID: SessionSchema.ID.make(row.session_id),
+          messageID: SessionMessage.ID.make(row.id),
+          sessionTitle: row.session_title,
+          directory: row.directory,
+          projectID: ProjectV2.ID.make(row.project_id),
+          time: { created: row.time_created },
+          type: row.type as SessionMessage.Type,
+          snippet: snippet(row.search_text, terms),
+          matchedTerms: terms,
+        })),
+        partRows.map((row) => ({
+          sessionID: SessionSchema.ID.make(row.session_id),
+          messageID: SessionMessage.ID.make(row.message_id),
+          sessionTitle: row.session_title,
+          directory: row.directory,
+          projectID: ProjectV2.ID.make(row.project_id),
+          time: { created: row.time_created },
+          type: (row.role === "assistant" ? "assistant" : "user") as SessionMessage.Type,
+          snippet: snippet(row.search_text, terms),
+          matchedTerms: terms,
+        })),
         limit,
+        ranking,
       ),
     }
     const elapsedMs = Date.now() - startedAt
@@ -378,6 +430,7 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
       const partBackfill = yield* readPartBackfillState(db).pipe(Effect.catch(() => Effect.succeed(undefined)))
       yield* Effect.logInfo("session search core completed slowly", {
         elapsedMs,
+        ranking,
         titleMs,
         messageMs,
         partMs,
@@ -397,20 +450,64 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
   })
 }
 
-// One session may surface matches from both the V2 session_message and the V1
-// part stores (e.g. a session that predates the V2 projection). Collapse to
-// one match per message ID, keeping the first (highest BM25-ranked) hit, and
-// cap the merged list at the requested limit.
-function mergeMatches(matches: SearchMessageMatch[], limit: number): SearchMessageMatch[] {
-  const seen = new Set<string>()
-  const merged: SearchMessageMatch[] = []
-  for (const match of matches) {
-    if (seen.has(match.messageID)) continue
-    seen.add(match.messageID)
-    merged.push(match)
-    if (merged.length >= limit) break
+// FTS5 ranks each of the two indexes independently; a raw BM25 score is not
+// calibrated across their different corpora. Previously the relevance merge
+// simply concatenated every V2 result before every V1 result, silently
+// burying legacy content. Reciprocal rank fusion balances the two ordered
+// lists without requiring cross-index score normalization or extra queries.
+// Duplicate message IDs gain agreement credit, not duplicate result slots.
+export function mergeMatches(
+  v2: SearchMessageMatch[],
+  v1: SearchMessageMatch[],
+  limit: number,
+  ranking: SearchRanking,
+): SearchMessageMatch[] {
+  if (ranking === "recent") {
+    const seen = new Set<string>()
+    const result: SearchMessageMatch[] = []
+    const ordered = [...v2, ...v1].sort((a, b) =>
+      b.time.created - a.time.created || String(b.messageID).localeCompare(String(a.messageID)))
+    for (const hit of ordered) {
+      if (seen.has(hit.messageID)) continue
+      seen.add(hit.messageID)
+      result.push(hit)
+      if (result.length >= limit) break
+    }
+    return result
   }
-  return merged
+  const fused = new Map<string, {
+    match: SearchMessageMatch
+    score: number
+    firstRank: number
+  }>()
+  for (const list of [v2, v1]) {
+    // V1 can have multiple matching parts inside the *same* message. Those
+    // are one source's repeated evidence, not independent confirmations.
+    const seenInIndex = new Set<string>()
+    let uniqueRank = 0
+    for (let i = 0; i < list.length; i++) {
+      const match = list[i]!
+      const key = String(match.messageID)
+      if (seenInIndex.has(key)) continue
+      seenInIndex.add(key)
+      const existing = fused.get(key)
+      const score = 1 / (60 + ++uniqueRank)
+      if (existing) {
+        existing.score += score
+        existing.firstRank = Math.min(existing.firstRank, uniqueRank)
+      } else {
+        fused.set(key, { match, score, firstRank: uniqueRank })
+      }
+    }
+  }
+  return [...fused.values()]
+    .sort((a, b) =>
+      b.score - a.score ||
+      a.firstRank - b.firstRank ||
+      b.match.time.created - a.match.time.created ||
+      String(a.match.messageID).localeCompare(String(b.match.messageID)))
+    .slice(0, limit)
+    .map((item) => item.match)
 }
 
 // The title query runs through raw SQL (db.all), so JSON-typed columns arrive
@@ -439,6 +536,10 @@ export interface IndexCoverage {
   readonly v2MessageIndexReady: boolean
   /** Current V2 extractor version (including structural tool-name markers) has been projected over history. */
   readonly v2ToolIndexReady: boolean
+  /** Exact producer-owned tool-call sidecar covers all historical V1 parts. */
+  readonly v1ToolRecallReady: boolean
+  /** Exact producer-owned tool-call sidecar covers all historical V2 messages. */
+  readonly v2ToolRecallReady: boolean
 }
 
 export function indexCoverage(db: Database): Effect.Effect<IndexCoverage, SearchError> {
@@ -458,11 +559,23 @@ export function indexCoverage(db: Database): Effect.Effect<IndexCoverage, Search
       .from(SearchBackfillTable)
       .where(eq(SearchBackfillTable.id, CurrentSearchProjectionVersion))
       .get(),
+    toolV1: db
+      .select({ done: SessionToolRecallBackfillTable.done })
+      .from(SessionToolRecallBackfillTable)
+      .where(eq(SessionToolRecallBackfillTable.source, "v1_part"))
+      .get(),
+    toolV2: db
+      .select({ done: SessionToolRecallBackfillTable.done })
+      .from(SessionToolRecallBackfillTable)
+      .where(eq(SessionToolRecallBackfillTable.source, "v2_message"))
+      .get(),
   }).pipe(
-    Effect.map(({ v1, v2, v2Current }) => ({
+    Effect.map(({ v1, v2, v2Current, toolV1, toolV2 }) => ({
       v1PartIndexReady: v1?.done === 1,
       v2MessageIndexReady: v2?.done === 1,
       v2ToolIndexReady: v2Current?.done === 1,
+      v1ToolRecallReady: toolV1?.done === 1,
+      v2ToolRecallReady: toolV2?.done === 1,
     })),
     Effect.mapError(() => new SearchError({ message: "Session search coverage could not be read" })),
   )
@@ -472,6 +585,8 @@ export interface RepairProgress {
   /** Rows reprojected with the current V2 search-text extractor version. */
   readonly sessionMessages: { readonly processed: number; readonly done: boolean }
   readonly parts: { readonly processed: number; readonly done: boolean }
+  readonly toolRecallV1: { readonly processed: number; readonly projected: number; readonly done: boolean }
+  readonly toolRecallV2: { readonly processed: number; readonly projected: number; readonly done: boolean }
   readonly timedOut: boolean
 }
 
@@ -631,6 +746,142 @@ function repairPartChunk(db: Database, maxRows: number) {
   })
 }
 
+function repairToolRecallV1Chunk(db: Database, maxRows: number) {
+  return Effect.gen(function* () {
+    const source = "v1_part" as const
+    const state = yield* retryOnLock(readToolRecallBackfillState(db, source))
+    if (state.done) return { processed: 0, projected: 0, done: true } as const
+    const rows = yield* retryOnLock(
+      db
+        .select({
+          id: PartTable.id,
+          message_id: PartTable.message_id,
+          session_id: PartTable.session_id,
+          time_created: PartTable.time_created,
+          rowid: sql<number>`rowid`,
+          part_type: legacyPartKind,
+          cdb_ref: legacyPartOpaque,
+        })
+        .from(PartTable)
+        // The cursor advances across physical rows, not only matching rows.
+        // This keeps one explicit repair call O(maxRows) even when tools are
+        // extremely sparse in a large historical part table.
+        .where(sql`rowid > ${state.watermark}`)
+        .orderBy(sql`rowid`)
+        .limit(maxRows)
+        .all(),
+    )
+    if (rows.length === 0) {
+      yield* retryOnLock(setToolRecallBackfillDone(db, source))
+      return { processed: 0, projected: 0, done: true } as const
+    }
+
+    const decodePart = Schema.decodeUnknownOption(SessionV1.Part)
+    const projected: SessionToolRecall.Row[] = []
+    const candidates = rows.filter((row) => row.part_type === "tool" || row.cdb_ref === 1)
+    const payloads = candidates.length === 0
+      ? []
+      : yield* db
+          .select({ id: PartTable.id, data: PartTable.data })
+          .from(PartTable)
+          .where(inArray(PartTable.id, candidates.map((row) => row.id)))
+          .all()
+          .pipe(Effect.orDie)
+    const payloadByID = new Map(payloads.map((row) => [row.id, row.data] as const))
+    for (const row of candidates) {
+      const raw = payloadByID.get(row.id)
+      if (raw === undefined) continue
+      const data = yield* resolveProjectionRef(db, row.session_id, "part.data", raw)
+      const part = decodePart({ ...data, id: row.id, sessionID: row.session_id, messageID: row.message_id })
+      if (Option.isNone(part)) continue
+      const next = SessionToolRecall.fromV1Part(part.value, row.time_created)
+      if (next) projected.push(next)
+    }
+
+    const watermark = rows.at(-1)!.rowid
+    const done = rows.length < maxRows
+    yield* retryOnLock(
+      db.transaction((tx) =>
+        Effect.gen(function* () {
+          yield* SessionToolRecall.insertHistoricalRowsIfAbsent(tx, projected)
+          yield* tx
+            .update(SessionToolRecallBackfillTable)
+            .set({ watermark_rowid: watermark, ...(done ? { done: 1 } : {}) })
+            .where(eq(SessionToolRecallBackfillTable.source, source))
+            .run()
+        }),
+      ),
+    )
+    return { processed: rows.length, projected: projected.length, done } as const
+  })
+}
+
+function repairToolRecallV2Chunk(db: Database, maxRows: number) {
+  return Effect.gen(function* () {
+    const source = "v2_message" as const
+    const state = yield* retryOnLock(readToolRecallBackfillState(db, source))
+    if (state.done) return { processed: 0, projected: 0, done: true } as const
+    const rows = yield* retryOnLock(
+      db
+        .select({
+          id: SessionMessageTable.id,
+          session_id: SessionMessageTable.session_id,
+          type: SessionMessageTable.type,
+          rowid: sql<number>`rowid`,
+        })
+        .from(SessionMessageTable)
+        // As with V1, bound progress by physical rows first. Filtering assistant
+        // rows before LIMIT could turn a 128-row repair request into a scan of
+        // an arbitrarily large user/system-heavy historical tail.
+        .where(sql`rowid > ${state.watermark}`)
+        .orderBy(sql`rowid`)
+        .limit(maxRows)
+        .all(),
+    )
+    if (rows.length === 0) {
+      yield* retryOnLock(setToolRecallBackfillDone(db, source))
+      return { processed: 0, projected: 0, done: true } as const
+    }
+
+    const decodeMessage = Schema.decodeUnknownOption(SessionMessage.Message)
+    const projected: SessionToolRecall.Row[] = []
+    const candidates = rows.filter((row) => row.type === "assistant")
+    const payloads = candidates.length === 0
+      ? []
+      : yield* db
+          .select({ id: SessionMessageTable.id, data: SessionMessageTable.data })
+          .from(SessionMessageTable)
+          .where(inArray(SessionMessageTable.id, candidates.map((row) => row.id)))
+          .all()
+          .pipe(Effect.orDie)
+    const payloadByID = new Map(payloads.map((row) => [row.id, row.data] as const))
+    for (const row of candidates) {
+      const raw = payloadByID.get(row.id)
+      if (raw === undefined) continue
+      const data = yield* resolveProjectionRef(db, row.session_id, "session_message.data", raw)
+      const message = decodeMessage({ ...data, id: row.id, type: row.type })
+      if (Option.isNone(message)) continue
+      projected.push(...SessionToolRecall.fromV2Message(row.session_id, message.value))
+    }
+
+    const watermark = rows.at(-1)!.rowid
+    const done = rows.length < maxRows
+    yield* retryOnLock(
+      db.transaction((tx) =>
+        Effect.gen(function* () {
+          yield* SessionToolRecall.insertHistoricalRowsIfAbsent(tx, projected)
+          yield* tx
+            .update(SessionToolRecallBackfillTable)
+            .set({ watermark_rowid: watermark, ...(done ? { done: 1 } : {}) })
+            .where(eq(SessionToolRecallBackfillTable.source, source))
+            .run()
+        }),
+      ),
+    )
+    return { processed: rows.length, projected: projected.length, done } as const
+  })
+}
+
 /**
  * Explicit bounded repair for interactive recall. This is intentionally not
  * automatic startup work: one call processes at most maxRows from each store.
@@ -643,7 +894,9 @@ export function repairChunk(
   return Effect.gen(function* () {
     const sessionMessages = yield* repairMessageChunk(db, maxRows)
     const parts = yield* repairPartChunk(db, maxRows)
-    return { sessionMessages, parts }
+    const toolRecallV1 = yield* repairToolRecallV1Chunk(db, maxRows)
+    const toolRecallV2 = yield* repairToolRecallV2Chunk(db, maxRows)
+    return { sessionMessages, parts, toolRecallV1, toolRecallV2 }
   }).pipe(
     Effect.mapError(() => new SearchError({ message: "Session search repair could not be completed" })),
   )
@@ -666,6 +919,8 @@ export function repairOnOwnConnection(
         : {
             sessionMessages: { processed: 0, done: false },
             parts: { processed: 0, done: false },
+            toolRecallV1: { processed: 0, projected: 0, done: false },
+            toolRecallV2: { processed: 0, projected: 0, done: false },
             timedOut: true,
           },
     ),
@@ -813,8 +1068,11 @@ export function backfillParts(db: Database): Effect.Effect<void> {
 function backfillCurrentProjection(db: Database): Effect.Effect<void> {
   return Effect.gen(function* () {
     for (;;) {
-      const progress = yield* repairMessageChunk(db, BackfillChunk)
-      if (progress.done) return
+      const message = yield* repairMessageChunk(db, BackfillChunk)
+      const toolV1 = yield* repairToolRecallV1Chunk(db, BackfillChunk)
+      const toolV2 = yield* repairToolRecallV2Chunk(db, BackfillChunk)
+      const identity = yield* SessionLegacyToolIndex.repairChunk(db)
+      if (message.done && toolV1.done && toolV2.done && identity.done) return
       yield* Effect.yieldNow
     }
   }).pipe(
@@ -891,6 +1149,38 @@ const setPartBackfillDone = (db: Database) =>
     .update(PartSearchBackfillTable)
     .set({ done: 1 })
     .where(eq(PartSearchBackfillTable.id, PartSearchBackfillID))
+    .run()
+    .pipe(Effect.asVoid)
+
+const readToolRecallBackfillState = (
+  db: Database,
+  source: SessionToolRecall.Source,
+) =>
+  Effect.gen(function* () {
+    const row = yield* db
+      .select({
+        watermark: SessionToolRecallBackfillTable.watermark_rowid,
+        done: SessionToolRecallBackfillTable.done,
+      })
+      .from(SessionToolRecallBackfillTable)
+      .where(eq(SessionToolRecallBackfillTable.source, source))
+      .get()
+    if (row) return { watermark: row.watermark, done: row.done === 1 }
+    yield* db
+      .insert(SessionToolRecallBackfillTable)
+      .values({ source, watermark_rowid: -1, done: 0 })
+      .run()
+    return { watermark: -1, done: false }
+  })
+
+const setToolRecallBackfillDone = (
+  db: Database,
+  source: SessionToolRecall.Source,
+) =>
+  db
+    .update(SessionToolRecallBackfillTable)
+    .set({ done: 1 })
+    .where(eq(SessionToolRecallBackfillTable.source, source))
     .run()
     .pipe(Effect.asVoid)
 

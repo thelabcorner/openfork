@@ -10,6 +10,8 @@ import { SessionExecutionOwner } from "../execution-owner"
 import { GoalAutomation } from "../../goal/automation"
 import { Database } from "../../database/database"
 import { SessionRecovery } from "../recovery"
+import { SessionDormantRecovery } from "../dormant-recovery"
+import { EventV2 } from "../../event"
 
 /** Current-process routing for implicit-local Locations. Future remote placement belongs here. */
 const layer = Layer.effect(
@@ -20,6 +22,7 @@ const layer = Layer.effect(
     const automation = yield* GoalAutomation.Service
     const ownership = yield* SessionExecutionOwner.Service
     const { db } = yield* Database.Service
+    const events = yield* EventV2.Service
     const coordinator = yield* SessionRunCoordinator.make<SessionSchema.ID, SessionRunner.RunError>({
       drain: Effect.fnUntraced(function* (sessionID: SessionSchema.ID, force) {
         const session = yield* store.get(sessionID)
@@ -36,13 +39,13 @@ const layer = Layer.effect(
           return
         }
         if (acquired.state === "busy") {
-          const recovery = yield* SessionRecovery.recoverDeadOwnerIfQuiescent(db, ownership, sessionID)
+           const recovery = yield* SessionRecovery.recoverDeadOwnerIfQuiescent(db, ownership, sessionID, events)
           if (recovery.state === "recovered") acquired = yield* ownership.tryAcquireLocal(sessionID)
-          else if (recovery.state === "effect-unknown")
-            yield* Effect.logWarning("Session recovery remains fenced by unresolved execution effects", {
+           else if (recovery.state === "effect-unknown" || recovery.state === "transcript-unverifiable")
+             yield* Effect.logWarning("Session recovery remains fenced by unresolved execution evidence", {
               sessionID,
               generation: recovery.token.generation,
-              hazards: recovery.hazards,
+              ...(recovery.state === "effect-unknown" ? { hazards: recovery.hazards } : { reason: recovery.reason }),
             })
         }
         if (acquired.state === "maintenance-blocked") {
@@ -116,6 +119,25 @@ const layer = Layer.effect(
       yield* Effect.forEach(pending, coordinator.wake, { concurrency: 8, discard: true })
     }).pipe(Effect.forkScoped)
 
+    // Dormant sessions with an abandoned provider step cannot depend on a
+    // user opening their tab before the transcript self-heals. Use this SAME
+    // process-global execution service, after normal startup admission, for
+    // one small best-effort sweep. It never bypasses exact ownership/death
+    // proof, never repairs uncertain tools unattended and never polls again.
+    yield* Effect.gen(function* () {
+      yield* Effect.sleep("3 seconds")
+      const report = yield* SessionDormantRecovery.reconcileDormant(db, ownership, events)
+      if (report.inspected > 0)
+        yield* Effect.logInfo("Dormant interrupted Session recovery sweep settled", report)
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.failCause(cause)
+          : Effect.logWarning("Dormant Session recovery sweep deferred", { cause: Cause.pretty(cause) }),
+      ),
+      Effect.forkScoped,
+    )
+
     return SessionExecution.Service.of({
       active: coordinator.active,
       interrupt: (sessionID) =>
@@ -132,7 +154,7 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: SessionExecution.Service,
   layer,
-  deps: [SessionStore.node, LocationServiceMap.node, GoalAutomation.node, SessionExecutionOwner.node, Database.node],
+  deps: [SessionStore.node, LocationServiceMap.node, GoalAutomation.node, SessionExecutionOwner.node, Database.node, EventV2.node],
 })
 
 export * as SessionExecutionLocal from "./local"

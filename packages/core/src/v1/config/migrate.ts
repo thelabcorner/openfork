@@ -80,7 +80,7 @@ export function migrate(info: typeof ConfigV1.Info.Type) {
 
 function permissions(info?: ConfigPermissionV1.Info, tools?: Readonly<Record<string, boolean>>) {
   const rules: Array<{ action: string; resource: string; effect: ConfigPermissionV1.Action }> = Object.entries(
-    tools ?? {},
+    ConfigPermissionV1.normalizeLegacyKeys(tools ?? {}),
   ).map(([action, enabled]) => ({
     action: normalizeAction(action),
     resource: "*",
@@ -98,6 +98,7 @@ function permissions(info?: ConfigPermissionV1.Info, tools?: Readonly<Record<str
 }
 
 function normalizeAction(action: string) {
+  if (action === "execute") return "code"
   return action === "write" || action === "patch" ? "edit" : action
 }
 
@@ -127,7 +128,7 @@ export function migrateAgent(info: ConfigAgentV1.Info) {
     color: info.color,
     steps: info.steps,
     disabled: info.disable,
-    permissions: permissions(info.permission),
+    permissions: permissions(info.permission, info.tools),
   }
 }
 

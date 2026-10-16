@@ -17,6 +17,7 @@ import { AgentV2 } from "../agent"
 import { isNull, sql } from "drizzle-orm"
 import type { Revert } from "@opencode-ai/schema/revert"
 import type { SessionGroup } from "@opencode-ai/schema/session-group"
+import type { Info as ProviderRouteIntentInfo } from "@opencode-ai/schema/model-select/provider-route-intent"
 
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
@@ -75,6 +76,7 @@ export const SessionTable = sqliteTable(
       providerID: string
       accountID?: string
       variant?: string
+      routeIntent?: ProviderRouteIntentInfo
     }>(),
     ...Timestamps,
     time_compacting: integer(),
@@ -84,6 +86,10 @@ export const SessionTable = sqliteTable(
   },
   (table) => [
     index("session_project_idx").on(table.project_id),
+    // Tier-1 Session recall commonly scopes across every root + child Session
+    // in the active directory. The sidebar indexes below are intentionally
+    // root-only and cannot serve that access path.
+    index("session_directory_idx").on(table.directory),
     // Startup/sidebar hot path:
     //   WHERE project_id=? AND directory=? AND parent_id IS NULL
     //   ORDER BY time_updated DESC LIMIT ?
@@ -198,8 +204,26 @@ export const MessageTable = sqliteTable(
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     ...Timestamps,
     data: text({ mode: "json" }).notNull().$type<V1MessageData>(),
+    // Persisted at the V1 MessageUpdated producer, not recomputed from JSON on
+    // every SQLite index write. OPCL marks opaque references explicitly.
+    context_summary: integer({ mode: "boolean" }).notNull().default(false),
+    context_opaque: integer({ mode: "boolean" }).notNull().default(false),
   },
-  (table) => [index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id)],
+  (table) => [
+    index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
+    // Context's paged ledger must prove whether completed compaction can
+    // reorder the effective transcript. Ordinary Sessions should not scan
+    // every message JSON just to establish that the first 50 rows are safe.
+    // Cheap scalar partial predicates: prior json_extract indexes imposed
+    // disproportionate cost on every message/part mutation.
+    index("message_session_summary_probe_idx").on(table.session_id)
+      .where(sql`${table.context_summary} = 1`),
+    // OPCL may replace old V1 message metadata with an opaque durable
+    // reference. A ledger must never infer "not compacted" from metadata it
+    // cannot decode. Keep the fail-closed guard indexed across whole history.
+    index("message_session_opaque_probe_idx").on(table.session_id)
+      .where(sql`${table.context_opaque} = 1`),
+  ],
 )
 
 export const PartTable = sqliteTable(
@@ -213,6 +237,23 @@ export const PartTable = sqliteTable(
     session_id: text().$type<SessionSchema.ID>().notNull(),
     ...Timestamps,
     data: text({ mode: "json" }).notNull().$type<V1PartData>(),
+    context_compaction: integer({ mode: "boolean" }).notNull().default(false),
+    context_opaque: integer({ mode: "boolean" }).notNull().default(false),
+    // Versioned, bounded, producer-written part facts. Historical rows default
+    // to v0 and use canonical V1 hydration until safely rebuilt. No secondary
+    // indexes: these columns are read by the existing (message_id,id) index.
+    context_projection_version: integer().notNull().default(0),
+    context_kind: text(),
+    context_tokens: integer().notNull().default(0),
+    context_preview: text(),
+    context_signed: integer({ mode: "boolean" }).notNull().default(false),
+    context_status: text(),
+    context_synthetic: integer({ mode: "boolean" }).notNull().default(false),
+    context_ignored: integer({ mode: "boolean" }).notNull().default(false),
+    // 0 = historical/unknown tool-call identity, 1 = current producer indexed
+    // this exact part (or proved it was not a tool). Deliberately no index on
+    // this large historical table; all new indexes are on the tiny sidecar.
+    tool_identity_version: integer().notNull().default(0),
     // Extracted searchable text backing the part_fts FTS5 index. Populated by
     // the SessionProjector via SessionSearch.partSearchText; the FTS triggers
     // keep the virtual table in sync on every write.
@@ -221,6 +262,134 @@ export const PartTable = sqliteTable(
   (table) => [
     index("part_message_id_id_idx").on(table.message_id, table.id),
     index("part_session_idx").on(table.session_id),
+    // OPCL may externalize old V1 part JSON. Context pagination cannot prove
+    // a historical compaction/signature when its part type is opaque.
+    index("part_session_opaque_context_probe_idx").on(table.session_id)
+      .where(sql`${table.context_opaque} = 1`),
+  ],
+)
+
+/** Explicit opt-in V1→current shadow projection. Never read as execution
+ * authority; the original message/part/event rows remain canonical. */
+export const SessionV1ShadowTable = sqliteTable("session_v1_shadow", {
+  message_id: text().$type<MessageID>().primaryKey().references(() => MessageTable.id, { onDelete: "cascade" }),
+  session_id: text().$type<SessionSchema.ID>().notNull().references(() => SessionTable.id, { onDelete: "cascade" }),
+  source_event_seq: integer().notNull(),
+  source_hash: text().notNull(),
+  source_snapshot_hash: text().notNull(),
+  wire_hash: text().notNull(),
+  wire: text({ mode: "json" }).notNull(),
+  time_written: integer().notNull(),
+}, (table) => [
+  index("session_v1_shadow_session_message_idx").on(table.session_id, table.message_id),
+])
+
+/** Cursor is diagnostic coverage only. It is never a migration certificate.
+ * An observed event-sequence change resets scanning to rowid 0. */
+export const SessionV1ShadowCursorTable = sqliteTable("session_v1_shadow_cursor", {
+  session_id: text().$type<SessionSchema.ID>().primaryKey().references(() => SessionTable.id, { onDelete: "cascade" }),
+  source_event_seq: integer().notNull(),
+  watermark_rowid: integer().notNull().default(0),
+  complete: integer({ mode: "boolean" }).notNull().default(false),
+})
+
+/** Index only actual V1 ToolParts; never duplicate their payload or output. */
+export const SessionV1ToolCallTable = sqliteTable(
+  "session_v1_tool_call",
+  {
+    part_id: text().$type<PartID>().primaryKey().references(() => PartTable.id, { onDelete: "cascade" }),
+    session_id: text().$type<SessionSchema.ID>().notNull().references(() => SessionTable.id, { onDelete: "cascade" }),
+    message_id: text().$type<MessageID>().notNull(),
+    call_id: text().notNull(),
+    status: text().notNull(),
+  },
+  (table) => [
+    index("session_v1_tool_call_session_call_idx").on(table.session_id, table.call_id, table.status),
+    index("session_v1_tool_call_session_status_idx").on(table.session_id, table.status),
+  ],
+)
+
+/** One bounded, resumable background cursor; never used to bypass v0 fallbacks. */
+export const SessionV1ToolCallBackfillTable = sqliteTable("session_v1_tool_call_backfill", {
+  id: integer().primaryKey(),
+  watermark_rowid: integer().notNull().default(0),
+  done: integer().notNull().default(0),
+})
+
+/**
+ * Exact tool-call recall projection.
+ *
+ * Tool recall is a compact durable routing read. Proving that a search hit is
+ * structurally a tool call must not require decoding assistant/part JSON or
+ * resolving an OPCL/CDB reference, so producers materialize one row per call.
+ */
+export const SessionToolRecallTable = sqliteTable(
+  "session_tool_recall",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    source: text().$type<"v1_part" | "v2_message">().notNull(),
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    message_id: text().notNull(),
+    part_id: text().notNull(),
+    tool: text().notNull(),
+    time_created: integer().notNull(),
+    /** Bounded producer-owned input projection for query+tool recall. */
+    search_text: text().notNull(),
+  },
+  (table) => [
+    uniqueIndex("session_tool_recall_identity_idx").on(table.source, table.message_id, table.part_id),
+    index("session_tool_recall_tool_time_idx").on(table.tool, table.time_created, table.id),
+    // Selective Session scopes (current directory/workspace/parent) drive from
+    // Session first and probe exact calls by Session + tool without touching
+    // unrelated global call history. The session_id prefix also serves plain
+    // Session-owned cleanup/lookups, so a second session-only index is redundant.
+    index("session_tool_recall_session_tool_time_idx").on(
+      table.session_id,
+      table.tool,
+      table.time_created,
+      table.id,
+    ),
+  ],
+)
+
+/**
+ * Full provider tool output retained independently from the bounded result
+ * sent back to the model and stored in the visible tool part. Rows are owned
+ * by the durable session/message/tool-call identity and cascade with history.
+ * `chunk_index = -1` is the completeness/header row; non-negative rows hold
+ * bounded Unicode-safe text chunks.
+ */
+export const SessionToolOutputTable = sqliteTable(
+  "session_tool_output",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    message_id: text()
+      .$type<MessageID>()
+      .notNull()
+      .references(() => MessageTable.id, { onDelete: "cascade" }),
+    tool_call_id: text().notNull(),
+    chunk_index: integer().notNull(),
+    start_offset: integer().notNull().default(0),
+    text: text(),
+    total_chars: integer(),
+    total_lines: integer(),
+    complete: integer({ mode: "boolean" }).notNull().default(false),
+    time_created: integer().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.session_id, table.message_id, table.tool_call_id, table.chunk_index] }),
+    index("session_tool_output_page_idx").on(
+      table.session_id,
+      table.message_id,
+      table.tool_call_id,
+      table.start_offset,
+    ),
   ],
 )
 
@@ -416,6 +585,14 @@ export const SearchBackfillTable = sqliteTable("search_backfill", {
 // high-watermark of parts whose search_text still needs computing.
 export const PartSearchBackfillTable = sqliteTable("part_search_backfill", {
   id: integer().primaryKey(),
+  watermark_rowid: integer().notNull().default(-1),
+  done: integer().notNull().default(0),
+})
+
+// Historical-only convergence cursors for the exact tool-call sidecar. New
+// calls are projected at their producer boundary and therefore need no scan.
+export const SessionToolRecallBackfillTable = sqliteTable("session_tool_recall_backfill", {
+  source: text().$type<"v1_part" | "v2_message">().primaryKey(),
   watermark_rowid: integer().notNull().default(-1),
   done: integer().notNull().default(0),
 })

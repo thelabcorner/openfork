@@ -48,9 +48,9 @@ const MAX_ITERATIONS = 16
 const COMMAND_TIMEOUT_MS = 60_000
 const GUARD_ID = "guard-g2-cross-process"
 const SQLITE_BUSY_CLASSIFICATION =
-  "[SQLITE_BUSY] current Database config: primary busy_timeout=5000ms (readDb=250ms); " +
-  "SessionExecutionOwner/DirectoryMaintenanceGuard authority transactions have no app-level retry " +
-  "and fail closed via Effect.orDie (defect) after the SQLite wait expires. Reported, not hidden."
+  "[SQLITE_BUSY] current Database config: primary busy_timeout=75ms (readDb=250ms); " +
+  "authority transactions use bounded whole-transaction retries where safe, and otherwise fail closed. " +
+  "Reported, not hidden."
 
 const nodes = () =>
   LayerNode.group([Database.node, RuntimeOwner.node, SessionExecutionOwner.node, DirectoryMaintenanceGuard.node])

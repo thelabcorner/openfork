@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -10,10 +10,9 @@ import { Effect } from "effect"
 import { sql } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
-const layer = AppNodeBuilder.build(
-  LayerNode.group([Database.node, EventV2.node, SessionTelemetry.node]),
-  [[Database.node, Database.layerFromPath(":memory:")]],
-)
+const layer = AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, SessionTelemetry.node]), [
+  [Database.node, Database.layerFromPath(":memory:")],
+])
 const it = testEffect(layer)
 
 const SESSION_ID = SessionSchema.ID.make("ses_telemetry_test")
@@ -31,6 +30,92 @@ const seed = Effect.fnUntraced(function* () {
 })
 
 describe("SessionTelemetry", () => {
+  it.live("fences model switches to one unstarted provider attempt and excludes compaction/tools", () =>
+    Effect.gen(function* () {
+      yield* seed()
+      const telemetry = yield* SessionTelemetry.Service
+
+      yield* telemetry.begin({
+        sessionID: SESSION_ID,
+        assistantMessageID: "msg_switch_compaction",
+        requestSentAt: 900,
+        isCompaction: true,
+        model: { providerID: "openai", modelID: "gpt-test", accountID: "acct-test", contextLimit: 200_000 },
+      })
+      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]).toMatchObject({
+        isCompaction: true,
+        model: { accountID: "acct-test" },
+      })
+      expect(
+        yield* telemetry.claimModelSwitchAttempt({
+          sessionID: SESSION_ID,
+          assistantMessageID: "msg_switch_compaction",
+          requestSentAt: 900,
+        }),
+      ).toBe(false)
+
+      yield* telemetry.begin({
+        sessionID: SESSION_ID,
+        assistantMessageID: "msg_switch_live",
+        requestSentAt: 1_000,
+        model: { providerID: "openai", modelID: "gpt-test", accountID: "acct-test", contextLimit: 200_000 },
+      })
+      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.isCompaction).toBeUndefined()
+      expect(
+        yield* telemetry.claimModelSwitchAttempt({
+          sessionID: SESSION_ID,
+          assistantMessageID: "msg_stale",
+          requestSentAt: 1_000,
+        }),
+      ).toBe(false)
+      expect(
+        yield* telemetry.claimModelSwitchAttempt({
+          sessionID: SESSION_ID,
+          assistantMessageID: "msg_switch_live",
+          requestSentAt: 1_000,
+        }),
+      ).toBe(true)
+      expect(yield* telemetry.providerAttempt(SESSION_ID)).toMatchObject({ preempted: true })
+      expect(
+        yield* telemetry.claimModelSwitchAttempt({
+          sessionID: SESSION_ID,
+          assistantMessageID: "msg_switch_live",
+          requestSentAt: 1_000,
+        }),
+      ).toBe(false)
+      expect(
+        yield* telemetry.observe({
+          sessionID: SESSION_ID,
+          at: 1_050,
+          event: LLMEvent.stepStart({ index: 0 }),
+        }),
+      ).toBe(false)
+      yield* telemetry.idle(SESSION_ID, 1_100)
+      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.isCompaction).toBeUndefined()
+
+      yield* telemetry.begin({
+        sessionID: SESSION_ID,
+        assistantMessageID: "msg_switch_tool",
+        requestSentAt: 1_200,
+        model: { providerID: "openai", modelID: "gpt-test", contextLimit: 200_000 },
+      })
+      expect(
+        yield* telemetry.observe({
+          sessionID: SESSION_ID,
+          at: 1_250,
+          event: LLMEvent.toolCall({ id: "tool_switch", name: "read", input: { path: "README.md" } }),
+        }),
+      ).toBe(true)
+      expect(
+        yield* telemetry.claimModelSwitchAttempt({
+          sessionID: SESSION_ID,
+          assistantMessageID: "msg_switch_tool",
+          requestSentAt: 1_200,
+        }),
+      ).toBe(false)
+    }),
+  )
+
   it.live("linearizes zero-progress preemption against provider events and retry restart", () =>
     Effect.gen(function* () {
       yield* seed()
@@ -153,28 +238,51 @@ describe("SessionTelemetry", () => {
       })
       expect(yield* telemetry.active).toContain(SESSION_ID)
 
-      yield* telemetry.observe({ sessionID: SESSION_ID, at: 1_100, event: LLMEvent.reasoningStart({ id: "r1" }) })
+      yield* telemetry.observe({
+        sessionID: SESSION_ID,
+        at: 1_100,
+        monotonicAt: 1_100,
+        event: LLMEvent.reasoningStart({ id: "r1" }),
+      })
       expect(yield* telemetry.providerAttempt(SESSION_ID)).toMatchObject({ observedEvents: 1 })
       yield* telemetry.observe({
         sessionID: SESSION_ID,
         at: 1_200,
+        monotonicAt: 1_200,
         event: LLMEvent.reasoningDelta({ id: "r1", text: "think" }),
       })
       expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.phase).toBe("reasoning")
 
-      yield* telemetry.observe({ sessionID: SESSION_ID, at: 1_500, event: LLMEvent.reasoningEnd({ id: "r1" }) })
-      yield* telemetry.observe({ sessionID: SESSION_ID, at: 1_600, event: LLMEvent.textStart({ id: "t1" }) })
+      yield* telemetry.observe({
+        sessionID: SESSION_ID,
+        at: 1_500,
+        monotonicAt: 1_500,
+        event: LLMEvent.reasoningEnd({ id: "r1" }),
+      })
+      yield* telemetry.observe({
+        sessionID: SESSION_ID,
+        at: 1_600,
+        monotonicAt: 1_600,
+        event: LLMEvent.textStart({ id: "t1" }),
+      })
       yield* telemetry.observe({
         sessionID: SESSION_ID,
         at: 1_700,
+        monotonicAt: 1_700,
         event: LLMEvent.textDelta({ id: "t1", text: "hello world" }),
       })
       expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.phase).toBe("generating")
-      yield* telemetry.observe({ sessionID: SESSION_ID, at: 2_100, event: LLMEvent.textEnd({ id: "t1" }) })
+      yield* telemetry.observe({
+        sessionID: SESSION_ID,
+        at: 2_100,
+        monotonicAt: 2_100,
+        event: LLMEvent.textEnd({ id: "t1" }),
+      })
 
       yield* telemetry.observe({
         sessionID: SESSION_ID,
         at: 2_200,
+        monotonicAt: 2_200,
         event: LLMEvent.toolCall({ id: "tool_1", name: "read", input: { path: "README.md" } }),
       })
       expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.phase).toBe("tool")
@@ -182,6 +290,7 @@ describe("SessionTelemetry", () => {
       yield* telemetry.observe({
         sessionID: SESSION_ID,
         at: 2_700,
+        monotonicAt: 2_700,
         event: LLMEvent.toolResult({
           id: "tool_1",
           name: "read",
@@ -262,13 +371,24 @@ describe("SessionTelemetry", () => {
         model: { providerID: "openai", modelID: "gpt-test", contextLimit: 200_000 },
       })
       expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.turnStartedAt).toBe(2_950)
-      yield* telemetry.observe({ sessionID: SESSION_ID, at: 3_100, event: LLMEvent.textStart({ id: "t2" }) })
+      yield* telemetry.observe({
+        sessionID: SESSION_ID,
+        at: 3_100,
+        monotonicAt: 3_100,
+        event: LLMEvent.textStart({ id: "t2" }),
+      })
       yield* telemetry.observe({
         sessionID: SESSION_ID,
         at: 3_200,
+        monotonicAt: 3_200,
         event: LLMEvent.textDelta({ id: "t2", text: "done" }),
       })
-      yield* telemetry.observe({ sessionID: SESSION_ID, at: 3_400, event: LLMEvent.textEnd({ id: "t2" }) })
+      yield* telemetry.observe({
+        sessionID: SESSION_ID,
+        at: 3_400,
+        monotonicAt: 3_400,
+        event: LLMEvent.textEnd({ id: "t2" }),
+      })
       yield* telemetry.streamed(SESSION_ID, 3_450)
       yield* telemetry.settle({
         sessionID: SESSION_ID,
@@ -281,6 +401,55 @@ describe("SessionTelemetry", () => {
       expect(second?.generatedMs).toBe(1_200)
       expect(second?.toolMs).toBe(500)
       expect(second?.step?.tokens?.output).toBe(10)
+    }),
+  )
+})
+
+describe("telemetryModelIdentity", () => {
+  test("projects a per-account key pin into account-neutral model identity", () => {
+    expect(
+      SessionTelemetry.telemetryModelIdentity({ providerID: "opencode-go", modelID: "m@zen-889db3308123" }),
+    ).toEqual({ providerID: "opencode-go", modelID: "m", accountID: "zen-889db3308123" })
+    expect(
+      SessionTelemetry.telemetryModelIdentity({
+        providerID: "opencode-go",
+        modelID: "m@zen-889db3308123",
+        routedAccountID: "zen-routed",
+        accountID: "zen-ref",
+      }),
+    ).toEqual({ providerID: "opencode-go", modelID: "m", accountID: "zen-routed" })
+    expect(
+      SessionTelemetry.telemetryModelIdentity({
+        providerID: "opencode-go",
+        modelID: "m",
+        accountID: "zen-ref",
+      }),
+    ).toEqual({ providerID: "opencode-go", modelID: "m", accountID: "zen-ref" })
+    expect(SessionTelemetry.telemetryModelIdentity({ providerID: "openrouter", modelID: "vendor/model@x" })).toEqual({
+      providerID: "openrouter",
+      modelID: "vendor/model@x",
+    })
+  })
+
+  it.live("begin keeps the projected pinned identity account-neutral through the snapshot", () =>
+    Effect.gen(function* () {
+      yield* seed()
+      const telemetry = yield* SessionTelemetry.Service
+      yield* telemetry.begin({
+        sessionID: SESSION_ID,
+        assistantMessageID: "msg_pin",
+        requestSentAt: 500,
+        model: SessionTelemetry.telemetryModelIdentity({
+          providerID: "opencode-go",
+          modelID: "deepseek-v4.1-flash@zen-889db3308123",
+        }),
+      })
+      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.model).toEqual({
+        providerID: "opencode-go",
+        modelID: "deepseek-v4.1-flash",
+        accountID: "zen-889db3308123",
+      })
+      yield* telemetry.idle(SESSION_ID, 600)
     }),
   )
 })

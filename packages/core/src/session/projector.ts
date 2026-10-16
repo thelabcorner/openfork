@@ -28,6 +28,9 @@ import {
   type SessionMessageSettlement,
 } from "./sql"
 import { SessionSearch } from "./search"
+import { SessionToolRecall } from "./tool-recall"
+import { SessionLegacyToolIndex } from "./legacy-tool-index"
+import { contextPartFacts } from "./context-part-facts"
 import { SessionExecutionBoundaryTable } from "./execution-boundary.sql"
 import { searchText, partSearchText } from "./search-text"
 import type { DeepMutable } from "../schema"
@@ -106,6 +109,16 @@ function partData(part: (typeof SessionV1.Event.PartUpdated.Type)["data"]["part"
   return rest as DeepMutable<typeof rest>
 }
 
+// Producer-owned Context scalars, computed while event parts are in memory.
+const messageContextFlags = (info: (typeof SessionV1.Event.MessageUpdated.Type)["data"]["info"]) => ({
+  context_summary: info.role === "assistant" && info.summary === true,
+  context_opaque: false,
+})
+const partContextFlags = (part: (typeof SessionV1.Event.PartUpdated.Type)["data"]["part"]) => ({
+  context_compaction: part.type === "compaction",
+  context_opaque: false,
+})
+
 function applyUsage(
   db: DatabaseService,
   sessionID: (typeof SessionV1.Event.MessageUpdated.Type)["data"]["sessionID"],
@@ -169,6 +182,7 @@ const writeLegacyUserProjection = Effect.fnUntraced(function* (
         session_id: input.info.sessionID,
         time_created: input.info.time.created,
         data,
+        ...messageContextFlags(input.info),
       })
       .run()
       .pipe(Effect.orDie)
@@ -195,10 +209,14 @@ const writeLegacyUserProjection = Effect.fnUntraced(function* (
         session_id: part.sessionID,
         time_created: input.info.time.created,
         data,
+        ...partContextFlags(part),
+        ...contextPartFacts(part),
+        tool_identity_version: SessionLegacyToolIndex.VERSION,
         search_text: search,
       })
       .run()
       .pipe(Effect.orDie)
+    if (part.type === "tool") yield* SessionLegacyToolIndex.project(db, part).pipe(Effect.orDie)
   }
 })
 
@@ -574,6 +592,7 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
           })
           .run()
           .pipe(Effect.orDie)
+        yield* SessionToolRecall.projectV2Call(db, event).pipe(Effect.orDie)
         return false
       }
 
@@ -783,8 +802,8 @@ const layer = Layer.effectDiscard(
         const data = messageData(event.data.info)
         yield* db
           .insert(MessageTable)
-          .values({ id, session_id: sessionID, time_created, data })
-          .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
+           .values({ id, session_id: sessionID, time_created, data, ...messageContextFlags(event.data.info) })
+           .onConflictDoUpdate({ target: MessageTable.id, set: { data, ...messageContextFlags(event.data.info) } })
           .run()
           .pipe(Effect.orDie)
         if (
@@ -859,6 +878,9 @@ const layer = Layer.effectDiscard(
             session_id: sessionID,
             time_created: event.data.time,
             data,
+            ...partContextFlags(event.data.part),
+            ...contextPartFacts(event.data.part),
+            tool_identity_version: SessionLegacyToolIndex.VERSION,
             search_text: nextSearchText,
           })
           .onConflictDoUpdate({
@@ -868,10 +890,35 @@ const layer = Layer.effectDiscard(
             // `row.search_text` is authoritative even when OPCL has collapsed
             // `row.data` to a reference, so this comparison stays cheap and
             // does not require decoding the previous JSON payload.
-            set: { data, ...(row?.search_text === nextSearchText ? {} : { search_text: nextSearchText }) },
+             set: {
+               data,
+                ...partContextFlags(event.data.part),
+                ...contextPartFacts(event.data.part),
+                tool_identity_version: SessionLegacyToolIndex.VERSION,
+                ...(row?.search_text === nextSearchText ? {} : { search_text: nextSearchText }),
+             },
           })
           .run()
           .pipe(Effect.orDie)
+        yield* SessionLegacyToolIndex.project(
+          db,
+          event.data.part,
+          row?.context_kind === "tool" ||
+            row?.search_text.startsWith("tool:") === true ||
+            (row?.tool_identity_version === 1 && row.context_projection_version !== 1),
+        ).pipe(Effect.orDie)
+        // New/ongoing ordinary text and reasoning parts have no exact-tool
+        // sidecar. Only run its write path for actual tool parts or an existing
+        // row whose previous producer-owned search projection identified a
+        // tool (id-preserving tool -> non-tool replacement).
+        if (event.data.part.type === "tool" || row?.search_text.startsWith("tool:") ||
+          (row?.tool_identity_version === 1 && row.context_projection_version !== 1)) {
+          yield* SessionToolRecall.projectV1Part(
+            db,
+            event.data.part,
+            row?.time_created ?? event.data.time,
+          ).pipe(Effect.orDie)
+        }
         const previous = row && usage(row.data)
         const next = usage(event.data.part)
         if (previous) yield* applyUsage(db, row.session_id, previous, -1)

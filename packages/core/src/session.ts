@@ -10,6 +10,7 @@ import { ModelV2 } from "./model"
 import { Location } from "./location"
 import { SessionMessage } from "./session/message"
 import { SessionMessageProjection } from "./session/message-projection"
+import { projectTimelineMessagePage, type TimelineMessagePage } from "./session/message-window"
 import { Prompt } from "./session/prompt"
 import { PromptInput } from "@opencode-ai/schema/prompt-input"
 import { EventV2 } from "./event"
@@ -144,6 +145,16 @@ export interface Interface {
       direction: "previous" | "next"
     }
   }) => Effect.Effect<SessionMessage.Message[], NotFoundError | MessageDecodeError>
+  /** Bounded presentation projection. Runtime/context consumers must use messages(). */
+  readonly timelineMessages: (input: {
+    sessionID: SessionSchema.ID
+    limit?: number
+    order?: "asc" | "desc"
+    cursor?: {
+      id: SessionMessage.ID
+      direction: "previous" | "next"
+    }
+  }) => Effect.Effect<TimelineMessagePage, NotFoundError | MessageDecodeError>
   readonly message: (input: {
     sessionID: SessionSchema.ID
     messageID: SessionMessage.ID
@@ -460,6 +471,10 @@ const layer = Layer.effect(
           Effect.orDie,
         )
         return yield* SessionMessageProjection.decodeRows(readDb, direction === "previous" ? rows.toReversed() : rows)
+      }),
+      timelineMessages: Effect.fn("V2Session.timelineMessages")(function* (input) {
+        const messages = yield* result.messages(input)
+        return projectTimelineMessagePage(messages)
       }),
       message: Effect.fn("V2Session.message")(function* (input) {
         const stored = yield* store.message(input.messageID)

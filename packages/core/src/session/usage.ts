@@ -110,7 +110,7 @@ const lastUsedAt = (rows: MessageCost[]) => {
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db } = yield* Database.Service
+    const { db, scanDb } = yield* Database.Service
 
     // Ad-hoc, idempotent performance index — not run through the shared migration
     // system, so it can't conflict with upstream migrations. SQLite expression
@@ -121,7 +121,11 @@ const layer = Layer.effect(
       .pipe(Effect.orDie)
 
     const rows = Effect.fn("SessionUsage.rows")(function* (sinceMs: number) {
-      return yield* db
+      // Historical usage scans must never occupy the primary writer or the
+      // latency-sensitive interactive reader, particularly on multi-GB DBs.
+      // The scan connection is lazily opened and independently admitted.
+      const reader = yield* scanDb()
+      return yield* reader
         .all<{ id: string; cost: number | null; createdMs: number }>(
           sql`
             SELECT id, json_extract(data,'$.cost') as cost, json_extract(data,'$.time.created') as createdMs
@@ -142,7 +146,8 @@ const layer = Layer.effect(
     const windows = Effect.fn("SessionUsage.windows")(function* () {
       const now = Date.now()
 
-      const earliest = yield* db
+      const reader = yield* scanDb()
+      const earliest = yield* reader
         .get<{ earliest: number | null }>(
           sql`
             SELECT min(json_extract(data,'$.time.created')) as earliest

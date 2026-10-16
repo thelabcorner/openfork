@@ -4,7 +4,8 @@ import { Effect } from "effect"
 import type { Database } from "../database/database"
 import type { EventV2 } from "../event"
 import type { SessionExecutionOwner } from "./execution-owner"
-import { executionHazards, failInterruptedTools, type ExecutionHazards } from "./recovery"
+import { executionHazards, failInterruptedTools, withSessionRecoveryLock, type ExecutionHazards } from "./recovery"
+import { SessionRecoveryTurn } from "./recovery-turn"
 
 type DatabaseReader = Pick<Database.Interface["db"], "select">
 
@@ -61,6 +62,7 @@ export const containAcknowledgedEffects = Effect.fn("SessionContainment.containA
   ownership: SessionExecutionOwner.Interface,
   token: SessionExecutionOwner.RecoveryToken,
 ) {
+  return yield* withSessionRecoveryLock(token.sessionID, Effect.gen(function* () {
   const snapshot = yield* ownership.snapshot(token.sessionID)
   if (
     snapshot.ownerID !== token.ownerID ||
@@ -73,6 +75,20 @@ export const containAcknowledgedEffects = Effect.fn("SessionContainment.containA
   const remaining = yield* executionHazards(db, token.sessionID)
   if (remaining.currentTool || remaining.legacyTool) return { state: "uncontained" as const, hazards: remaining, sealed }
 
+  // Explicit operator containment must also finish the abandoned assistant
+  // boundary, even when its provider failed before the first tool call. Do
+  // not CAS-release first or the next generation may inherit a ghost stream.
+  const transcript = yield* SessionRecoveryTurn.sealInterruptedGeneration(
+    db, events, token.sessionID, snapshot.acquiredAt,
+  )
+  if (transcript.state !== "sealed") {
+    yield* Effect.logWarning("Explicit Session containment cannot verify abandoned transcript", {
+      sessionID: token.sessionID, generation: token.generation, reason: transcript.reason,
+    })
+    return { state: "uncontained" as const, hazards: remaining, sealed }
+  }
+
   const release = yield* ownership.completeRecovery(token)
   return { state: "contained" as const, token, sealed, release }
+  }))
 })
