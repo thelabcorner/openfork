@@ -4,8 +4,7 @@
   --markdown-inline-code-bg-mix: 8%;
   --markdown-shell-code-background: var(--v2-background-bg-layer-02);
   --markdown-shell-code-border: var(--v2-border-border-muted);
-  --markdown-shell-code-color: var(--v2-text-text-base);
-  --markdown-shell-code-token-color: currentColor;
+  --markdown-shell-code-color: var(--syntax-code-foreground, var(--v2-text-text-base));
 
   /* Reset & Base Typography */
   min-width: 0;
@@ -174,7 +173,7 @@
 
   .shiki {
     background: var(--color-background-stronger);
-    color: var(--text-base);
+    color: var(--syntax-code-foreground, var(--text-base));
     font-size: 13px;
     padding: 12px;
     border-radius: 6px;
@@ -185,6 +184,39 @@
     position: relative;
     direction: ltr;
     unicode-bidi: isolate;
+  }
+
+  [data-markdown-oversized-code] {
+    box-sizing: border-box;
+    position: relative;
+    width: 100%;
+    height: 32rem;
+    max-height: 60vh;
+    min-height: 8rem;
+    margin: 0;
+    overflow: auto;
+    contain: strict;
+    border: 0.5px solid var(--v2-border-border-base);
+    border-radius: 6px;
+    background: var(--color-background-stronger);
+    color: var(--syntax-code-foreground, var(--text-base));
+  }
+
+  [data-markdown-oversized-code-content] {
+    position: absolute;
+    inset-inline: 0;
+    margin: 0;
+    padding: 12px;
+    overflow: visible;
+    background: transparent;
+    border: 0;
+    color: inherit;
+    font-family: var(--font-family-mono);
+    font-size: 13px;
+    line-height: 20px;
+    white-space: pre;
+    tab-size: 2;
+    pointer-events: none;
   }
 
   [data-component="markdown-mermaid"] {
@@ -542,10 +574,6 @@
     color: var(--markdown-shell-code-color);
   }
 
-  [data-component="markdown-code"][data-code-kind="shell"] code span {
-    color: var(--markdown-shell-code-token-color) !important;
-  }
-
   [data-slot="markdown-copy-button"] {
     position: absolute;
     top: 4px;
@@ -644,6 +672,21 @@
     border-radius: 4px;
     margin: 1.5rem 0;
     display: block;
+    cursor: zoom-in;
+  }
+
+  img:focus-visible {
+    outline: 2px solid var(--v2-border-border-strong);
+    outline-offset: 3px;
+  }
+
+  svg[tabindex="0"]:not([data-component="markdown-mermaid"]) {
+    cursor: zoom-in;
+  }
+
+  svg[tabindex="0"]:not([data-component="markdown-mermaid"]):focus-visible {
+    outline: 2px solid var(--v2-border-border-strong);
+    outline-offset: 3px;
   }
 }
 

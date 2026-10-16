@@ -1,0 +1,75 @@
+/* Lazy-tool broker: present the delegated capability as a first-class tool.
+   Inherit the canonical tool surface and zinc/new-layout typography; never
+   elevate broker contracts or internal ids into the timeline header. */
+[data-component="lazy-tool"] {
+  min-width: 0;
+  width: 100%;
+
+  [data-component="tool-block"] > [data-slot="tool-block-head"] {
+    min-height: 26px;
+  }
+
+  [data-component="tool-row"] {
+    min-height: 28px;
+    gap: 10px;
+  }
+
+  [data-component="tool-row"] [data-slot="tool-row-primary"] {
+    flex: 0 1 132px;
+    min-width: 72px;
+  }
+
+  [data-component="tool-row"] [data-slot="tool-row-secondary"] {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--v2-text-text-weak);
+  }
+
+  [data-slot="lazy-tool-parameter-meta"] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    white-space: nowrap;
+    color: var(--v2-text-text-faint);
+    font-family: var(--v2-font-family-mono, ui-monospace, monospace);
+    font-size: 10.5px;
+  }
+
+  [data-slot="lazy-tool-raw-toggle"] {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-height: 27px;
+    padding: 5px 10px;
+    border: 0;
+    border-top: 1px solid var(--tool-border);
+    color: var(--v2-text-text-weak);
+    background: transparent;
+    text-align: left;
+    font-size: 11px;
+    line-height: 16px;
+    cursor: pointer;
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+
+  [data-slot="lazy-tool-raw-toggle"]:hover {
+    color: var(--v2-text-text-base);
+    background: var(--tool-hover);
+  }
+
+  [data-slot="lazy-tool-raw-toggle"]:focus-visible {
+    outline: 2px solid var(--v2-border-focus, currentColor);
+    outline-offset: -2px;
+  }
+
+  [data-slot="lazy-tool-raw-output"] {
+    max-height: 360px;
+    min-width: 0;
+    overflow: auto;
+    border-top: 1px solid var(--tool-border);
+  }
+}

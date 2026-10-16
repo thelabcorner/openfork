@@ -16,6 +16,8 @@ import {
   ToolStats,
   type Tone,
 } from "./tool-parts"
+import { backgroundShape, parseMonitorBlock } from "./background-monitor-presentation"
+import { selfClosing, tagBlocks, tagText, unescapeXml } from "./tool-output-xml"
 
 /**
  * Renderers for built-in tools.
@@ -28,40 +30,6 @@ import {
  * Each parser degrades to `SmartToolOutput` when the shape doesn't match, so a
  * server-side format change downgrades the presentation instead of breaking it.
  */
-
-/* ── Shared XML helpers ──────────────────────────────────────────────────── */
-
-function unescapeXml(text: string) {
-  return text
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&")
-}
-
-function tagText(source: string, name: string) {
-  const match = new RegExp(`<${name}[^>]*>([\\s\\S]*?)<\\/${name}>`).exec(source)
-  return match ? unescapeXml(match[1]!.trim()) : undefined
-}
-
-function tagBlocks(source: string, name: string) {
-  const out: { attrs: Record<string, string>; inner: string }[] = []
-  for (const match of source.matchAll(new RegExp(`<${name}([^>]*)>([\\s\\S]*?)<\\/${name}>`, "g"))) {
-    const attrs: Record<string, string> = {}
-    for (const attr of (match[1] ?? "").matchAll(/([\w-]+)="([^"]*)"/g)) attrs[attr[1]!] = unescapeXml(attr[2]!)
-    out.push({ attrs, inner: match[2]! })
-  }
-  return out
-}
-
-function selfClosing(source: string, name: string) {
-  const match = new RegExp(`<${name}([^>]*)\\/>`).exec(source)
-  if (!match) return undefined
-  const attrs: Record<string, string> = {}
-  for (const attr of (match[1] ?? "").matchAll(/([\w-]+)="([^"]*)"/g)) attrs[attr[1]!] = unescapeXml(attr[2]!)
-  return attrs
-}
 
 /** Drops the trailing agent-facing hint paragraphs from a tool's output. */
 function withoutHints(text: string) {
@@ -610,28 +578,38 @@ export function TestOutput(props: { output: string; metadata?: Record<string, un
 
 export function MonitorOutput(props: { output: string }) {
   const i18n = useI18n()
-  const block = createMemo(() => tagBlocks(props.output, "monitor")[0])
+  // Reads only the recorded <monitor> block on this part — the same block the tool
+  // wrote at launch, so a monitor that has since exited still renders its job id,
+  // watched condition and log path instead of a live process snapshot.
+  const block = createMemo(() => parseMonitorBlock(props.output))
 
   return (
     <Show when={block()} fallback={<SmartToolOutput output={props.output} />}>
       {(monitor) => (
-        <ToolFields
-          items={[
-            {
-              key: i18n.t("ui.tool.monitor.state"),
-              value: <ToolBadge tone="info">{monitor().attrs.state ?? "monitoring"}</ToolBadge>,
-            },
-            ...(tagText(monitor().inner, "description")
-              ? [{ key: i18n.t("ui.tool.monitor.watching"), value: tagText(monitor().inner, "description")! }]
-              : []),
-            ...(tagText(monitor().inner, "command")
-              ? [{ key: i18n.t("ui.tool.monitor.command"), value: tagText(monitor().inner, "command")!, mono: true }]
-              : []),
-            ...(monitor().attrs.job
-              ? [{ key: i18n.t("ui.tool.monitor.job"), value: monitor().attrs.job!, mono: true }]
-              : []),
-          ]}
-        />
+        <>
+          <ToolFields
+            items={[
+              {
+                key: i18n.t("ui.tool.monitor.state"),
+                value: <ToolBadge tone="info">{monitor().state ?? "monitoring"}</ToolBadge>,
+              },
+              ...(monitor().description
+                ? [{ key: i18n.t("ui.tool.monitor.watching"), value: monitor().description! }]
+                : []),
+              ...(monitor().command
+                ? [{ key: i18n.t("ui.tool.monitor.command"), value: monitor().command!, mono: true }]
+                : []),
+              ...(monitor().jobId ? [{ key: i18n.t("ui.tool.monitor.job"), value: monitor().jobId!, mono: true }] : []),
+            ]}
+          />
+          <Show when={monitor().logPath}>
+            {(path) => (
+              <ToolBlock label={i18n.t("ui.tool.background.log")}>
+                <ToolRow primary={<ToolPath path={path()} />} truncate="start" />
+              </ToolBlock>
+            )}
+          </Show>
+        </>
       )}
     </Show>
   )
@@ -940,17 +918,25 @@ export function BackgroundOutput(props: {
   const action = createMemo(() => (typeof props.input?.action === "string" ? props.input.action : undefined))
   const rows = createMemo(() => jobRows(props.metadata))
   const job = createMemo(() => parseJobBlock(props.output))
+  const shape = createMemo(() => backgroundShape({ action: action(), output: props.output }))
   const logPath = createMemo(() =>
     typeof props.metadata?.logPath === "string" ? (props.metadata.logPath as string) : undefined,
   )
 
   return (
     <Switch fallback={<SmartToolOutput output={props.output} />}>
-      <Match when={action() === "list"}>
+      <Match when={shape() === "list"}>
         <BackgroundJobList rows={rows()} />
       </Match>
 
-      <Match when={job()}>
+      {/* `monitor` records a <monitor> block, not a <job> one. Without its own
+          branch here it fell through to markdown, which strips the wrapper and
+          wraps the command mid-flag. */}
+      <Match when={shape() === "monitor"}>
+        <MonitorOutput output={props.output} />
+      </Match>
+
+      <Match when={shape() === "job" && job()}>
         {(parsed) => (
           <>
             <Show when={parsed().command}>
@@ -976,7 +962,7 @@ export function BackgroundOutput(props: {
       </Match>
 
       {/* `read` returns the log verbatim — ANSI and all. */}
-      <Match when={action() === "read"}>
+      <Match when={shape() === "read"}>
         <>
           <Show when={logPath()}>
             {(path) => (

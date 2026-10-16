@@ -8,6 +8,7 @@ import {
   onMount,
 } from "solid-js"
 import { Icon } from "@opencode-ai/ui/icon"
+import { createInertialImageZoom } from "@opencode-ai/ui/image-zoom"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
 import type {
   VisualArtifactPreviewResolver,
@@ -16,7 +17,7 @@ import type {
 } from "./tool-visual-media-model"
 
 const MIN_SCALE = 0.25
-const MAX_SCALE = 6
+const MAX_SCALE = 8
 const SCALE_STEP = 0.25
 const STAGE_PADDING = 36
 
@@ -90,6 +91,7 @@ function observeSize(element: HTMLElement, callback: ResizeCallback) {
 }
 
 function sourceLabel(kind: VisualMediaSourceKind, t: ReturnType<typeof useI18n>["t"]) {
+  if (kind === "read") return t("ui.tool.read")
   if (kind === "baseline") return t("ui.tool.visual.baseline")
   if (kind === "current") return t("ui.tool.visual.current")
   if (kind === "diff") return t("ui.tool.visual.diff")
@@ -99,14 +101,11 @@ function sourceLabel(kind: VisualMediaSourceKind, t: ReturnType<typeof useI18n>[
 }
 
 function cardLabel(presentation: VisualToolPresentation, t: ReturnType<typeof useI18n>["t"]) {
+  if (presentation.kind === "read") return t("ui.tool.read")
   if (presentation.kind === "screenshot") return t("ui.tool.visual.screenshot")
   if (presentation.kind === "capture") return t("ui.tool.visual.capture")
   if (presentation.kind === "diff") return t("ui.tool.visual.diff")
   return t("ui.tool.visual.record")
-}
-
-function clampScale(value: number) {
-  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, value))
 }
 
 export function ToolVisualMedia(props: {
@@ -120,19 +119,19 @@ export function ToolVisualMedia(props: {
   const [url, setUrl] = createSignal<string>()
   const [loading, setLoading] = createSignal(false)
   const [failed, setFailed] = createSignal(false)
-  const [scale, setScale] = createSignal(1)
+  const [percent, setPercent] = createSignal(100)
+  const [targetScale, setTargetScale] = createSignal(1)
   const [expanded, setExpanded] = createSignal(false)
   const [placeholderHeight, setPlaceholderHeight] = createSignal<number>()
-  const [intrinsicSize, setIntrinsicSize] = createSignal<{ width: number; height: number }>()
-  const [viewportSize, setViewportSize] = createSignal({ width: 0, height: 0 })
   const objectUrls = new Map<string, string>()
   let host: HTMLDivElement | undefined
   let viewport: HTMLDivElement | undefined
+  let stage: HTMLDivElement | undefined
+  let image: HTMLImageElement | undefined
+  let imageZoom: ReturnType<typeof createInertialImageZoom> | undefined
   let loadGeneration = 0
   let stopVisibility: (() => void) | undefined
   let stopResize: (() => void) | undefined
-  let pointer: { id: number; x: number; y: number; left: number; top: number; moved: boolean } | undefined
-  let dragged = false
 
   const source = createMemo(
     () => props.presentation.sources.find((candidate) => candidate.key === selectedKey()) ?? props.presentation.sources[0],
@@ -159,29 +158,6 @@ export function ToolVisualMedia(props: {
     if (props.presentation.captureMs !== undefined) bits.push(`${Math.round(props.presentation.captureMs)} ms`)
     return bits.join(" · ")
   })
-  const baseSize = createMemo(() => {
-    const image = intrinsicSize()
-    const view = viewportSize()
-    if (!image || image.width <= 0 || image.height <= 0 || view.width <= 0 || view.height <= 0) return
-    const availableWidth = Math.max(1, view.width - STAGE_PADDING)
-    const availableHeight = Math.max(1, view.height - STAGE_PADDING)
-    const fit = Math.min(1, availableWidth / image.width, availableHeight / image.height)
-    return { width: image.width * fit, height: image.height * fit }
-  })
-  const scaledSize = createMemo(() => {
-    const base = baseSize()
-    if (!base) return
-    return { width: base.width * scale(), height: base.height * scale() }
-  })
-  const stageStyle = createMemo(() => {
-    const image = scaledSize()
-    const view = viewportSize()
-    if (!image || view.width <= 0 || view.height <= 0) return undefined
-    return {
-      width: `${Math.max(view.width, image.width + STAGE_PADDING)}px`,
-      height: `${Math.max(view.height, image.height + STAGE_PADDING)}px`,
-    }
-  })
 
   const notifySize = () => {
     if (!props.onContentRendered) return
@@ -191,12 +167,29 @@ export function ToolVisualMedia(props: {
   onMount(() => {
     if (!host) return
     stopVisibility = observeNearViewport(host, () => setActive(true))
-    if (viewport) stopResize = observeSize(viewport, setViewportSize)
+    if (viewport && stage) {
+      imageZoom = createInertialImageZoom({
+        viewport,
+        stage,
+        image: () => image,
+        maxScale: MAX_SCALE,
+        minScale: MIN_SCALE,
+        padding: STAGE_PADDING / 2,
+        onScale: (current, target) => {
+          const rounded = Math.round(current * 100)
+          setPercent((current) => current === rounded ? current : rounded)
+          setTargetScale((current) => current === target ? current : target)
+        },
+      })
+      stopResize = observeSize(viewport, ({ width, height }) => imageZoom?.resize(width, height))
+      if (image?.complete && image.naturalWidth > 0) imageZoom.setIntrinsic(image.naturalWidth, image.naturalHeight)
+    }
   })
 
   onCleanup(() => {
     stopVisibility?.()
     stopResize?.()
+    imageZoom?.dispose()
     loadGeneration += 1
     for (const value of objectUrls.values()) URL.revokeObjectURL(value)
     objectUrls.clear()
@@ -206,10 +199,10 @@ export function ToolVisualMedia(props: {
     const current = source()
     if (!current) return
     if (selectedKey() !== current.key) setSelectedKey(current.key)
-    setScale(1)
     const width = props.presentation.width
     const height = props.presentation.height
-    setIntrinsicSize(width && height ? { width, height } : undefined)
+    if (width && height) imageZoom?.setIntrinsic(width, height)
+    else imageZoom?.zoomTo(1, undefined, undefined, false)
     if (!active()) return
 
     const generation = ++loadGeneration
@@ -224,7 +217,7 @@ export function ToolVisualMedia(props: {
 
     if (current.inline) {
       setLoading(false)
-      setUrl(`data:${current.inline.mime};base64,${current.inline.data}`)
+      setUrl(current.inline.url ?? (current.inline.data ? `data:${current.inline.mime};base64,${current.inline.data}` : undefined))
       notifySize()
       return
     }
@@ -264,33 +257,7 @@ export function ToolVisualMedia(props: {
     )
   })
 
-  const zoom = (next: number, clientX?: number, clientY?: number) => {
-    const element = viewport
-    const target = clampScale(next)
-    if (!element || target === scale()) {
-      setScale(target)
-      return
-    }
-    const rect = element.getBoundingClientRect()
-    const localX = clientX === undefined ? rect.width / 2 : clientX - rect.left
-    const localY = clientY === undefined ? rect.height / 2 : clientY - rect.top
-    const anchorX = element.scrollLeft + localX
-    const anchorY = element.scrollTop + localY
-    const ratio = target / scale()
-    setScale(target)
-    requestAnimationFrame(() => {
-      if (!viewport) return
-      viewport.scrollLeft = anchorX * ratio - localX
-      viewport.scrollTop = anchorY * ratio - localY
-    })
-  }
-
-  const reset = () => {
-    setScale(1)
-    requestAnimationFrame(() => {
-      viewport?.scrollTo({ left: 0, top: 0, behavior: "smooth" })
-    })
-  }
+  const reset = () => imageZoom?.reset()
 
   const setExpandedState = (next: boolean) => {
     if (next === expanded()) return
@@ -328,57 +295,12 @@ export function ToolVisualMedia(props: {
     tab.focus()
   }
 
-  const onWheel = (event: WheelEvent) => {
-    if (!event.ctrlKey && !event.metaKey) return
-    event.preventDefault()
-    const pixels =
-      event.deltaMode === WheelEvent.DOM_DELTA_LINE
-        ? event.deltaY * 16
-        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
-          ? event.deltaY * (viewport?.clientHeight ?? 600)
-          : event.deltaY
-    const bounded = Math.max(-180, Math.min(180, pixels))
-    zoom(scale() * Math.exp(-bounded * 0.0018), event.clientX, event.clientY)
-  }
-
   const onKeyDown = (event: KeyboardEvent) => {
     if (event.key === "Escape" && expanded()) {
       event.preventDefault()
       setExpandedState(false)
       return
     }
-    if (event.key === "+" || event.key === "=") {
-      event.preventDefault()
-      zoom(scale() + SCALE_STEP)
-      return
-    }
-    if (event.key === "-") {
-      event.preventDefault()
-      zoom(scale() - SCALE_STEP)
-      return
-    }
-    if (event.key === "0") {
-      event.preventDefault()
-      reset()
-      return
-    }
-    if (!viewport) return
-    const amount = event.shiftKey ? 48 : 20
-    const delta =
-      event.key === "ArrowLeft" ? { left: -amount, top: 0 }
-      : event.key === "ArrowRight" ? { left: amount, top: 0 }
-      : event.key === "ArrowUp" ? { left: 0, top: -amount }
-      : event.key === "ArrowDown" ? { left: 0, top: amount }
-      : undefined
-    if (!delta) return
-    event.preventDefault()
-    viewport.scrollBy({ ...delta, behavior: "smooth" })
-  }
-
-  const stopPan = (event: PointerEvent) => {
-    if (!pointer || pointer.id !== event.pointerId) return
-    pointer = undefined
-    if (viewport) delete viewport.dataset.panning
   }
 
   return (
@@ -392,7 +314,7 @@ export function ToolVisualMedia(props: {
         data-component="tool-visual-media"
         data-origin={props.presentation.origin}
         data-expanded={expanded() ? "true" : undefined}
-        data-zoomed={scale() !== 1 ? "true" : undefined}
+        data-zoomed={targetScale() !== 1 ? "true" : undefined}
         onKeyDown={(event) => {
           if (event.defaultPrevented || event.key !== "Escape" || !expanded()) return
           event.preventDefault()
@@ -431,8 +353,8 @@ export function ToolVisualMedia(props: {
               type="button"
               aria-label={i18n.t("ui.tool.visual.zoomOut")}
               title={i18n.t("ui.tool.visual.zoomOut")}
-              disabled={scale() <= MIN_SCALE}
-              onClick={() => zoom(scale() - SCALE_STEP)}
+              disabled={targetScale() <= MIN_SCALE}
+              onClick={() => imageZoom?.zoomBy(-SCALE_STEP)}
             >
               <Icon name="dash" size="small" />
             </button>
@@ -443,14 +365,14 @@ export function ToolVisualMedia(props: {
               title={i18n.t("ui.tool.visual.zoomReset")}
               onClick={reset}
             >
-              {Math.round(scale() * 100)}%
+              {percent()}%
             </button>
             <button
               type="button"
               aria-label={i18n.t("ui.tool.visual.zoomIn")}
               title={i18n.t("ui.tool.visual.zoomIn")}
-              disabled={scale() >= MAX_SCALE}
-              onClick={() => zoom(scale() + SCALE_STEP)}
+              disabled={targetScale() >= MAX_SCALE}
+              onClick={() => imageZoom?.zoomBy(SCALE_STEP)}
             >
               <Icon name="plus-small" size="small" />
             </button>
@@ -472,65 +394,33 @@ export function ToolVisualMedia(props: {
           data-panning={undefined}
           tabIndex={0}
           aria-label={i18n.t("ui.tool.visual.viewport", { source: sourceName() })}
-          onWheel={onWheel}
           onKeyDown={onKeyDown}
-          onDblClick={reset}
-          onPointerDown={(event) => {
-            if (event.button !== 0 || !viewport) return
-            if (viewport.scrollWidth <= viewport.clientWidth && viewport.scrollHeight <= viewport.clientHeight) return
-            event.preventDefault()
-            dragged = false
-            pointer = {
-              id: event.pointerId,
-              x: event.clientX,
-              y: event.clientY,
-              left: viewport.scrollLeft,
-              top: viewport.scrollTop,
-              moved: false,
-            }
-            viewport.setPointerCapture(event.pointerId)
-            viewport.dataset.panning = "true"
-          }}
-          onPointerMove={(event) => {
-            if (!pointer || pointer.id !== event.pointerId || !viewport) return
-            const dx = event.clientX - pointer.x
-            const dy = event.clientY - pointer.y
-            if (Math.abs(dx) + Math.abs(dy) > 3) {
-              pointer.moved = true
-              dragged = true
-            }
-            viewport.scrollLeft = pointer.left - dx
-            viewport.scrollTop = pointer.top - dy
-          }}
-          onPointerUp={stopPan}
-          onPointerCancel={stopPan}
         >
-          <div data-slot="tool-visual-stage" style={stageStyle()}>
+          <div ref={stage} data-slot="tool-visual-stage">
             <Show when={url()}>
               {(src) => (
                 <img
+                  ref={image}
                   src={src()}
                   alt={i18n.t("ui.tool.visual.previewAlt", { source: sourceName() })}
                   draggable={false}
                   loading="lazy"
                   decoding="async"
-                  style={{
-                    width: scaledSize() ? `${scaledSize()!.width}px` : `${scale() * 100}%`,
-                    height: scaledSize() ? `${scaledSize()!.height}px` : "auto",
-                  }}
                   onLoad={(event) => {
                     const image = event.currentTarget
                     if (image.naturalWidth > 0 && image.naturalHeight > 0) {
-                      setIntrinsicSize({ width: image.naturalWidth, height: image.naturalHeight })
+                      imageZoom?.setIntrinsic(image.naturalWidth, image.naturalHeight)
                     }
                     notifySize()
                   }}
+                  onError={() => {
+                    setUrl(undefined)
+                    setFailed(true)
+                    notifySize()
+                  }}
                   onClick={() => {
-                    if (dragged) {
-                      dragged = false
-                      return
-                    }
-                    if (expanded() || scale() !== 1) return
+                    if (imageZoom?.consumeDrag()) return
+                    if (expanded() || imageZoom?.target() !== 1) return
                     setExpandedState(true)
                   }}
                 />

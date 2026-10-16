@@ -1,6 +1,8 @@
 import { afterEach, expect, test } from "bun:test"
 import {
   MARKDOWN_FRAME_WORK_MAX_JOB_BYTES,
+  MARKDOWN_FRAME_WORK_FRAME_STEPS,
+  MARKDOWN_FRAME_WORK_FRAME_MS,
   cancelMarkdownFrameWork,
   markdownFrameWorkSnapshot,
   reserveMarkdownFrameWork,
@@ -30,7 +32,7 @@ function restoreFrame() {
 
 afterEach(restoreFrame)
 
-test("one shared frame owner runs only one bounded sanitizer continuation per frame", async () => {
+test("the shared owner batches tiny sanitizers with tail priority and bounded task count", async () => {
   installFrame()
   const runs: string[] = []
   const jobs = ["visible-a", "tail-a", "visible-b", "background"].map((key) =>
@@ -47,11 +49,45 @@ test("one shared frame owner runs only one bounded sanitizer continuation per fr
     const before = runs.length
     frames.shift()!(0)
     await Promise.resolve()
-    expect(runs.length - before).toBeLessThanOrEqual(1)
+    expect(runs.length - before).toBeLessThanOrEqual(MARKDOWN_FRAME_WORK_FRAME_STEPS)
   }
   await Promise.all(jobs)
   expect(runs).toHaveLength(4)
+  expect(runs[0]).toBe("tail-a")
   expect(markdownFrameWorkSnapshot().queuedJobs).toBe(0)
+})
+
+test("sanitizer batches stop after the CPU budget and retain the next job", async () => {
+  installFrame()
+  const runs: number[] = []
+  const jobs = [1, 2].map((value) => runMarkdownFrameWork({
+    key: `cpu-budget:${value}`, priority: "visible", bytes: 32, current: () => true,
+    run: () => {
+      const start = performance.now()
+      while (performance.now() - start <= MARKDOWN_FRAME_WORK_FRAME_MS + 1) {}
+      runs.push(value)
+    },
+  }))
+  frames.shift()!(0)
+  expect(runs).toEqual([1])
+  expect(markdownFrameWorkSnapshot().queuedJobs).toBe(1)
+  while (frames.length) frames.shift()!(0)
+  await Promise.all(jobs)
+  expect(runs).toEqual([1, 2])
+})
+
+test("sanitizer batching charges actual input bytes and does not combine two capped jobs", async () => {
+  installFrame()
+  const runs: number[] = []
+  const jobs = [1, 2].map((value) => runMarkdownFrameWork({
+    key: `byte-budget:${value}`, priority: "visible", bytes: MARKDOWN_FRAME_WORK_MAX_JOB_BYTES,
+    current: () => true, run: () => runs.push(value),
+  }))
+  frames.shift()!(0)
+  expect(runs).toEqual([1])
+  while (frames.length) frames.shift()!(0)
+  await Promise.all(jobs)
+  expect(runs).toEqual([1, 2])
 })
 
 test("owner cancellation discards queued sanitizer work and oversized tasks fail closed", async () => {

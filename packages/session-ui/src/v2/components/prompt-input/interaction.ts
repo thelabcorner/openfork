@@ -137,6 +137,8 @@ export function createPromptInputV2Controller(input: {
   openContext?: (key: string) => void
   /** Called once whenever the @ context picker transitions from closed to open. */
   onContextOpen?: () => void
+  /** Called once whenever slash-command intent opens the command picker. */
+  onCommandOpen?: () => void
   onContextRemove?: (item: PromptInputV2Comment) => void
   onEditor?: (element: HTMLElement) => void
   onSuggestionSelect?: (item: PromptInputV2Suggestion) => (() => void) | void
@@ -229,6 +231,7 @@ export function createPromptInputV2Controller(input: {
     contextWasOpen = open
   })
 
+
   const execute = (command: PromptInputV2InteractionCommand) => {
     if (command.type === "draft.setText") {
       draft.setText(command.value)
@@ -253,6 +256,8 @@ export function createPromptInputV2Controller(input: {
   function dispatch(event: PromptInputV2InteractionEvent) {
     const mode = state.mode
     const result = transitionPromptInputV2(state, event, draft.state)
+    const commandWasOpen = state.popover.type === "command-inline" || state.popover.type === "command-menu"
+    const commandIsOpen = result.state.popover.type === "command-inline" || result.state.popover.type === "command-menu"
     const action = event.type === "popover.select" ? input.onSuggestionSelect?.(event.item) : undefined
     if (event.type === "popover.select") {
       if (!action || state.popover.type !== "command-menu") result.commands.forEach(execute)
@@ -264,6 +269,7 @@ export function createPromptInputV2Controller(input: {
       }
     }
     setState(reconcile(result.state))
+    if (!commandWasOpen && commandIsOpen) input.onCommandOpen?.()
     if (event.type !== "popover.select") result.commands.forEach(execute)
     if (mode !== result.state.mode) {
       if (result.state.mode === "shell") input.view.shell?.onOpen()
@@ -305,7 +311,7 @@ export function createPromptInputV2Controller(input: {
     }
     if (handled) return true
     const stop =
-      input.view.submit.working?.() &&
+      (input.view.submit.working?.() || input.view.submit.stopping()) &&
       ((event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "g") ||
         event.key === "Escape")
     if (stop) {

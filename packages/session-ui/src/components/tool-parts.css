@@ -322,6 +322,118 @@
   }
 }
 
+/* ── Quota / usage analytics ───────────────────────────────────────────────
+   First-party accounting tools keep the same New York-density vocabulary as
+   every other native tool: one compact metric rail, 20px rows, bounded detail.
+   These are historical tool-result projections — no timers, polling, or hidden
+   data fetches are attached to the presentation. */
+
+[data-component="quota-tool-output"],
+[data-component="usage-tool-output"],
+[data-component="quota-provider-body"] {
+  width: 100%;
+  min-width: 0;
+}
+
+[data-component="quota-provider-body"] {
+  display: flex;
+  flex-direction: column;
+}
+
+[data-component="quota-meter"] {
+  position: relative;
+  display: inline-flex;
+  width: 72px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--tool-surface-badge);
+
+  [data-slot="quota-meter-fill"] {
+    height: 100%;
+    min-width: 1px;
+    border-radius: inherit;
+    background: var(--v2-text-text-muted);
+  }
+
+  &[data-tone="success"] [data-slot="quota-meter-fill"] {
+    background: var(--v2-state-fg-success);
+  }
+
+  &[data-tone="warning"] [data-slot="quota-meter-fill"] {
+    background: var(--v2-state-fg-warning);
+  }
+
+  &[data-tone="danger"] [data-slot="quota-meter-fill"] {
+    background: var(--v2-state-fg-danger);
+  }
+}
+
+[data-component="quota-row-meta"] {
+  display: inline-block;
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-component="quota-tool-output"] {
+  [data-component="tool-block"] > [data-component="quota-provider-body"] > [data-component="tool-stats"] {
+    padding-top: 5px;
+    padding-bottom: 5px;
+  }
+
+  [data-component="tool-block"] > [data-component="quota-provider-body"] > [data-component="tool-stats"] [data-slot="tool-stat-value"] {
+    font-size: 12px;
+    line-height: 16px;
+  }
+}
+
+[data-component="usage-micro-timeline"] {
+  padding: 8px 10px 7px;
+  border-bottom: 1px solid var(--tool-border);
+
+  &:last-child {
+    border-bottom: 0;
+  }
+
+  [data-slot="usage-bars"] {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    width: 100%;
+    height: 54px;
+    padding-top: 2px;
+  }
+
+  [data-slot="usage-bar"] {
+    flex: 1 1 0;
+    min-width: 1px;
+    max-width: 10px;
+    border-radius: 2px 2px 0 0;
+    background: var(--v2-text-text-accent);
+    opacity: 0.72;
+    transition: opacity 0.12s ease;
+
+    &:hover {
+      opacity: 1;
+    }
+  }
+
+  [data-slot="usage-timeline-axis"] {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 4px;
+    font-family: var(--tp-sans);
+    font-size: 10px;
+    line-height: 13px;
+    font-variant-numeric: tabular-nums;
+    color: var(--v2-text-text-faint);
+  }
+}
+
 /* ── Show more ───────────────────────────────────────────────────────────── */
 
 [data-component="tool-more"] {

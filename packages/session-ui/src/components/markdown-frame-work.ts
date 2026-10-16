@@ -5,11 +5,15 @@ export const MARKDOWN_FRAME_WORK_MAX_BYTES = 8 * 1024 * 1024
 export const MARKDOWN_FRAME_WORK_MAX_JOB_BYTES = 256 * 1024
 export const MARKDOWN_FRAME_WORK_MAX_WAITERS = 256
 export const MARKDOWN_FRAME_WORK_MAX_WAITING_BYTES = 64 * 1024 * 1024
+export const MARKDOWN_FRAME_WORK_FRAME_STEPS = 8
+export const MARKDOWN_FRAME_WORK_FRAME_BYTES = 256 * 1024
+export const MARKDOWN_FRAME_WORK_FRAME_MS = 4
 
 type Work<T> = {
   key: string
   priority: MarkdownWorkPriority
   bytes: number
+  inputBytes: number
   order: number
   age: number
   current: () => boolean
@@ -166,23 +170,35 @@ function choose() {
 function flush() {
   if (document.hidden) return
   frame++
-  // Main-thread rich sanitization is deliberately serialized: each job is
-  // input-capped and only one runs between paint opportunities.
-  const work = choose()
-  if (!work) return
-  byKey.delete(work.key)
-  bytes -= work.bytes
-  if (!work.current()) {
-    work.reject(new DOMException("Markdown frame work was superseded", "AbortError"))
-  } else {
-    try {
-      work.resolve(work.run())
-      completed++
-    } catch (error) {
-      work.reject(error instanceof Error ? error : new Error(String(error)))
+  const started = performance.now()
+  let steps = 0
+  let frameBytes = 0
+  // Tiny rich blocks should not each cost a paint interval. The shared owner
+  // remains serial, priority-aware and bounded in time, input and task count.
+  // One non-preemptible task may cross the time limit; the next always yields.
+  while (steps < MARKDOWN_FRAME_WORK_FRAME_STEPS && performance.now() - started < MARKDOWN_FRAME_WORK_FRAME_MS) {
+    const work = choose()
+    if (!work) break
+    if (steps && frameBytes + work.inputBytes > MARKDOWN_FRAME_WORK_FRAME_BYTES) {
+      queues[work.priority].unshift(work)
+      break
     }
+    steps++
+    frameBytes += work.inputBytes
+    byKey.delete(work.key)
+    bytes -= work.bytes
+    if (!work.current()) {
+      work.reject(new DOMException("Markdown frame work was superseded", "AbortError"))
+    } else {
+      try {
+        work.resolve(work.run())
+        completed++
+      } catch (error) {
+        work.reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+    promoteReservations()
   }
-  promoteReservations()
   schedule()
 }
 
@@ -211,7 +227,7 @@ export function runMarkdownFrameWork<T>(input: {
       reservedBytes -= reservation.bytes
     }
     const charge = reservation?.bytes ?? input.bytes
-    const work: Work<T> = { ...input, bytes: charge, order: order++, age: frame, resolve, reject }
+    const work: Work<T> = { ...input, inputBytes: input.bytes, bytes: charge, order: order++, age: frame, resolve, reject }
     byKey.set(input.key, work as Work<unknown>)
     queues[input.priority].push(work as Work<unknown>)
     bytes += charge

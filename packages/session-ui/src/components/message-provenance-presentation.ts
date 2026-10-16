@@ -93,6 +93,8 @@ export function messageProvenancePresentation(message: MessageLike): MessageProv
       return automation("goalContinuation", "Goal continuation", "Goal continuation", { kind: "goal" })
     case SessionTurnProvenance.Source.RecoveryContinuation:
       return automation("recoveryContinuation", "Recovery", "Recovery continuation", { kind: "recovery", tone: "warning" })
+    case SessionTurnProvenance.Source.ProviderTimeoutContinuation:
+      return automation("providerTimeoutContinuation", "Provider timeout recovery", "Resuming after provider timeout", { kind: "recovery", tone: "warning" })
     case SessionTurnProvenance.Source.UnknownFinishContinuation:
       return automation("providerContinuation", "Provider continuation", "Provider continuation", { kind: "recovery", tone: "warning" })
     case SessionTurnProvenance.Source.CompactionReplay:

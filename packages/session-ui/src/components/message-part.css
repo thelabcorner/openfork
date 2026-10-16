@@ -545,7 +545,8 @@
 }
 
 [data-component="shell-timer"],
-[data-component="shell-timer-remaining-badge"] {
+[data-component="shell-timer-remaining-badge"],
+[data-slot="shell-timer-queued"] {
   --shell-timer-color: var(--v2-text-text-faint, var(--text-weak));
 
   display: inline-flex;

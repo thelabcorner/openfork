@@ -182,7 +182,13 @@ export function applyMarkdownWorkerResponse(
     id: response.id,
     generation: (state?.generation ?? 0) + (response.reset ? 1 : 0),
     language: response.language,
-    stable: response.reset ? response.stable : [...(state?.stable ?? []), ...response.stable],
+    // Streaming updates often replace only the unstable terminal token.
+    // Keep the immutable stable prefix by reference in that case.
+    stable: response.reset
+      ? response.stable
+      : response.stable.length
+        ? [...(state?.stable ?? []), ...response.stable]
+        : (state?.stable ?? []),
     unstable: response.unstable,
   }
 }

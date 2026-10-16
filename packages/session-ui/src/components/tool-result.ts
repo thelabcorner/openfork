@@ -24,8 +24,8 @@ export function lineCount(output: string | undefined) {
 }
 
 /**
- * `edit` reports structured `filediff` counts, but `write` and `patch` only
- * hand back a unified diff string, so count the hunks directly for those.
+ * Prefer structured `filediff` counts when available. Older write results and
+ * patch results may only have the unified diff string, so count those hunks.
  */
 export function countUnifiedDiff(value: unknown) {
   if (typeof value !== "string" || !value) return undefined

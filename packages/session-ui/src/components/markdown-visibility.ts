@@ -17,8 +17,10 @@ function painted(element: Element, cache = new Map<Element, boolean>()) {
         style.display !== "none" &&
         style.visibility !== "hidden" &&
         style.contentVisibility !== "hidden" &&
-        Number(style.opacity) !== 0 &&
-        node.getAttribute("aria-hidden") !== "true"
+        Number(style.opacity) !== 0
+      // aria-hidden controls accessibility exposure, not paint. The live
+      // timeline deliberately silences announcements without hiding content.
+      // Treating it as visual visibility withholds all Markdown until idle.
       cache.set(node, visible)
     }
     if (!visible) return false
@@ -100,7 +102,7 @@ export function observeMarkdownVisibility(element: Element, onChange: (visible: 
     if (!targets) {
       targets = new Set()
       observedAncestors.set(ancestor, targets)
-      mutations?.observe(ancestor, { attributes: true, attributeFilter: ["class", "style", "hidden", "aria-hidden"] })
+      mutations?.observe(ancestor, { attributes: true, attributeFilter: ["class", "style", "hidden"] })
     }
     targets.add(element)
     if (ancestor === document.documentElement) break
@@ -146,5 +148,5 @@ function rebuildMutationObserver() {
   if (current !== mutations || generation !== mutationGeneration || subscribers.size === 0) return
   current.disconnect()
   for (const ancestor of observedAncestors.keys())
-    current.observe(ancestor, { attributes: true, attributeFilter: ["class", "style", "hidden", "aria-hidden"] })
+    current.observe(ancestor, { attributes: true, attributeFilter: ["class", "style", "hidden"] })
 }

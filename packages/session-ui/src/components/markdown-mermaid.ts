@@ -1,5 +1,6 @@
 import { checksum } from "@opencode-ai/core/util/encode"
 import DOMPurify from "dompurify"
+import { dampedZoom, IMAGE_ZOOM_SMOOTH_TIME } from "@opencode-ai/ui/image-zoom"
 
 type MermaidAPI = (typeof import("mermaid"))["default"]
 
@@ -78,7 +79,6 @@ const MERMAID_MIN_SCALE = 0.5
 const MERMAID_MAX_SCALE = 3
 const MERMAID_SCALE_STEP = 0.2
 const MERMAID_STAGE_PADDING = 40
-const MERMAID_ZOOM_SMOOTH_TIME = 0.11
 const MERMAID_PNG_MIN_DENSITY = 2
 const MERMAID_PNG_MAX_DENSITY = 3
 const MERMAID_PNG_MAX_DIMENSION = 8192
@@ -620,7 +620,7 @@ function animateZoom(state: MermaidState, time: number) {
   const dt = Math.max(1 / 240, Math.min(1 / 30, (time - last) / 1000))
   state.zoomLastTime = time
 
-  const stepped = smoothDamp(state.scale, state.targetScale, state.zoomVelocity, MERMAID_ZOOM_SMOOTH_TIME, dt)
+  const stepped = dampedZoom(state.scale, state.targetScale, state.zoomVelocity, dt, IMAGE_ZOOM_SMOOTH_TIME)
   state.scale = stepped.value
   state.zoomVelocity = stepped.velocity
   const done = Math.abs(state.targetScale - state.scale) < 0.0005 && Math.abs(state.zoomVelocity) < 0.005
@@ -632,20 +632,6 @@ function animateZoom(state: MermaidState, time: number) {
   if (!done) state.zoomFrame = requestAnimationFrame((nextTime) => animateZoom(state, nextTime))
 }
 
-function smoothDamp(current: number, target: number, velocity: number, smoothTime: number, dt: number) {
-  const omega = 2 / Math.max(0.0001, smoothTime)
-  const x = omega * dt
-  const decay = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x)
-  const change = current - target
-  const temp = (velocity + omega * change) * dt
-  let nextVelocity = (velocity - omega * temp) * decay
-  let value = target + (change + temp) * decay
-  if ((target - current > 0) === (value > target)) {
-    value = target
-    nextVelocity = 0
-  }
-  return { value, velocity: nextVelocity }
-}
 
 function cancelZoomAnimation(state: MermaidState) {
   if (state.zoomFrame !== undefined) cancelAnimationFrame(state.zoomFrame)

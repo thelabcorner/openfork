@@ -51,6 +51,14 @@
   }
 }
 
+/* The running shell's 28px stop button disappears on completion. Reserving
+   the same trigger height prevents a 4px upward rebound while bottom-anchored
+   logs remain otherwise byte-identical. Only opted-in tools pay this space. */
+[data-component="collapsible"].tool-collapsible[data-stable-trigger-height="true"]
+  > [data-slot="collapsible-trigger"] {
+  min-height: 28px;
+}
+
 /* Shell output should sit on the same base surface as the edit diff viewer. */
 [data-slot="tool-content"][data-variant="card"]:has(> [data-component="bash-output"]) {
   --tool-surface-card: var(--opencode-diffs-bg, var(--color-background-stronger));
@@ -389,7 +397,8 @@
   > [data-component="sqlite-table-wrap"],
   > [data-component="sympy-output"],
   > [data-component="todos"],
-  > [data-component="diagnostics"] {
+  > [data-component="diagnostics"],
+  > [data-component="code-tool-output"] {
     border: 0;
     border-radius: 0;
     background: transparent;

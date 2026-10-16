@@ -17,10 +17,15 @@ type CommitInput = {
   tokens?: MarkdownToken[]
   tokenSpan?: (token: MarkdownToken) => HTMLElement
   tokenProgress?: (count: number) => void
+  /** Reuse ancestors continued from an earlier bounded rich fragment. */
+  mergeElement?: (source: Element, parent: Node) => Element
+  textContainer?: (parent: Node, text: string) => Node
   target?: HTMLElement
   bytes?: number
   parent: HTMLElement
   wrapper: HTMLElement
+  /** Permit bounded rendering into a detached replacement until it is fully ready. */
+  allowDetached?: boolean
   priority: MarkdownWorkPriority
   isCurrent: () => boolean
   complete: () => void
@@ -130,7 +135,7 @@ function flush() {
     const job = chooseJob()
     if (!job) break
     steps++
-    if (!job.isCurrent() || !job.wrapper.isConnected || job.parent.children.length === 0) {
+    if (!job.isCurrent() || (!job.wrapper.isConnected && !job.allowDetached) || job.parent.children.length === 0) {
       removeJob(job)
       job.wrapper.removeAttribute("data-markdown-pending")
       wakeOneWaiter()
@@ -240,10 +245,19 @@ function flush() {
       break
     }
     if (task.text !== undefined || source?.nodeType === Node.TEXT_NODE) {
+      if (nodes + (job.textContainer ? 2 : 1) > MARKDOWN_DOM_COMMIT_NODES) {
+        job.stack.push(task)
+        queues[job.priority].push(job)
+        break
+      }
       const text = task.text ?? source?.nodeValue ?? ""
       const start = task.offset ?? 0
       const remaining = MARKDOWN_DOM_COMMIT_CHARS - chars
       let end = Math.min(text.length, start + TEXT_NODE_CHARS, start + remaining)
+      if (job.textContainer && end < text.length) {
+        const space = text.slice(start, end).lastIndexOf(" ")
+        if (space > 0) end = start + space + 1
+      }
       if (end < text.length && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end--
       if (end <= start) {
         if (text.length === start) {
@@ -258,16 +272,18 @@ function flush() {
           break
         }
       } else {
-        parent.appendChild(document.createTextNode(text.slice(start, end)))
+        const content = text.slice(start, end)
+        const target = job.textContainer?.(parent, content) ?? parent
+        target.appendChild(document.createTextNode(content))
         chars += end - start
-        nodes++
+        nodes += target === parent ? 1 : 2
         if (source && start === 0 && source.nextSibling) job.stack.push({ source: source.nextSibling, parent })
         if (end < text.length)
           job.stack.push(task.text === undefined ? { source, parent, offset: end } : { text, parent, offset: end })
       }
     } else if (source?.nodeType === Node.ELEMENT_NODE) {
-      const clone = source.cloneNode(false) as Element
-      parent.appendChild(clone)
+      const clone = job.mergeElement?.(source as Element, parent) ?? source.cloneNode(false) as Element
+      if (clone.parentNode !== parent) parent.appendChild(clone)
       if (source.nextSibling) job.stack.push({ source: source.nextSibling, parent })
       if (source.firstChild) job.stack.push({ source: source.firstChild, parent: clone })
       nodes++

@@ -34,29 +34,47 @@ function Hourglass(props: { spinning: boolean }) {
 }
 
 /**
- * Live-ticking elapsed/timeout badge for long-running shell commands.
- * Freezes on the final duration once `running` goes false so completed
- * cards keep showing how long the command actually took.
+ * Live-ticking command-runtime and queue badges. The timeout measures runtime
+ * after slot admission; queued time is shown separately. Runtime freezes on
+ * completion so cards keep showing the command's actual execution duration.
  */
-export function ShellTimer(props: { startedAt: number; timeoutMs?: number; running: boolean; endedAt?: number }) {
+export function ShellTimer(props: {
+  startedAt?: number
+  queueStartedAt?: number
+  timeoutMs?: number
+  running: boolean
+  endedAt?: number
+}) {
   const i18n = useI18n()
   const [now, setNow] = createSignal(Date.now())
 
   const interval = setInterval(() => setNow(Date.now()), 1000)
   onCleanup(() => clearInterval(interval))
 
+  const queued = createMemo(() => {
+    if (props.queueStartedAt === undefined) return undefined
+    if (props.startedAt !== undefined) {
+      const duration = Math.max(0, props.startedAt - props.queueStartedAt)
+      return duration >= 1_000 ? duration : undefined
+    }
+    if (!props.running) return undefined
+    const duration = Math.max(0, now() - props.queueStartedAt)
+    return duration >= 1_000 ? duration : undefined
+  })
+
   const elapsed = createMemo(() => {
+    if (props.startedAt === undefined) return 0
     const end = props.running ? now() : (props.endedAt ?? now())
     return Math.max(0, end - props.startedAt)
   })
 
   const remaining = createMemo(() => {
-    if (props.timeoutMs === undefined) return undefined
+    if (props.startedAt === undefined || props.timeoutMs === undefined) return undefined
     return props.timeoutMs - elapsed()
   })
 
   const ratio = createMemo(() => {
-    if (props.timeoutMs === undefined || props.timeoutMs <= 0) return 0
+    if (props.startedAt === undefined || props.timeoutMs === undefined || props.timeoutMs <= 0) return 0
     return elapsed() / props.timeoutMs
   })
 
@@ -70,10 +88,15 @@ export function ShellTimer(props: { startedAt: number; timeoutMs?: number; runni
 
   return (
     <span data-component="shell-timer-group">
-      <span data-component="shell-timer" data-running={props.running ? "true" : undefined} data-urgency={urgency()}>
-        <Hourglass spinning={props.running} />
-        <span data-slot="shell-timer-elapsed">{formatDuration(elapsed())}</span>
-      </span>
+      <Show when={props.startedAt !== undefined}>
+        <span data-component="shell-timer" data-running={props.running ? "true" : undefined} data-urgency={urgency()}>
+          <Hourglass spinning={props.running} />
+          <span data-slot="shell-timer-elapsed">{formatDuration(elapsed())}</span>
+        </span>
+      </Show>
+      <Show when={queued() !== undefined}>
+        <span data-slot="shell-timer-queued">{i18n.t("ui.tool.shell.queued", { duration: formatDuration(queued()!) })}</span>
+      </Show>
       <Show when={props.running && remaining() !== undefined}>
         <span data-component="shell-timer-remaining-badge" data-urgency={urgency()}>
           {remaining()! > 0

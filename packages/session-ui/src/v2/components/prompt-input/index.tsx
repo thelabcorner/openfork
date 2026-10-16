@@ -1,4 +1,5 @@
-import { createEffect, createMemo, For, Show, type Accessor, type JSX } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, type Accessor, type JSX } from "solid-js"
+import { Portal } from "solid-js/web"
 import { FileIcon } from "@opencode-ai/ui/file-icon"
 import { Icon } from "@opencode-ai/ui/icon"
 import { IconButton } from "@opencode-ai/ui/icon-button"
@@ -30,6 +31,9 @@ import type {
 } from "./types"
 import type { PromptInputV2Interaction, PromptInputV2SelectControl } from "./interaction"
 import "./attachments.css"
+import { createPromptWritingHighlights } from "./writing-highlights"
+import { WritingHoverBadge } from "./writing-hover-badge"
+import { createWritingHoverController } from "./writing-hover-controller"
 
 export type {
   PromptInputV2Attachment,
@@ -62,6 +66,34 @@ export type PromptInputV2Props = {
   variantControlVisible?: boolean
   attachKeybind?: string[]
   attachShortcut?: string
+  /** Editor-only, app-owned annotations. Never modifies authored DOM or send. */
+  writingAssistance?: {
+    enabled: boolean
+    status?: "off" | "idle" | "loading" | "ready" | "unavailable"
+    issues: readonly {
+      id: string
+      start: number
+      end: number
+      original: string
+      message: string
+      category: "spelling" | "grammar"
+      suggestions: readonly string[]
+    }[]
+    onApply: (id: string, replacement: string) => void
+    onIgnore?: (word: string) => void
+    onCompositionChange?: (active: boolean) => void
+    undoAvailable?: boolean
+    onUndo?: () => void
+    autoChanges?: readonly {
+      id: string
+      original: string
+      replacement: string
+      start: number
+      end: number
+    }[]
+    onRejectAuto?: (id: string) => void
+    onDismiss?: (id: string) => void
+  }
 }
 
 export function PromptInputV2(props: PromptInputV2Props) {
@@ -70,12 +102,57 @@ export function PromptInputV2(props: PromptInputV2Props) {
   const view = props.controller.view
   let editor: HTMLDivElement | undefined
   let editorArea: HTMLDivElement | undefined
+  let suggestionPopup: HTMLDivElement | undefined
+  let correctionPopup: HTMLDivElement | undefined
   let localInput = false
   let previousParts: PromptInputV2Prompt | undefined
+  const highlights = createPromptWritingHighlights()
+  let highlightFrame: number | undefined
+  const clearHarperHighlights = () => highlights.clear()
+  onCleanup(() => {
+    if (highlightFrame !== undefined) cancelAnimationFrame(highlightFrame)
+    highlights.destroy()
+  })
   const updateCursor = () => {
     if (!editor || !window.getSelection()?.isCollapsed) return
     props.controller.onCursor(promptInputV2Cursor(editor))
   }
+  const [activeLint, setActiveLint] = createSignal<{ id: string; x: number; y: number }>()
+  const [autoReview, setAutoReview] = createSignal<{ x: number; y: number }>()
+  const hover = createWritingHoverController({
+    highlights,
+    enabled: () => Boolean(props.writingAssistance?.enabled) && state.mode === "normal" && !composing(),
+    corrected: () => props.writingAssistance?.autoChanges ?? [],
+    issues: () => props.writingAssistance?.issues ?? [],
+  })
+  const [composing, setComposing] = createSignal(false)
+  createEffect(() => {
+    if (!(props.writingAssistance?.autoChanges?.length ?? 0)) setAutoReview(undefined)
+  })
+  const activeIssue = createMemo(() => props.writingAssistance?.issues.find((item) => item.id === activeLint()?.id))
+  createEffect(() => {
+    if (!autoReview()) return
+    const outside = (event: PointerEvent) => {
+      const node = event.target
+      if (node instanceof Node && correctionPopup?.contains(node)) return
+      setAutoReview(undefined)
+    }
+    document.addEventListener("pointerdown", outside, true)
+    onCleanup(() => document.removeEventListener("pointerdown", outside, true))
+  })
+  createEffect(() => {
+    if (!activeLint()) return
+    const closeOutside = (event: PointerEvent) => {
+      const node = event.target
+      if (node instanceof Node && suggestionPopup?.contains(node)) return
+      setActiveLint(undefined)
+    }
+    document.addEventListener("pointerdown", closeOutside, true)
+    onCleanup(() => document.removeEventListener("pointerdown", closeOutside, true))
+    requestAnimationFrame(() => suggestionPopup?.querySelector<HTMLButtonElement>(
+      '[data-action="prompt-grammar-accept"], [aria-label="Dismiss suggestion"]',
+    )?.focus())
+  })
   const mode = createMemo(() => state.mode)
   const buttons = createMemo(() => ({
     opacity: mode() === "normal" ? 1 : 0,
@@ -116,6 +193,26 @@ export function PromptInputV2(props: PromptInputV2Props) {
     renderPromptInputV2Editor(editor, parts, cursor, scrollTop)
   })
 
+  createEffect(() => {
+    const parts = props.controller.parts()
+    const enabled = props.writingAssistance?.enabled && mode() === "normal" && !composing()
+    const issues = props.writingAssistance?.issues ?? []
+    const changes = props.writingAssistance?.autoChanges ?? []
+    if (highlightFrame !== undefined) cancelAnimationFrame(highlightFrame)
+    if (!enabled || (!issues.length && !changes.length)) {
+      highlights.clear()
+      hover.clear()
+      setActiveLint(undefined)
+      return
+    }
+    highlightFrame = requestAnimationFrame(() => {
+      highlightFrame = undefined
+      if (!editor) return
+      const text = parts.filter((part) => part.type !== "image").map((part) => part.content).join("")
+      highlights.paint(editor, text, issues, changes)
+    })
+  })
+
   return (
     <div class={`relative size-full flex flex-col gap-0 ${props.class ?? ""}`}>
       <input
@@ -153,6 +250,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
       </Show>
       <form
         data-component="prompt-input-v2"
+        data-harper-state={props.writingAssistance?.status ?? "off"}
         data-dock-border-underlay={props.borderUnderlay ? "v2" : undefined}
         class="group/prompt-input relative min-h-[96px] w-full overflow-clip rounded-xl bg-v2-background-bg-base"
         classList={{
@@ -202,20 +300,43 @@ export function PromptInputV2(props: PromptInputV2Props) {
             aria-label={i18n.t("ui.promptInput.label")}
             contenteditable={!props.disabled && !props.readOnly}
             autocapitalize={state.mode === "normal" ? "sentences" : "off"}
-            autocorrect={state.mode === "normal" ? "on" : "off"}
-            spellcheck={state.mode === "normal"}
+            autocorrect={state.mode === "normal" && !props.writingAssistance?.enabled ? "on" : "off"}
+             spellcheck={state.mode === "normal" &&
+               !(props.writingAssistance?.enabled && props.writingAssistance.status === "ready" &&
+                 typeof CSS !== "undefined" && CSS.highlights && typeof Highlight !== "undefined")}
             // @ts-expect-error
             autocomplete="off"
             class="relative z-10 block min-h-[60px] max-h-[180px] w-full overflow-y-auto no-scrollbar whitespace-pre-wrap bg-transparent px-4 pt-4 pb-2 text-[13px] font-[440] leading-5 text-v2-text-text-base focus:outline-none empty:before:content-['\200B'] [&_[data-mention=file]]:text-syntax-property [&_[data-mention=agent]]:text-syntax-type [&_[data-mention=reference]]:text-syntax-keyword [&_[data-mention=tool]]:text-v2-text-text-accent"
             classList={{ "font-mono!": state.mode === "shell", "opacity-50": props.disabled }}
-            onInput={(event) => {
-              const cursor = promptInputV2Cursor(event.currentTarget)
-              const { parts: prompt, text } = parsePromptInputV2Editor(event.currentTarget)
+             onCompositionStart={() => {
+               setComposing(true)
+               props.writingAssistance?.onCompositionChange?.(true)
+               clearHarperHighlights()
+               setActiveLint(undefined)
+             }}
+             onCompositionEnd={() => {
+               setComposing(false)
+               props.writingAssistance?.onCompositionChange?.(false)
+             }}
+             onInput={(event) => {
+                clearHarperHighlights()
+                hover.clear()
+                setActiveLint(undefined)
+               const cursor = promptInputV2Cursor(event.currentTarget)
+               const { parts: prompt, text } = parsePromptInputV2Editor(event.currentTarget)
               const images = props.controller.parts().filter((part) => part.type === "image")
               localInput = true
               props.controller.onInput(text, [...prompt, ...images], cursor)
             }}
             onKeyDown={(event) => {
+              if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.isComposing &&
+                event.key.toLowerCase() === "z" && props.writingAssistance?.undoAvailable) {
+                if (props.writingAssistance.onUndo?.()) {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  return
+                }
+              }
               if (props.controller.onKeyDown(event)) return
               if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
                 event.preventDefault()
@@ -223,8 +344,33 @@ export function PromptInputV2(props: PromptInputV2Props) {
                 props.controller.submit()
               }
             }}
-            onKeyUp={updateCursor}
-            onPointerUp={updateCursor}
+             onKeyUp={updateCursor}
+             onPointerMove={(event) => hover.onMove(event)}
+             onPointerLeave={hover.onLeave}
+             onScroll={hover.clear}
+             onPointerUp={(event) => {
+              updateCursor()
+                const hit = event.button === 0 && !composing() && window.getSelection()?.isCollapsed
+                if (hit && highlights.atCorrectionPoint(event.clientX, event.clientY) &&
+                  props.writingAssistance?.enabled) {
+                  setAutoReview({
+                    x: Math.max(8, Math.min(event.clientX, window.innerWidth - 316)),
+                    y: Math.max(8, Math.min(event.clientY + 10, window.innerHeight - 265)),
+                  })
+                  setActiveLint(undefined)
+                  return
+                }
+                const issue = hit ? highlights.atPoint(event.clientX, event.clientY) : undefined
+                if (!issue || !props.writingAssistance?.enabled) {
+                setActiveLint(undefined)
+                return
+              }
+              setActiveLint({
+                id: issue.id,
+                x: Math.max(8, Math.min(event.clientX, window.innerWidth - 316)),
+                y: Math.max(8, Math.min(event.clientY + 10, window.innerHeight - 236)),
+              })
+            }}
             onPaste={props.controller.onPaste}
             onFocus={() => props.controller.dispatch({ type: "focus.editor" })}
           />
@@ -240,6 +386,47 @@ export function PromptInputV2(props: PromptInputV2Props) {
             </div>
           </Show>
           <ScrollViewOverlayScrollbar viewport={() => editor} hoverTarget={() => editorArea} />
+           <Show when={props.writingAssistance?.enabled && props.writingAssistance.undoAvailable &&
+             !(props.writingAssistance.autoChanges?.length ?? 0)}>
+             <button type="button" data-action="prompt-grammar-undo"
+               class="absolute bottom-1 z-10 rounded px-1.5 py-0.5 text-[10px] text-v2-text-text-muted hover:bg-v2-background-bg-hover"
+               style={{ right: props.writingAssistance?.issues.length ? "96px" : "16px" }}
+               onClick={() => props.writingAssistance?.onUndo?.()}>
+               Undo correction
+             </button>
+           </Show>
+           <Show when={props.writingAssistance?.enabled && (props.writingAssistance.autoChanges?.length ?? 0) > 0}>
+             <button type="button" data-action="prompt-grammar-auto-review"
+               class="absolute bottom-1 right-4 z-10 rounded px-1.5 py-0.5 text-[10px] tabular-nums text-v2-text-text-muted hover:bg-v2-background-bg-hover"
+               aria-label="Review automatic spelling corrections"
+               onClick={(event) => {
+                 const rect = event.currentTarget.getBoundingClientRect()
+                 setAutoReview({
+                   x: Math.max(8, Math.min(rect.left, window.innerWidth - 316)),
+                   y: Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - 265)),
+                 })
+                 setActiveLint(undefined)
+               }}>
+               {props.writingAssistance?.autoChanges?.length} auto-fixed · Review
+             </button>
+           </Show>
+           <Show when={props.writingAssistance?.enabled && (props.writingAssistance.issues.length > 0)}>
+             <button
+              type="button"
+              data-action="prompt-grammar-issues"
+               class="absolute bottom-1 z-10 rounded px-1.5 py-0.5 text-[10px] tabular-nums text-v2-text-text-muted hover:bg-v2-background-bg-hover"
+               style={{ right: props.writingAssistance?.autoChanges?.length ? "147px" : "16px" }}
+               aria-label={`${props.writingAssistance?.issues.length} writing suggestions`}
+              onClick={(event) => {
+                const rect = event.currentTarget.getBoundingClientRect()
+                setActiveLint({
+                  id: props.writingAssistance?.issues[0]?.id ?? "",
+                  x: Math.max(8, Math.min(rect.left, window.innerWidth - 316)),
+                  y: Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - 236)),
+                })
+              }}
+            >{props.writingAssistance?.issues.length} suggestions</button>
+          </Show>
         </div>
 
         <div class="flex h-11 items-center px-2">
@@ -325,7 +512,183 @@ export function PromptInputV2(props: PromptInputV2Props) {
             {props.submitControl}
           </Show>
         </div>
-      </form>
+       </form>
+       <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">
+         <Show when={props.writingAssistance?.enabled && props.writingAssistance.autoChanges?.at(-1)}>
+           {(change) => `Corrected ${change().original} to ${change().replacement}. Open Review to restore the original.`}
+         </Show>
+       </div>
+       <Show when={hover.hover() && hover.item()}>
+         <Portal>
+           <WritingHoverBadge
+             value={hover.hover()!}
+             onPointerEnter={hover.onEnterBadge}
+             onPointerLeave={hover.onLeaveBadge}
+             onClose={hover.clear}
+             onOpen={() => {
+               const current = hover.hover()
+               if (!current) return
+               hover.clear()
+               if (current.kind === "corrected") {
+                 setAutoReview({ x: current.x, y: current.y + 36 })
+                 setActiveLint(undefined)
+                 return
+               }
+               setActiveLint({ id: current.id, x: current.x, y: current.y + 36 })
+               setAutoReview(undefined)
+             }}
+             onReject={() => {
+               const current = hover.hover()
+               if (!current) return
+               if (current.kind === "corrected") props.writingAssistance?.onRejectAuto?.(current.id)
+               else props.writingAssistance?.onDismiss?.(current.id)
+               hover.clear()
+             }}
+           />
+         </Portal>
+       </Show>
+        <Show when={autoReview() && props.writingAssistance?.autoChanges?.length}>
+         <Portal>
+            <div ref={correctionPopup}
+              data-action="prompt-grammar-auto-popup" role="dialog"
+             aria-label="Review automatic corrections" aria-modal="false"
+             class="fixed z-[111] w-[292px] max-w-[calc(100vw-16px)] rounded-lg border border-v2-border-border-base bg-v2-background-bg-base p-2 shadow-lg"
+             style={{ left: `${autoReview()?.x ?? 8}px`, top: `${autoReview()?.y ?? 8}px` }}
+              onKeyDown={(event) => {
+                if (event.key !== "Escape") return
+                event.preventDefault()
+                event.stopPropagation()
+                setAutoReview(undefined)
+                editor?.focus()
+              }}
+              onPointerDown={(event) => event.stopPropagation()}>
+             <div class="mb-2 flex items-center justify-between gap-2 px-1">
+               <div class="flex min-w-0 items-center gap-2">
+                 <span class="inline-flex size-5 items-center justify-center rounded bg-v2-background-bg-hover text-xs text-v2-text-text-muted" aria-hidden="true">✓</span>
+                 <div class="min-w-0">
+                   <p class="text-xs font-semibold text-v2-text-text-base">Writing corrections</p>
+                   <p class="text-[10px] leading-4 text-v2-text-text-muted">
+                     {props.writingAssistance?.autoChanges?.length} applied · Hover to restore
+                   </p>
+                 </div>
+               </div>
+               <button type="button" aria-label="Close correction review"
+                 class="flex size-6 shrink-0 items-center justify-center rounded text-xs text-v2-text-text-muted hover:bg-v2-background-bg-hover hover:text-v2-text-text-base"
+                 onClick={() => setAutoReview(undefined)}>×</button>
+             </div>
+             <div class="max-h-[230px] overflow-auto rounded border border-v2-border-border-muted">
+               <For each={props.writingAssistance?.autoChanges ?? []}>
+                 {(change) => (
+                   <div data-action="prompt-grammar-auto-entry"
+                     class="group/word flex min-w-0 items-center gap-2 border-b border-v2-border-border-muted px-2 py-1.5 text-xs last:border-b-0 hover:bg-v2-background-bg-hover focus-within:bg-v2-background-bg-hover">
+                     <span class="min-w-0 flex-1 truncate font-mono leading-5"
+                       title={`${change.original} → ${change.replacement}`}>
+                       <span class="text-v2-text-text-muted line-through decoration-v2-text-text-muted">{change.original}</span>
+                       <span class="mx-1.5 text-v2-text-text-muted">→</span>
+                       <span class="font-semibold text-v2-text-text-base">{change.replacement}</span>
+                     </span>
+                     <button type="button" data-action="prompt-grammar-auto-reject"
+                       class="flex size-6 shrink-0 items-center justify-center rounded text-sm text-v2-text-text-muted opacity-0 transition-opacity motion-reduce:transition-none hover:bg-v2-background-bg-base hover:text-v2-text-text-base focus-visible:opacity-100 focus-visible:outline focus-visible:outline-1 focus-visible:outline-v2-border-border-focus group-hover/word:opacity-100 group-focus-within/word:opacity-100 max-sm:opacity-100"
+                       title="Restore original"
+                       aria-label={`Restore ${change.original}`}
+                       onClick={() => {
+                         props.writingAssistance?.onRejectAuto?.(change.id)
+                         if ((props.writingAssistance?.autoChanges?.length ?? 0) <= 1) setAutoReview(undefined)
+                       }}>×</button>
+                   </div>
+                 )}
+               </For>
+             </div>
+             <p class="mt-2 px-1 text-[10px] leading-4 text-v2-text-text-muted">
+               Restored words stay unchanged for this draft.
+             </p>
+           </div>
+         </Portal>
+       </Show>
+       <Show when={activeIssue() && activeLint()}>
+        <Portal>
+          <div
+            ref={suggestionPopup}
+            data-action="prompt-grammar-suggestion-popup"
+            role="dialog"
+            aria-label="Writing suggestion"
+            aria-modal="false"
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") return
+              event.stopPropagation()
+              event.preventDefault()
+              setActiveLint(undefined)
+              editor?.focus()
+            }}
+            class="fixed z-[110] w-[292px] max-w-[calc(100vw-16px)] rounded-lg border border-v2-border-border-base bg-v2-background-bg-base p-2 shadow-lg"
+            style={{ left: `${activeLint()?.x ?? 8}px`, top: `${activeLint()?.y ?? 8}px` }}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+             <div class="mb-2 flex items-start justify-between gap-2">
+               <div class="flex min-w-0 items-start gap-2">
+                 <span class="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded bg-v2-background-bg-hover text-xs font-semibold text-v2-text-text-muted" aria-hidden="true">
+                   {activeIssue()?.category === "spelling" ? "Aa" : "!"}
+                 </span>
+                 <div class="min-w-0">
+                   <p class="text-[11px] font-semibold text-v2-text-text-base">
+                     {activeIssue()?.category === "spelling" ? "Spelling suggestion" : "Grammar suggestion"}
+                   </p>
+                   <p class="mt-0.5 text-xs leading-4 text-v2-text-text-muted">{activeIssue()?.message}</p>
+                 </div>
+               </div>
+               <button type="button" aria-label="Dismiss suggestion"
+                 title="Dismiss this issue for the current draft"
+                 class="flex size-6 shrink-0 items-center justify-center rounded text-sm text-v2-text-text-muted hover:bg-v2-background-bg-hover hover:text-v2-text-text-base"
+                 onClick={() => {
+                   const issue = activeIssue()
+                   if (issue) props.writingAssistance?.onDismiss?.(issue.id)
+                   setActiveLint(undefined)
+                 }}>×</button>
+             </div>
+             <div class="max-h-[220px] space-y-1 overflow-y-auto">
+               <For each={activeIssue()?.suggestions ?? []}>
+                 {(suggestion) => (
+                   <button
+                     type="button"
+                     data-action="prompt-grammar-accept"
+                     class="group flex w-full min-w-0 items-center gap-2 rounded border border-v2-border-border-muted px-2 py-1.5 text-left font-mono text-xs text-v2-text-text-base hover:border-v2-border-border-base hover:bg-v2-background-bg-hover focus-visible:outline focus-visible:outline-1 focus-visible:outline-v2-border-border-focus"
+                     title={suggestion || "Remove"}
+                     onClick={() => {
+                       const issue = activeIssue()
+                       if (!issue) return
+                       props.writingAssistance?.onApply(issue.id, suggestion)
+                       setActiveLint(undefined)
+                     }}>
+                     <span class="min-w-0 flex-1 truncate">
+                       <span class="text-v2-text-text-muted line-through">{activeIssue()?.original}</span>
+                       <span class="mx-1.5 text-v2-text-text-muted">→</span>
+                       <span class="font-semibold">{suggestion || "Remove"}</span>
+                     </span>
+                     <span aria-hidden="true" class="text-v2-text-text-muted opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100">↵</span>
+                   </button>
+                 )}
+               </For>
+              <Show when={!activeIssue()?.suggestions.length}>
+                <p class="text-xs text-v2-text-text-muted">No automatic replacement is available.</p>
+              </Show>
+            </div>
+            <Show when={activeIssue()?.category === "spelling" &&
+              /^[A-Za-z]{2,40}$/.test(activeIssue()?.original ?? "") &&
+              props.writingAssistance?.onIgnore}>
+              <button type="button" data-action="prompt-grammar-ignore"
+                class="mt-2 w-full rounded border-t border-v2-border-border-muted pt-2 text-left text-xs text-v2-text-text-muted hover:text-v2-text-text-base"
+                onClick={() => {
+                  const issue = activeIssue()
+                  if (!issue) return
+                  props.writingAssistance?.onIgnore?.(issue.original)
+                  setActiveLint(undefined)
+                }}>
+                Ignore this spelling
+              </button>
+            </Show>
+          </div>
+        </Portal>
+      </Show>
     </div>
   )
 }
