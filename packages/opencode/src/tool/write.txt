@@ -1,8 +1,11 @@
 Writes a file to the local filesystem.
 
 Usage:
-- This tool will overwrite the existing file if there is one at the provided path.
-- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.
+- This tool creates a file or replaces its complete contents. Use it for intentional full-file changes; use `edit` for targeted changes and `patch` for multi-file changes.
+- Absolute paths are accepted. Relative paths resolve from the project directory.
+- Existing files are shown as a diff for permission review. The tool refuses to overwrite a file that changed while approval was pending.
+- Existing line endings and a UTF-8 BOM are preserved. A configured formatter may reshape the content; the returned diff describes the final file.
+- An unchanged write is a no-op: it does not ask for permission, invoke formatting, or emit file-change events.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
 - Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.

@@ -56,8 +56,15 @@ export function normalizeBrokerArgs(
       try {
         const parsed = JSON.parse(text)
         if (isBrokerArgs(parsed)) return parsed
-      } catch {
-        // Fall through to the actionable broker error below.
+      } catch (error) {
+        // "is not an object" and "is malformed JSON" are different mistakes, and
+        // the generic message below actively misleads a caller who DID pass an
+        // object-shaped string: it tells them not to pass placeholder text. Keep
+        // the parse detail — it is available here and otherwise discarded.
+        const detail = error instanceof Error ? error.message : String(error)
+        throw new Error(
+          `${options.broker} args must be a JSON object for action=call; it was passed as a string but is not valid JSON: ${detail}`,
+        )
       }
     }
   }

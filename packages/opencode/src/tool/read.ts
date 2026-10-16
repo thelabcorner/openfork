@@ -10,7 +10,7 @@ import DESCRIPTION from "./read.txt"
 import { InstanceState } from "@/effect/instance-state"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
-import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
+import { isPdfAttachment, isVideoAttachment, isAudioAttachment, isAmbiguousTsPath, resolveAttachmentMime } from "@/util/media"
 import { getOutline, makeOutlineCache } from "./symbols/outline"
 import {
   coerceFilePaths,
@@ -23,12 +23,16 @@ import {
 import { AROUND_MAX, renderGrep, renderHeal, renderOutline, aroundWindow } from "./read/inspect"
 import { globalReadCache } from "./edit/prior-read"
 import { ReadFilesystem } from "@/read/filesystem"
+import { remuxMpegTransportStream } from "@/exchange/media-preview"
 
 const DEFAULT_READ_LIMIT = ReadFilesystem.DEFAULT_READ_LIMIT
 const MAX_BYTES = ReadFilesystem.MAX_BYTES
 const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
 const SAMPLE_BYTES = ReadFilesystem.SAMPLE_BYTES
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
+// The native LLM protocol validates decoded media at 20 MiB; reject before
+// allocating a full video and its base64 expansion.
+const MAX_VIDEO_BYTES = 20 * 1024 * 1024
 const MAX_BULK_FILES = 8
 const DEFAULT_TAIL = ReadFilesystem.DEFAULT_TAIL
 const HINT =
@@ -53,6 +57,7 @@ const noteRead = (
   sessionID: string,
   filepath: string,
   stat: { type: string; mtime: Option.Option<Date>; size: unknown } | undefined,
+  groundedByRead = true,
 ) => {
   if (!stat || stat.type === "Directory") return
   globalReadCache.recordRead(
@@ -60,6 +65,7 @@ const noteRead = (
     filepath,
     Option.getOrElse(stat.mtime, () => new Date(0)).getTime(),
     Number(stat.size),
+    groundedByRead,
   )
 }
 
@@ -397,6 +403,31 @@ export const ReadTool = Tool.define<
             blocks.push(`<file path="${filepath}">\n<missing />${hint}\n</file>`)
             continue
           }
+          // Batch Read promises TEXT windows only. Unlike the single-file
+          // dispatcher, it must never decode MPEG-TS as lines of TypeScript.
+          // Keep successful siblings: return a concise actionable receipt for
+          // this item and direct the agent to single-target media Read.
+          if (resolved.stat.type !== "File") {
+            blocks.push(`<file path="${filepath}"><unsupported reason="not-a-regular-file" /></file>`)
+            continue
+          }
+          const sample = yield* readSample(filepath, Number(resolved.stat.size), SAMPLE_BYTES)
+          const mime = resolveAttachmentMime(sample, filepath, FSUtil.mimeType(filepath))
+          const media = SUPPORTED_IMAGE_MIMES.has(mime) ||
+            isPdfAttachment(mime) || isVideoAttachment(mime) || isAudioAttachment(mime)
+          const unsupported = isAmbiguousTsPath(filepath) && mime === "application/octet-stream"
+          const binary = path.extname(filepath).toLowerCase() !== ".br" && isBinaryFile(filepath, sample)
+          if (media || unsupported || binary) {
+            const kind = mime === "video/mp2t" ? "mpeg-transport-stream" :
+              unsupported ? "unclassified-ts-binary" : media ? "media" : "binary"
+            const next = mime === "video/mp2t"
+              ? "Verified MPEG transport-stream video, not TypeScript. Use a single Read target for bounded lossless MP4 remux."
+              : unsupported
+                ? "Ambiguous .ts/.mts bytes; inspect packet structure or encoding before proceeding."
+                : "Batch Read supports text only. Read this file individually using a compatible model or tool."
+            blocks.push(`<file path="${filepath}"><skipped kind="${kind}" mime="${mime}">${next}</skipped></file>`)
+            continue
+          }
           const file = yield* clampRead(filepath, {
             limit: request.limit ?? DEFAULT_READ_LIMIT,
             offset: request.offset || 1,
@@ -407,6 +438,11 @@ export const ReadTool = Tool.define<
           const block = [
             heal,
             `<file path="${filepath}" lines="${file.count}">`,
+            ...(isAmbiguousTsPath(filepath) ? [
+              mime === "application/xml"
+                ? "<note>Qt Linguist XML translation catalog, not TypeScript or video.</note>"
+                : "<note>Verified UTF-8 .ts/.mts text, TypeScript source candidate (syntax not compiled), not MPEG-TS video.</note>",
+            ] : []),
             "<content>",
             file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n"),
             file.more || file.cut
@@ -528,12 +564,49 @@ export const ReadTool = Tool.define<
       const loaded = yield* instruction.resolve(ctx.messages, filepath, ctx.messageID)
       const sample = yield* readSample(filepath, Number(stat.size), SAMPLE_BYTES)
 
-      const mime = sniffAttachmentMime(sample, FSUtil.mimeType(filepath))
+      const mime = resolveAttachmentMime(sample, filepath, FSUtil.mimeType(filepath))
       const isImage = SUPPORTED_IMAGE_MIMES.has(mime)
+      const tsSource = isAmbiguousTsPath(filepath) && mime === "text/plain"
+      const tsTranslation = isAmbiguousTsPath(filepath) && mime === "application/xml"
 
-      if (isImage || isPdfAttachment(mime)) {
+      if (isAmbiguousTsPath(filepath) && mime === "application/octet-stream") {
+        return yield* Effect.fail(new Error(
+          "Ambiguous .ts/.mts file: bytes are neither valid UTF-8 TypeScript source nor a verified MPEG transport stream. " +
+          "Refusing to guess or deliver binary data as source code; inspect with ffprobe/hex before retrying.",
+        ))
+      }
+
+      if (isImage || isPdfAttachment(mime) || isVideoAttachment(mime) || isAudioAttachment(mime)) {
+        if ((isVideoAttachment(mime) || isAudioAttachment(mime)) && Number(stat.size) > MAX_VIDEO_BYTES) {
+          return yield* Effect.fail(
+            new Error(
+              `Media exceeds the ${MAX_VIDEO_BYTES / (1024 * 1024)} MiB direct-input limit: ${filepath}. Trim or compress it before reading.`,
+            ),
+          )
+        }
         const bytes = yield* fs.readFile(filepath)
-        const msg = isPdfAttachment(mime) ? "PDF read successfully" : "Image read successfully"
+        // MPEG-TS is a valid video container, but MiMo's documented direct
+        // input list excludes TS. Only send a genuine MP4 if FFmpeg managed a
+        // bounded, lossless remux; never lie about the container MIME.
+        const converted = mime === "video/mp2t"
+          ? yield* Effect.promise(() => remuxMpegTransportStream(bytes, ctx.abort))
+          : undefined
+        if (mime === "video/mp2t" && !converted) return yield* Effect.fail(new Error(
+          "MPEG transport stream detected from packet structure (not TypeScript). " +
+          "Automatic lossless MP4 remux is unavailable or failed (missing FFmpeg, incompatible codec, malformed stream or resource limit). " +
+          "Remux with ffmpeg -i input.ts -c copy output.mp4 and read the MP4; renaming alone is not conversion.",
+        ))
+        const wireBytes = converted ?? bytes
+        const wireMime = converted ? "video/mp4" : mime
+        const msg = converted
+          ? "MPEG transport-stream video detected and losslessly remuxed to MP4 for model input (not TypeScript; provider frame sampling may miss transient frames)"
+          : isVideoAttachment(mime)
+            ? "Video read successfully (attached as video input; delivery and frame sampling depend on the provider)"
+            : isAudioAttachment(mime)
+              ? "Audio read successfully (attached as audio input; delivery depends on the provider)"
+            : isPdfAttachment(mime)
+              ? "PDF read successfully"
+              : "Image read successfully"
         return {
           title,
           output: repairNote + msg,
@@ -542,13 +615,14 @@ export const ReadTool = Tool.define<
             truncated: false,
             loaded: loaded.map((item) => item.filepath),
             action: "read",
+            ...(converted ? { detectedFileKind: "mpeg-transport-stream", originalMime: mime, deliveredMime: wireMime, remux: "lossless-container-copy" } : {}),
             ...healMeta,
           },
           attachments: [
             {
               type: "file" as const,
-              mime,
-              url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`,
+              mime: wireMime,
+              url: `data:${wireMime};base64,${Buffer.from(wireBytes).toString("base64")}`,
             },
           ],
         }
@@ -558,13 +632,12 @@ export const ReadTool = Tool.define<
         return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
       }
 
-      noteRead(ctx.sessionID, filepath, stat)
-
       yield* noteActivity(filepath)
 
       if (action === "outline") {
         const cache = yield* InstanceState.get(cacheState)
         const outline = yield* getOutline(fs, cache, filepath)
+        noteRead(ctx.sessionID, filepath, stat, false)
         const output =
           repairNote +
           (outline
@@ -587,6 +660,7 @@ export const ReadTool = Tool.define<
         const pattern = params.pattern ?? params.symbol
         if (!pattern) throw new Error(`grep requires pattern. Example: {"filePath":"${filepath}","pattern":"TODO"}`)
         const found = yield* grepFile(filepath, pattern)
+        noteRead(ctx.sessionID, filepath, stat, false)
         const output = repairNote + renderGrep(filepath, pattern, found.hits, found.truncated)
         return {
           title: `grep ${title}`,
@@ -618,6 +692,7 @@ export const ReadTool = Tool.define<
             offset: Math.max(1, hit.line - 2),
             limit: params.limit ?? AROUND_MAX,
           })
+          noteRead(ctx.sessionID, filepath, stat, false)
           const rendered = renderWindow(
             filepath,
             file,
@@ -649,6 +724,7 @@ export const ReadTool = Tool.define<
           offset: window.offset,
           limit: params.limit ?? window.limit,
         })
+        noteRead(ctx.sessionID, filepath, stat, false)
         const rendered = renderWindow(
           filepath,
           file,
@@ -681,11 +757,17 @@ export const ReadTool = Tool.define<
         action === "tail"
           ? yield* tailFile(filepath, params.limit ?? DEFAULT_TAIL)
           : yield* clampRead(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
+      // Only a successful text window/tail establishes line grounding.
+      noteRead(ctx.sessionID, filepath, stat)
 
       const rendered = renderWindow(filepath, file)
       yield* warm(filepath)
 
-      let output = repairNote + rendered.output
+      let output = repairNote + (tsSource
+        ? "<note>Verified UTF-8 text with .ts/.mts extension (TypeScript source candidate), not MPEG transport-stream video. Compilation/syntax not verified.</note>\n"
+        : tsTranslation
+          ? "<note>Qt Linguist XML translation catalog detected from .ts content, not TypeScript or MPEG-TS video.</note>\n"
+          : "") + rendered.output
       if (loaded.length > 0) {
         output += `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
       }
@@ -699,6 +781,8 @@ export const ReadTool = Tool.define<
           loaded: loaded.map((item) => item.filepath),
           action: action === "tail" ? "tail" : "read",
           clamped: Boolean(file.clamped),
+          ...(tsSource ? { detectedFileKind: "typescript-candidate", detection: "verified-text-not-video" } : {}),
+          ...(tsTranslation ? { detectedFileKind: "qt-translation", detection: "xml-content-header" } : {}),
           ...healMeta,
           display: {
             type: "file" as const,

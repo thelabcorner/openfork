@@ -11,7 +11,7 @@ export const BrowserExtensionsListTool = Tool.define(
     const broker = yield* BrokerClient.Service
     return {
       description:
-        "List Chrome extensions installed in the browser guest session, including React DevTools. Returns id, name, version, and enabled flag for each extension (disabled-but-known extensions are also listed via the host's stash). Use to verify React DevTools / Babel-related extensions are available before calling browser_open_devtools or browser_react_inspect. Tab is resolved to this session's most-recently-active owned tab when tabId is omitted.",
+        "List extensions loaded in OpenFork's embedded browser guest session. This is not an inventory of extensions installed in your regular Chrome profile. For Chrome tabs controlled through the OpenFork companion extension, browser_profiler_start checks whether a React DevTools-compatible hook and renderer are actually connected to that page.",
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {

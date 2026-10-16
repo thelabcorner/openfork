@@ -5,6 +5,9 @@ import { SwarmRender } from "@opencode-ai/core/swarm/render"
 import { Swarm as SwarmModel } from "@opencode-ai/schema/swarm"
 import { InstanceState } from "@/effect/instance-state"
 import { SwarmCommand } from "@/swarm/command"
+import { SwarmAX } from "@/swarm/ax-projection"
+import { SwarmTaskBatch } from "@/swarm/task-batch"
+import { SwarmCreationKey } from "@/swarm/creation-key"
 import { SwarmContainment } from "@/swarm/containment"
 import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
 import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
@@ -32,12 +35,15 @@ const SWARM_ACTIONS = [
   "get",
   "summary",
   "delegate",
+  "creation.lookup",
   "set_status",
   "state",
   "member.add",
+  "member.batch",
   "member.stop",
   "member.resume",
   "task.create",
+  "task.batch",
   "task.dependencies",
   "task.runs",
   "task.settle",
@@ -55,8 +61,19 @@ const SWARM_ACTIONS = [
   "recover.members",
   "recover.effects",
   "recover.contain",
+  "recover.session",
   "task.review",
+  "admin.overview",
+  "admin.contain",
+  "admin.session",
+  "admin.review",
 ] as const
+
+const FORCEABLE_ACTIONS = new Set<string>([
+  "set_status", "state", "member.add", "member.batch", "member.stop", "member.resume",
+  "task.create", "task.batch", "task.dependencies", "message.send",
+  "recover.members", "recover.effects", "recover.contain", "recover.session", "task.review",
+])
 
 /**
  * One source of truth for action-specific input shape.
@@ -87,16 +104,25 @@ const ACTION_INPUTS = {
     forbidden: { taskId: "get does not filter by taskId; use task.runs for run-level audit" },
   },
   summary: { required: ["swarmId"] },
-  delegate: { required: ["swarmName"] },
+  delegate: { required: ["swarmName"], note: "optional requestKey makes creation at-most-once for this coordinator principal; a repeat returns a conflict with the existing swarmId for reconciliation" },
+  "creation.lookup": { required: ["requestKey"], note: "read-only lookup after a lost creation result; returns durable state and whether bootstrap is incomplete, never assumes workers ran" },
   "set_status": {
     required: ["swarmId", "status"],
     note: "mutating Swarm lifecycle action; `state` is the deprecated alias of this action",
   },
   state: { required: ["swarmId", "status"], note: "deprecated alias of set_status" },
   "member.add": { required: ["swarmId", "memberName", "memberRole", "desiredProfile", "workspacePolicy"] },
+  "member.batch": {
+    required: ["swarmId", "members"],
+    note: "1-8 workers; choose a small batch when model/authority failure risk is unknown; independent created/satisfied/failed receipts; retry only failed keys",
+  },
   "member.stop": { required: ["swarmId", "memberId"] },
   "member.resume": { required: ["swarmId", "memberId"] },
   "task.create": { required: ["swarmId", "title"] },
+  "task.batch": {
+    required: ["swarmId", "tasks"],
+    note: "1-8 stable keyed DAG tasks; size by dependency and failure risk; created/satisfied/failed receipts preserve committed siblings; retry only failures",
+  },
   "task.dependencies": { required: ["swarmId", "taskId"] },
   "task.runs": {
     required: ["swarmId"],
@@ -112,6 +138,7 @@ const ACTION_INPUTS = {
   "message.send": {
     required: ["swarmId", "body"],
     oneOf: [["targetMemberId", "broadcast=true"]],
+    when: [{ when: "force=true", requires: ["sourceSwarmId"] }],
   },
   "blackboard.get": { required: ["swarmId"] },
   "blackboard.put": {
@@ -134,9 +161,29 @@ const ACTION_INPUTS = {
     required: ["swarmId", "taskId", "leaseGeneration"],
     note: "explicit containment acknowledgement; requires a recover.effects entry for this Swarm",
   },
+  "recover.session": {
+    required: ["swarmId", "memberId"],
+    note: "operator containment acknowledgement for a proven-dead bound Session; preserves binding and pending input; task-owned effects require recover.contain",
+  },
   "task.review": {
     required: ["swarmId", "taskId", "decision", "expectedLeaseGeneration"],
     note: "expectedLeaseGeneration is the task's current leaseGeneration as last observed; a stale value fails closed",
+  },
+  "admin.overview": {
+    required: [],
+    note: "read-only operator recovery overview for the current project; optional swarmId scope and limit; lists fenced task effects, the review backlog, and proven-dead bound member Sessions when scoped to one Swarm",
+  },
+  "admin.contain": {
+    required: ["swarmId", "taskId", "leaseGeneration"],
+    note: "operator containment without coordinator membership; requires a listed admin.overview/recover.effects entry; requires the swarm.admin permission",
+  },
+  "admin.session": {
+    required: ["swarmId", "memberId"],
+    note: "operator containment for a proven-dead bound Session without coordinator membership; requires the swarm.admin permission",
+  },
+  "admin.review": {
+    required: ["swarmId", "taskId", "decision", "expectedLeaseGeneration"],
+    note: "operator review recorded against the Swarm's durable coordinator member without coordinator membership; requires the swarm.admin permission; a stale generation fails closed",
   },
 } as const satisfies Record<(typeof SWARM_ACTIONS)[number], ActionInputShape>
 
@@ -146,7 +193,7 @@ function requirementText(input: ActionInput): string {
   const head: string[] = []
   if (input.required.length > 0) head.push(input.required.join(", "))
   for (const group of input.oneOf ?? []) head.push(`either ${group.join(" or ")}`)
-  if (head.length === 0) return "none"
+  if (head.length === 0) head.push("none")
   const extras = [
     ...(input.when ?? []).map((rule) => `when ${rule.when} also require ${rule.requires.join(", ")}`),
     ...(input.note ? [input.note] : []),
@@ -220,17 +267,20 @@ const SwarmArguments = Schema.Struct({
   action: Schema.Literals([
     ...SWARM_ACTIONS,
   ]).annotate({ description: "Swarm action to perform." }),
-  swarmId: Schema.optional(Schema.String).annotate({ description: "Target Swarm id. Required except for list and delegate." }),
+  swarmId: Schema.optional(Schema.String).annotate({ description: "Target Swarm id. Not needed for list, delegate or creation.lookup." }),
+  force: Schema.optional(LosslessBoolean).annotate({ description: "Request one-operation force authority; requires separate swarm.force approval and preserves identity, lifecycle, project, task, and leaf-permission fences." }),
+  sourceSwarmId: Schema.optional(Schema.String).annotate({ description: "Forced message.send: Swarm where the caller identity is registered." }),
   status: Schema.optional(SwarmModel.Status).annotate({ description: "list filter, or set_status target status." }),
   limit: Schema.optional(LosslessInteger(BoundedReadLimit)).annotate({ description: "Bounded read limit. message.list and task.runs default to 50." }),
   runCursor: Schema.optional(TaskRunCursorInput).annotate({
     description: "task.runs keyset cursor. Pass the previous task.runs response.next object unchanged to continue older runs.",
   }),
   swarmName: Schema.optional(Schema.String).annotate({ description: "delegate: new Swarm name." }),
+  requestKey: Schema.optional(SwarmCreationKey.Input).annotate({ description: "delegate: optional caller-scoped at-most-once key; creation.lookup: required. After a lost response, inspect the same key rather than replaying; durable state does not prove worker execution." }),
   coordinatorName: Schema.optional(Schema.String).annotate({ description: "delegate: coordinator roster name." }),
   coordinatorRole: Schema.optional(Schema.String).annotate({ description: "delegate: coordinator role." }),
-  members: Schema.optional(Schema.Array(DelegateMemberInput)).annotate({ description: "delegate: managed workers with explicit execution/profile authority." }),
-  tasks: Schema.optional(Schema.Array(DelegateTaskInput)).annotate({ description: "delegate: initial DAG tasks. dependsOn references request-local task keys." }),
+  members: Schema.optional(Schema.Array(DelegateMemberInput)).annotate({ description: "delegate/member.batch: managed workers with explicit execution/profile authority. Stage based on observed failure risk and dependency coupling; member.batch admits 1-8 per call." }),
+  tasks: Schema.optional(Schema.Array(DelegateTaskInput)).annotate({ description: "delegate/task.batch: keyed DAG tasks. task.batch keys persist across staged retries and may depend on earlier staged keys." }),
   memberId: Schema.optional(Schema.String).annotate({ description: "member lifecycle target or optional deliverable.list filter." }),
   memberName: Schema.optional(Schema.String).annotate({ description: "member.add: unique member name." }),
   memberRole: Schema.optional(Schema.String).annotate({ description: "member.add: member role." }),
@@ -292,10 +342,19 @@ const ActionInputs = Schema.makeFilter<Schema.Schema.Type<typeof SwarmArguments>
     const params = value as Record<string, unknown>
     const input: ActionInput | undefined = ACTION_INPUTS[params.action as keyof typeof ACTION_INPUTS]
     if (!input) return true
-    const action = params.action
+    const action = params.action as string
+    if (params.force === true && !FORCEABLE_ACTIONS.has(action)) return "action " + action + " does not support force."
+    if (params.force === true && action === "message.send" && params.sourceSwarmId === params.swarmId)
+      return "message.send within the caller's own Swarm does not need force."
+    if (params.sourceSwarmId !== undefined && (action !== "message.send" || params.force !== true))
+      return "sourceSwarmId is only accepted for forced message.send."
     const missing = input.required.filter((field) => !supplied(params, field))
     if (missing.length > 0)
       return `action "${action}" is missing required input(s): ${missing.join(", ")}. Required inputs: ${requirementText(input)}.`
+    if (action === "member.batch" && (!Array.isArray(params.members) || params.members.length === 0 || params.members.length > 8))
+      return "member.batch requires 1-8 members; split larger requests into safely replayable stages."
+    if (action === "task.batch" && (!Array.isArray(params.tasks) || params.tasks.length === 0 || params.tasks.length > 8))
+      return "task.batch requires 1-8 tasks; split larger requests into dependency-safe stages."
     for (const group of input.oneOf ?? []) {
       if (group.some((label) => supplied(params, label))) continue
       return `action "${action}" needs one of: ${group.join(" or ")}.`
@@ -333,6 +392,8 @@ type Metadata = {
   taskId?: string
   count?: number
   status?: string
+  forced?: boolean
+  sourceSwarmId?: string
 }
 
 const LEAF_PERMISSION: Record<Params["action"], string> = {
@@ -340,12 +401,15 @@ const LEAF_PERMISSION: Record<Params["action"], string> = {
   get: "swarm.read",
   summary: "swarm.read",
   delegate: "swarm.member",
+  "creation.lookup": "swarm.read",
   "set_status": "swarm.member",
   state: "swarm.member",
   "member.add": "swarm.member",
+  "member.batch": "swarm.member",
   "member.stop": "swarm.member",
   "member.resume": "swarm.member",
   "task.create": "swarm.task",
+  "task.batch": "swarm.task",
   "task.dependencies": "swarm.task",
   "task.runs": "swarm.read",
   "task.settle": "swarm.task",
@@ -363,7 +427,12 @@ const LEAF_PERMISSION: Record<Params["action"], string> = {
   "recover.members": "swarm.member",
   "recover.effects": "swarm.read",
   "recover.contain": "swarm.review",
+  "recover.session": "swarm.review",
   "task.review": "swarm.review",
+  "admin.overview": "swarm.read",
+  "admin.contain": "swarm.admin",
+  "admin.session": "swarm.admin",
+  "admin.review": "swarm.admin",
 }
 
 function required(value: string | undefined, name: string) {
@@ -389,7 +458,16 @@ function outputData(label: string, value: unknown) {
 }
 
 function result(action: Params["action"], permission: string, title: string, output: string, metadata: Omit<Metadata, "action" | "permission"> = {}) {
-  return { title, output, metadata: { action, permission, ...metadata } satisfies Metadata }
+  return {
+    title,
+    output,
+    metadata: {
+      action,
+      permission,
+      ...(permission.split("+").includes("swarm.force") ? { forced: true } : {}),
+      ...metadata,
+    } satisfies Metadata,
+  }
 }
 
 export const SwarmTool = Tool.define<
@@ -424,24 +502,44 @@ export const SwarmTool = Tool.define<
       return member
     })
 
-    const coordinator = Effect.fn("SwarmTool.coordinator")(function* (id: SwarmModel.ID, ctx: Tool.Context<Metadata>) {
-      const detail = yield* scopedDetail(id)
-      const caller = yield* callerMember(id, ctx)
-      if (detail.swarm.coordinatorMemberID !== caller.id)
-        return yield* Effect.fail(new Error(`Action requires the recorded coordinator of Swarm ${id}.`))
-      return { detail, caller }
-    })
+    const coordinatorOrForced = Effect.fn("SwarmTool.coordinatorOrForced")(
+      function* (id: SwarmModel.ID, ctx: Tool.Context<Metadata>, force: boolean, action: Params["action"]) {
+        const detail = yield* scopedDetail(id)
+        const caller = yield* callerMember(id, ctx)
+        const isCoordinator = detail.swarm.coordinatorMemberID === caller.id
+        if (!isCoordinator && !force)
+          return yield* Effect.fail(new Error("Action requires the recorded coordinator of Swarm " + id + "."))
+        if (force) {
+          yield* Effect.logWarning("Swarm member performed a coordinator action with an explicit force grant", {
+            swarmID: id, memberID: caller.id, sessionID: ctx.sessionID, action, isCoordinator,
+          })
+        }
+        return { detail, caller }
+      },
+    )
 
     const ask = Effect.fn("SwarmTool.ask")(function* (params: Params, ctx: Tool.Context<Metadata>) {
       const permission = LEAF_PERMISSION[params.action]
       const instance = yield* InstanceState.context
       const resource = params.action === "delegate"
-        ? `project:${instance.project.id}:create`
-        : params.action === "list"
-          ? `project:${instance.project.id}`
-          : `swarm:${required(params.swarmId, "swarmId")}`
+      ? `project:${instance.project.id}:create`
+       : params.action === "list" || params.action === "creation.lookup" || (params.action === "admin.overview" && !params.swarmId)
+        ? `project:${instance.project.id}`
+        : `swarm:${required(params.swarmId, "swarmId")}`
       yield* ctx.ask({ permission, patterns: [resource], always: [resource], metadata: { action: params.action, resource } })
-      return permission
+      if (params.force === true) {
+        const target = required(params.swarmId, "swarmId")
+        const forceScope = params.action === "message.send"
+          ? "swarm:" + required(params.sourceSwarmId, "sourceSwarmId") + "->" + target + ":message.send"
+          : "swarm:" + target + ":" + params.action
+        yield* ctx.ask({
+          permission: "swarm.force",
+          patterns: [forceScope],
+          always: [],
+          metadata: { action: "force:" + params.action, resource: forceScope },
+        })
+      }
+      return params.force === true ? `${permission}+swarm.force` : permission
     })
 
     const execute = Effect.fn("SwarmTool.execute")(function* (params: Params, ctx: Tool.Context<Metadata>) {
@@ -456,7 +554,8 @@ export const SwarmTool = Tool.define<
 
       if (params.action === "delegate") {
         const workspaceID = yield* InstanceState.workspaceID
-        const created = yield* SwarmCommand.delegate(swarms, profilePreflight, {
+         const created = yield* SwarmCommand.delegatePartial(swarms, profilePreflight, {
+          ...(params.requestKey === undefined ? {} : { requestKey: params.requestKey }),
           projectID: instance.project.id,
           ...(workspaceID === undefined ? {} : { workspaceID }),
           directory: instance.directory,
@@ -467,7 +566,44 @@ export const SwarmTool = Tool.define<
           members: params.members ?? [],
           tasks: params.tasks ?? [],
         })
-        return result(params.action, permission, `Created Swarm ${created.swarm.name}`, outputData("DELEGATE", created), { swarmId: created.swarm.id, memberId: created.coordinator.id, count: created.members.length, status: created.swarm.status })
+        return result(params.action, permission, `Created Swarm ${created.swarm.name}`, outputData("DELEGATE", SwarmAX.creation(created)), { swarmId: created.swarm.id, memberId: created.coordinator.id, count: created.members.length, status: created.admission.complete ? created.swarm.status : "partial" })
+      }
+
+      if (params.action === "creation.lookup") {
+        const workspaceID = yield* InstanceState.workspaceID
+        const found = yield* SwarmCreationKey.lookup(swarms, {
+          requestKey: params.requestKey,
+          projectID: instance.project.id,
+          ...(workspaceID === undefined ? {} : { workspaceID }),
+          directory: instance.directory,
+          coordinatorSessionID: SessionV2.ID.make(ctx.sessionID),
+        })
+        return result(params.action, permission,
+          found.found ? `Creation found (${found.status})` : "No creation under this key",
+          outputData("CREATION LOOKUP", found),
+          { swarmId: found.swarmId, status: found.found ? found.status : "not_found" })
+      }
+
+      if (params.action === "admin.overview") {
+        const scoped = params.swarmId === undefined ? undefined : yield* scopedDetail(swarmID(params.swarmId))
+        const overview = yield* containment.operatorOverview({
+          projectID: instance.project.id,
+          ...(scoped === undefined ? {} : { swarmID: scoped.swarm.id }),
+          ...(params.limit === undefined ? {} : { limit: params.limit }),
+        })
+        return result(
+          params.action,
+          permission,
+          overview.effects.length === 0
+            ? `Operator overview (${overview.reviewBacklog.length} review, ${overview.boundSessions.length} session)`
+            : `Unresolved external effects (${overview.effects.length})`,
+          outputData("ADMIN", overview),
+          {
+            ...(scoped === undefined ? {} : { swarmId: scoped.swarm.id }),
+            count: overview.effects.length,
+            status: overview.effects.length === 0 ? "clear" : "blocked",
+          },
+        )
       }
 
       const id = swarmID(params.swarmId)
@@ -482,7 +618,7 @@ export const SwarmTool = Tool.define<
         return result(params.action, permission, `Swarm summary ${summary.swarm.name}`, outputData("SUMMARY", summary), { swarmId: id, status: summary.swarm.status })
       }
       if (params.action === "set_status" || params.action === "state") {
-        const { detail } = yield* coordinator(id, ctx)
+        const { detail } = yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
         const status = params.status
         if (!status || !["active", "paused", "completed", "failed", "archived"].includes(status))
           throw new Error("set_status requires status=active|paused|completed|failed|archived")
@@ -490,7 +626,7 @@ export const SwarmTool = Tool.define<
         return result(params.action, permission, `Swarm ${updated.status}`, outputData("STATE", updated), { swarmId: id, status: updated.status })
       }
       if (params.action === "member.add") {
-        const { detail } = yield* coordinator(id, ctx)
+        const { detail } = yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
         if (!params.desiredProfile) throw new Error("desiredProfile is required for member.add")
         if (!params.workspacePolicy) throw new Error("workspacePolicy is required for member.add")
         // An unbound managed member is worse than an absent one: it looks
@@ -502,8 +638,22 @@ export const SwarmTool = Tool.define<
         const member = yield* swarms.addMember({ swarmID: id, name: required(params.memberName, "memberName"), kind: "managed_worker", role: required(params.memberRole, "memberRole"), desiredProfile: params.desiredProfile, workspacePolicy: params.workspacePolicy, ...(params.capabilities === undefined ? {} : { capabilities: params.capabilities }) })
         return result(params.action, permission, `Added member ${member.name}`, outputData("MEMBER", member), { swarmId: id, memberId: member.id, status: member.lifecycle })
       }
+      if (params.action === "member.batch") {
+        yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
+        if (!params.members?.length) throw new Error("member.batch requires at least one worker.")
+         if (params.members.length > 8) throw new Error("member.batch accepts up to 8 workers; split larger requests into verifiable stages.")
+        const receipt = yield* SwarmCommand.addMembersPartial(swarms, profilePreflight, {
+          swarmID: id,
+          members: params.members,
+          // Recheck the actual durable coordinator/active membership on every
+          // side effect, not only on batch entry. A permission grant is not a
+          // license to keep writing after coordinator authority changes.
+          beforeWrite: () => coordinatorOrForced(id, ctx, params.force === true, params.action).pipe(Effect.asVoid),
+        })
+        return result(params.action, permission, `Members: ${receipt.created} created, ${receipt.satisfied} satisfied, ${receipt.failed} failed`, outputData("MEMBER BATCH", receipt), { swarmId: id, count: receipt.created, status: receipt.failed ? "partial" : "complete" })
+      }
       if (params.action === "member.stop" || params.action === "member.resume") {
-        const { detail } = yield* coordinator(id, ctx)
+        const { detail } = yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
         const targetID = memberID(params.memberId)
         const target = detail.members.find((member) => member.id === targetID)
         if (!target) throw new Error(`Member not found in Swarm ${id}: ${targetID}`)
@@ -515,7 +665,7 @@ export const SwarmTool = Tool.define<
         return result(params.action, permission, `Member ${member.name} ${lifecycle}`, outputData("MEMBER", member), { swarmId: id, memberId: member.id, status: member.lifecycle })
       }
       if (params.action === "task.create") {
-        const { caller, detail } = yield* coordinator(id, ctx)
+        const { caller, detail } = yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
         const dependencies = (params.dependencies ?? []).map((dependency) => ({ taskID: SwarmModel.TaskID.make(dependency.taskId), ...(dependency.requirement === undefined ? {} : { requirement: dependency.requirement }) }))
         let reservedMemberID: SwarmModel.MemberID | undefined
         if (params.reservedMemberId) {
@@ -524,11 +674,22 @@ export const SwarmTool = Tool.define<
           if (target.kind !== "managed_worker") throw new Error("Tasks may only be reserved to managed workers.")
           reservedMemberID = target.id
         }
-        const task = yield* swarms.createTask({ swarmID: id, title: required(params.title, "title"), ...(params.description === undefined ? {} : { description: params.description }), ...(params.priority === undefined ? {} : { priority: params.priority }), createdByMemberID: caller.id, ...(reservedMemberID === undefined ? {} : { reservedMemberID }), ...(params.acceptance === undefined ? {} : { acceptance: params.acceptance }), ...(params.metadata === undefined ? {} : { metadata: params.metadata }), dependencies })
+        const task = yield* swarms.createTask({ swarmID: id, allowedStatuses: ["active", "paused"], title: required(params.title, "title"), ...(params.description === undefined ? {} : { description: params.description }), ...(params.priority === undefined ? {} : { priority: params.priority }), createdByMemberID: caller.id, ...(reservedMemberID === undefined ? {} : { reservedMemberID }), ...(params.acceptance === undefined ? {} : { acceptance: params.acceptance }), ...(params.metadata === undefined ? {} : { metadata: params.metadata }), dependencies })
         return result(params.action, permission, `Created task ${task.title}`, outputData("TASK", task), { swarmId: id, taskId: task.id, status: task.status })
       }
+      if (params.action === "task.batch") {
+        const { caller } = yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
+        const receipt = yield* SwarmTaskBatch.add(swarms, {
+          swarmID: id, createdByMemberID: caller.id, tasks: params.tasks ?? [],
+          beforeWrite: () => coordinatorOrForced(id, ctx, params.force === true, params.action).pipe(Effect.asVoid),
+        })
+        return result(params.action, permission,
+          `Tasks: ${receipt.created} created, ${receipt.satisfied} satisfied, ${receipt.failed} failed`,
+          outputData("TASK BATCH", receipt),
+          { swarmId: id, count: receipt.created, status: receipt.failed ? "partial" : "complete" })
+      }
       if (params.action === "task.dependencies") {
-        yield* coordinator(id, ctx)
+        yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
         const targetID = taskID(params.taskId)
         const detail = yield* scopedDetail(id)
         if (!detail.tasks.some((task) => task.id === targetID)) throw new Error(`Task is not in Swarm ${id}: ${targetID}`)
@@ -596,12 +757,45 @@ export const SwarmTool = Tool.define<
         return result(params.action, permission, `Swarm messages (${messages.length})`, rendered, { swarmId: id, count: messages.length })
       }
       if (params.action === "message.send") {
-        const sender = yield* callerMember(id, ctx)
         const broadcast = params.broadcast === true
+        let sender: SwarmModel.Member
+        let sourceSwarm: SwarmModel.Info | undefined
+        if (params.force === true) {
+          const sourceID = swarmID(params.sourceSwarmId)
+          const source = yield* scopedDetail(sourceID)
+          const target = yield* scopedDetail(id)
+          if (source.swarm.projectID !== target.swarm.projectID)
+            throw new Error("Forced cross-Swarm messaging must stay within the same project.")
+          const sessionID = SessionV2.ID.make(ctx.sessionID)
+          const matches = (yield* swarms.membersForSession(sessionID)).filter((member) => member.swarmID === sourceID)
+          if (matches.length !== 1)
+            throw new Error(matches.length === 0 ? "Caller Session is not a member of source Swarm " + sourceID + "." : "Caller Session has ambiguous membership in source Swarm " + sourceID + ".")
+          sender = matches[0]!
+          if (sender.lifecycle === "stopping" || sender.lifecycle === "stopped")
+            throw new Error("Caller member is " + sender.lifecycle + " and cannot send forced Swarm messages.")
+          sourceSwarm = source.swarm
+          yield* Effect.logWarning("Swarm member sent a cross-Swarm message with an explicit force grant", {
+            sourceSwarmID: source.swarm.id,
+            targetSwarmID: target.swarm.id,
+            memberID: sender.id,
+            sessionID,
+          })
+        } else {
+          sender = yield* callerMember(id, ctx)
+        }
         if (broadcast && params.targetMemberId) throw new Error("message.send cannot combine broadcast with targetMemberId")
         if (!broadcast && !params.targetMemberId) throw new Error("message.send requires targetMemberId or broadcast=true")
-        const sent = yield* swarms.enqueueMessage({ swarmID: id, senderMemberID: sender.id, target: broadcast ? { type: "broadcast" } : { type: "member", memberID: memberID(params.targetMemberId, "targetMemberId") }, kind: params.kind ?? (params.responseTo ? "response" : "message"), body: required(params.body, "body"), ...(params.messagePriority === undefined ? {} : { priority: params.messagePriority }), ...(params.replyExpected === undefined ? {} : { replyExpected: params.replyExpected }), ...(params.taskId === undefined ? {} : { taskID: SwarmModel.TaskID.make(params.taskId) }), ...(params.correlationId === undefined ? {} : { correlationID: params.correlationId }), ...(params.responseTo === undefined ? {} : { responseTo: SwarmModel.MessageID.make(params.responseTo) }), ...(params.expiresAt === undefined ? {} : { expiresAt: params.expiresAt }) })
-        return result(params.action, permission, `Sent ${sent.message.kind}`, [SwarmRender.peer(sent.message), outputData("DELIVERIES", sent.deliveries)].join("\n\n"), { swarmId: id, memberId: sender.id, count: sent.deliveries.length })
+        const sent = yield* swarms.enqueueMessage({ swarmID: id, senderMemberID: sender.id, target: broadcast ? { type: "broadcast" } : { type: "member", memberID: memberID(params.targetMemberId, "targetMemberId") }, kind: params.kind ?? (params.responseTo ? "response" : "message"), body: required(params.body, "body"), ...(params.messagePriority === undefined ? {} : { priority: params.messagePriority }), ...(params.replyExpected === undefined ? {} : { replyExpected: params.replyExpected }), ...(params.taskId === undefined ? {} : { taskID: SwarmModel.TaskID.make(params.taskId) }), ...(params.correlationId === undefined ? {} : { correlationID: params.correlationId }), ...(params.responseTo === undefined ? {} : { responseTo: SwarmModel.MessageID.make(params.responseTo) }), ...(params.expiresAt === undefined ? {} : { expiresAt: params.expiresAt }), ...(params.force === true ? { force: true } : {}) })
+        return result(params.action, permission, `Sent ${sent.message.kind}`, [
+          ...(sourceSwarm ? [outputData("FORCED ORIGIN", { swarmID: sourceSwarm.id, swarm: sourceSwarm.name })] : []),
+          SwarmRender.peer(sent.message),
+          outputData("DELIVERIES", sent.deliveries),
+        ].join("\n\n"), {
+          swarmId: id,
+          memberId: sender.id,
+          count: sent.deliveries.length,
+          ...(sourceSwarm === undefined ? {} : { forced: true, sourceSwarmId: sourceSwarm.id }),
+        })
       }
       if (params.action === "blackboard.get") {
         yield* scopedDetail(id)
@@ -663,7 +857,7 @@ export const SwarmTool = Tool.define<
         return result(params.action, permission, `Deliverable ${deliverable.verdict}`, outputData("DELIVERABLE", deliverable), { swarmId: id, memberId: reviewer.id })
       }
       if (params.action === "recover.members") {
-        yield* coordinator(id, ctx)
+        yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
         const unresolved = (yield* swarms.unboundManagedMemberTargets({ swarmID: id })).filter(
           (target) => target.swarm.status === "active" && target.member.lifecycle === "active",
         )
@@ -684,7 +878,7 @@ export const SwarmTool = Tool.define<
         )
       }
       if (params.action === "recover.effects") {
-        yield* coordinator(id, ctx)
+        yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
         const pending = (yield* containment.unresolved({ limit: params.limit ?? 32 })).filter(
           (entry) => entry.swarmID === id,
         )
@@ -707,8 +901,13 @@ export const SwarmTool = Tool.define<
           { swarmId: id, count: rows.length, status: rows.length === 0 ? "clear" : "blocked" },
         )
       }
+      if (params.action === "recover.session") {
+        yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
+        const recovered = yield* containment.acknowledgeSession({ swarmID: id, memberID: memberID(params.memberId) })
+        return result(params.action, permission, `Session recovery ${recovered.state}`, outputData("RECOVERY", recovered), { swarmId: id, status: recovered.state })
+      }
       if (params.action === "recover.contain") {
-        yield* coordinator(id, ctx)
+        yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
         const target = taskID(params.taskId)
         const generation = params.leaseGeneration!
         // Fail closed on Swarm scope: acknowledge only resolves a (task,
@@ -744,7 +943,7 @@ export const SwarmTool = Tool.define<
         )
       }
       if (params.action === "task.review") {
-        const { caller } = yield* coordinator(id, ctx)
+        const { caller } = yield* coordinatorOrForced(id, ctx, params.force === true, params.action)
         const type = required(params.decision, "decision") as
           | "accept"
           | "request_changes"
@@ -771,6 +970,93 @@ export const SwarmTool = Tool.define<
           `Task ${task.status}`,
           outputData("TASK", { ...task, leaseGeneration: task.leaseGeneration }),
           { swarmId: id, taskId: task.id, memberId: caller.id, status: task.status },
+        )
+      }
+      if (params.action === "admin.contain") {
+        yield* scopedDetail(id)
+        const target = taskID(params.taskId)
+        const generation = params.leaseGeneration!
+        // Fail closed on Swarm scope: acknowledge only resolves a (task,
+        // generation) pair durably fenced in *this* Swarm, exactly like
+        // recover.contain, but under the operator permission instead of
+        // coordinator membership.
+        const pending = (yield* containment.unresolved({ limit: 256, swarmID: id })).find(
+          (entry) => entry.taskID === target && entry.leaseGeneration === generation,
+        )
+        if (!pending)
+          throw new Error(
+            `No unresolved external effect for task ${target} at lease generation ${generation} in Swarm ${id}. Run admin.overview or recover.effects first.`,
+          )
+        const acknowledged = yield* containment.acknowledge({ taskID: target, generation })
+        if (acknowledged.state !== "contained")
+          throw new Error(
+            `Containment was not acknowledged for task ${target} (${acknowledged.state}). The execution fence is unchanged and the task stays fenced.`,
+          )
+        const parked = (yield* swarms.get(id)).tasks.find((task) => task.id === target)
+        return result(
+          params.action,
+          permission,
+          `Task ${target} contained; awaiting review`,
+          outputData("CONTAINED", {
+            taskId: target,
+            leaseGeneration: generation,
+            sealed: acknowledged.sealed,
+            // The external outcome is unknown, not failed and not successful.
+            outcome: "unknown",
+            taskStatus: parked?.status,
+            nextAction: "admin.review",
+          }),
+          { swarmId: id, taskId: target, status: parked?.status },
+        )
+      }
+      if (params.action === "admin.session") {
+        yield* scopedDetail(id)
+        const recovered = yield* containment.acknowledgeSession({
+          swarmID: id,
+          memberID: memberID(params.memberId),
+        })
+        return result(params.action, permission, `Session recovery ${recovered.state}`, outputData("RECOVERY", recovered), {
+          swarmId: id,
+          status: recovered.state,
+        })
+      }
+      if (params.action === "admin.review") {
+        const detail = yield* scopedDetail(id)
+        const type = required(params.decision, "decision") as
+          | "accept"
+          | "request_changes"
+          | "retry"
+          | "fail"
+          | "cancel"
+        // The durable coordinator member is the Swarm's review authority even
+        // when no Session is bound to it (for example an OXP connector-owned
+        // coordinator); reviewTask re-proves the member is active at commit.
+        const reviewerMemberID = detail.swarm.coordinatorMemberID
+        if (!reviewerMemberID)
+          throw new Error(`Swarm ${id} has no recorded coordinator member to carry an operator review decision.`)
+        const decision =
+          type === "accept"
+            ? ({ type } as const)
+            : ({ type, ...(params.detail === undefined ? {} : { detail: params.detail }) } as const)
+        const task = yield* swarms.reviewTask({
+          swarmID: id,
+          taskID: taskID(params.taskId),
+          reviewerMemberID,
+          expectedLeaseGeneration: params.expectedLeaseGeneration!,
+          decision,
+        })
+        yield* Effect.logWarning("Swarm operator resolved an unsettled task without coordinator authority", {
+          swarmID: id,
+          taskID: task.id,
+          decision: type,
+          expectedLeaseGeneration: params.expectedLeaseGeneration,
+        })
+        return result(
+          params.action,
+          permission,
+          `Task ${task.status}`,
+          outputData("TASK", { ...task, leaseGeneration: task.leaseGeneration }),
+          { swarmId: id, taskId: task.id, memberId: reviewerMemberID, status: task.status },
         )
       }
       return yield* Effect.die(`Unhandled Swarm action: ${params.action}`)

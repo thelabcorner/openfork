@@ -4,7 +4,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import type { MessageV2 } from "../session/message-v2"
 import type { Permission } from "../permission"
-import type { SessionID, MessageID } from "../session/schema"
+import type { SessionID, MessageID, PartID } from "../session/schema"
+import type { Inventory as CapabilityInventory } from "./capability"
 import * as Truncate from "./truncate"
 import { ToolExposure } from "./exposure"
 import type { Agent } from "@/agent/agent"
@@ -40,10 +41,33 @@ export type Context<M extends Metadata = Metadata> = {
   agent: string
   abort: AbortSignal
   callID?: string
+  /**
+   * Explicit durable-retention intent for this invocation. Omitted means
+   * provider-owned when `callID` is present. `"none"` marks host/direct
+   * execution that has no durable tool-call owner (prompt file expansion,
+   * scheduled-task lowering, debug CLI); it must never retain a timeline row.
+   */
+  retention?: "none"
+  /** Durable root ToolPart identity when this context belongs to a provider tool call. */
+  partID?: PartID
+  /** Effective current session+agent rules; nested gateways re-evaluate admission live. */
+  permissionRuleset?: PermissionV1.Ruleset
+  /** Processor-owned observation hook for delegated/nested mutating leaves. */
+  markWorkspaceMutation?: () => Effect.Effect<void>
+  /**
+   * Lazily captures the frozen capability graph for this real provider root.
+   * SessionTools owns the registry dependency and caches one snapshot per
+   * provider call so tools such as Code never recurse back into ToolRegistry.
+   */
+  captureCapabilities?(): Effect.Effect<CapabilityInventory>
   extra?: { [key: string]: unknown }
   messages: SessionV1.WithParts[]
   metadata(input: { title?: string; metadata?: M }): Effect.Effect<void>
   ask(input: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">): Effect.Effect<void>
+  /** Raw semantic permission boundary used by nested/programmatic composition. */
+  semanticAsk?(input: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">): Effect.Effect<void, PermissionV1.Error>
+  /** Host-owned nested capability path used by delegators such as the lazy broker. */
+  invokeCapability?(ref: string, args: unknown): Effect.Effect<ExecuteResult, Failure>
 }
 
 /**
@@ -138,6 +162,21 @@ export interface Info<
   init: () => Effect.Effect<InitializedDef<Parameters, M>>
 }
 
+export function hasSemantic(tool: Def): tool is InitializedDef {
+  return typeof (tool as Partial<InitializedDef>).semantic === "function"
+}
+
+/**
+ * Derive a durable retention owner only from an explicitly provider-owned tool
+ * call. A missing call ID or `retention: "none"` produces no owner; callers must
+ * never substitute an empty string, the tool name, or a non-ToolPart ID.
+ */
+export function timelineOwner(ctx: Context): Truncate.TimelineOwner | undefined {
+  if (ctx.retention === "none") return undefined
+  if (!ctx.callID) return undefined
+  return { sessionID: ctx.sessionID, messageID: ctx.messageID, toolCallID: ctx.callID }
+}
+
 type Init<Parameters extends Schema.Decoder<unknown>, M extends Metadata> =
   | DefWithoutID<Parameters, M>
   | (() => Effect.Effect<DefWithoutID<Parameters, M>>)
@@ -194,7 +233,10 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
                 }),
             ),
           )
-          return yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
+          const semanticContext = ctx.semanticAsk
+            ? { ...ctx, ask: ctx.semanticAsk as Context["ask"] }
+            : ctx
+          return yield* execute(decoded as Schema.Schema.Type<Parameters>, semanticContext)
         })
 
       return {
@@ -216,7 +258,17 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
             // Producer/domain truncation (for example grep hit caps or SQLite row
             // paging) is not authority to bypass the harness's final model-facing
             // output bound. Every tool result crosses this boundary exactly once.
-            const projected = yield* truncate.output(result.output)
+            const projected = yield* truncate.output(
+              result.output,
+              {
+                // A producer such as shell may already own a complete durable
+                // timeline stream. Never overwrite that source of truth with the
+                // producer's already-bounded provider result.
+                timelineRetained: ctx.retention !== "none" && result.metadata.timelineOutput === true,
+              },
+              undefined,
+              timelineOwner(ctx),
+            )
             return {
               ...result,
               output: projected.content,

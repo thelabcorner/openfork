@@ -11,7 +11,7 @@ export const BrowserProfilerStartTool = Tool.define(
     const broker = yield* BrokerClient.Service
     return {
       description:
-        "Start React profiling on the guest page (observation-only). The host installs the React DevTools commit hook if absent and records commit timings + per-component render counts between start and stop. Fails with BrowserNotAReactAppError on non-React pages. IMPORTANT HONESTY CONSTRAINT: render counts come from a fiber-walk approximation — they are NOT wall-clock profiling; treat them as relative signals only. Pair with browser_profiler_stop.",
+        "Start React profiling on the active browser page (observation-only). Requires a React DevTools-compatible hook with a connected renderer; this is detected live on the page, so no Chrome extension-management permission is needed. If missing, enable React Developer Tools for the site and reload the page. Works through both the embedded browser and the OpenFork Chrome companion bridge. Records commit timings plus per-component render-count approximations between start and stop. Render counts are NOT wall-clock profiling; treat them as relative signals only. Pair with browser_profiler_stop.",
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {

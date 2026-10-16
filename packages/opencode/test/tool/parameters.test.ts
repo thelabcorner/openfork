@@ -340,6 +340,18 @@ describe("tool parameters", () => {
     test("rejects missing prompt", () => {
       expect(accepts(Task, { description: "d", subagent_type: "general" })).toBe(false)
     })
+    test("accepts an optional symbolic attachment handle list", () => {
+      const parsed = parse(Task, {
+        description: "d",
+        prompt: "p",
+        subagent_type: "general",
+        attachments: ["upload-1", "upload-2"],
+      })
+      expect(parsed.attachments).toEqual(["upload-1", "upload-2"])
+    })
+    test("rejects non-string attachment handles", () => {
+      expect(accepts(Task, { description: "d", prompt: "p", subagent_type: "general", attachments: [1] })).toBe(false)
+    })
   })
 
   describe("todo", () => {

@@ -74,7 +74,7 @@ export const OfxpTool = Tool.define<typeof Parameters, Metadata, OfxpRuntime.Ser
         "Use trusted OpenFork peers over OFXP without manual host/port handling.",
         "This tool cannot pair peers, change trust, approve roots, widen grants, revoke peers, or start/stop OFXP; those are operator-owned settings.",
         "Use peers to choose a trusted machine, roots to discover the roots that machine grants this OpenFork instance, list to discover remote capabilities, then describe before every call and echo the returned contract exactly.",
-        "Remote schemas stay lazy: never guess capability arguments or reuse a contract from another peer/capability.",
+        "Remote schemas stay lazy: never guess capability arguments or reuse a contract from another OFXP peer/capability.",
       ].join(" "),
       parameters: Parameters,
       jsonSchema: ProviderParameters,

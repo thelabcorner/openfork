@@ -1,6 +1,6 @@
 import { Effect, Semaphore } from "effect"
 import { availableParallelism } from "node:os"
-import { acquireMachineSlot } from "@/util/machine-slot-budget"
+import { acquireMachineSlot, withLocalAdmissionSlot } from "@/util/machine-slot-budget"
 
 /**
  * Machine-wide admission control for agent-triggered CPU-heavy child work.
@@ -11,14 +11,13 @@ import { acquireMachineSlot } from "@/util/machine-slot-budget"
  * therefore unsafe: on a 24-thread machine it can multiply into dozens of fully
  * parallel process trees.
  *
- * Defaults are intentionally conservative:
+ * Defaults scale with machine size but cap child process trees aggressively:
  *   <= 8 logical CPUs: 1 heavy job
- *   >  8 logical CPUs: 2 heavy jobs
+ *   >  8 logical CPUs: 1 job per 8 logical CPUs, with a floor of 2 and cap of 4
  *
- * Operators can lower or raise the budget with
- * OPENCODE_MAX_CONCURRENT_HEAVY_TOOLS. Values are clamped to a safe maximum of
- * 4. The legacy OPENCODE_MAX_CONCURRENT_SHELL_COMMANDS key is accepted as a
- * fallback so existing installations keep their intended override.
+ * OPENCODE_MAX_CONCURRENT_HEAVY_TOOLS can tune the default. Values are clamped
+ * to a safe maximum of 4. The legacy OPENCODE_MAX_CONCURRENT_SHELL_COMMANDS
+ * key remains a fallback override.
  *
  * Disabling the limiter requires the deliberately alarming
  * OPENCODE_UNSAFE_DISABLE_HEAVY_TOOL_LIMIT=1. A typo, zero, negative number, or
@@ -31,7 +30,8 @@ export const UNSAFE_DISABLE_ENV = "OPENCODE_UNSAFE_DISABLE_HEAVY_TOOL_LIMIT"
 export const MAX_SAFE_HEAVY_JOBS = 4
 
 export function defaultHeavyProcessPermits(parallelism = safeParallelism()): number {
-  return parallelism > 8 ? 2 : 1
+  if (parallelism <= 8) return 1
+  return Math.min(MAX_SAFE_HEAVY_JOBS, Math.max(2, Math.floor(parallelism / 8)))
 }
 
 function safeParallelism(): number {
@@ -68,15 +68,21 @@ function sharedState(): SharedState {
   return (root[SHARED_KEY] ??= {})
 }
 
-function getSemaphore(): Semaphore.Semaphore | undefined {
+function getBudget(): { readonly semaphore: Semaphore.Semaphore; readonly permits: number } | undefined {
+  const state = sharedState()
+  // Do not silently replace a live semaphore when runtime env changes. Older
+  // holders would remain on the old counter while new Sessions enter on the
+  // replacement, bypassing the machine's CPU guard. Capacity is a lifetime
+  // admission decision; an explicit test reset may replace it only after work
+  // drains. Keep the cross-process slot count consistent with the local lane.
+  if (state.semaphore && state.permits !== undefined) {
+    return { semaphore: state.semaphore, permits: state.permits }
+  }
   const permits = configuredHeavyProcessPermits()
   if (permits === undefined) return undefined
-  const state = sharedState()
-  if (!state.semaphore || state.permits !== permits) {
-    state.semaphore = Semaphore.makeUnsafe(permits)
-    state.permits = permits
-  }
-  return state.semaphore
+  state.semaphore = Semaphore.makeUnsafe(permits)
+  state.permits = permits
+  return { semaphore: state.semaphore, permits }
 }
 
 /** Test escape hatch: drop the process-global cached semaphore. */
@@ -87,23 +93,24 @@ export function resetHeavyProcessConcurrencyForTesting(): void {
 }
 
 export const withHeavyProcessSlot = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> => {
-  const current = getSemaphore()
-  if (!current) return effect
-  const permits = configuredHeavyProcessPermits()
-  if (permits === undefined) return effect
-  return current.withPermit(
-    Effect.acquireUseRelease(
+  const budget = getBudget()
+  if (!budget) return effect
+  return withLocalAdmissionSlot(budget.semaphore,
+    (remainingWaitMs) => Effect.acquireUseRelease(
       Effect.tryPromise((signal) =>
         acquireMachineSlot({
           prefix: GLOBAL_SLOT_PREFIX,
-          slots: permits,
+          slots: budget.permits,
           signal,
           staleMs: GLOBAL_SLOT_STALE_MS,
+          maxWaitMs: remainingWaitMs,
         }),
-      ).pipe(Effect.orDie),
+      ).pipe(Effect.orDie, Effect.interruptible),
       () => effect,
       (lease) => Effect.promise(() => lease.release()).pipe(Effect.ignore),
     ),
+    "opencode-local-heavy-v1",
+    budget.permits,
   )
 }
 

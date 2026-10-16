@@ -1,0 +1,16 @@
+Run a read-only Dreamer special agent in the background. Dreamer is a host-owned special agent, not a
+delegatable subagent: the generic Task tool cannot start it. This tool returns a persisted child Session ID;
+the shared background-job lifecycle delivers completion notifications while its runtime remains alive.
+Use for historically complex questions, old decisions, user corrections, failed approaches and
+multi-session contradictions. Normal memory.search remains cheaper for routine recall.
+Dreamer can inspect only project-scoped Session history and existing memory. It cannot code, edit,
+run commands, spawn subagents, change memory or repair search indexes. Proposed memories are NOT saved.
+Start with focus to create a detached investigation; resume with task_id and an optional new focus.
+Use status with task_id to inspect an owned child without waiting or running the model.
+Use cancel with task_id to interrupt a live owned Dreamer; it never starts a provider turn.
+If its job is not in this process, cancellation is NOT confirmed (check child history).
+Status not_in_process means the child exists but no process-local job is present; outcome is unknown.
+Status/cancel return cheap persisted Session timestamps as recovery clues, not a worker heartbeat or proof of completion.
+Independent focuses may be started separately and run concurrently; do not duplicate the same topic.
+Use the result's task_id to inspect or resume the child via Dream or Session if necessary.
+Unlike a regular Task worker, Dreamer cannot be switched into foreground/supervisor mode: it always runs detached.

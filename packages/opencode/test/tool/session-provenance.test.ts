@@ -4,12 +4,13 @@ import { Parameters } from "@/tool/session"
 import { ToolJsonSchema } from "@/tool/json-schema"
 
 describe("SessionTool surface", () => {
-  test("provider-visible actions are inspection-only", () => {
+  test("provider-visible actions exclude creation/prompting mutations", () => {
     const schema = ToolJsonSchema.fromSchema(Parameters)
-    expect(schema.properties?.action).toMatchObject({ enum: ["list", "search", "get", "status", "messages", "children"] })
+    expect(schema.properties?.action).toMatchObject({ enum: ["list", "search", "get", "status", "messages", "children", "oxp", "delete"] })
     for (const action of ["create", "send", "fork"] as const) {
       expect(Result.isFailure(Schema.decodeUnknownResult(Parameters)({ action }))).toBe(true)
     }
+    expect(Result.isSuccess(Schema.decodeUnknownResult(Parameters)({ action: "delete", sessionId: "ses_test" }))).toBe(true)
   })
 
   test("search exposes bounded recall inputs without mutation fields", () => {

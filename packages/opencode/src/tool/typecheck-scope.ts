@@ -41,8 +41,15 @@ export type TypecheckOutcome = {
   stdout: string
   stderr: string
   truncated: boolean
-  bin: "tsgo" | "tsc"
+  bin: TypecheckCompilerBin | "script"
   diagnostics: Diagnostic[]
+}
+
+export type TypecheckCompilerPreference = "auto" | "bun" | "tsgo" | "tsc"
+export type TypecheckCompilerBin = Exclude<TypecheckCompilerPreference, "auto">
+export type ResolvedCompiler = {
+  bin: TypecheckCompilerBin
+  path: string
 }
 
 export type ScopeSummary = {
@@ -387,30 +394,54 @@ export async function findNearestTsconfigFile(fromDir: string, stopAt: string): 
   }
 }
 
-// Resolve the compiler binary by walking up from the tsconfig directory toward
-// the worktree root, preferring the nearest node_modules. tsgo (the native
-// preview compiler) is primary; plain tsc.js is the fallback. Falls back to
-// the host package's own node_modules (cwd) so the tool works even when the
-// project under check has no local TypeScript install (e.g. tests).
-export async function resolveCompiler(tsconfigDir: string, worktree: string): Promise<{ bin: "tsgo" | "tsc"; path: string }> {
-  const walk = async (start: string, stop: string): Promise<{ bin: "tsgo" | "tsc"; path: string } | undefined> => {
+// Resolve the compiler backend. Auto mode prefers Bun's built-in TypeScript
+// checker when this Bun runtime exposes one, then walks up from the tsconfig
+// directory toward the worktree for tsgo / tsc. The final cwd fallback keeps
+// tests and external worktrees usable when they do not install a compiler.
+export function bunTypecheckVersion(): string | undefined {
+  const version = (process.versions as typeof process.versions & { typescript?: string }).typescript
+  return typeof version === "string" && version.length > 0 ? version : undefined
+}
+
+export function supportsBunTypecheck(): boolean {
+  return bunTypecheckVersion() !== undefined
+}
+
+export async function resolveCompiler(
+  tsconfigDir: string,
+  worktree: string,
+  preference: TypecheckCompilerPreference = "auto",
+): Promise<ResolvedCompiler> {
+  if (preference === "auto" || preference === "bun") {
+    const bun = supportsBunTypecheck() ? Bun.which("bun") : null
+    if (bun) return { bin: "bun", path: bun }
+    if (preference === "bun") {
+      throw new Error(
+        "Bun's native type checker is unavailable in this runtime. Upgrade Bun to a build with `bun check`, or use compiler='auto' for tsgo/tsc fallback.",
+      )
+    }
+  }
+
+  const walk = async (start: string, stop: string): Promise<ResolvedCompiler | undefined> => {
     let dir = path.resolve(start)
     const root = path.resolve(stop)
     while (true) {
       const tsgo = path.join(dir, "node_modules", "@typescript", "native-preview", "bin", "tsgo.js")
       const tsc = path.join(dir, "node_modules", "typescript", "lib", "tsc.js")
       if (
-        await fs
+        preference !== "tsc" &&
+        (await fs
           .stat(tsgo)
           .then(() => true)
-          .catch(() => false)
+          .catch(() => false))
       )
         return { bin: "tsgo", path: tsgo }
       if (
-        await fs
+        preference !== "tsgo" &&
+        (await fs
           .stat(tsc)
           .then(() => true)
-          .catch(() => false)
+          .catch(() => false))
       )
         return { bin: "tsc", path: tsc }
       if (dir === root || dir === path.dirname(dir)) return undefined
@@ -423,17 +454,25 @@ export async function resolveCompiler(tsconfigDir: string, worktree: string): Pr
     (await walk(process.cwd(), path.dirname(process.cwd())))
   if (found) return found
   throw new Error(
-    "No TypeScript compiler found: neither @typescript/native-preview (tsgo) nor typescript (tsc.js) is installed under the project's node_modules.",
+    preference === "auto"
+      ? "No TypeScript compiler found: Bun's native checker is unavailable and neither @typescript/native-preview (tsgo) nor typescript (tsc.js) is installed under the project's node_modules."
+      : `Requested TypeScript compiler '${preference}' is unavailable under the project's node_modules.`,
   )
+}
+
+export function compilerInvocation(compiler: ResolvedCompiler, projectPath: string): [string, ...string[]] {
+  if (compiler.bin === "bun") {
+    // Use the flag form so a project's package.json "check" script cannot
+    // shadow Bun's native type checker. --tsconfig-override gives us the same
+    // scoped-project semantics as `bun check --project <temp config>`.
+    return [compiler.path, "--check", "--tsconfig-override", projectPath, "--no-pretty", "--all"]
+  }
+  return ["node", compiler.path, "--project", projectPath, "--noEmit", "--pretty", "false"]
 }
 
 const TEMP_TSCONFIG_PREFIX = ".openfork-typecheck-"
 
-export function scopedConfigText(input: {
-  baseTsconfig: string
-  tempDir: string
-  files: readonly string[]
-}) {
+export function scopedConfigText(input: { baseTsconfig: string; tempDir: string; files: readonly string[] }) {
   let extendsPath = path.relative(input.tempDir, input.baseTsconfig).split(path.sep).join("/")
   if (!extendsPath.startsWith(".")) extendsPath = "./" + extendsPath
   return JSON.stringify(
@@ -458,6 +497,7 @@ export const runScopedTypecheck = Effect.fn("TypecheckScope.runScoped")(function
   tsconfigDir: string
   tsconfigPath?: string
   files: string[]
+  compiler?: TypecheckCompilerPreference
   maxErrors?: number
   timeoutMs?: number
   signal?: AbortSignal
@@ -480,8 +520,9 @@ export const runScopedTypecheck = Effect.fn("TypecheckScope.runScoped")(function
       }),
     )
 
-    const compiler = yield* Effect.promise(() => resolveCompiler(input.tsconfigDir, input.worktree))
-    const command = ChildProcess.make("node", [compiler.path, "--project", tempPath, "--noEmit", "--pretty", "false"], {
+    const compiler = yield* Effect.promise(() => resolveCompiler(input.tsconfigDir, input.worktree, input.compiler))
+    const [executable, ...args] = compilerInvocation(compiler, tempPath)
+    const command = ChildProcess.make(executable, args, {
       cwd: input.tsconfigDir,
       stdin: "ignore",
       stdout: "pipe",
@@ -511,7 +552,7 @@ export const runScopedTypecheck = Effect.fn("TypecheckScope.runScoped")(function
 
     const stdout = result.stdout.toString("utf8")
     const stderr = result.stderr.toString("utf8")
-    const combined = stdout || stderr
+    const combined = [stdout, stderr].filter(Boolean).join("\n")
     const truncated = result.stdoutTruncated || result.stderrTruncated
     const diagnostics = parseDiagnostics(combined, input.maxErrors ?? 80)
 
@@ -582,13 +623,26 @@ export const runFullTypecheck = Effect.fn("TypecheckScope.runFull")(function* (i
   )
   const stdout = result.stdout.toString("utf8")
   const stderr = result.stderr.toString("utf8")
-  const combined = stdout || stderr
+  const combined = [stdout, stderr].filter(Boolean).join("\n")
+  const scriptText = yield* Effect.promise(() =>
+    fs
+      .readFile(path.join(scriptDir, "package.json"), "utf8")
+      .then((text) => (JSON.parse(text) as { scripts?: Record<string, string> }).scripts?.typecheck ?? "")
+      .catch(() => ""),
+  )
+  const bin: TypecheckOutcome["bin"] = /(^|\s)bun\s+check(?:\s|$)/.test(scriptText)
+    ? "bun"
+    : /(^|\s)tsgo(?:\s|$)/.test(scriptText)
+      ? "tsgo"
+      : /(^|\s)tsc(?:\s|$)/.test(scriptText)
+        ? "tsc"
+        : "script"
   return {
     exitCode: result.exitCode,
     stdout,
     stderr,
     truncated: result.stdoutTruncated || result.stderrTruncated,
-    bin: "tsc" as const,
+    bin,
     diagnostics: parseDiagnostics(combined, 80),
   } satisfies TypecheckOutcome
 })

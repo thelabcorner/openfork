@@ -32,6 +32,7 @@ import { Identifier } from "@/id/id"
 import type { SessionPromptOps } from "@/session/prompt-contract"
 import { Scope } from "effect"
 import { ShellLaunch } from "./shell/launch"
+import { ShellHeal } from "./shell/heal"
 import { withShellSlot } from "./shell-concurrency"
 import { userChildEnvironment } from "@/util/javascript-runtime"
 import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
@@ -676,19 +677,23 @@ export const ShellTool = Tool.define(
       const limits = yield* trunc.limits()
       const window = makeChunkWindow(limits.maxBytes * 2)
       let full = ""
+      let fullNewlines = 0
       let last = ""
       let file = ""
       let spill: Truncate.Writer | undefined
+      let timelineOutput = false
       let cut = false
       let expired = false
       let aborted = false
-      const startedAt = Date.now()
+      const queuedAt = Date.now()
+      let startedAt = queuedAt
 
       const closeSpill = Effect.fnUntraced(function* () {
         const current = spill
         if (!current) return
         spill = undefined
         yield* current.close
+        timelineOutput = current.timelineHealthy()
         if (!current.healthy()) file = ""
       })
 
@@ -696,7 +701,7 @@ export const ShellTool = Tool.define(
         metadata: {
           output: "",
           timeout: input.timeout,
-          startedAt,
+          queueStartedAt: queuedAt,
         },
       })
 
@@ -711,6 +716,15 @@ export const ShellTool = Tool.define(
         input.command,
         Effect.scoped(
           Effect.gen(function* () {
+            startedAt = Date.now()
+            yield* ctx.metadata({
+              metadata: {
+                output: "",
+                timeout: input.timeout,
+                queueStartedAt: queuedAt,
+                startedAt,
+              },
+            })
             yield* Effect.addFinalizer(closeSpill)
             const handle = yield* spawner.spawn(ShellLaunch.command(input.shell, input.command, input.cwd, input.env))
 
@@ -722,34 +736,43 @@ export const ShellTool = Tool.define(
                 last = preview(last + chunk)
 
                 if (spill) {
-                  return spill.write(chunk).pipe(
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                          timeout: input.timeout,
-                          startedAt,
-                        },
-                      }),
-                    ),
-                  )
+                  return Effect.gen(function* () {
+                    yield* spill!.write(chunk)
+                    timelineOutput = spill!.timelineHealthy()
+                    yield* ctx.metadata({
+                      metadata: {
+                        output: last,
+                        timeout: input.timeout,
+                        queueStartedAt: queuedAt,
+                        startedAt,
+                      },
+                    })
+                  })
                 } else {
                   full += chunk
-                  if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                    return trunc.writer(full).pipe(
+                  // Spill before either reservoir bound can discard a byte.
+                  // Keep the complete decoded prefix in `full` until its first
+                  // durable DB flush succeeds.
+                  fullNewlines += (chunk.match(/\n/g) ?? []).length
+                  const fullLines = fullNewlines + (full.length > 0 && !full.endsWith("\n") ? 1 : 0)
+                  if (Buffer.byteLength(full, "utf-8") > limits.maxBytes || fullLines > limits.maxLines) {
+                    return trunc.writer(full, Tool.timelineOwner(ctx)).pipe(
                       Effect.andThen((next) =>
                         Effect.sync(() => {
                           spill = next
                           file = next.outputPath ?? ""
+                          timelineOutput = next.timelineHealthy()
                           cut = true
                           full = ""
+                          fullNewlines = 0
                         }),
                       ),
-                      Effect.andThen(
+                      Effect.andThen(() =>
                         ctx.metadata({
                           metadata: {
                             output: last,
                             timeout: input.timeout,
+                            queueStartedAt: queuedAt,
                             startedAt,
                           },
                         }),
@@ -762,6 +785,7 @@ export const ShellTool = Tool.define(
                   metadata: {
                     output: last,
                     timeout: input.timeout,
+                    queueStartedAt: queuedAt,
                     startedAt,
                   },
                 })
@@ -795,6 +819,7 @@ export const ShellTool = Tool.define(
             return exit.kind === "exit" ? exit.code : null
           }),
         ),
+        input.shell,
       ).pipe(Effect.orDie)
 
       const meta: string[] = []
@@ -807,36 +832,52 @@ export const ShellTool = Tool.define(
       const snapshot = window.snapshot()
       if (window.cut || snapshot.totalBytes > limits.maxBytes || snapshot.totalLines > limits.maxLines) cut = true
       if (!file && (cut || snapshot.totalBytes > limits.maxBytes || snapshot.totalLines > limits.maxLines)) {
-        // This path is only reachable when the retained reservoir detected a
-        // line-bound overflow before the byte-triggered streaming spill. The
-        // reservoir is still complete while cut=false; retain that complete
-        // source before projecting it.
-        if (!snapshot.cut)
-          file = yield* trunc.write(snapshot.head + snapshot.tail).pipe(
+        // If the complete source is still resident, opportunistically retain it.
+        // If streaming retention was unavailable and the bounded reservoir has
+        // already cut, return the explicit lossy projection rather than turning
+        // a successful command into a Session error.
+        if (!snapshot.cut && full) {
+          const owner = Tool.timelineOwner(ctx)
+          timelineOutput = owner ? yield* trunc.retainTimeline(owner, full) : false
+          file = yield* trunc.write(full).pipe(
             Effect.catchDefect((defect) =>
-              Effect.logWarning("failed to retain line-truncated shell output; continuing with bounded preview", {
+              Effect.logWarning("failed to write optional line-truncated shell archive", {
                 defect: String(defect),
               }).pipe(Effect.as("")),
             ),
           )
+        }
       }
 
       const marker = file
         ? `... shell output truncated (original: ${snapshot.totalLines} lines, ${snapshot.totalBytes} bytes; showing beginning + end). Full output saved to ${file}. Use archive({action:"read", path:"${file}"}) to inspect it. ...`
-        : `... shell output truncated (original: ${snapshot.totalLines} lines, ${snapshot.totalBytes} bytes; showing beginning + end). ...`
+        : timelineOutput
+          ? `... shell output truncated (original: ${snapshot.totalLines} lines, ${snapshot.totalBytes} bytes; showing beginning + end). Full output is retained in the durable session timeline; archive recovery is unavailable. ...`
+          : `... shell output truncated (original: ${snapshot.totalLines} lines, ${snapshot.totalBytes} bytes; showing beginning + end). Full-output recovery is unavailable. ...`
       let output = projectChunkWindow(window, limits, marker)
       if (!output) output = "(no output)"
+      output = ShellHeal.stripAnsi(output)
 
       if (meta.length > 0) {
         output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
       }
+      const heal = ShellHeal.hints({
+        command: input.command,
+        output,
+        dialect: ShellLaunch.profile(input.shell).dialect,
+        exit: code,
+      })
+      if (heal) output += "\n\n" + heal
       return {
         title: input.command,
         metadata: {
           output: last || preview(output),
           exit: code,
           truncated: cut,
+          ...(cut && timelineOutput ? { timelineOutput: true } : {}),
           timeout: input.timeout,
+          queueStartedAt: queuedAt,
+          queueDurationMs: Math.max(0, startedAt - queuedAt),
           startedAt,
           endedAt: Date.now(),
           ...(cut && file ? { outputPath: file } : {}),
@@ -877,7 +918,7 @@ export const ShellTool = Tool.define(
       const limits = yield* trunc.limits()
       const text = yield* fs.readFileStringSafe(logPath)
       if (!text) return "(no output)"
-      return tail(text, limits.maxLines, limits.maxBytes).text || "(no output)"
+      return tail(ShellHeal.stripAnsi(text), limits.maxLines, limits.maxBytes).text || "(no output)"
     })
 
     const runBackground = Effect.fn("ShellTool.runBackground")(function* (
@@ -1029,6 +1070,7 @@ export const ShellTool = Tool.define(
         command: string
         logPath: string
         notify: boolean
+        shell: string
       },
       ctx: Tool.Context,
     ) {
@@ -1046,6 +1088,15 @@ export const ShellTool = Tool.define(
           }
           if (result.info?.status === "error") {
             return readLogTail(input.logPath).pipe(
+              Effect.map((preview) => {
+                const heal = ShellHeal.hints({
+                  command: input.command,
+                  output: preview,
+                  dialect: ShellLaunch.profile(input.shell).dialect,
+                  exit: null,
+                })
+                return heal ? preview + "\n\n" + heal : preview
+              }),
               Effect.flatMap((preview) =>
                 inject(ctx, input.jobId, renderError(meta, result.info?.error ?? "Command failed", preview, null)),
               ),
@@ -1198,7 +1249,8 @@ export const ShellTool = Tool.define(
                 // resolve the handle without racing the launch. If the process
                 // dies before registration (spawn failure), settle quickly.
                 yield* pollUntilRegistered(jobId)
-                if (wantsNotify) yield* notify({ jobId, command: params.command, logPath, notify: wantsNotify }, ctx)
+                if (wantsNotify)
+                  yield* notify({ jobId, command: params.command, logPath, notify: wantsNotify, shell }, ctx)
 
                 return {
                   title: params.command,

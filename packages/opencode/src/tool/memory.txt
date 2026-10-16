@@ -7,10 +7,14 @@ sources before acting on them.
 Nothing is recalled automatically. Use this tool when prior project experience
 might change what you do next: a rejected approach, a non-obvious workflow, a
 correction the user already made, or a decision whose rationale is not in the code.
+For expensive multi-session reconstruction or contradictory history, use the
+lazy dream tool to launch a read-only background Dreamer investigation. Dreamer
+returns evidence and uncommitted proposals; it never auto-saves memory.
 
 Progressive disclosure (cheapest first):
   map      - what memory EXISTS (free). Start here when unsure.
-  search   - compact routing rows: ids, topics, kinds, snippets. Then:
+  search   - consults SAVED memory and recent indexed Session evidence by default;
+             compact results are separately labeled, dated, and scoped. Then:
   open     - the full current view of one topic (current facts + history)
   get      - one memory in detail, with its evidence
   timeline - the supersession chain for a memory or a stable key
@@ -27,6 +31,14 @@ gotcha, a non-obvious workflow, an error's real cause.
 Bad memory: directory trees, dependency lists, anything readable from source
 in milliseconds, speculative explanations, raw logs, secrets.
 
-FLOW: map (or skip if you know the topic) -> search -> open/get -> act.
+Search sources: both (default), fallback (Session lookup only if no saved memory),
+or memory (saved entries only). Session hits are uncurated historical evidence,
+NOT automatically saved facts. Session indexed coverage may be incomplete. Newer
+message evidence normally outranks older mutable state; live code/runtime wins.
+Use sessionRanking:"relevance" for intentional historical/corroborative searches;
+the default sessionRanking:"recent" prioritizes matching conversation recency.
+
+FLOW: map (or skip if you know the topic) -> search -> open/get or inspect the
+referenced Session via session tool -> verify live state -> act.
 Do NOT search before every trivial edit; do search before repeating work,
 revisiting a design decision, or touching a subsystem with known failures.

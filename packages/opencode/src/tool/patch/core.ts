@@ -26,7 +26,10 @@ export function looksLikeOpencode(text: string): boolean {
 
 export function looksLikeGitDiff(text: string): boolean {
   const t = text.trim()
-  return /^--- /m.test(t) && /^\+\+\+ /m.test(t) && t.includes("@@")
+  // Empty-file additions have file headers but no @@ hunk. Metadata-only
+  // renames have a diff --git header and are detected so we can explain the
+  // supported move syntax instead of treating them as arbitrary text.
+  return (/^--- /m.test(t) && /^\+\+\+ /m.test(t)) || /^diff --git /m.test(t)
 }
 
 export function detectFormat(text: string): PatchFormat | null {
@@ -37,9 +40,9 @@ export function detectFormat(text: string): PatchFormat | null {
 
 // ── Git-style unified diff translation ────────────────────────────────────────
 
-function stripGitPrefix(name: string | undefined): string | null {
+function stripGitPrefix(name: string | undefined, expectedPrefix: "a/" | "b/"): string | null {
   if (!name) return null
-  const cleaned = name.replace(/^a\//, "").replace(/^b\//, "")
+  const cleaned = name.startsWith(expectedPrefix) ? name.slice(expectedPrefix.length) : name
   if (cleaned === "/dev/null") return null
   return cleaned
 }
@@ -51,14 +54,17 @@ function stripGitPrefix(name: string | undefined): string | null {
  * translatable unified diff.
  *
  * SAFETY GATES (a translated patch can never silently mis-apply):
- * - Only files that parse with at least one hunk are emitted.
+ * - Metadata-only renames without parsed file headers are rejected with a
+ *   caller-facing explanation; textual changes require unified hunks.
  * - An update hunk with no old lines (no context, no removals) would map to the
  *   native "append at EOF" semantics — refuse the whole translation instead.
  * - After translation, every update chunk is verified against the real file by
  *   Patch.deriveNewContentsFromChunks (throws on mismatch → nothing is written).
  */
 export function translateGitDiff(patchText: string): Hunk[] | null {
-  const cleaned = stripHeredoc(normalizePatchText(patchText).trim())
+  // Preserve whitespace in file-content lines, especially the final line.
+  // parsePatch tolerates blank transport around headers and hunks.
+  const cleaned = stripHeredoc(normalizePatchText(patchText))
   if (!looksLikeGitDiff(cleaned)) return null
 
   let parsed: ParsedGitFile[]
@@ -71,14 +77,35 @@ export function translateGitDiff(patchText: string): Hunk[] | null {
 
   const hunks: Hunk[] = []
   for (const file of parsed) {
-    if (!file.hunks || file.hunks.length === 0) continue
-    const oldName = stripGitPrefix(file.oldFileName)
-    const newName = stripGitPrefix(file.newFileName)
+    const oldName = stripGitPrefix(file.oldFileName, "a/")
+    const newName = stripGitPrefix(file.newFileName, "b/")
 
     if (newName === null) {
-      // `+++ /dev/null` (or a missing new name): deletion
+      // `+++ /dev/null`: carry the removed hunks into the executor so it
+      // verifies the complete deletion against current file contents.
       if (oldName === null) return null
-      hunks.push({ type: "delete", path: oldName })
+      const chunks: UpdateFileChunk[] = (file.hunks ?? []).map((h) => {
+        const oldLines: string[] = []
+        const newLines: string[] = []
+        for (const line of h.lines) {
+          if (line.startsWith("\\")) continue
+          if (line.startsWith(" ")) {
+            oldLines.push(line.slice(1))
+            newLines.push(line.slice(1))
+          } else if (line.startsWith("-")) oldLines.push(line.slice(1))
+          else if (line.startsWith("+")) newLines.push(line.slice(1))
+        }
+        return { old_lines: oldLines, new_lines: newLines, old_start: h.oldStart }
+      })
+      hunks.push({ type: "delete", path: oldName, chunks })
+      continue
+    }
+    if (!file.hunks || file.hunks.length === 0) {
+      // Empty file creation still carries explicit old/new paths even though
+      // it has no textual hunks. Metadata-only rename headers are not parsed
+      // into old/new paths by jsdiff and are rejected below.
+      if (oldName === null) hunks.push({ type: "add", path: newName, contents: "", finalNewline: false })
+      else if (oldName !== newName) hunks.push({ type: "update", path: oldName, move_path: newName, chunks: [] })
       continue
     }
     if (oldName === null) {
@@ -88,7 +115,8 @@ export function translateGitDiff(patchText: string): Hunk[] | null {
         .filter((l) => l.startsWith("+"))
         .map((l) => l.slice(1))
         .join("\n")
-      hunks.push({ type: "add", path: newName, contents })
+      const lastLine = file.hunks.at(-1)?.lines.at(-1)
+      hunks.push({ type: "add", path: newName, contents, finalNewline: !lastLine?.startsWith("\\ No newline at end of file") })
       continue
     }
 

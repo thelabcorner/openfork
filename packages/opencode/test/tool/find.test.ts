@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Layer } from "effect"
+import { Cause, Effect, Layer } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -145,6 +145,22 @@ describe("tool.find", () => {
       yield* find.execute({ grep: "needle", path: test.directory, include: "*.ts" }, next)
 
       expect(permissions).toEqual(["glob", "grep"])
+    }),
+  )
+
+  it.instance("names both accepted search modes when neither is supplied", () =>
+    Effect.gen(function* () {
+      const info = yield* FindTool
+      const find = yield* info.init()
+      const exit = yield* find.execute({}, ctx).pipe(Effect.exit)
+
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag !== "Failure") return
+      const message = Cause.pretty(exit.cause)
+      expect(message).toContain("Accepted fields")
+      expect(message).toContain("glob")
+      expect(message).toContain("grep")
+      expect(message).toContain("`pattern` is not a find parameter")
     }),
   )
 })

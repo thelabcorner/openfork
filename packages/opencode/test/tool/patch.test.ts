@@ -209,6 +209,32 @@ describe("tool.patch", () => {
     }),
     { git: true },
   )
+  it.instance("merges path aliases that normalize to the same file", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "same.txt")
+      yield* writeText(target, "one\ntwo\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: same.txt",
+        "@@",
+        "-one",
+        "+ONE",
+        "*** Update File: nested/../same.txt",
+        "@@",
+        "-two",
+        "+TWO",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: patch, apply: false }, ctx)
+      expect(plan.output).toContain("M same.txt (+2/-2) clean")
+      expect(plan.metadata.files).toHaveLength(1)
+      yield* execute({ patchText: patch, apply: true }, ctx)
+      expect(yield* readText(target)).toBe("ONE\nTWO\n")
+    }),
+    { git: true },
+  )
   it.instance("applies update sections onto added files in the same patch", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -746,6 +772,95 @@ describe("tool.patch", () => {
       expect(plan.output).toContain("M dbl.txt (+2/-2) clean")
       yield* execute({ patchText: patch, apply: true }, ctx)
       expect(yield* readText(path.join(test.directory, "dbl.txt"))).toBe("a\nB1\nc\na\nB2\nc\n")
+    }),
+    { git: true },
+  )
+  it.instance("deletes complete lines without leaving blank lines across EOL styles", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const cases = [
+        { name: "lf-middle", before: "alpha\nbeta\ngamma\n", removed: ["beta"], after: "alpha\ngamma\n" },
+        { name: "crlf-middle", before: "alpha\r\nbeta\r\ngamma\r\n", removed: ["beta"], after: "alpha\r\ngamma\r\n" },
+        {
+          name: "bom-crlf-middle",
+          before: "\uFEFFalpha\r\nbeta\r\ngamma\r\n",
+          removed: ["beta"],
+          after: "\uFEFFalpha\r\ngamma\r\n",
+        },
+        { name: "cr-middle", before: "alpha\rbeta\rgamma", removed: ["beta"], after: "alpha\rgamma" },
+        { name: "unterminated-eof", before: "alpha\nbeta", removed: ["beta"], after: "alpha\n" },
+        { name: "all-lines", before: "alpha\r\nbeta\r\n", removed: ["alpha", "beta"], after: "" },
+        { name: "single-line", before: "beta", removed: ["beta"], after: "" },
+      ]
+      for (const item of cases) {
+        const filepath = `${item.name}.txt`
+        yield* writeText(path.join(test.directory, filepath), item.before)
+        const patch = [
+          "*** Begin Patch",
+          `*** Update File: ${filepath}`,
+          "@@",
+          ...item.removed.map((line) => `-${line}`),
+          "*** End Patch",
+        ].join("\n")
+        yield* execute({ patchText: patch, apply: true }, ctx)
+        expect(yield* readText(path.join(test.directory, filepath)), item.name).toBe(item.after)
+      }
+    }),
+    { git: true },
+  )
+  it.instance("refuses a move when the destination already exists", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const source = path.join(test.directory, "old.txt")
+      const destination = path.join(test.directory, "new.txt")
+      yield* writeText(source, "old\n")
+      yield* writeText(destination, "keep destination\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: old.txt",
+        "*** Move to: new.txt",
+        "@@",
+        "-old",
+        "+updated",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: patch }, ctx)
+      expect(plan.output).toContain("CONFLICT")
+      yield* expectFailure(execute({ patchText: patch, apply: true }, ctx), "destination already exists")
+      expect(yield* readText(source)).toBe("old\n")
+      expect(yield* readText(destination)).toBe("keep destination\n")
+    }),
+    { git: true },
+  )
+  it.instance("revalidates every patch source after permission before writing any file", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const first = path.join(test.directory, "first.txt")
+      const second = path.join(test.directory, "second.txt")
+      yield* writeText(first, "first\n")
+      yield* writeText(second, "second\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: first.txt",
+        "@@",
+        "-first",
+        "+FIRST",
+        "*** Update File: second.txt",
+        "@@",
+        "-second",
+        "+SECOND",
+        "*** End Patch",
+      ].join("\n")
+      const mutatingCtx: ToolCtx = {
+        ...ctx,
+        ask: () => Effect.promise(() => fs.writeFile(second, "external update\n", "utf-8")).pipe(Effect.asVoid),
+      }
+      yield* expectFailure(execute({ patchText: patch, apply: true }, mutatingCtx), "Patch became stale")
+      expect(yield* readText(first)).toBe("first\n")
+      expect(yield* readText(second)).toBe("external update\n")
     }),
     { git: true },
   )

@@ -17,7 +17,9 @@ import { ShellJob } from "@/background/shell-job"
 import { MonitorDelivery } from "@/background/monitor-delivery"
 import { InstanceState } from "@/effect/instance-state"
 import { Agent } from "@/agent/agent"
+import { Agent as AgentContract } from "@opencode-ai/schema/agent"
 import { ShellLaunch } from "./shell/launch"
+import { ShellPrompt } from "./shell/prompt"
 import { userChildEnvironment } from "@/util/javascript-runtime"
 
 export const Parameters = Schema.Struct({
@@ -125,12 +127,15 @@ function renderMonitorStarted(
   description: string,
   logPath: string,
   persistent: boolean,
+  admitted: boolean,
 ) {
   return [
-    `<monitor job="${escapeXML(jobId)}" state="monitoring">`,
-    `  <summary>Monitoring ${escapeXML(description)}</summary>`,
+    `<monitor job="${escapeXML(jobId)}" state="${admitted ? "monitoring" : "queued"}">`,
+    `  <summary>${admitted ? "Monitoring" : "Queued to monitor"} ${escapeXML(description)}</summary>`,
     `  <command>${escapeXML(command)}</command>`,
-    "  Each meaningful stdout line may wake this session in a future turn.",
+    admitted
+      ? "  Each meaningful stdout line may wake this session in a future turn."
+      : "  Awaiting a free monitor process slot; no process or observation is active yet. Use background status to check admission.",
     "  Do not poll this job. Use background status/read/send/wait/kill with the returned id when management is needed.",
     `  Full output: ${escapeXML(logPath)}`,
     `  ${persistent ? "Persistent: runs until killed." : "Bounded monitor: exits at timeout unless it finishes first."}`,
@@ -185,7 +190,7 @@ export const BackgroundTool = Tool.define(
         const description = (entry as any)?.description ?? metaString(info?.metadata, "description")
         return {
           id,
-          status: info?.status ?? "running",
+          status: info?.status === "running" && kind === "monitor" && !entry ? "queued" : (info?.status ?? "running"),
           kind,
           description,
           command: entry?.command ?? info?.title ?? id,
@@ -241,7 +246,8 @@ export const BackgroundTool = Tool.define(
         const cfg = yield* config.get()
         const monitorShell = Shell.acceptable(cfg.shell)
         const runtime = ShellLaunch.profile(monitorShell)
-        const description = `${DESCRIPTION}\n\n# Monitor shell profile\n- Host OS: ${runtime.platform}\n- Actual interpreter: ${runtime.shellName} (${runtime.shellPath})\n- Dialect: ${runtime.dialect}\n- Invocation protocol: ${runtime.invocationProtocol}\n- Path environment: ${runtime.pathEnvironment}\n- Native argument mode: ${runtime.nativeArgMode}\n- monitor.command is a shell SCRIPT STRING, not argv.\n- Each monitor starts a fresh shell process. Do not add a redundant same-shell wrapper.`
+        const interpreter = ShellPrompt.interpreterSection(runtime.shellName)
+        const description = `${DESCRIPTION}\n\n# Monitor shell profile\n- Host OS: ${runtime.platform}\n- Actual interpreter: ${runtime.shellName} (${runtime.shellPath})\n- Dialect: ${runtime.dialect}\n- Invocation protocol: ${runtime.invocationProtocol}\n- Path environment: ${runtime.pathEnvironment}\n- Native argument mode: ${runtime.nativeArgMode}\n- monitor.command is a shell SCRIPT STRING, not argv.\n- Each monitor starts a fresh shell process. Do not add a redundant same-shell wrapper.${interpreter ? `\n\n${interpreter}` : ""}`
 
         return {
           description,
@@ -266,9 +272,9 @@ export const BackgroundTool = Tool.define(
               switch (params.action) {
                 case "monitor": {
                   const ag = yield* agents.get(ctx.agent).pipe(Effect.catch(() => Effect.succeed(undefined)))
-                  if (ag && ag.mode === "subagent") {
+                  if (ag && (ag.mode === "subagent" || AgentContract.isSpecialAgentID(ag.name))) {
                     throw new Error(
-                      "background action=monitor is not available to subagents in V1; run it from the primary session",
+                      "background action=monitor is not available to subagents or host-owned special agents in V1; run it from the primary session",
                     )
                   }
 
@@ -350,7 +356,7 @@ export const BackgroundTool = Tool.define(
                       persistent,
                       timeoutMs,
                       startedAt,
-                      status: "running",
+                       status: job.admitted ? "running" : "queued",
                       delivery: {
                         mode: "events",
                         ownerSessionID: String(ctx.sessionID),
@@ -359,15 +365,18 @@ export const BackgroundTool = Tool.define(
                         debounceMs: 200,
                       },
                     },
-                    output: renderMonitorStarted(job.jobId, command, description, job.logPath, persistent),
+                     output: renderMonitorStarted(job.jobId, command, description, job.logPath, persistent, job.admitted),
                   }
                 }
 
                 case "list": {
                   const infos = yield* background.list()
+                  const admitted = new Set((yield* jobs.list()).map((job) => job.id))
                   const rows: Row[] = infos.map((info) => ({
                     id: info.id,
-                    status: info.status,
+                    status: info.status === "running" && metaString(info.metadata, "kind") === "monitor" && !admitted.has(info.id)
+                      ? "queued"
+                      : info.status,
                     kind: metaString(info.metadata, "kind") ?? "shell",
                     description: metaString(info.metadata, "description"),
                     command: info.title ?? info.id,

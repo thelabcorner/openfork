@@ -22,6 +22,23 @@ const BaseParameterFields = {
       "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
   }),
   command: Schema.optional(Schema.String).annotate({ description: "The command that triggered this task" }),
+  attachments: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description:
+      "Optional symbolic handles for user uploads to deliver to this subagent's first model request. Only handles shown in the current attachment manifest, returned by an explicit session-index lookup, or already granted to a resumed worker are accepted; omitted or empty means no attachments.",
+  }),
+  model: Schema.optional(
+    Schema.Struct({
+      providerID: Schema.String.annotate({ description: "Provider ID exactly as shown in the model selector." }),
+      modelID: Schema.String.annotate({ description: "Model ID exactly as shown in the model selector." }),
+      accountID: Schema.optional(Schema.String).annotate({
+        description: "Optional connected account ID when this provider has multiple accounts.",
+      }),
+      variant: Schema.optional(Schema.String).annotate({ description: "Optional model variant, such as high." }),
+    }).annotate({
+      description:
+        "Optional model override for this subagent. Omit to inherit the model currently running the parent session turn.",
+    }),
+  ),
 }
 
 export const Parameters = Schema.Struct({
@@ -64,12 +81,15 @@ export const TaskTool = Tool.define(
               subagentType: params.subagent_type,
               taskID: params.task_id,
               command: params.command,
+              attachments: params.attachments,
+              model: params.model,
               background: params.background,
               mode: params.mode,
             },
             {
               parentSessionID: ctx.sessionID,
               assistantMessageID: ctx.messageID,
+              toolCallID: ctx.callID,
               parentAgent: ctx.agent,
               abort: ctx.abort,
               messages: ctx.messages,

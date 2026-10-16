@@ -66,10 +66,10 @@ const MEMBER_SETTLEMENT_FAILURES = [
   "internal",
 ] as const
 
-export const Parameters = Schema.Struct({
+const MemberArguments = Schema.Struct({
   action: Schema.Literals([...MEMBER_ACTIONS]).annotate({
     description:
-      "status=current assignment; done=task completed; fail=task failed; send=peer mail; inbox=read peer mail; shared.get/shared.put=shared working state; publish=record deliverable.",
+      "status=current assignment; done=task completed; fail=task failed; send=Swarm member mail; inbox=read Swarm member mail; shared.get/shared.put=shared working state; publish=record deliverable.",
   }),
   swarmName: Schema.optional(Schema.String).annotate({
     description: "Only needed when this Session belongs to more than one Swarm.",
@@ -82,13 +82,22 @@ export const Parameters = Schema.Struct({
   }),
   detail: Schema.optional(Schema.String).annotate({ description: "fail only: concise failure detail." }),
   to: Schema.optional(Schema.String).annotate({
-    description: "send only: peer member roster name, or 'all' to broadcast.",
+    description: "send only: Swarm member roster name, or 'all' to broadcast.",
   }),
   kind: Schema.optional(SwarmModel.MessageKind).annotate({ description: "send only: message kind." }),
   priority: Schema.optional(SwarmModel.MessagePriority).annotate({ description: "send only: message priority." }),
   body: Schema.optional(Schema.String).annotate({ description: "send only: message body." }),
   replyExpected: Schema.optional(Schema.Boolean).annotate({ description: "send only: reply contract." }),
   key: Schema.optional(Schema.String).annotate({ description: "shared.get/shared.put: shared-state key." }),
+  afterKey: Schema.optional(Schema.String).annotate({
+    description: "shared.get without key only: resume keyset pagination using the previous result.nextKey. Never guess a cursor.",
+  }),
+  inboxCursor: Schema.optional(Schema.Struct({
+    createdAt: Schema.Int,
+    id: Schema.String,
+  })).annotate({
+    description: "inbox only: exact {createdAt,id} from the preceding inbox page's next field. Fetches older deliveries.",
+  }),
   value: Schema.optional(Schema.Json).annotate({ description: "shared.put: JSON value." }),
   contentType: Schema.optional(Schema.String).annotate({ description: "shared.put: content type." }),
   expectedVersion: Schema.optional(Schema.Int).annotate({
@@ -103,6 +112,33 @@ export const Parameters = Schema.Struct({
       "inbox: how many delivered messages to return (default 20). shared.get without a key: how many shared-state entries to page (default 50).",
   }),
 })
+
+/** Reject incomplete worker actions before resolving identity or asking permission. */
+const MemberActionInputs = Schema.makeFilter<Schema.Schema.Type<typeof MemberArguments>>((value) => {
+  const fields: Record<string, readonly string[]> = {
+    fail: ["failureKind"],
+    send: ["to", "body"],
+    "shared.put": ["key", "value"],
+    publish: ["summary"],
+  }
+  const required = fields[value.action] ?? []
+  const missing = required.filter((field) => {
+    const supplied = value[field as keyof typeof value]
+    return supplied === undefined ||
+      (typeof supplied === "string" && supplied.trim().length === 0)
+  })
+  if (missing.length > 0)
+    return `swarm_member action "${value.action}" is missing required input(s): ${missing.join(", ")}.`
+  if (value.afterKey !== undefined && (value.action !== "shared.get" || value.key !== undefined))
+    return "afterKey is only valid for shared.get without key; use the previous nextKey as afterKey."
+  if (value.afterKey !== undefined && value.afterKey.trim() === "")
+    return "afterKey must be a non-empty cursor from an earlier shared.get page."
+  if (value.inboxCursor !== undefined && value.action !== "inbox")
+    return "inboxCursor is only valid for inbox; use the preceding inbox result.next unchanged."
+  return true
+}, { description: "Validate required fields before worker authorization or database reads." })
+
+export const Parameters = MemberArguments.check(MemberActionInputs)
 
 type Params = Schema.Schema.Type<typeof Parameters>
 type Metadata = {
@@ -329,11 +365,18 @@ export const SwarmMemberTool = Tool.define<typeof Parameters, Metadata, SwarmV2.
       }
 
       if (params.action === "inbox") {
-        const rows = yield* swarms.memberInbox({
+        const page = yield* swarms.memberInboxPage({
           swarmID: found.swarm.id,
           memberID: found.member.id,
           limit: params.limit ?? 20,
+          ...(params.inboxCursor === undefined ? {} : {
+            before: {
+              createdAt: params.inboxCursor.createdAt,
+              id: SwarmModel.DeliveryID.make(params.inboxCursor.id),
+            },
+          }),
         })
+        const rows = page.items
         const output =
           rows.length === 0
             ? "[SWARM INBOX]\n(no mail addressed to you)"
@@ -346,10 +389,18 @@ export const SwarmMemberTool = Tool.define<typeof Parameters, Metadata, SwarmV2.
                     }`,
                 ),
               ].join("\n\n")
-        return result(params.action, permission, `Inbox (${rows.length})`, output, {
+        return result(params.action, permission, `Inbox (${rows.length})`, [
+          output,
+          fenced("INBOX PAGE", {
+            hasMore: page.more,
+            complete: !page.more,
+            ...(page.more ? { next: page.next, nextAction: "Call swarm_member inbox with inboxCursor=next to retrieve older messages." } : {}),
+          }),
+        ].join("\n\n"), {
           swarmId: found.swarm.id,
           memberId: found.member.id,
           count: rows.length,
+          status: page.more ? "more" : "complete",
         })
       }
 
@@ -364,18 +415,23 @@ export const SwarmMemberTool = Tool.define<typeof Parameters, Metadata, SwarmV2.
         // Shared working state is unbounded durable state, so a keyless read must
         // be a bounded page rather than the whole board. Truncation is stated in
         // the result so a worker never mistakes a prefix for the full board.
-        const page = yield* swarms.blackboardPage({ swarmID: found.swarm.id, limit: params.limit ?? 50 })
+        const page = yield* swarms.blackboardPage({
+          swarmID: found.swarm.id,
+          limit: params.limit ?? 50,
+          ...(params.afterKey === undefined ? {} : { afterKey: params.afterKey }),
+        })
         return result(
           params.action,
           permission,
           `Shared state (${page.items.length})`,
           fenced("SHARED", {
             entries: page.items,
-            truncated: page.more,
+            hasMore: page.more,
+            complete: !page.more,
             ...(page.more
               ? {
                   nextKey: page.nextKey,
-                  note: "More keys exist after this page. Read one specific key here, or ask the coordinator for a full listing.",
+                  nextAction: "Call swarm_member shared.get again with afterKey set to this nextKey; preserve the same swarmName and limit.",
                 }
               : {}),
           }),

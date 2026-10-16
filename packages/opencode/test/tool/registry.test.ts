@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from "url"
 import { Cause, Effect, Exit, Layer, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ToolRegistry, toolMayMutateWorkspace } from "@/tool/registry"
+import { ToolExposure } from "@/tool/exposure"
 import { Tool } from "@/tool/tool"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -13,6 +14,7 @@ import { Config } from "@/config/config"
 import { Plugin } from "@/plugin"
 import { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { InstanceState } from "@/effect/instance-state"
 
 import { ToolJsonSchema } from "@/tool/json-schema"
@@ -21,6 +23,9 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
+import { McpCatalog } from "@/mcp/catalog"
+import * as McpResourceTools from "@/mcp/resource-capabilities"
+import * as Capability from "@/tool/capability"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
 import { OxpToolCoverage } from "@/oxp/tool-coverage"
 import { ExternalToolCoverage } from "@/exchange/tool-coverage"
@@ -104,6 +109,89 @@ const withEmptyCodeMode = testEffect(
     ],
   ]),
 )
+
+const withExactMcpCapabilities = testEffect(
+  LayerNode.compile(root, [
+    [Config.node, configLayer],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalCodeMode: false })],
+    [
+      MCP.node,
+      Layer.mock(MCP.Service, {
+        tools: () => Effect.succeed({}),
+        clients: () =>
+          Effect.succeed({
+            resource: {
+              getServerCapabilities: () => ({ resources: {} }),
+            } as any,
+          }),
+        resources: () =>
+          Effect.succeed({
+            one: { name: "one", uri: "res://one", client: "resource" },
+          } as any),
+        resourceTemplates: () => Effect.succeed({}),
+        readResource: (_server, uri) =>
+          Effect.succeed({ contents: [{ uri, mimeType: "text/plain", text: "resource text" }] } as any),
+        exactTools: () =>
+          Effect.succeed([
+            {
+              server: "corp.github",
+              def: {
+                name: "issue.search/%",
+                description: "search issues",
+                inputSchema: {
+                  type: "object",
+                  properties: { query: { type: "string" } },
+                  required: ["query"],
+                },
+                outputSchema: {
+                  type: "object",
+                  properties: { count: { type: "number" } },
+                },
+              } as MCPToolDef,
+            },
+            {
+              server: "a_b",
+              def: {
+                name: "c",
+                description: "collision left",
+                inputSchema: { type: "object", properties: {} },
+              } as MCPToolDef,
+            },
+            {
+              server: "a",
+              def: {
+                name: "b_c",
+                description: "collision right",
+                inputSchema: { type: "object", properties: {} },
+              } as MCPToolDef,
+            },
+          ]),
+        invokeTool: ({ server, tool, args }) =>
+          Effect.succeed({
+            content: [{ type: "text", text: "called " + server + "/" + tool }],
+            structuredContent: { count: 1, args },
+          } as any),
+      }),
+    ],
+  ]),
+)
+const mutableMcpCatalog: {
+  current: Array<{ server: string; def: MCPToolDef }>
+} = { current: [] }
+const withMutableMcpCapabilities = testEffect(
+  LayerNode.compile(root, [
+    [Config.node, configLayer],
+    [RuntimeFlags.node, RuntimeFlags.layer()],
+    [
+      MCP.node,
+      Layer.mock(MCP.Service, {
+        tools: () => Effect.succeed({}),
+        clients: () => Effect.succeed({}),
+        exactTools: () => Effect.succeed(mutableMcpCatalog.current),
+      }),
+    ],
+  ]),
+)
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
 const withAcp = testEffect(
   LayerNode.compile(root, [
@@ -123,7 +211,7 @@ describe("tool.registry", () => {
       const ids = yield* registry.ids()
       const missing = ids.filter((id) => !OxpToolCoverage.BY_NATIVE.has(id))
       expect(missing).toEqual([])
-      for (const optional of ["execute", "lsp", "plan_exit"]) {
+      for (const optional of ["lsp", "plan_exit"]) {
         expect(OxpToolCoverage.BY_NATIVE.has(optional)).toBe(true)
       }
     }),
@@ -135,7 +223,7 @@ describe("tool.registry", () => {
       const ids = yield* registry.ids()
       const missing = ids.filter((id) => !ExternalToolCoverage.BY_NATIVE.get(id)?.ofxp)
       expect(missing).toEqual([])
-      for (const optional of ["execute", "lsp", "plan_exit"]) {
+      for (const optional of ["lsp", "plan_exit"]) {
         expect(ExternalToolCoverage.BY_NATIVE.get(optional)?.ofxp).toBeDefined()
       }
     }),
@@ -145,7 +233,8 @@ describe("tool.registry", () => {
     Effect.sync(() => {
       const report = ExternalToolCoverage.ofxpExecutionReport(EXECUTABLE_CAPABILITY_IDS)
       expect(report.unmappedExecutable).toEqual([])
-      expect(report.executableSurfaces).toEqual(["archive", "browser", "edit", "find", "git", "json", "lsp", "memory", "patch", "process", "project", "read", "refactor", "skill", "sqlite", "symbols", "sympy", "test", "typecheck", "web", "write"])
+      expect(report.executableSurfaces).toEqual(["archive", "browser", "code", "edit", "find", "git", "json", "lsp", "memory", "patch", "process", "project", "read", "refactor", "skill", "sqlite", "symbols", "sympy", "test", "typecheck", "web", "write"])
+      expect(report.pendingSurfaces).not.toContain("code")
       expect(report.pendingSurfaces).not.toContain("archive")
       expect(report.pendingSurfaces).not.toContain("json")
       expect(report.pendingSurfaces).not.toContain("sqlite")
@@ -159,6 +248,22 @@ describe("tool.registry", () => {
       expect(report.pendingSurfaces).not.toContain("typecheck")
       expect(report.pendingSurfaces).not.toContain("test")
       expect(report.nativePending).not.toContain("credential")
+    }),
+  )
+
+  it.instance("maps native Code to real OXP/OFXP Code surfaces rather than generic broker substitution", () =>
+    Effect.sync(() => {
+      const code = ExternalToolCoverage.BY_NATIVE.get("code")
+      expect(code).toBeDefined()
+      expect(code?.oxp).toBe("code")
+      expect(code?.ofxp).toMatchObject({
+        surface: "code",
+        mode: "capability",
+        plane: "augmentation",
+        authorities: ["code"],
+      })
+      expect(code?.oxp).not.toBe("capability")
+      expect(code?.ofxp.surface).not.toBe("capability")
     }),
   )
 
@@ -236,7 +341,7 @@ describe("tool.registry", () => {
       expect(createSchema.properties?.tasks?.items).toEqual(lazySchema.properties?.tasks?.items)
       const directMember = createSchema.properties?.members?.items as Record<string, any>
       const directMemberProperties = Object.keys(directMember?.properties ?? {})
-      for (const field of ["name", "role", "agent", "providerID", "modelID", "permissionBoundary", "workspace"]) {
+      for (const field of ["name", "role", "providerID", "modelID", "modelRequirements", "permissionBoundary", "workspace"]) {
         expect(directMemberProperties).toContain(field)
       }
       expect(directMemberProperties).not.toContain("desiredProfile")
@@ -395,13 +500,71 @@ describe("tool.registry", () => {
       })
       const visible = tools.map((tool) => tool.id)
 
-      for (const id of ["checkpoint", "archive", "json", "test"]) {
+      for (const id of ["checkpoint", "archive", "github", "json", "test"]) {
         expect(ids).toContain(id)
         expect(visible).not.toContain(id)
       }
       expect(visible).toContain("tool")
       expect(visible).toContain("memory")
       expect(visible).toContain("typecheck")
+    }),
+  )
+
+  it.instance("registers Dreamer as a lazy detached-only investigation capability", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const all = yield* registry.all()
+      const dream = all.find((tool) => tool.id === "dream")
+      expect(dream).toBeDefined()
+      expect(dream?.exposure).toBe("lazy")
+      expect(ToolExposure.loadPolicy("dream")).toBe("lazy")
+      expect(toolMayMutateWorkspace("dream", { action: "start" })).toBe(false)
+      const visible = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      expect(visible.some((tool) => tool.id === "dream")).toBe(false)
+      expect(visible.some((tool) => tool.id === "tool")).toBe(true)
+      const dreamer = (yield* agents.get("dreamer"))!
+      const widened = Permission.fromConfig({ "*": "allow" })
+      const filteredDream = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: dreamer,
+        permission: widened,
+      })
+      expect(filteredDream.map((tool) => tool.id).sort()).toEqual(["memory", "session"])
+      const inventory = yield* registry.capabilities({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: dreamer,
+      })
+      expect(inventory.entries.map((entry) => entry.identity.ref).sort()).toEqual([
+        Capability.nativeIdentity("memory").ref,
+        Capability.nativeIdentity("session").ref,
+      ].sort())
+      expect(ExternalToolCoverage.BY_NATIVE.get("dream")?.oxp).toBe("openfork_worker")
+      expect(ExternalToolCoverage.BY_NATIVE.get("dream")?.ofxp.surface).toBe("worker")
+      const context = {
+        sessionID: SessionID.descending(),
+        messageID: MessageID.ascending(),
+        agent: "dreamer",
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      } satisfies Tool.Context
+      const memory = all.find((tool) => tool.id === "memory")!
+      const denied = yield* memory.execute({ action: "remember", content: "must not save" } as any, context)
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(denied)).toBe(true)
+      if (Exit.isFailure(denied)) expect(Cause.pretty(denied.cause)).toContain("inspection-only")
+      const invalidStart = yield* dream!.execute({ action: "start", focus: " " } as any, context)
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(invalidStart)).toBe(true)
+      if (Exit.isFailure(invalidStart)) expect(Cause.pretty(invalidStart.cause)).toContain("cannot spawn or resume")
     }),
   )
 
@@ -436,7 +599,9 @@ describe("tool.registry", () => {
         ask: () => Effect.void,
       } satisfies Tool.Context
       const providers = yield* web.execute({ action: "providers" }, ctx)
-      expect(providers.output).toContain("providers (7")
+      // The provider catalog is extensible: adding an integration must not
+      // invalidate the native-tool identity/coalescing invariant.
+      expect(providers.output).toMatch(/websearch providers \(\d+, \d+ keyless-ready\):/)
     }),
   )
 
@@ -551,6 +716,179 @@ describe("tool.registry", () => {
     }),
   )
 
+
+  it.instance("capability inventory keeps native identity stable while exposing lazy leaves directly", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const agent = yield* agents.defaultInfo()
+      const inventory = yield* registry.capabilities({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("claude-test"),
+        agent,
+      })
+      const byRef = new Map(inventory.entries.map((entry) => [entry.identity.ref, entry] as const))
+
+      expect(byRef.get("native:sqlite")?.kind).toBe("lazy")
+      expect(byRef.get("native:sqlite")?.codeCallable).toBe(true)
+      expect(byRef.get("native:swarm")?.kind).toBe("lazy")
+      expect(byRef.get("native:swarm")?.lifetime).toBe("durable")
+      expect(byRef.get("native:background")?.lifetime).toBe("durable")
+
+      expect(byRef.get("native:tool")?.codeCallable).toBe(false)
+      expect(byRef.get("native:invalid")?.codeCallable).toBe(false)
+      expect(byRef.has("native:execute")).toBe(false)
+      expect(byRef.get("native:code")?.codeCallable).toBe(false)
+
+      const provider = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("claude-test"),
+        agent,
+      })
+      expect(provider.map((tool) => tool.id)).not.toContain("sqlite")
+    }),
+  )
+
+  it.instance("capability inventory shares provider model selection without hiding lazy tools", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const inventory = yield* registry.capabilities({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("gpt-5.6-test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const refs = inventory.entries.map((entry) => entry.identity.ref)
+
+      expect(refs).toContain("native:apply_patch")
+      expect(refs).not.toContain("native:patch")
+      expect(refs).not.toContain("native:edit")
+      expect(refs).not.toContain("native:write")
+      expect(refs).toContain("native:sqlite")
+    }),
+  )
+
+  it.instance("capability inventory generation advances when custom registrations refresh", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const request = {
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("claude-test"),
+        agent: yield* agents.defaultInfo(),
+      }
+
+      const before = yield* registry.capabilities(request)
+      yield* registry.refreshCustom([
+        {
+          id: "custom_capability_probe",
+          description: "custom capability probe",
+          parameters: Schema.Struct({}),
+          jsonSchema: { type: "object", properties: {} },
+          execute: () => Effect.succeed({ title: "probe", metadata: {}, output: "ok" }),
+        },
+      ])
+      const after = yield* registry.capabilities(request)
+      const probe = after.entries.find((entry) => entry.identity.ref === "native:custom_capability_probe")
+
+      expect(after.generation).not.toBe(before.generation)
+      expect(probe).toBeDefined()
+      // Raw custom/plugin Tool.Def values have not adopted the semantic executor
+      // contract yet, so they fail closed for Code until that owner is migrated.
+      expect(probe?.codeCallable).toBe(false)
+    }),
+  )
+
+
+  withExactMcpCapabilities.instance("capability inventory keeps exact MCP identity and fails legacy-key collisions closed", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const inventory = yield* registry.capabilities({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("claude-test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const byRef = new Map(inventory.entries.map((entry) => [entry.identity.ref, entry] as const))
+
+      const safe = byRef.get("mcp:corp.github/issue.search%2F%25")
+      expect(safe).toBeDefined()
+      expect(safe?.kind).toBe("mcp")
+      expect(safe?.codeCallable).toBe(true)
+      expect(safe?.identity.segments).toEqual(["corp.github", "issue.search/%"])
+      expect(safe?.permissionKey).toBe(McpCatalog.toolName("corp.github", "issue.search/%"))
+
+      const left = byRef.get("mcp:a_b/c")
+      const right = byRef.get("mcp:a/b_c")
+      expect(left?.identity.key).not.toBe(right?.identity.key)
+      expect(left?.permissionKey).toBe("a_b_c")
+      expect(right?.permissionKey).toBe("a_b_c")
+      expect(left?.codeCallable).toBe(false)
+      expect(right?.codeCallable).toBe(false)
+      expect(left?.diagnostic?.kind).toBe("AmbiguousPermissionIdentity")
+      expect(right?.diagnostic?.kind).toBe("AmbiguousPermissionIdentity")
+    }),
+  )
+
+  withExactMcpCapabilities.instance("capability inventory exposes shared MCP resource semantic registrations", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const inventory = yield* registry.capabilities({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("claude-test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const byRef = new Map(inventory.entries.map((entry) => [entry.identity.ref, entry] as const))
+
+      for (const definition of McpResourceTools.definitions) {
+        const entry = byRef.get(Capability.mcpResourceIdentity(definition.id).ref)
+        expect(entry?.kind).toBe("mcp-resource")
+        expect(entry?.codeCallable).toBe(true)
+        expect(entry?.permissionKey).toBe("read")
+        expect(entry?.classifyWorkspaceMutation({})).toBe(false)
+      }
+    }),
+  )
+
+  withExactMcpCapabilities.instance("MCP semantic capability preserves structured data and ordinary leaf permission ask", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const inventory = yield* registry.capabilities({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("claude-test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const capability = inventory.entries.find((entry) => entry.identity.ref === "mcp:corp.github/issue.search%2F%25")!
+      const asks: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      const ctx = {
+        sessionID: SessionID.make("ses_mcp_capability_semantic"),
+        messageID: MessageID.ascending(),
+        agent: "build",
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: (request) =>
+          Effect.sync(() => {
+            asks.push(request)
+          }),
+      } satisfies Tool.Context
+
+      const result = yield* capability.invokeSemantic({ query: "bug" }, ctx)
+      expect(result.output).toBe("called corp.github/issue.search/%")
+      expect(result.data).toEqual({ count: 1, args: { query: "bug" } })
+      expect(asks).toEqual([
+        {
+          permission: McpCatalog.toolName("corp.github", "issue.search/%"),
+          metadata: { server: "corp.github", tool: "issue.search/%" },
+          patterns: ["*"],
+          always: ["*"],
+        },
+      ])
+    }),
+  )
+
   withAcp.instance("keeps fork tools exposed through the ACP runtime", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
@@ -563,25 +901,49 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("exposes execute by default", () =>
+  withAcp.instance("exposes the full native Code surface through ACP and never legacy execute", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
-      const ids = yield* registry.ids()
-
-      expect(ids).toContain("execute")
+      const agents = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const ids = tools.map((tool) => tool.id)
+      const code = tools.find((tool) => tool.id === "code")
+      expect(ids).toContain("code")
+      expect(ids).not.toContain("execute")
+      expect(code).toBeDefined()
+      const schema = Schema.toJsonSchemaDocument(code!.parameters).schema as {
+        properties?: { action?: { enum?: unknown[] } }
+      }
+      expect(schema.properties?.action?.enum).toEqual(["search", "describe", "run", "save", "call"])
+      expect(schema.properties?.action?.enum).not.toContain("execute")
     }),
   )
 
-  withoutCodeMode.instance("removes execute when code mode is explicitly disabled", () =>
+  it.instance("exposes code and never legacy execute by default", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const ids = yield* registry.ids()
 
+      expect(ids).toContain("code")
       expect(ids).not.toContain("execute")
     }),
   )
 
-  withCodeMode.instance("keeps the upstream enable flag compatible and exposes the MCP catalog through execute", () =>
+  withoutCodeMode.instance("treats legacy Code Mode disable as a no-op compatibility flag", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+
+      expect(ids).toContain("code")
+      expect(ids).not.toContain("execute")
+    }),
+  )
+
+  withCodeMode.instance("keeps legacy enable compatible without dynamic execute or direct MCP provider tools", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agents = yield* Agent.Service
@@ -591,15 +953,18 @@ describe("tool.registry", () => {
         modelID: ModelV2.ID.make("test"),
         agent: yield* agents.defaultInfo(),
       })
-      const execute = tools.find((tool) => tool.id === "execute")
+      const code = tools.find((tool) => tool.id === "code")
 
-      expect(ids).toContain("execute")
-      expect(tools.map((tool) => tool.id)).toContain("execute")
-      expect(execute?.description).toContain("tools.weather.current(input: {\n  city: string,\n})")
+      expect(ids).toContain("code")
+      expect(ids).not.toContain("execute")
+      expect(tools.map((tool) => tool.id)).toContain("code")
+      expect(tools.map((tool) => tool.id)).not.toContain("execute")
+      expect(tools.map((tool) => tool.id)).not.toContain("weather_current")
+      expect(code?.description).not.toContain("tools.weather.current")
     }),
   )
 
-  withEmptyCodeMode.instance("does not expose execute when code mode has no visible tools", () =>
+  withEmptyCodeMode.instance("keeps code visible even when no MCP tools are connected", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agents = yield* Agent.Service
@@ -609,7 +974,151 @@ describe("tool.registry", () => {
         agent: yield* agents.defaultInfo(),
       })
 
+      expect(tools.map((tool) => tool.id)).toContain("code")
       expect(tools.map((tool) => tool.id)).not.toContain("execute")
+    }),
+  )
+
+  it.instance("exposes only the static code orchestration surface", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const ids = yield* registry.ids()
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const visible = tools.map((tool) => tool.id)
+      const code = tools.find((tool) => tool.id === "code")
+
+      expect(ids).toContain("code")
+      expect(ids).not.toContain("execute")
+      expect(visible).toContain("code")
+      expect(visible).not.toContain("execute")
+      expect(code?.description).toContain("code.search finds refs")
+      expect(code?.description).toContain("target=saved")
+      expect(code?.description).toContain("target=runs")
+      expect(code?.description).toContain("safe replay descriptor")
+      expect(code?.description).not.toContain("Available tools")
+    }),
+  )
+
+  it.instance("keeps the code provider definition stable across capability inventory refreshes", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const request = {
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      }
+      const project = (tool: { description: string; parameters: Schema.Top; jsonSchema?: unknown }) => ({
+        description: tool.description,
+        parameterSchema: Schema.toJsonSchemaDocument(tool.parameters).schema,
+        jsonSchema: tool.jsonSchema,
+      })
+
+      const before = (yield* registry.tools(request)).find((tool) => tool.id === "code")
+      if (!before) throw new Error("code tool missing before refresh")
+      const serializedBefore = JSON.stringify(project(before))
+
+      yield* registry.refreshCustom([
+        {
+          id: "inventory_growth_probe",
+          description: "A capability whose presence must not perturb the code provider prefix.",
+          parameters: Schema.Struct({ value: Schema.String }),
+          jsonSchema: {
+            type: "object",
+            properties: { value: { type: "string" } },
+            required: ["value"],
+          },
+          execute: () => Effect.succeed({ title: "probe", metadata: {}, output: "ok" }),
+        },
+      ])
+
+      const after = (yield* registry.tools(request)).find((tool) => tool.id === "code")
+      if (!after) throw new Error("code tool missing after refresh")
+      expect(JSON.stringify(project(after))).toBe(serializedBefore)
+    }),
+  )
+
+  withMutableMcpCapabilities.instance("keeps the code provider definition byte-stable across MCP catalog churn", () =>
+    Effect.gen(function* () {
+      mutableMcpCatalog.current = []
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const agent = yield* agents.defaultInfo()
+      const request = {
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent,
+      }
+      const project = (tool: { description: string; parameters: Schema.Top; jsonSchema?: unknown }) =>
+        JSON.stringify({
+          description: tool.description,
+          parameterSchema: Schema.toJsonSchemaDocument(tool.parameters).schema,
+          jsonSchema: tool.jsonSchema,
+        })
+
+      const beforeInventory = yield* registry.capabilities(request)
+      const before = (yield* registry.tools(request)).find((tool) => tool.id === "code")
+      if (!before) throw new Error("code tool missing before MCP churn")
+
+      mutableMcpCatalog.current = [
+        {
+          server: "churn.server",
+          def: {
+            name: "lookup",
+            description: "MCP capability added after the provider prefix was built.",
+            inputSchema: {
+              type: "object",
+              properties: { id: { type: "string" } },
+              required: ["id"],
+            },
+          } as MCPToolDef,
+        },
+      ]
+
+      const afterInventory = yield* registry.capabilities(request)
+      const after = (yield* registry.tools(request)).find((tool) => tool.id === "code")
+      if (!after) throw new Error("code tool missing after MCP churn")
+
+      expect(afterInventory.generation).not.toBe(beforeInventory.generation)
+      expect(afterInventory.entries.some((entry) => entry.identity.ref === "mcp:churn.server/lookup")).toBe(true)
+      expect(project(after)).toBe(project(before))
+      mutableMcpCatalog.current = []
+    }),
+  )
+
+  it.instance("keeps the code provider definition byte-stable across permission churn", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const agent = yield* agents.defaultInfo()
+      const request = {
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent,
+      }
+      const project = (tool: { description: string; parameters: Schema.Top; jsonSchema?: unknown }) =>
+        JSON.stringify({
+          description: tool.description,
+          parameterSchema: Schema.toJsonSchemaDocument(tool.parameters).schema,
+          jsonSchema: tool.jsonSchema,
+        })
+
+      const allowed = (yield* registry.tools({
+        ...request,
+        permission: [{ permission: "code", pattern: "*", action: "allow" as const }],
+      })).find((tool) => tool.id === "code")
+      const denied = (yield* registry.tools({
+        ...request,
+        permission: [{ permission: "code", pattern: "*", action: "deny" as const }],
+      })).find((tool) => tool.id === "code")
+      if (!allowed || !denied) throw new Error("code tool missing during permission churn")
+
+      expect(project(denied)).toBe(project(allowed))
     }),
   )
 
@@ -1092,7 +1601,7 @@ describe("toolMayMutateWorkspace policy", () => {
   // project tree served to the next checkpoint/diff/revert.
 
   test("known read-only tools preserve a completed snapshot", () => {
-    for (const id of ["read", "find", "web", "todo", "skill", "project", "symbols", "sympy", "lsp"]) {
+    for (const id of ["read", "find", "web", "todo", "skill", "github", "quota", "usage", "project", "symbols", "sympy", "lsp"]) {
       expect(`${id}=${toolMayMutateWorkspace(id, {})}`).toBe(`${id}=false`)
     }
   })
@@ -1104,6 +1613,13 @@ describe("toolMayMutateWorkspace policy", () => {
   })
 
   test("dynamic tools classify by their effective operation", () => {
+    expect(toolMayMutateWorkspace("code", { action: "search" })).toBe(false)
+    expect(toolMayMutateWorkspace("code", { action: "describe" })).toBe(false)
+    expect(toolMayMutateWorkspace("code", { action: "run" })).toBe(true)
+    expect(toolMayMutateWorkspace("code", { action: "save" })).toBe(true)
+    expect(toolMayMutateWorkspace("code", { action: "call" })).toBe(true)
+    expect(toolMayMutateWorkspace("code", {})).toBe(true)
+
     expect(toolMayMutateWorkspace("archive", { action: "list" })).toBe(false)
     expect(toolMayMutateWorkspace("archive", { action: "read" })).toBe(false)
     expect(toolMayMutateWorkspace("archive", { action: "extract" })).toBe(true)

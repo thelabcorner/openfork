@@ -1,4 +1,5 @@
-import { Effect, Schema } from "effect"
+import { DateTime, Effect, Schema } from "effect"
+import { and, desc, eq, inArray, isNull } from "drizzle-orm"
 import * as Tool from "./tool"
 import DESCRIPTION from "./session.txt"
 import { Session } from "@/session/session"
@@ -21,12 +22,19 @@ import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provena
 import { ExchangeSessionSearch } from "@/exchange/session-search"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionSearch } from "@opencode-ai/core/session/search"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionMessageProjection } from "@opencode-ai/core/session/message-projection"
+import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { OxpInvocationTable, OxpParentActivityTable } from "@opencode-ai/core/oxp-activity/sql"
+import { OxpActivitySchema } from "@opencode-ai/core/oxp-activity/schema"
+import { SessionTurnProvenance as CurrentTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 
 export const Parameters = Schema.Struct({
-  action: Schema.Literals(["list", "search", "get", "status", "messages", "children"]).annotate({
+  action: Schema.Literals(["list", "search", "get", "status", "messages", "children", "oxp", "delete"]).annotate({
     description: "Action to perform",
   }),
-  sessionId: Schema.optional(Schema.String).annotate({ description: "Target session ID for get/status/messages" }),
+  sessionId: Schema.optional(Schema.String).annotate({ description: "Target session ID for get/status/messages/delete" }),
   scope: Schema.optional(Schema.Literals(["current", "project", "global"])).annotate({
     description: "list/search: current (default), project, or global",
   }),
@@ -38,11 +46,16 @@ export const Parameters = Schema.Struct({
     description: "search: full-text query across Session titles and indexed conversation content",
   }),
   tool: Schema.optional(Schema.String).annotate({
-    description: "search: exact tool name; returns structurally verified tool-call hits (may be combined with query)",
+    description:
+      "search: exact tool name; reads producer-projected exact tool-call evidence without hydrating message/part payloads (may be combined with query)",
   }),
   repairIndex: Schema.optional(Schema.Boolean).annotate({
     description:
       "search: process one bounded historical-index repair chunk before searching. Use when coverage.complete is false; normal search does not perform maintenance.",
+  }),
+  ranking: Schema.optional(Schema.Literals(["recent", "relevance"])).annotate({
+    description:
+      "search: recent (default) prioritizes newest matching conversation evidence; relevance preserves corroboration-first historical search",
   }),
   roots: Schema.optional(Schema.Boolean).annotate({ description: "list/search: only root sessions (parentID null)" }),
   parentId: Schema.optional(Schema.String).annotate({
@@ -68,6 +81,11 @@ export const Parameters = Schema.Struct({
   timeout: Schema.optional(Schema.Number).annotate({
     description: "messages wait timeout in seconds (default 600, max 86400)",
   }),
+  oxpActivityId: Schema.optional(Schema.String).annotate({
+    description: "oxp: inspect one OXP parent activity by id (returns its recent invocations instead of a list)",
+  }),
+  oxpLimit: Schema.optional(Schema.Number).annotate({ description: "oxp: max activities to return (default 10, max 100)" }),
+  oxpIncludeArchived: Schema.optional(Schema.Boolean).annotate({ description: "oxp: include archived activities" }),
 })
 
 type Metadata = {
@@ -75,6 +93,7 @@ type Metadata = {
   count?: number
   scope?: string
   sessionId?: string
+  activityId?: string
   paused?: boolean
   truncated?: boolean
 }
@@ -118,10 +137,14 @@ type AgentSessionSummary = {
     cacheWrite: number
   }
   createdAt: number
+  createdAtIso: string
   updatedAt: number
+  updatedAtIso: string
+  updatedAtBasis: "session_record"
+  updatedAgeMs: number
 }
 
-function projectSession(session: Session.Info, status?: string): AgentSessionSummary {
+function projectSession(session: Session.Info, status: string | undefined, retrievedAt: number): AgentSessionSummary {
   const model = session.model ? `${session.model.providerID}/${session.model.id}` : undefined
   const variant = session.model?.variant && session.model.variant !== "default" ? session.model.variant : undefined
   const summary: AgentSessionSummary = {
@@ -146,7 +169,11 @@ function projectSession(session: Session.Info, status?: string): AgentSessionSum
       cacheWrite: session.tokens?.cache?.write ?? 0,
     },
     createdAt: session.time.created,
+    createdAtIso: new Date(session.time.created).toISOString(),
     updatedAt: session.time.updated,
+    updatedAtIso: new Date(session.time.updated).toISOString(),
+    updatedAtBasis: "session_record",
+    updatedAgeMs: Math.max(0, retrievedAt - session.time.updated),
   }
   return summary
 }
@@ -171,6 +198,79 @@ type AgentSessionMessage = {
 // history: one larger bounded retry is enough, and the result reports when the
 // scan ceiling prevented proving completeness.
 export const MESSAGE_SCAN_LIMIT = 2_000
+
+// Historical transcripts are untrusted, often extremely long, and Dreamer
+// cannot take follow-up actions beyond inspection. Bound *bytes presented to
+// its model* separately from the existing message-count/DB scan limits.
+// The original message IDs/times remain attached to explicit excerpts so an
+// excerpt is never misrepresented as the complete underlying evidence.
+export const DREAMER_MESSAGE_TEXT_LIMIT = 6_000
+export const DREAMER_MESSAGE_TOTAL_TEXT_LIMIT = 24_000
+export const DREAMER_MESSAGE_COUNT_LIMIT = 12
+export const DREAMER_MESSAGE_SCAN_LIMIT = 200
+export const DREAMER_DISCOVERY_RESULT_LIMIT = 20
+
+// JSON quoting can expand control characters 6x, and Unicode text is multibyte.
+// Count serialized UTF-8 bytes, not JS string length, before the outer Tool
+// truncation layer can turn a structured history result into an invalid JSON
+// preview. The 24 KiB text budget leaves room for bounded message metadata.
+const serializedTextBytes = (text: string) => Buffer.byteLength(JSON.stringify(text), "utf8") - 2
+
+export function boundDreamerMessages<T extends { readonly text: string }>(messages: readonly T[]) {
+  let remaining = DREAMER_MESSAGE_TOTAL_TEXT_LIMIT
+  const selected: Array<T & { textTruncated?: boolean; omittedCharacters?: number }> = []
+  let omittedMessages = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!
+    if (remaining < 512) {
+      omittedMessages++
+      continue
+    }
+    const text = message.text
+    const budget = Math.min(remaining, DREAMER_MESSAGE_TEXT_LIMIT)
+    const fullBytes = serializedTextBytes(text)
+    if (fullBytes <= budget) {
+      selected.push(message)
+      remaining -= fullBytes
+      continue
+    }
+    // Both the beginning and ending matter in historical reasoning: preserve
+    // the question/claim and its conclusion rather than silently tail-trimming.
+    // The omission is explicit and costs *within* the per-message budget.
+    const marker = "\n[... historical message excerpt omitted ...]\n"
+    let lower = 0
+    let upper = Math.min(text.length, budget)
+    let excerpt = marker
+    let retained = 0
+    // Monotonic in the number of preserved UTF-16 units, even when quoting
+    // expands a character. Binary search avoids repeatedly scanning an
+    // arbitrarily large original transcript for every proposed cut.
+    while (lower <= upper) {
+      const mid = Math.floor((lower + upper) / 2)
+      const head = Math.ceil(mid / 2)
+      const tail = mid - head
+      const candidate = text.slice(0, head) + marker + (tail ? text.slice(-tail) : "")
+      if (serializedTextBytes(candidate) <= budget) {
+        excerpt = candidate
+        retained = mid
+        lower = mid + 1
+      } else upper = mid - 1
+    }
+    selected.push({
+      ...message,
+      text: excerpt,
+      textTruncated: true,
+      omittedCharacters: text.length - retained,
+    })
+    remaining -= serializedTextBytes(excerpt)
+  }
+  return {
+    messages: selected.reverse(),
+    truncated: omittedMessages > 0 || selected.some((message) => message.textTruncated === true),
+    omittedMessages,
+    textBudget: DREAMER_MESSAGE_TOTAL_TEXT_LIMIT,
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Aggregated child/worker inspection (`action: "children"`)
@@ -215,6 +315,9 @@ export type WorkerSnapshot = {
   }
   cost: number
   updatedAt: number
+  updatedAtIso: string
+  updatedAgeMs: number
+  updatedAtBasis: "session_record"
   terminal?: {
     state: "completed" | "failed" | "cancelled"
     summary?: string
@@ -225,6 +328,12 @@ export type WorkerSnapshot = {
 export type ChildrenOutput = {
   parentId: string
   groupId?: string
+  temporal: {
+    retrievedAt: number
+    retrievedAtIso: string
+    order: "session_record_updated_desc"
+    note: string
+  }
   workers: WorkerSnapshot[]
   truncated?: boolean
 }
@@ -306,6 +415,63 @@ function activityFromMessages(messages: ReadonlyArray<SessionV1.WithParts>) {
   return { recent, consecutiveToolFailures }
 }
 
+/** Latest assistant message in an ascending current/V2 window. */
+function currentAssistant(messages: readonly SessionMessage.Message[]): SessionMessage.Assistant | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!
+    if (message.type === "assistant") return message
+  }
+  return undefined
+}
+
+/** Mirrors latestMeaningfulText: last non-empty text part of the latest assistant. */
+function latestCurrentAssistantText(message: SessionMessage.Assistant | undefined): string | undefined {
+  if (!message) return undefined
+  for (let index = message.content.length - 1; index >= 0; index--) {
+    const part = message.content[index]!
+    if (part.type !== "text") continue
+    if (part.text.trim() === "") continue
+    return part.text
+  }
+  return undefined
+}
+
+/** Mirrors lastToolActivity: last tool part of the latest assistant, with error status. */
+function lastCurrentToolActivity(message: SessionMessage.Assistant | undefined): string | undefined {
+  if (!message) return undefined
+  for (let index = message.content.length - 1; index >= 0; index--) {
+    const part = message.content[index]!
+    if (part.type !== "tool") continue
+    const input = part.state.status === "pending" ? undefined : part.state.input
+    const label = describeToolInput(part.name, input)
+    if (part.state.status === "error") return `${label} (error)`
+    return label
+  }
+  return undefined
+}
+
+/** Terminal error only from an explicit assistant settlement; host text never fabricates one. */
+function currentAssistantTerminal(message: SessionMessage.Assistant | undefined): { error?: string } | undefined {
+  if (!message?.error) return undefined
+  return { error: message.error.message }
+}
+
+/** V2 mirror of activityFromMessages: only assistant tool parts are evidence. */
+function activityFromCurrentMessages(messages: readonly SessionMessage.Message[]) {
+  const recent: string[] = []
+  let consecutiveToolFailures = 0
+  for (const message of messages) {
+    if (message.type !== "assistant") continue
+    for (const part of message.content) {
+      if (part.type !== "tool") continue
+      recent.push(part.name)
+      consecutiveToolFailures = part.state.status === "error" ? consecutiveToolFailures + 1 : 0
+    }
+  }
+  if (recent.length === 0) return undefined
+  return { recent, consecutiveToolFailures }
+}
+
 function resolveWorkerMode(input: {
   taskDelegation: SubagentSupervisionMetadata.TaskDelegation | undefined
   job: BackgroundJob.Info | undefined
@@ -373,6 +539,53 @@ function extractAgentMessage(message: SessionV1.WithParts, includeSynthetic: boo
   return result
 }
 
+// Durable current/V2 transcript rows that carry conversational text. `system`
+// rows are host-owned instructions and follow the same synthetic filter as
+// `synthetic` turns; `agent-switched`/`model-switched` control rows carry no
+// text and are deliberately excluded here.
+const CURRENT_TRANSCRIPT_TYPES = ["user", "synthetic", "system", "assistant"] as const
+
+function extractCurrentAgentMessage(
+  message: SessionMessage.Message,
+  includeSynthetic: boolean,
+): AgentSessionMessage | undefined {
+  if (message.type === "assistant") {
+    const textParts: string[] = []
+    for (const part of message.content) {
+      if (part.type !== "text") continue
+      if (part.text.trim() === "") continue
+      textParts.push(part.text)
+    }
+    if (textParts.length === 0) return undefined
+    return {
+      id: message.id,
+      role: "assistant",
+      kind: "assistant",
+      createdAt: DateTime.toEpochMillis(message.time.created),
+      ...(message.time.completed ? { completedAt: DateTime.toEpochMillis(message.time.completed) } : {}),
+      agent: message.agent,
+      model: `${message.model.providerID}/${message.model.id}`,
+      ...(message.model.variant && message.model.variant !== "default" ? { variant: message.model.variant } : {}),
+      text: textParts.join("\n"),
+    }
+  }
+  if (message.type !== "user" && message.type !== "synthetic" && message.type !== "system") return undefined
+  if (message.text.trim() === "") return undefined
+  const semantic = message.type === "system" ? "system" : CurrentTurnProvenance.semanticKind(message)
+  const kind: SessionTurnProvenance.SemanticKind = semantic === "system" ? "synthetic" : semantic
+  if (!includeSynthetic && kind === "synthetic") return undefined
+  const provenance = CurrentTurnProvenance.resolve(message)
+  return {
+    id: message.id,
+    role: "user",
+    kind,
+    ...(provenance ? { owner: provenance.owner, source: provenance.source } : {}),
+    createdAt: DateTime.toEpochMillis(message.time.created),
+    ...(includeSynthetic && kind === "synthetic" ? { synthetic: true } : {}),
+    text: message.text,
+  }
+}
+
 function titleFor(action: string): string {
   switch (action) {
     case "list":
@@ -387,6 +600,10 @@ function titleFor(action: string): string {
       return "Read session messages"
     case "children":
       return "Inspect supervised workers"
+    case "oxp":
+      return "Inspect OXP activity"
+    case "delete":
+      return "Delete session"
     default:
       return "Session"
   }
@@ -396,7 +613,7 @@ const validateActionParams = Effect.fn("SessionTool.validateActionParams")(funct
   params: Schema.Schema.Type<typeof Parameters>,
 ) {
   const action = params.action
-  if (action === "get" || action === "status" || action === "messages") {
+  if (action === "get" || action === "status" || action === "messages" || action === "delete") {
     if (!params.sessionId) return yield* Effect.fail(new Error(`sessionId is required for ${action}`))
   }
   if (params.last === true && params.limit !== undefined) {
@@ -410,6 +627,12 @@ const validateActionParams = Effect.fn("SessionTool.validateActionParams")(funct
   }
   if (params.withStatus !== undefined && action !== "list") {
     return yield* Effect.fail(new Error("withStatus is only valid for list"))
+  }
+  if (params.limit !== undefined && action === "delete") {
+    return yield* Effect.fail(new Error("limit is not valid for delete"))
+  }
+  if (params.last !== undefined && action === "delete") {
+    return yield* Effect.fail(new Error("last is only valid for messages"))
   }
   if (params.search !== undefined && action !== "list") {
     return yield* Effect.fail(new Error("search is only valid for list; use query for full session search"))
@@ -452,6 +675,19 @@ const validateActionParams = Effect.fn("SessionTool.validateActionParams")(funct
     const t = normalizeTimeout(params.timeout)
     if (t > 86400) return yield* Effect.fail(new Error("timeout must be <= 86400"))
   }
+  if (params.oxpActivityId !== undefined && action !== "oxp") {
+    return yield* Effect.fail(new Error("oxpActivityId is only valid for oxp"))
+  }
+  if (params.oxpLimit !== undefined && action !== "oxp") {
+    return yield* Effect.fail(new Error("oxpLimit is only valid for oxp"))
+  }
+  if (params.oxpIncludeArchived !== undefined && action !== "oxp") {
+    return yield* Effect.fail(new Error("oxpIncludeArchived is only valid for oxp"))
+  }
+  if (action === "oxp") {
+    if (params.scope !== undefined) return yield* Effect.fail(new Error("scope cannot be combined with oxp"))
+    if (params.sessionId !== undefined) return yield* Effect.fail(new Error("sessionId cannot be combined with oxp"))
+  }
 })
 
 export const SessionTool = Tool.define<
@@ -479,10 +715,43 @@ export const SessionTool = Tool.define<
         return yield* effect.pipe(Effect.provideService(InstanceRef, target))
       })
 
-    const list = Effect.fn("SessionTool.list")(function* (params: Schema.Schema.Type<typeof Parameters>) {
+    // Bounded read of one durable current/V2 transcript window. Host-owned
+    // special-agent Sessions never write V1 message/part rows, so their only
+    // durable history is the `session_message` projection; reuse the same
+    // authoritative decoder the current transcript readers use.
+    const readCurrentTranscriptWindow = Effect.fnUntraced(function* (sessionID: SessionID, windowLimit: number) {
+      const rows = yield* readDb
+        .select()
+        .from(SessionMessageTable)
+        .where(
+          and(
+            eq(SessionMessageTable.session_id, sessionID),
+            inArray(SessionMessageTable.type, [...CURRENT_TRANSCRIPT_TYPES]),
+          ),
+        )
+        .orderBy(desc(SessionMessageTable.seq))
+        .limit(windowLimit)
+        .all()
+        .pipe(Effect.orDie)
+      return yield* SessionMessageProjection.decodeRows(readDb, rows.toReversed()).pipe(Effect.orDie)
+    })
+
+    const list = Effect.fn("SessionTool.list")(function* (
+      params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>,
+    ) {
       const current = yield* InstanceState.context
       const scopeVal = params.scope ?? "current"
-      const limit = normalizeLimit(params.limit, 10)
+      const requestedLimit = normalizeLimit(params.limit, 10)
+      const limit = Math.min(requestedLimit,
+        ctx.agent === "dreamer" ? DREAMER_DISCOVERY_RESULT_LIMIT : 100)
+      const retrievedAt = Date.now()
+      const temporal = {
+        retrievedAt,
+        retrievedAtIso: new Date(retrievedAt).toISOString(),
+        order: "session_record_updated_desc" as const,
+        updatedAtBasis: "session_record" as const,
+        note: "updatedAt reflects Session-record mutation time, not guaranteed conversation activity. Use search.latestAt for matching conversation recency and live status/runtime state for current truth.",
+      }
       const parentID = params.parentId !== undefined ? SessionID.make(params.parentId) : undefined
       let rows: Session.Info[] = []
       if (scopeVal === "global") {
@@ -542,11 +811,13 @@ export const SessionTool = Tool.define<
       }
 
       if (!params.withStatus) {
-        const sessionsOut = rows.map((s) => projectSession(s))
+        const sessionsOut = rows.map((s) => projectSession(s, undefined, retrievedAt))
         return {
           title: "List sessions",
-          output: JSON.stringify({ scope: scopeVal, sessions: sessionsOut }),
-          metadata: { action: "list", count: sessionsOut.length, scope: scopeVal },
+          output: JSON.stringify({ scope: scopeVal, temporal, sessions: sessionsOut,
+            ...(requestedLimit > limit ? { limitCapped: true, effectiveLimit: limit } : {}) }),
+          metadata: { action: "list", count: sessionsOut.length, scope: scopeVal,
+            ...(requestedLimit > limit ? { limitCapped: true } : {}) },
         }
       }
 
@@ -582,19 +853,24 @@ export const SessionTool = Tool.define<
           const v = mp.get(s.id as SessionID)
           st = v ? (v.type as string) : "idle"
         } else st = "unknown"
-        return projectSession(s, st)
+        return projectSession(s, st, retrievedAt)
       })
       return {
         title: "List sessions",
-        output: JSON.stringify({ scope: scopeVal, sessions: sessionsOut }),
+        output: JSON.stringify({ scope: scopeVal, temporal, sessions: sessionsOut }),
         metadata: { action: "list", count: sessionsOut.length, scope: scopeVal },
       }
     })
 
-    const searchSessions = Effect.fn("SessionTool.search")(function* (params: Schema.Schema.Type<typeof Parameters>) {
+    const searchSessions = Effect.fn("SessionTool.search")(function* (
+      params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>,
+    ) {
       const current = yield* InstanceState.context
       const scopeVal = params.scope ?? "current"
       const parentID = params.parentId !== undefined ? SessionID.make(params.parentId) : undefined
+      const requestedLimit = normalizeLimit(params.limit, 20)
+      const limit = Math.min(requestedLimit,
+        ctx.agent === "dreamer" ? DREAMER_DISCOVERY_RESULT_LIMIT : 100)
       const result = yield* ExchangeSessionSearch.execute(readDb, {
         ...(params.query?.trim() ? { query: params.query.trim() } : {}),
         ...(params.tool?.trim() ? { tool: params.tool.trim() } : {}),
@@ -606,7 +882,8 @@ export const SessionTool = Tool.define<
         ...(parentID ? { parentID } : {}),
         ...(params.roots !== undefined ? { roots: params.roots } : {}),
         includeArchived: params.includeArchived === true,
-        limit: normalizeLimit(params.limit, 20),
+        ranking: params.ranking ?? "recent",
+        limit,
         scopeLabel: scopeVal,
         ...(params.repairIndex === true ? { repairIndex: true } : {}),
       }, {
@@ -615,11 +892,14 @@ export const SessionTool = Tool.define<
 
       return {
         title: result.title,
-        output: result.output,
+        output: requestedLimit > limit
+          ? JSON.stringify({ ...result.structured, limitCapped: true, effectiveLimit: limit })
+          : result.output,
         metadata: {
           action: "search",
           count: result.metadata.count,
           scope: scopeVal,
+          ...(requestedLimit > limit ? { limitCapped: true } : {}),
           ...(result.metadata.truncated ? { truncated: true } : {}),
         } as Metadata,
       }
@@ -642,9 +922,23 @@ export const SessionTool = Tool.define<
         statuses.get(id).pipe(Effect.catch(() => Effect.succeed({ type: "unknown" as const }))),
       ).pipe(Effect.orDie)
       const paused = session.pausedAt !== undefined
+      const retrievedAt = Date.now()
       return {
         title: "Check session status",
-        output: JSON.stringify({ sessionId: session.id, directory: session.directory, status: st, paused }),
+        output: JSON.stringify({
+          sessionId: session.id,
+          directory: session.directory,
+          status: st,
+          paused,
+          temporal: {
+            retrievedAt,
+            retrievedAtIso: new Date(retrievedAt).toISOString(),
+            recordUpdatedAt: session.time.updated,
+            recordUpdatedAtIso: new Date(session.time.updated).toISOString(),
+            recordUpdatedAgeMs: Math.max(0, retrievedAt - session.time.updated),
+            note: "status is live as observed at retrievedAt; recordUpdatedAt is Session-record mutation time and is not the status observation time.",
+          },
+        }),
         metadata: { action: "status", sessionId: session.id, paused },
       }
     })
@@ -684,47 +978,104 @@ export const SessionTool = Tool.define<
         }
       }
 
-      const limit = normalizeLimit(params.limit, 10)
+      const requestedLimit = normalizeLimit(params.limit, 10)
+      const limit = Math.min(requestedLimit,
+        ctx.agent === "dreamer" ? DREAMER_MESSAGE_COUNT_LIMIT : 100)
+      const limitCapped = requestedLimit > limit
       const role = params.role ?? "all"
       const includeSynthetic = params.includeSynthetic ?? false
       const fetchLimit = role === "all" ? limit : Math.max(100, limit * 4)
+
+      const matchesRole = (message: AgentSessionMessage) => {
+        if (role === "all") return true
+        if (role === "user") return message.kind === "user"
+        return message.kind === "assistant"
+      }
 
       const toAgent = (msgs: SessionV1.WithParts[]) =>
         msgs
           .map((m) => extractAgentMessage(m, includeSynthetic))
           .filter((m): m is AgentSessionMessage => m !== undefined)
-          .filter((m) => {
-            if (role === "all") return true
-            if (role === "user") return m.kind === "user"
-            return m.kind === "assistant"
-          })
+          .filter(matchesRole)
 
-      let raw = yield* sessions.messages({ sessionID: id, limit: fetchLimit }).pipe(Effect.orDie)
-      let filtered = toAgent(raw)
+      // Host-owned special-agent transcripts execute their own provider turns
+      // and are durable only in the `session_message` projection: they never
+      // write V1 `message`/`part` rows, so the V1 reader would always be empty.
+      // Read the same authoritative current projection those sessions use.
+      const specialAgent = SessionMetadataOwnership.isSpecialAgent(session.metadata)
+      const toCurrentAgent = (msgs: readonly SessionMessage.Message[]) =>
+        msgs
+          .map((m) => extractCurrentAgentMessage(m, includeSynthetic))
+          .filter((m): m is AgentSessionMessage => m !== undefined)
+          .filter(matchesRole)
+
+      type MessageWindow = { readonly size: number; readonly messages: AgentSessionMessage[] }
+      const readWindow = (windowLimit: number): Effect.Effect<MessageWindow> =>
+        specialAgent
+          ? readCurrentTranscriptWindow(id, windowLimit).pipe(
+              Effect.map((msgs) => ({ size: msgs.length, messages: toCurrentAgent(msgs) })),
+            )
+          : sessions.messages({ sessionID: id, limit: windowLimit }).pipe(
+              Effect.map((msgs) => ({ size: msgs.length, messages: toAgent(msgs) })),
+              Effect.orDie,
+            )
+
+      let window = yield* readWindow(fetchLimit)
       let truncated = false
-      if (filtered.length < limit && raw.length >= fetchLimit) {
-        const scanLimit = Math.max(fetchLimit, MESSAGE_SCAN_LIMIT)
-        raw = yield* sessions.messages({ sessionID: id, limit: scanLimit }).pipe(Effect.orDie)
-        filtered = toAgent(raw)
-        truncated = filtered.length < limit && raw.length >= scanLimit
+      if (window.messages.length < limit && window.size >= fetchLimit) {
+        const scanLimit = Math.max(fetchLimit, ctx.agent === "dreamer" ? DREAMER_MESSAGE_SCAN_LIMIT : MESSAGE_SCAN_LIMIT)
+        window = yield* readWindow(scanLimit)
+        truncated = window.messages.length < limit && window.size >= scanLimit
       }
 
-      let result: AgentSessionMessage[]
-      if (params.last === true) {
-        result = filtered.slice(-1)
-      } else {
-        result = filtered.slice(-limit)
-      }
+      const result = params.last === true ? window.messages.slice(-1) : window.messages.slice(-limit)
 
-      const st = yield* inDirectory(
-        session.directory,
-        statuses.get(id).pipe(Effect.catch(() => Effect.succeed({ type: "idle" as const }))),
-      ).pipe(Effect.orDie)
+      // Dreamer reconstructs *historical* evidence. Looking up the live status
+      // can bootstrap a different worktree's Instance solely to decorate a
+      // transcript, violating the Tier 0/1 history-read architecture.
+      const st = ctx.agent === "dreamer"
+        ? { type: "unobserved" as const }
+        : yield* inDirectory(
+            session.directory,
+            statuses.get(id).pipe(Effect.catch(() => Effect.succeed({ type: "idle" as const }))),
+          ).pipe(Effect.orDie)
+      const retrievedAt = Date.now()
+      const projection = ctx.agent === "dreamer" ? boundDreamerMessages(result) : undefined
+      const dated = (projection?.messages ?? result).map((message) => ({
+        ...message,
+        createdAtIso: new Date(message.createdAt).toISOString(),
+        ageMs: Math.max(0, retrievedAt - message.createdAt),
+        ...(message.completedAt === undefined
+          ? {}
+          : { completedAtIso: new Date(message.completedAt).toISOString() }),
+      }))
+      const oldest = dated[0]
+      const newest = dated.at(-1)
 
       return {
         title: "Read session messages",
-        output: JSON.stringify({ sessionId: session.id, status: st, messages: result, ...(truncated ? { truncated: true } : {}) }),
-        metadata: { action: "messages", sessionId: session.id, count: result.length, ...(truncated ? { truncated: true } : {}) },
+        output: JSON.stringify({
+          sessionId: session.id,
+          status: st,
+          temporal: {
+            retrievedAt,
+            retrievedAtIso: new Date(retrievedAt).toISOString(),
+            order: "oldest_to_newest",
+            window: params.last === true ? "last_matching_message" : "latest_matching_messages",
+            ...(oldest ? { oldestAt: oldest.createdAt, oldestAtIso: oldest.createdAtIso } : {}),
+            ...(newest ? { newestAt: newest.createdAt, newestAtIso: newest.createdAtIso } : {}),
+            note: "Message createdAt is conversation event time. Newer messages normally supersede older mutable-state claims unless the user asks for history; live repository/runtime state remains authoritative.",
+          },
+          messages: dated,
+          ...((truncated || projection?.truncated) ? { truncated: true } : {}),
+          ...(limitCapped ? { limitCapped: true, requestedMessageLimit: requestedLimit,
+            effectiveMessageLimit: limit } : {}),
+          ...(projection ? { excerpted: projection.truncated, omittedMessages: projection.omittedMessages,
+            textBudget: projection.textBudget } : {}),
+        }),
+        metadata: { action: "messages", sessionId: session.id, count: dated.length,
+          ...(limitCapped ? { limitCapped: true } : {}),
+          ...((truncated || projection?.truncated) ? { truncated: true } : {}) },
       }
     })
 
@@ -735,6 +1086,7 @@ export const SessionTool = Tool.define<
       const parentId = params.parentId !== undefined ? SessionID.make(params.parentId) : ctx.sessionID
       const groupId = params.groupId?.trim() || undefined
       const limit = Math.max(1, Math.min(CHILDREN_MAX_WORKERS, Math.floor(params.limit ?? CHILDREN_DEFAULT_WORKERS)))
+      const retrievedAt = Date.now()
 
       // Tier 1 durable location read: children rows come straight from the
       // Session table. We do not materialize child instances; live status and
@@ -753,7 +1105,10 @@ export const SessionTool = Tool.define<
       // Stable order for a supervisor: most recently updated first, bounded.
       const ordered = scoped
         .slice()
-        .sort((a, b) => (b.session.time.updated ?? 0) - (a.session.time.updated ?? 0))
+        .sort((a, b) =>
+          (b.session.time.updated ?? 0) - (a.session.time.updated ?? 0) ||
+          String(b.session.id).localeCompare(String(a.session.id)),
+        )
       const truncated = ordered.length > limit
       const selected = ordered.slice(0, limit)
 
@@ -788,15 +1143,35 @@ export const SessionTool = Tool.define<
         const id = session.id as SessionID
         const job = jobById.get(String(id))
 
-        // One bounded history window per worker. Never a transcript.
-        const window = yield* sessions
-          .messages({ sessionID: id, limit: CHILDREN_MESSAGE_WINDOW })
-          .pipe(Effect.catch(() => Effect.succeed([] as SessionV1.WithParts[])))
-        const orderedMessages = window.slice().sort((a, b) => (a.info.time.created ?? 0) - (b.info.time.created ?? 0))
-        const latestAssistant = [...orderedMessages].reverse().find((m) => m.info.role === "assistant")
-        const latestText = latestMeaningfulText(latestAssistant)
-        const tool = lastToolActivity(latestAssistant)
-        const terminalError = assistantTerminal(latestAssistant)
+        // One bounded history window per worker. Never a transcript. Host-owned
+        // special-agent children are durable only in the current/V2 projection,
+        // so read that projection instead of the always-empty V1 history.
+        let latestText: string | undefined
+        let tool: string | undefined
+        let terminalError: { error?: string } | undefined
+        let activity: ReturnType<typeof activityFromMessages>
+        if (SessionMetadataOwnership.isSpecialAgent(session.metadata)) {
+          const window = yield* readCurrentTranscriptWindow(id, CHILDREN_MESSAGE_WINDOW).pipe(
+            Effect.catch(() => Effect.succeed([] as SessionMessage.Message[])),
+          )
+          const latestAssistant = currentAssistant(window)
+          latestText = latestCurrentAssistantText(latestAssistant)
+          tool = lastCurrentToolActivity(latestAssistant)
+          terminalError = currentAssistantTerminal(latestAssistant)
+          activity = activityFromCurrentMessages(window)
+        } else {
+          const window = yield* sessions
+            .messages({ sessionID: id, limit: CHILDREN_MESSAGE_WINDOW })
+            .pipe(Effect.catch(() => Effect.succeed([] as SessionV1.WithParts[])))
+          const orderedMessages = window
+            .slice()
+            .sort((a, b) => (a.info.time.created ?? 0) - (b.info.time.created ?? 0))
+          const latestAssistant = [...orderedMessages].reverse().find((m) => m.info.role === "assistant")
+          latestText = latestMeaningfulText(latestAssistant)
+          tool = lastToolActivity(latestAssistant)
+          terminalError = assistantTerminal(latestAssistant)
+          activity = activityFromMessages(window)
+        }
 
         const statusInfo = yield* inDirectory(
           session.directory,
@@ -824,7 +1199,7 @@ export const SessionTool = Tool.define<
           backgroundStatus: job?.status,
           hasPermission: pendingPermission !== undefined,
           hasQuestion: pendingQuestion !== undefined,
-          activity: activityFromMessages(window),
+          activity,
         })
         const blocked = classified.state
 
@@ -873,6 +1248,9 @@ export const SessionTool = Tool.define<
           },
           cost: session.cost ?? 0,
           updatedAt: session.time.updated,
+          updatedAtIso: new Date(session.time.updated).toISOString(),
+          updatedAgeMs: Math.max(0, retrievedAt - session.time.updated),
+          updatedAtBasis: "session_record",
           ...(terminalState
             ? {
                 terminal: {
@@ -889,6 +1267,12 @@ export const SessionTool = Tool.define<
       const output: ChildrenOutput = {
         parentId: String(parentId),
         ...(groupId ? { groupId } : {}),
+        temporal: {
+          retrievedAt,
+          retrievedAtIso: new Date(retrievedAt).toISOString(),
+          order: "session_record_updated_desc",
+          note: "Worker rows are ordered by Session-record update time. Live status/blocked fields are observed at retrievedAt; updatedAt alone never proves runtime liveness or current task authority.",
+        },
         workers,
         ...(truncated ? { truncated: true } : {}),
       }
@@ -905,18 +1289,268 @@ export const SessionTool = Tool.define<
       }
     })
 
+// ---------------------------------------------------------------------------
+// OXP parent-activity inspection (`action: "oxp"`). Rows are ChatGPT
+// conversations keyed by an opaque id; `title` is display metadata only, never
+// identity. Durable SQLite read through the tool's existing Database handle:
+// no workspace instance, no directory resolution.
+// ---------------------------------------------------------------------------
+
+/** Bound on recent invocations returned for one parent activity. */
+const OXP_INVOCATIONS_WINDOW = 20
+
+type OxpActivitySummary = {
+  id: string
+  title: string
+  firstSeenAt: number
+  firstSeenAtIso: string
+  lastSeenAt: number
+  lastSeenAtIso: string
+  lastSeenAgeMs: number
+  timeBasis: "oxp_activity_observed"
+  callCount: number
+  failureCount: number
+  planeMix: {
+    augmentation: number
+    supervision: number
+    delegation: number
+  }
+  observedEpochCount: number
+  lastTool?: string
+  lastRootAlias?: string
+  archived: boolean
+}
+
+type OxpInvocationSummary = {
+  id: string
+  tool: string
+  action?: string
+  status: string
+  rootAlias?: string
+  startedAt: number
+  startedAtIso: string
+  startedAgeMs: number
+  completedAt?: number
+  completedAtIso?: string
+  timeBasis: "oxp_invocation_event"
+}
+
+type OxpTemporal = {
+  retrievedAt: number
+  retrievedAtIso: string
+  order: "last_seen_desc" | "started_desc"
+  note: string
+}
+
+type OxpListOutput = {
+  temporal: OxpTemporal
+  activities: OxpActivitySummary[]
+  truncated: boolean
+}
+
+type OxpDetailOutput = {
+  temporal: OxpTemporal
+  activity: OxpActivitySummary
+  invocations: OxpInvocationSummary[]
+  truncated?: boolean
+}
+
+function projectOxpActivity(
+  row: typeof OxpParentActivityTable.$inferSelect,
+  retrievedAt: number,
+): OxpActivitySummary {
+  return {
+    id: row.id,
+    title: row.title ?? row.last_root_alias ?? "untitled",
+    firstSeenAt: row.first_seen_at,
+    firstSeenAtIso: new Date(row.first_seen_at).toISOString(),
+    lastSeenAt: row.last_seen_at,
+    lastSeenAtIso: new Date(row.last_seen_at).toISOString(),
+    lastSeenAgeMs: Math.max(0, retrievedAt - row.last_seen_at),
+    timeBasis: "oxp_activity_observed",
+    callCount: row.call_count,
+    failureCount: row.failure_count,
+    planeMix: {
+      augmentation: row.augmentation_calls,
+      supervision: row.supervision_calls,
+      delegation: row.delegation_calls,
+    },
+    observedEpochCount: row.observed_epoch_count,
+    ...(row.last_tool ? { lastTool: row.last_tool } : {}),
+    ...(row.last_root_alias ? { lastRootAlias: row.last_root_alias } : {}),
+    archived: row.time_archived !== null && row.time_archived !== undefined,
+  }
+}
+
+function projectOxpInvocation(
+  row: typeof OxpInvocationTable.$inferSelect,
+  retrievedAt: number,
+): OxpInvocationSummary {
+  return {
+    id: row.id,
+    tool: row.tool,
+    ...(row.action ? { action: row.action } : {}),
+    status: row.status,
+    ...(row.root_alias ? { rootAlias: row.root_alias } : {}),
+    startedAt: row.time_started,
+    startedAtIso: new Date(row.time_started).toISOString(),
+    startedAgeMs: Math.max(0, retrievedAt - row.time_started),
+    ...(row.time_completed === null || row.time_completed === undefined
+      ? {}
+      : {
+          completedAt: row.time_completed,
+          completedAtIso: new Date(row.time_completed).toISOString(),
+        }),
+    timeBasis: "oxp_invocation_event",
+  }
+}
+
+const oxpActivities = Effect.fn("SessionTool.oxpActivities")(function* (params: Schema.Schema.Type<typeof Parameters>) {
+  const retrievedAt = Date.now()
+  if (params.oxpActivityId !== undefined) {
+    const activityId = params.oxpActivityId as OxpActivitySchema.ActivityID
+    const row = yield* readDb
+      .select()
+      .from(OxpParentActivityTable)
+      .where(eq(OxpParentActivityTable.id, activityId))
+      .get()
+      .pipe(Effect.orDie)
+    if (!row) {
+      return {
+        title: "OXP activity not found",
+        output: JSON.stringify({ activityId, found: false }),
+        metadata: { action: "oxp", activityId } as Metadata,
+      }
+    }
+    const window = OXP_INVOCATIONS_WINDOW
+    const rows = yield* readDb
+      .select()
+      .from(OxpInvocationTable)
+      .where(eq(OxpInvocationTable.activity_id, activityId))
+      .orderBy(desc(OxpInvocationTable.time_started), desc(OxpInvocationTable.id))
+      .limit(window + 1)
+      .all()
+      .pipe(Effect.orDie)
+    const truncated = rows.length > window
+    const output: OxpDetailOutput = {
+      temporal: {
+        retrievedAt,
+        retrievedAtIso: new Date(retrievedAt).toISOString(),
+        order: "started_desc",
+        note: "Invocation timestamps are OXP event times. Newer invocations normally supersede older mutable-state observations; parent lastSeenAt records OXP activity observation, not repository/runtime truth.",
+      },
+      activity: projectOxpActivity(row, retrievedAt),
+      invocations: rows.slice(0, window).map((invocation) => projectOxpInvocation(invocation, retrievedAt)),
+      ...(truncated ? { truncated: true } : {}),
+    }
+    return {
+      title: "Inspect OXP activity",
+      output: JSON.stringify(output),
+      metadata: {
+        action: "oxp",
+        activityId,
+        count: output.invocations.length,
+        ...(truncated ? { truncated: true } : {}),
+      } as Metadata,
+    }
+  }
+
+  const limit = normalizeLimit(params.oxpLimit, 10)
+  const rows = yield* readDb
+    .select()
+    .from(OxpParentActivityTable)
+    .where(params.oxpIncludeArchived === true ? undefined : isNull(OxpParentActivityTable.time_archived))
+    .orderBy(desc(OxpParentActivityTable.last_seen_at), desc(OxpParentActivityTable.id))
+    .limit(limit + 1)
+    .all()
+    .pipe(Effect.orDie)
+  const truncated = rows.length > limit
+  const output: OxpListOutput = {
+    temporal: {
+      retrievedAt,
+      retrievedAtIso: new Date(retrievedAt).toISOString(),
+      order: "last_seen_desc",
+      note: "lastSeenAt is the latest observed OXP activity for this parent conversation, not proof that any worker/runtime is still live. Prefer newer activity unless historical state was requested.",
+    },
+    activities: rows.slice(0, limit).map((activity) => projectOxpActivity(activity, retrievedAt)),
+    truncated,
+  }
+  return {
+    title: "Inspect OXP activity",
+    output: JSON.stringify(output),
+    metadata: {
+      action: "oxp",
+      count: output.activities.length,
+      ...(truncated ? { truncated: true } : {}),
+    } as Metadata,
+  }
+})
+
+    const removeSession = Effect.fn("SessionTool.delete")(function* (
+      params: Schema.Schema.Type<typeof Parameters>,
+      ctx: Tool.Context<Metadata>,
+    ) {
+      const id = SessionID.make(params.sessionId!)
+      if (String(ctx.sessionID) === String(id)) {
+        return yield* Effect.fail(new Error("Refusing to delete the calling session"))
+      }
+      const target = yield* sessions.get(id).pipe(
+        Effect.catch((err: unknown) => {
+          const m = err instanceof Error ? err.message : String(err)
+          const tag = (err as any)?._tag
+          if (tag === "NotFoundError" || m.toLowerCase().includes("not found")) {
+            return Effect.fail(new Error(`Session not found: ${params.sessionId}`))
+          }
+          return Effect.fail(err as Error)
+        }),
+      )
+      if (SessionMetadataOwnership.isProducerOwned(target.metadata ?? undefined)) {
+        return yield* Effect.fail(new Error(`Session ${params.sessionId} is producer-owned and cannot be deleted through this tool`))
+      }
+      const kids = yield* sessions.children(id).pipe(Effect.orDie)
+      yield* sessions.remove(id).pipe(
+        Effect.catch((err: unknown) => {
+          const m = err instanceof Error ? err.message : String(err)
+          const tag = (err as any)?._tag
+          if (tag === "NotFoundError" || m.toLowerCase().includes("not found")) {
+            return Effect.fail(new Error(`Session not found: ${params.sessionId}`))
+          }
+          return Effect.fail(err as Error)
+        }),
+      )
+      return {
+        title: "Delete session",
+        output: JSON.stringify({ deleted: true, sessionId: target.id, title: target.title, deletedChildren: kids.length }),
+        metadata: { action: "delete", sessionId: target.id, count: kids.length } as Metadata,
+      }
+    })
+
     const execute = Effect.fn("SessionTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
       ctx: Tool.Context<Metadata>,
     ) {
+      if (ctx.agent === "dreamer") {
+        if (!["list", "search", "get", "messages"].includes(params.action) ||
+            params.scope === "global" || params.repairIndex === true ||
+            params.withStatus === true || params.wait === true) {
+          return yield* Effect.fail(new Error("Dreamer may only inspect project-scoped Sessions without index repair, bulk live-status fanout, waiting, or mutation."))
+        }
+        if (params.sessionId) {
+          const caller = yield* sessions.get(ctx.sessionID)
+          const target = yield* sessions.get(SessionID.make(params.sessionId))
+          if (target.projectID !== caller.projectID) {
+            return yield* Effect.fail(new Error("Dreamer cannot read a Session outside its owning project."))
+          }
+        }
+      }
       yield* validateActionParams(params)
       yield* ctx.metadata({ title: titleFor(params.action), metadata: { action: params.action, sessionId: params.sessionId } })
 
       switch (params.action) {
         case "list":
-          return yield* list(params)
+          return yield* list(params, ctx)
         case "search":
-          return yield* searchSessions(params)
+          return yield* searchSessions(params, ctx)
         case "get": {
           const id = SessionID.make(params.sessionId!)
           const sess = yield* sessions.get(id).pipe(
@@ -929,20 +1563,31 @@ export const SessionTool = Tool.define<
               return Effect.fail(err as Error)
             }),
           )
-          const st = yield* inDirectory(
-            sess.directory,
-            statuses.list().pipe(
-              Effect.map((mp) => {
-                const v = mp.get(id)
-                return v ? (v.type as string) : "idle"
-              }),
-              Effect.catch(() => Effect.succeed("unknown")),
-            ),
-          ).pipe(Effect.orDie)
-          const summary = projectSession(sess, st)
+          const st = ctx.agent === "dreamer"
+            ? "unobserved"
+            : yield* inDirectory(
+                sess.directory,
+                statuses.list().pipe(
+                  Effect.map((mp) => {
+                    const v = mp.get(id)
+                    return v ? (v.type as string) : "idle"
+                  }),
+                  Effect.catch(() => Effect.succeed("unknown")),
+                ),
+              ).pipe(Effect.orDie)
+          const retrievedAt = Date.now()
+          const summary = projectSession(sess, st, retrievedAt)
           return {
             title: "View session",
-            output: JSON.stringify({ session: summary }),
+            output: JSON.stringify({
+              temporal: {
+                retrievedAt,
+                retrievedAtIso: new Date(retrievedAt).toISOString(),
+                updatedAtBasis: "session_record",
+                note: "updatedAt is Session-record mutation time; inspect messages/search evidence and live runtime state before treating it as conversation currentness.",
+              },
+              session: summary,
+            }),
             metadata: { action: "get", sessionId: summary.id } as Metadata,
           }
         }
@@ -952,6 +1597,10 @@ export const SessionTool = Tool.define<
           return yield* messages(params, ctx)
         case "children":
           return yield* children(params, ctx)
+        case "oxp":
+          return yield* oxpActivities(params)
+        case "delete":
+          return yield* removeSession(params, ctx)
         default:
           return yield* Effect.fail(new Error(`Unknown action: ${(params as any).action}`))
       }

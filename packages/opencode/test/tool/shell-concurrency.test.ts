@@ -95,12 +95,12 @@ describe("shell concurrency", () => {
     })
   })
 
-  test("defaults stay conservative on high-core machines", () => {
+  test("defaults scale up on high-core machines but stay within the hard cap", () => {
     expect(defaultHeavyProcessPermits(4)).toBe(1)
     expect(defaultHeavyProcessPermits(8)).toBe(1)
     expect(defaultHeavyProcessPermits(12)).toBe(2)
-    expect(defaultHeavyProcessPermits(24)).toBe(2)
-    expect(defaultHeavyProcessPermits(128)).toBe(2)
+    expect(defaultHeavyProcessPermits(24)).toBe(3)
+    expect(defaultHeavyProcessPermits(128)).toBe(4)
   })
 
   test("explicit heavy-tool override is hard-capped", () => {
@@ -154,6 +154,47 @@ describe("shell concurrency", () => {
     }
   })
 
+  test("changing heavy-tool capacity while Sessions run cannot fork a second admission lane", async () => {
+    const prior = process.env[HEAVY_TOOL_ENV]
+    process.env[HEAVY_TOOL_ENV] = "1"
+    resetForTesting()
+    try {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+        const gate = yield* Deferred.make<void>()
+        const firstEntered = yield* Deferred.make<void>()
+        const active = yield* Ref.make(0)
+        const peak = yield* Ref.make(0)
+        const first = yield* Effect.forkScoped(withHeavyProcessSlot(Effect.gen(function* () {
+          const count = yield* Ref.updateAndGet(active, (n) => n + 1)
+          yield* Ref.update(peak, (value) => Math.max(value, count))
+          yield* Deferred.succeed(firstEntered, undefined)
+          yield* Deferred.await(gate)
+          yield* Ref.update(active, (n) => n - 1)
+        })))
+        yield* Deferred.await(firstEntered)
+        // A changed env value must not split active Sessions between old and
+        // newly constructed permit counters.
+        process.env[HEAVY_TOOL_ENV] = "4"
+        const second = yield* Effect.forkScoped(withHeavyProcessSlot(Effect.gen(function* () {
+          const count = yield* Ref.updateAndGet(active, (n) => n + 1)
+          yield* Ref.update(peak, (value) => Math.max(value, count))
+          yield* Ref.update(active, (n) => n - 1)
+        })))
+        yield* Effect.sleep("35 millis")
+        expect(yield* Ref.get(active)).toBe(1)
+        expect(yield* Ref.get(peak)).toBe(1)
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.join(first)
+        yield* Fiber.join(second)
+        expect(yield* Ref.get(peak)).toBe(1)
+      })).pipe(Effect.timeout("10 seconds")))
+    } finally {
+      if (prior === undefined) delete process.env[HEAVY_TOOL_ENV]
+      else process.env[HEAVY_TOOL_ENV] = prior
+      resetForTesting()
+    }
+  })
+
   test("classifies only simple known waiting commands into the I/O pool", () => {
     expect(classifyShellCommand("curl https://example.com")).toBe("io")
     expect(classifyShellCommand("Start-Sleep -Seconds 30")).toBe("io")
@@ -165,6 +206,17 @@ describe("shell concurrency", () => {
     expect(classifyShellCommand("npm run build")).toBe("heavy")
     expect(classifyShellCommand("curl https://example.com | node parse.js")).toBe("heavy")
     expect(classifyShellCommand("sleep 30 && bun test")).toBe("heavy")
+  })
+
+  test("literal read-only Git worktree listing has a quick lane, not arbitrary Git", () => {
+    expect(classifyShellCommand("git worktree list --porcelain")).toBe("quick")
+    expect(classifyShellCommand("git -C 'C:\\Users\\slooshied\\WebstormProjects\\snapdom' worktree list --porcelain")).toBe("quick")
+    expect(classifyShellCommand('git.exe -C "C:\\Projects\\my repo" worktree list')).toBe("quick")
+    expect(classifyShellCommand("git worktree add feature")).toBe("heavy")
+    expect(classifyShellCommand("git -C 'C:\\repo' worktree prune")).toBe("heavy")
+    expect(classifyShellCommand("git -C 'C:\\repo' worktree list --porcelain; bun test")).toBe("heavy")
+    expect(classifyShellCommand('git -C "C:\\$env:USERPROFILE" worktree list --porcelain')).toBe("heavy")
+    expect(classifyShellCommand("git -C 'C:\\repo'; Remove-Item foo")).toBe("heavy")
   })
 
   test("I/O shell budget is wider but bounded", () => {

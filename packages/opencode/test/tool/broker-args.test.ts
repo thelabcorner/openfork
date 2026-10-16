@@ -48,4 +48,14 @@ describe("broker argument normalization", () => {
       )
     }
   })
+
+  test("surfaces the JSON parse failure when object-shaped args are malformed", () => {
+    // Both failures used to collapse into one message, which told a caller who
+    // really did pass JSON not to pass placeholder strings instead of naming the
+    // actual syntax error.
+    const run = () => normalizeBrokerArgs("{broken}", { broker: "tool" })
+    expect(run).toThrow("tool args must be a JSON object")
+    expect(run).toThrow("not valid JSON")
+    expect(run).toThrow(/Expected|position/)
+  })
 })

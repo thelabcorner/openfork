@@ -1,0 +1,14 @@
+GitHub operations through the installed gh CLI. Use for remote GitHub/GitHub Enterprise repo, issue, pull request, Actions, release, search, and API work; local Git remains the git tool.
+
+Actions:
+  status   — bounded auth/account status; never requests token output
+  help     — help for an approved gh command family when syntax is genuinely needed
+  catalog  — search the GitHub capability index when the endpoint, mutation, or command is unknown
+  describe — detail one catalog ref: exact invocation shape plus a canonical descriptor
+  command  — allowlisted high-level gh repo/issue/pr/run/workflow/release/search/label/cache/ruleset operations
+  api      — GitHub REST through gh api
+  graphql  — GitHub GraphQL through gh api graphql
+
+Prefer command for common product workflows and machine-readable --json/--jq output. Use catalog/describe to find the right long-tail operation, then api/graphql for Git objects, reactions, checks, refs, review threads, and endpoints absent from curated command mode.
+
+Calls use direct argv, disabled prompts/pagers, bounded argv/stdin/output/time, configured-host checks, GitHub-specific read/write permission patterns, and fail-closed api_host routing checks. Browser/editor/token-display, local checkout/worktree, implicit PR push/fork, credential headers, file-backed input modes, and authenticated API redirects are refused. Remote GitHub writes never count as local workspace mutations.

@@ -8,23 +8,24 @@ import { InstanceState } from "@/effect/instance-state"
 import { TypecheckScope } from "./typecheck-scope"
 import DESCRIPTION from "./typecheck.txt"
 
-
-const GIT_ARGS = [
-  "--no-optional-locks",
-  "-c",
-  "core.quotepath=false",
-  ...GitRuntime.args([]),
-] as const
+const GIT_ARGS = ["--no-optional-locks", "-c", "core.quotepath=false", ...GitRuntime.args([])] as const
 
 export const Parameters = Schema.Struct({
-  mode: Schema.optional(Schema.Literals(["file", "files", "folder", "changed", "bottomUp", "full", "explain"])).annotate({
+  mode: Schema.optional(
+    Schema.Literals(["file", "files", "folder", "changed", "bottomUp", "full", "explain"]),
+  ).annotate({
     description:
       "What to typecheck (default: file when filePath given, files when files[] given, folder when folder given, else changed)",
   }),
   filePath: Schema.optional(Schema.String).annotate({ description: "One file to typecheck" }),
   files: Schema.optional(Schema.Array(Schema.String)).annotate({ description: "Files to typecheck" }),
   folder: Schema.optional(Schema.String).annotate({ description: "Folder to recursively scan for TS files" }),
-  tsconfig: Schema.optional(Schema.String).annotate({ description: "Explicit tsconfig path (default: nearest up the tree)" }),
+  tsconfig: Schema.optional(Schema.String).annotate({
+    description: "Explicit tsconfig path (default: nearest up the tree)",
+  }),
+  compiler: Schema.optional(Schema.Literals(["auto", "bun", "tsgo", "tsc"])).annotate({
+    description: "Scoped compiler backend (default auto: Bun native checker when available, then tsgo/tsc fallback)",
+  }),
   maxErrors: Schema.optional(Schema.Int).annotate({
     description: "Cap on reported diagnostics (default 80, max 500)",
   }),
@@ -35,7 +36,9 @@ export const Parameters = Schema.Struct({
     description: "bottomUp: import dependency closure depth (default 2, max 5)",
   }),
   includeTests: Schema.optional(Schema.Boolean).annotate({ description: "folder mode: include test files" }),
-  includeUntracked: Schema.optional(Schema.Boolean).annotate({ description: "changed mode: include untracked TS files" }),
+  includeUntracked: Schema.optional(Schema.Boolean).annotate({
+    description: "changed mode: include untracked TS files",
+  }),
   includeImporters: Schema.optional(Schema.Boolean).annotate({
     description: "bottomUp: also include files that import the seed files",
   }),
@@ -57,7 +60,6 @@ function escapeXml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
 
-
 export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess.Service>(
   "typecheck",
   Effect.gen(function* () {
@@ -65,10 +67,13 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
 
     const runGit = Effect.fn("TypecheckTool.runGit")(function* (args: string[], cwd: string) {
       const result = yield* app
-        .run(ChildProcess.make("git", [...GIT_ARGS, ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" }), {
-          maxOutputBytes: 2_000_000,
-          timeout: 15_000,
-        })
+        .run(
+          ChildProcess.make("git", [...GIT_ARGS, ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" }),
+          {
+            maxOutputBytes: 2_000_000,
+            timeout: 15_000,
+          },
+        )
         .pipe(Effect.catch(() => Effect.succeed(undefined)))
       if (!result || result.exitCode !== 0) return [] as string[]
       return result.stdout
@@ -89,7 +94,6 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
       return "changed"
     })
 
-
     return {
       description: DESCRIPTION,
       parameters: Parameters,
@@ -103,7 +107,9 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
             const codeText = params.filePath?.replace(/\D/g, "")
             const code = codeText ? Number.parseInt(codeText, 10) : NaN
             if (!Number.isFinite(code) || code <= 0) {
-              throw new Error("explain mode requires a TS error code (pass it as filePath, e.g. filePath: 'TS2307' or '2307')")
+              throw new Error(
+                "explain mode requires a TS error code (pass it as filePath, e.g. filePath: 'TS2307' or '2307')",
+              )
             }
             const info = TypecheckScope.explainCode(code)
             const output = [
@@ -120,7 +126,9 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
 
           if (mode === "full") {
             if (!params.reason) {
-              throw new Error("full mode requires a `reason` — it runs the repo's own typecheck script and is slow. Prefer a scoped mode (file/files/folder/changed/bottomUp).")
+              throw new Error(
+                "full mode requires a `reason` — it runs the repo's own typecheck script and is slow. Prefer a scoped mode (file/files/folder/changed/bottomUp).",
+              )
             }
           }
           const fullReason = params.reason
@@ -175,9 +183,13 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
           } else {
             const firstDir = path.dirname(scope[0]!)
             const tsconfigPath = params.tsconfig
-              ? (path.isAbsolute(params.tsconfig) ? params.tsconfig : path.join(instance.directory, params.tsconfig))
-              : (yield* Effect.promise(() => TypecheckScope.findNearestTsconfigFile(firstDir, instance.worktree))) ??
-                (yield* Effect.promise(() => TypecheckScope.findNearestTsconfigFile(instance.directory, instance.worktree)))
+              ? path.isAbsolute(params.tsconfig)
+                ? params.tsconfig
+                : path.join(instance.directory, params.tsconfig)
+              : ((yield* Effect.promise(() => TypecheckScope.findNearestTsconfigFile(firstDir, instance.worktree))) ??
+                (yield* Effect.promise(() =>
+                  TypecheckScope.findNearestTsconfigFile(instance.directory, instance.worktree),
+                )))
             if (!tsconfigPath) throw new Error(`No tsconfig found for ${scope[0]} — cannot run a scoped typecheck.`)
             tsconfigDir = path.dirname(tsconfigPath)
             outcome = yield* TypecheckScope.runScopedTypecheck({
@@ -186,6 +198,7 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
               tsconfigDir,
               tsconfigPath,
               files: scope,
+              compiler: params.compiler,
               maxErrors,
               timeoutMs,
               signal: ctx.abort,
@@ -200,7 +213,9 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
 
           const rel = (f: string) => TypecheckScope.relativePosix(instance.worktree, f)
           const scopeXml = `<scope mode="${mode}" files="${scope.length}">${scope.map((f) => `\n  <file>${escapeXml(rel(f))}</file>`).join("")}\n</scope>`
-          const tsconfigXml = tsconfigDir ? `<tsconfig>${escapeXml(path.relative(instance.worktree, tsconfigDir))}</tsconfig>` : "<tsconfig>package typecheck script</tsconfig>"
+          const tsconfigXml = tsconfigDir
+            ? `<tsconfig>${escapeXml(path.relative(instance.worktree, tsconfigDir))}</tsconfig>`
+            : "<tsconfig>package typecheck script</tsconfig>"
           const summaryXml = `<summary status="${status}" errors="${diagnostics.length}" bin="${outcome.bin}" exit="${outcome.exitCode}">`
           const triageXml = [
             `<triage>`,
@@ -217,7 +232,10 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
 
           const clusterXml = [
             `<clusters>`,
-            ...clusters.map((c) => `  <cluster code="TS${c.code}" severity="${c.severity}" category="${c.category}" occurrences="${c.count}" files="${c.files}"/>`),
+            ...clusters.map(
+              (c) =>
+                `  <cluster code="TS${c.code}" severity="${c.severity}" category="${c.category}" occurrences="${c.count}" files="${c.files}"/>`,
+            ),
             `</clusters>`,
           ].join("\n")
 
@@ -253,4 +271,3 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
     }
   }),
 )
-

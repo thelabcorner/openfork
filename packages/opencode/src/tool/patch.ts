@@ -10,6 +10,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import { Conflict } from "./conflict"
 import { withFileLocks } from "./file-lock"
 import { LSP } from "@/lsp/lsp"
+import { Diagnostic } from "@/lsp/diagnostic"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -25,6 +26,7 @@ import {
   noteMove as noteSessionMove,
   noteWrite as noteSessionWrite,
 } from "./edit/prior-read"
+import { atomicWrite } from "./edit/commit"
 import { Option } from "effect"
 import DESCRIPTION from "./patch.txt"
 
@@ -56,6 +58,8 @@ type FileChange = {
   additions: number
   deletions: number
   bom: boolean
+  /** Source BOM state used for stale-plan checks and rollback. */
+  expectedBom?: boolean
   warnings: string[]
   conflict?: string
 }
@@ -96,7 +100,14 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
       const parseNative = (): Patch.Hunk[] => Patch.parsePatch(patchText).hunks
       const parseGit = (): Patch.Hunk[] => {
         const h = Core.translateGitDiff(patchText)
-        if (!h) throw new Error("not a translatable git-style diff")
+        if (!h) {
+          if (/^diff --git /m.test(patchText) && /^rename from /m.test(patchText) && /^rename to /m.test(patchText)) {
+            throw new Error(
+              "metadata-only Git renames are not supported because they contain no content hunk to verify. Use the native *** Update File / *** Move to patch format with a context hunk, or perform the rename separately.",
+            )
+          }
+          throw new Error("not a translatable git-style diff; include ---/+++ file headers and valid unified-diff hunks for content changes")
+        }
         return h
       }
 
@@ -125,6 +136,16 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
 
       const instance = yield* InstanceState.context
       const rel = (p: string) => path.relative(instance.worktree, p).replaceAll("\\", "/")
+      const absolute = (p: string) => path.resolve(instance.directory, p)
+      const pathKey = (p: string) => {
+        const key = FSUtil.normalizePath(absolute(p))
+        return process.platform === "win32" ? key.toLowerCase() : key
+      }
+      hunks = hunks.map((hunk) => ({
+        ...hunk,
+        path: absolute(hunk.path),
+        ...(hunk.type === "update" && hunk.move_path ? { move_path: absolute(hunk.move_path) } : {}),
+      }))
 
       // ── Build per-file changes, validating EVERY hunk before any write ──
       const fileChanges: FileChange[] = []
@@ -155,41 +176,68 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
       // disagree, deletes combined with anything, and updates landing on a
       // rename destination are explicit conflicts instead of silent loss.
       const mergedHunks: Patch.Hunk[] = []
-      const earlyConflicts: Array<{ path: string; reason: string }> = []
+      const earlyConflicts: Array<{ path: string; type: FileChange["type"]; reason: string }> = []
       const updateIndexByPath = new Map<string, number>()
       const seedByPath = new Map<string, { text: string; bom: boolean }>()
       const deletedPaths = new Set<string>()
       const moveDestinations = new Set<string>()
+      const moveSourceByDestination = new Map<string, string>()
       for (const hunk of hunks) {
+        const sourceKey = pathKey(hunk.path)
         if (hunk.type === "add") {
-          if (seedByPath.has(hunk.path)) {
+          if (seedByPath.has(sourceKey)) {
             earlyConflicts.push({
               path: hunk.path,
+              type: "add",
               reason: "duplicate *** Add File: sections for one path in a single patch",
             })
             continue
           }
-          // Mirrors the add branch below: seeds carry the trailing newline.
-          const raw = hunk.contents.length === 0 || hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`
+          // Seed bytes follow the patch format's final-newline semantics.
+          const raw =
+            hunk.finalNewline === false || hunk.contents.length === 0 || hunk.contents.endsWith("\n")
+              ? hunk.contents
+              : `${hunk.contents}\n`
           const next = Bom.split(raw)
-          seedByPath.set(hunk.path, { text: next.text, bom: next.bom })
+          seedByPath.set(sourceKey, { text: next.text, bom: next.bom })
           mergedHunks.push(hunk)
           continue
         }
         if (hunk.type === "delete") {
-          deletedPaths.add(hunk.path)
+          if (deletedPaths.has(sourceKey)) {
+            earlyConflicts.push({ path: hunk.path, type: "delete", reason: "duplicate delete sections target the same file" })
+            continue
+          }
+          deletedPaths.add(sourceKey)
           mergedHunks.push(hunk)
           continue
         }
-        if (hunk.move_path) moveDestinations.add(hunk.move_path)
-        const at = updateIndexByPath.get(hunk.path)
+        if (hunk.move_path) {
+          const destinationKey = pathKey(hunk.move_path)
+          if (destinationKey === sourceKey) {
+            earlyConflicts.push({ path: hunk.path, type: "move", reason: "move source and destination resolve to the same path" })
+          }
+          const otherSource = moveSourceByDestination.get(destinationKey)
+          if (otherSource !== undefined && otherSource !== sourceKey) {
+            earlyConflicts.push({ path: hunk.path, type: "move", reason: `another move already targets ${hunk.move_path}` })
+          }
+          moveSourceByDestination.set(destinationKey, sourceKey)
+          moveDestinations.add(destinationKey)
+        }
+        const at = updateIndexByPath.get(sourceKey)
         const prior = at === undefined ? undefined : mergedHunks[at]
         if (prior === undefined || prior.type !== "update") {
-          updateIndexByPath.set(hunk.path, mergedHunks.length)
+          if (hunk.move_path && seedByPath.has(sourceKey)) {
+            earlyConflicts.push({ path: hunk.path, type: "move", reason: "a newly added file cannot also be moved in the same patch" })
+          }
+          updateIndexByPath.set(sourceKey, mergedHunks.length)
           mergedHunks.push(hunk)
-        } else if ((prior.move_path ?? null) !== (hunk.move_path ?? null)) {
+        } else if (
+          (prior.move_path ? pathKey(prior.move_path) : null) !== (hunk.move_path ? pathKey(hunk.move_path) : null)
+        ) {
           earlyConflicts.push({
             path: hunk.path,
+            type: "move",
             reason: `conflicting renames in one patch (${prior.move_path ?? "(no rename)"} vs ${hunk.move_path ?? "(no rename)"})`,
           })
         } else {
@@ -200,15 +248,34 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
       // ./patch/resolve at derive time below — every chunk is located against
       // the original bytes without assuming input order, so no pre-sorting
       // pass is needed here. Merged sections flow through untouched.
-      const orderedHunks: Patch.Hunk[] = mergedHunks
+      // Seed add operations before updates so add+update sections can be
+      // composed into one final file change instead of scheduling two writes.
+      const orderedHunks: Patch.Hunk[] = [
+        ...mergedHunks.filter((hunk) => hunk.type === "add"),
+        ...mergedHunks.filter((hunk) => hunk.type !== "add"),
+      ]
       for (const hunk of orderedHunks) {
-        const filePath = path.resolve(instance.directory, hunk.path)
+        const filePath = hunk.path
+        const sourceKey = pathKey(filePath)
         yield* assertExternalDirectoryEffect(ctx, filePath)
 
         if (hunk.type === "add") {
+          if (moveDestinations.has(sourceKey)) {
+            fileChanges.push(conflict(filePath, "add", "path is also the destination of a move in this patch"))
+            continue
+          }
           const raw =
-            hunk.contents.length === 0 || hunk.contents.endsWith("\n") ? hunk.contents : `${hunk.contents}\n`
+            hunk.finalNewline === false || hunk.contents.length === 0 || hunk.contents.endsWith("\n")
+              ? hunk.contents
+              : `${hunk.contents}\n`
           const next = Bom.split(raw)
+          const existing = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (existing) {
+            const current = yield* Bom.readFile(afs, filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+            if (current?.text === next.text && current.bom === next.bom) continue
+            fileChanges.push(conflict(filePath, "add", "target already exists with different content; use Update File to change it"))
+            continue
+          }
           Core.assertTextContent(next.text, filePath)
           const diff = Core.trimDiff(createTwoFilesPatch(filePath, filePath, "", next.text))
           const { additions, deletions } = Core.countPatchChanges(diff)
@@ -225,11 +292,11 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             warnings: [],
           })
         } else if (hunk.type === "update") {
-          if (deletedPaths.has(hunk.path)) {
+          if (deletedPaths.has(sourceKey)) {
             fileChanges.push(conflict(filePath, "update", "path is also deleted in this same patch; drop one of the two sections"))
             continue
           }
-          if (moveDestinations.has(hunk.path)) {
+          if (moveDestinations.has(sourceKey)) {
             fileChanges.push(conflict(filePath, "update", "path is the destination of a rename in this same patch; retarget the update at the renamed path in a follow-up call"))
             continue
           }
@@ -238,7 +305,7 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             fileChanges.push(conflict(filePath, "update", "path is a directory, not a file"))
             continue
           }
-          const seed = seedByPath.get(hunk.path)
+          const seed = seedByPath.get(sourceKey)
           if (!stats && seed === undefined) {
             const hint = yield* Conflict.missingFileHint(afs, filePath)
             fileChanges.push(conflict(filePath, "update", hint ? `file not found; ${hint}` : "file not found"))
@@ -276,24 +343,46 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             // (./patch/resolve): replaces the cursor resolver + pre-sort.
             const derived = deriveContent(baseText, hunk.chunks, filePath)
             const next = Bom.split(derived.content)
-            const diff = Core.trimDiff(createTwoFilesPatch(filePath, filePath, diffBase, next.text))
+            const movePath = hunk.move_path ? hunk.move_path : undefined
+            if (movePath) {
+              yield* assertExternalDirectoryEffect(ctx, movePath)
+              if (pathKey(movePath) === sourceKey) {
+                fileChanges.push(conflict(filePath, "move", "move source and destination resolve to the same path"))
+                continue
+              }
+              const destination = yield* afs.stat(movePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+              if (destination) {
+                fileChanges.push(conflict(filePath, "move", `destination already exists: ${rel(movePath)}`))
+                continue
+              }
+            }
+            const diff = Core.trimDiff(createTwoFilesPatch(filePath, filePath, seed ? "" : diffBase, next.text))
             const { additions, deletions } = Core.countPatchChanges(diff)
-            const movePath = hunk.move_path ? path.resolve(instance.directory, hunk.move_path) : undefined
-            if (movePath) yield* assertExternalDirectoryEffect(ctx, movePath)
             for (const w of derived.warnings) planWarnings.push(`${rel(filePath)}: ${w}`)
-            fileChanges.push({
-              filePath,
-              relPath: rel(movePath ?? filePath),
-              oldContent: diffBase,
-              newContent: next.text,
-              type: movePath ? "move" : "update",
-              movePath,
-              diff,
-              additions,
-              deletions,
-              bom: next.bom || baseBom,
-              warnings: derived.warnings,
-            })
+            const composedAdd = seed ? fileChanges.find((change) => change.type === "add" && pathKey(change.filePath) === sourceKey) : undefined
+            if (composedAdd) {
+              composedAdd.newContent = next.text
+              composedAdd.diff = diff
+              composedAdd.additions = additions
+              composedAdd.deletions = deletions
+              composedAdd.bom = next.bom || baseBom
+              composedAdd.warnings.push(...derived.warnings)
+            } else {
+              fileChanges.push({
+                filePath,
+                relPath: rel(movePath ?? filePath),
+                oldContent: diffBase,
+                newContent: next.text,
+                type: movePath ? "move" : "update",
+                movePath,
+                diff,
+                additions,
+                deletions,
+                bom: next.bom || baseBom,
+                expectedBom: baseBom,
+                warnings: derived.warnings,
+              })
+            }
           } catch (error) {
             fileChanges.push(
               conflict(
@@ -304,8 +393,12 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             )
           }
         } else {
-          if (seedByPath.has(hunk.path) || updateIndexByPath.has(hunk.path)) {
+          if (seedByPath.has(sourceKey) || updateIndexByPath.has(sourceKey)) {
             fileChanges.push(conflict(filePath, "delete", "path is also added or updated in this same patch; drop one of the sections"))
+            continue
+          }
+          if (moveDestinations.has(sourceKey)) {
+            fileChanges.push(conflict(filePath, "delete", "path is also the destination of a move in this patch"))
             continue
           }
           const fresh = yield* checkFresh(filePath)
@@ -320,6 +413,23 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             fileChanges.push(conflict(filePath, "delete", hint ? `file not found; ${hint}` : "file not found"))
             continue
           }
+          if (hunk.chunks !== undefined) {
+            try {
+              const verified = deriveContent(source.text, hunk.chunks, filePath)
+              if (verified.content !== "") {
+                throw new Error("the supplied git deletion hunks do not account for all current file content")
+              }
+            } catch (error) {
+              fileChanges.push(
+                conflict(
+                  filePath,
+                  "delete",
+                  `git deletion does not match the complete current file: ${error instanceof Error ? error.message : String(error)}`,
+                ),
+              )
+              continue
+            }
+          }
           const diff = Core.trimDiff(createTwoFilesPatch(filePath, filePath, source.text, ""))
           const { additions, deletions } = Core.countPatchChanges(diff)
           fileChanges.push({
@@ -332,14 +442,42 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             additions,
             deletions,
             bom: source.bom,
+            expectedBom: source.bom,
             warnings: [],
           })
         }
       }
 
       for (const early of earlyConflicts) {
-        fileChanges.push(conflict(path.resolve(instance.directory, early.path), "update", early.reason))
+        fileChanges.push(conflict(early.path, early.type, early.reason))
       }
+
+      // Plans describe each path once. When several sections on one file
+      // conflict, collapse them into one actionable receipt instead of showing
+      // duplicate A/M/D rows that obscure whether any part can be applied.
+      const uniqueChanges: FileChange[] = []
+      const changeIndexByPath = new Map<string, number>()
+      for (const change of fileChanges) {
+        const key = pathKey(change.filePath)
+        const index = changeIndexByPath.get(key)
+        if (index === undefined) {
+          changeIndexByPath.set(key, uniqueChanges.length)
+          uniqueChanges.push(change)
+          continue
+        }
+        const prior = uniqueChanges[index]!
+        if (prior.conflict || change.conflict) {
+          const reasons = [prior.conflict, change.conflict].filter((reason): reason is string => !!reason)
+          uniqueChanges[index] = conflict(prior.filePath, prior.type, [...new Set(reasons)].join("; "))
+          continue
+        }
+        uniqueChanges[index] = conflict(
+          prior.filePath,
+          prior.type,
+          "multiple sections produced separate writes for one path; combine them into one add/update/move/delete operation",
+        )
+      }
+      fileChanges.splice(0, fileChanges.length, ...uniqueChanges)
 
       const conflicts = fileChanges.filter((c) => c.conflict)
       const actionable = fileChanges.filter((c) => !c.conflict && (c.type !== "update" || c.oldContent !== c.newContent))
@@ -498,7 +636,7 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             filePath: change.filePath,
             existedBefore: true,
             contentBefore: change.oldContent,
-            bom: change.bom,
+            bom: change.expectedBom ?? change.bom,
             committed: false,
           })
         } else if (change.type === "add") {
@@ -514,7 +652,7 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             filePath: change.filePath,
             existedBefore: true,
             contentBefore: change.oldContent,
-            bom: change.bom,
+            bom: change.expectedBom ?? change.bom,
             committed: false,
           })
         }
@@ -522,6 +660,32 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
       const applyAll = Effect.gen(function* () {
         // ── Apply (mirrors apply_patch: BOM, format sync, events, LSP) ──
         const updates: Array<{ file: string; event: "add" | "change" | "unlink" }> = []
+        const editedFiles: string[] = []
+        // The approval prompt can wait indefinitely. Revalidate every source
+        // and destination after acquiring all locks so a stale plan never
+        // overwrites, deletes, or replaces a file changed during approval.
+        for (const change of actionable) {
+          const current = yield* Bom.readFile(afs, change.filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (change.type === "add") {
+            if (current !== undefined) {
+              return yield* Effect.fail(
+                new Error(`Patch became stale: ${rel(change.filePath)} now exists. Nothing was written; re-read and reissue the patch.`),
+              )
+            }
+          } else if (current === undefined || current.text !== change.oldContent || current.bom !== change.expectedBom) {
+            return yield* Effect.fail(
+              new Error(`Patch became stale: ${rel(change.filePath)} changed after validation. Nothing was written; re-read and reissue the patch.`),
+            )
+          }
+          if (change.movePath) {
+            const destination = yield* afs.stat(change.movePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+            if (destination !== undefined) {
+              return yield* Effect.fail(
+                new Error(`Patch became stale: move destination ${rel(change.movePath)} now exists. Nothing was written; re-read and reissue the patch.`),
+              )
+            }
+          }
+        }
         yield* withRollback(
           afs,
           journal,
@@ -533,14 +697,14 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             case "update": {
               const target = change.movePath ?? change.filePath
               const content = Bom.join(change.newContent, change.bom)
-              yield* afs.writeWithDirs(target, content)
+              yield* atomicWrite(afs, target, content)
               yield* markCommitted(target, true, encoded(content))
               updates.push({ file: target, event: change.type === "add" ? "add" : "change" })
               break
             }
             case "move": {
               const content = Bom.join(change.newContent, change.bom)
-              yield* afs.writeWithDirs(change.movePath!, content)
+              yield* atomicWrite(afs, change.movePath!, content)
               yield* markCommitted(change.movePath!, true, encoded(content))
               yield* afs.remove(change.filePath)
               yield* markCommitted(change.filePath, false)
@@ -562,11 +726,14 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             // compare-before-restore image so a later failure can distinguish
             // our final bytes from a subsequent external writer.
             yield* refreshCommittedContent(edited)
-            yield* events.publish(FileSystem.Event.Edited, { file: edited })
+            editedFiles.push(edited)
           }
         }
           }),
         )
+        for (const file of editedFiles) {
+          yield* events.publish(FileSystem.Event.Edited, { file })
+        }
         for (const update of updates) {
           yield* events.publish(Watcher.Event.Updated, update)
         }
@@ -590,7 +757,8 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
         const target = change.movePath ?? change.filePath
         yield* lsp.touchFile(target, "document")
       }
-      const diagnostics = yield* lsp.diagnostics()
+      const diagnosticPaths = actionable.flatMap((change) => (change.type === "delete" ? [] : [change.movePath ?? change.filePath])).map(FSUtil.normalizePath)
+      const diagnostics = yield* lsp.diagnosticsFor(diagnosticPaths)
 
       let output = Core.formatApplySummary({
         mode: auto === true ? "apply" : "if-clean",
@@ -620,7 +788,10 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
         metadata: {
           diff: totalDiff,
           files: filesMeta(actionable),
-          diagnostics,
+          diagnostics: Diagnostic.metadataForFiles(
+            actionable.flatMap((change) => (change.type === "delete" ? [] : [change.movePath ?? change.filePath])).map(FSUtil.normalizePath),
+            diagnostics,
+          ),
           format: fmt,
           applied: true,
           fileCount: actionable.length,

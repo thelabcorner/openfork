@@ -5,7 +5,13 @@ import { afterEach, describe, expect, test } from "bun:test"
 import path from "path"
 import type { Tool } from "../../src/tool/tool"
 import { TypecheckTool } from "../../src/tool/typecheck"
-import { parseDiagnostics, clusterDiagnostics } from "../../src/tool/typecheck-scope"
+import {
+  clusterDiagnostics,
+  compilerInvocation,
+  parseDiagnostics,
+  resolveCompiler,
+  supportsBunTypecheck,
+} from "../../src/tool/typecheck-scope"
 import { ToolRegistry } from "@/tool/registry"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -50,7 +56,8 @@ const toolByID = (registry: ToolRegistry.Interface, id: string) =>
     })
     .pipe(Effect.map((list) => list.find((t) => t.id === id)))
 
-const write = (dir: string, name: string, content: string) => Effect.promise(() => Bun.write(path.join(dir, name), content))
+const write = (dir: string, name: string, content: string) =>
+  Effect.promise(() => Bun.write(path.join(dir, name), content))
 
 describe("typecheck-scope diagnostics parser (pure)", () => {
   test("parses diagnostic lines with continuation lines", () => {
@@ -79,13 +86,39 @@ describe("typecheck-scope diagnostics parser (pure)", () => {
 
   test("clusters by code and message", () => {
     const diags = parseDiagnostics(
-      ["a.ts(1,1): error TS2304: Cannot find name 'x'.", "b.ts(2,2): error TS2304: Cannot find name 'x'.", "c.ts(1,1): error TS2322: Bad type."].join("\n"),
+      [
+        "a.ts(1,1): error TS2304: Cannot find name 'x'.",
+        "b.ts(2,2): error TS2304: Cannot find name 'x'.",
+        "c.ts(1,1): error TS2322: Bad type.",
+      ].join("\n"),
       80,
     )
     const clusters = clusterDiagnostics(diags)
     expect(clusters).toHaveLength(2)
     expect(clusters[0]!.severity).toBe("P0")
     expect(clusters[0]!.count).toBe(2)
+  })
+})
+
+describe("typecheck-scope compiler selection", () => {
+  test("builds Bun's native typecheck invocation with machine-readable output", () => {
+    expect(compilerInvocation({ bin: "bun", path: "bun" }, "tsconfig.scoped.json")).toEqual([
+      "bun",
+      "--check",
+      "--tsconfig-override",
+      "tsconfig.scoped.json",
+      "--no-pretty",
+      "--all",
+    ])
+  })
+
+  test("auto prefers Bun when the running Bun exposes its TypeScript checker", async () => {
+    const compiler = await resolveCompiler(process.cwd(), process.cwd())
+    if (supportsBunTypecheck() && Bun.which("bun")) {
+      expect(compiler.bin).toBe("bun")
+    } else {
+      expect(["tsgo", "tsc"]).toContain(compiler.bin)
+    }
   })
 })
 
@@ -114,6 +147,21 @@ describe("tool.typecheck", () => {
       const result = yield* tool.execute({ mode: "file", filePath: "ok.ts" }, ctx)
       expect(result.output).toContain('status="passed"')
       expect(items.some((i) => i.permission === "typecheck")).toBe(true)
+    }),
+  )
+
+  it.instance("file mode can force the tsgo fallback backend", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* write(test.directory, "tsconfig.json", JSON.stringify({ compilerOptions: { strict: true, noEmit: true } }))
+      yield* write(test.directory, "ok.ts", "export const x: number = 1\n")
+      const registry = yield* ToolRegistry.Service
+      const tool = yield* toolByID(registry, TypecheckTool.id)
+      if (!tool) throw new Error("typecheck tool not found")
+
+      const result = yield* tool.execute({ mode: "file", filePath: "ok.ts", compiler: "tsgo" }, asks().ctx)
+      expect(result.output).toContain('status="passed"')
+      expect(result.output).toContain('bin="tsgo"')
     }),
   )
 

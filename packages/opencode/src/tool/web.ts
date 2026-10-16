@@ -77,8 +77,10 @@ export const WebTool = Tool.define<
         const year = new Date().getFullYear()
         return [
           "Fetch known URLs or search the web through one compact tool.",
-          "FETCH FIRST: when you already have a URL, pass url and omit action; fetching is the default and preferred path.",
-          "Use action=search with query only for discovery/current information, and action=providers to inspect search backends.",
+          "SEARCH for current facts, upstream code/API research, provider releases, and external discovery: pass query and omit action, or use action=search.",
+          "FETCH when the exact URL is already known: pass url and omit action (or use action=fetch). Follow search hits with fetch when primary-source details matter.",
+          "For github.com URLs (repos, issues, PRs, diffs, Actions), prefer the github tool over fetch.",
+          "Use action=providers to inspect configured and keyless backends without a network search.",
           `For current-event searches, include the current year (${year}) when it materially improves freshness.`,
         ].join(" ")
       },

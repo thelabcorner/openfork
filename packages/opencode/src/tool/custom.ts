@@ -5,6 +5,7 @@ import path from "path"
 import type { JSONSchema7, JSONSchema7Definition } from "@ai-sdk/provider"
 import type { Hooks, ToolContext as PluginToolContext, ToolDefinition } from "@opencode-ai/plugin"
 import type * as Tool from "./tool"
+import { timelineOwner } from "./tool"
 import { Truncate } from "@/tool/truncate"
 import { EffectBridge } from "@/effect/bridge"
 import { Glob } from "@opencode-ai/core/util/glob"
@@ -59,7 +60,9 @@ export function fromPlugin(id: string, def: ToolDefinition, deps: CustomToolDeps
         const output = typeof result === "string" ? result : result.output
         const metadata = typeof result === "string" ? {} : (result.metadata ?? {})
         const attachments = typeof result === "string" ? undefined : result.attachments
-        const out = yield* deps.truncate.output(output)
+        // Host/direct plugin invocation has no durable tool-call owner; only a
+        // real provider call ID may retain a timeline row.
+        const out = yield* deps.truncate.output(output, {}, undefined, timelineOwner(toolCtx))
         return {
           title: typeof result === "string" ? "" : (result.title ?? ""),
           output: out.content,

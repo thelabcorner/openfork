@@ -19,6 +19,11 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/To
 // \u0000 separator keeps session/call pairs unambiguous; both ids are opaque strings.
 const key = (sessionID: string, callID: string) => `${sessionID}\u0000${callID}`
 
+// Session/call identities are process-global. InstanceState still owns executor
+// cleanup, but a routed Stop must find the existing handle regardless of which
+// directory supplied the request. Never create an instance to discover it.
+const liveEntries = new Map<string, Entry>()
+
 function trackEntry(
   entries: Map<string, Entry>,
   input: { sessionID: string; callID: string; parent: AbortSignal },
@@ -34,6 +39,7 @@ function trackEntry(
   }
   input.parent.addEventListener("abort", onParentAbort, { once: true })
   entries.set(id, { controller, parent: input.parent, onParentAbort })
+  liveEntries.set(id, entries.get(id)!)
   return controller.signal
 }
 
@@ -41,8 +47,8 @@ function killEntry(entries: Map<string, Entry>, input: { sessionID: string; call
   const entry = entries.get(key(input.sessionID, input.callID))
   // The entry stays registered so the executor's release() remains the single
   // cleanup point; a second kill is a harmless no-op.
-  if (!entry || entry.controller.signal.aborted) return false
-  entry.controller.abort()
+  if (!entry) return false
+  if (!entry.controller.signal.aborted) entry.controller.abort()
   return true
 }
 
@@ -52,6 +58,7 @@ function releaseEntry(entries: Map<string, Entry>, input: { sessionID: string; c
   if (!entry) return
   entry.parent.removeEventListener("abort", entry.onParentAbort)
   entries.delete(id)
+  if (liveEntries.get(id) === entry) liveEntries.delete(id)
 }
 
 const make = Effect.gen(function* () {
@@ -59,7 +66,11 @@ const make = Effect.gen(function* () {
 
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
-      for (const entry of entries.values()) entry.parent.removeEventListener("abort", entry.onParentAbort)
+      for (const [id, entry] of entries) {
+        entry.controller.abort()
+        entry.parent.removeEventListener("abort", entry.onParentAbort)
+        if (liveEntries.get(id) === entry) liveEntries.delete(id)
+      }
       entries.clear()
     }),
   )
@@ -78,7 +89,7 @@ const layer = Layer.effect(
     const state = yield* InstanceState.make(() => make)
     return Service.of({
       track: (input) => InstanceState.useEffect(state, (entries) => entries.track(input)),
-      kill: (input) => InstanceState.useEffect(state, (entries) => entries.kill(input)),
+      kill: (input) => Effect.sync(() => killEntry(liveEntries, input)),
       release: (input) => InstanceState.useEffect(state, (entries) => entries.release(input)),
     })
   }),

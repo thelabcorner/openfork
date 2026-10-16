@@ -41,8 +41,35 @@ export const resolveWithin = Effect.fn("EditCommit.resolveWithin")(function* (
   candidate: string,
 ) {
   const normalized = path.normalize(path.resolve(candidate))
-  const real = yield* afs.realPath(normalized).pipe(Effect.catch(() => Effect.succeed(normalized)))
-  const realWorktree = yield* afs.realPath(worktree).pipe(Effect.catch(() => Effect.succeed(worktree)))
+  let real = yield* afs.realPath(normalized).pipe(
+    Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(undefined)),
+  )
+  if (!real) {
+    // New files may sit below a symlinked directory and several not-yet-made
+    // parents. Resolve the nearest existing ancestor, then append the missing
+    // suffix so containment and locking use the actual destination.
+    let current = path.dirname(normalized)
+    const suffix = [path.basename(normalized)]
+    while (!real) {
+      real = yield* afs.realPath(current).pipe(
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(undefined)),
+      )
+      if (real) {
+        real = path.resolve(real, ...suffix)
+        break
+      }
+      const parent = path.dirname(current)
+      if (parent === current) {
+        real = normalized
+        break
+      }
+      suffix.unshift(path.basename(current))
+      current = parent
+    }
+  }
+  const realWorktree = yield* afs
+    .realPath(worktree)
+    .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(worktree)))
   const relative = path.relative(realWorktree, real)
   const inside = relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
   return { resolved: normalized, real, inside }
@@ -61,7 +88,20 @@ export const atomicWrite = Effect.fn("EditCommit.atomicWrite")(function* (
   bytes: string | Uint8Array,
 ) {
   const temp = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${tempCounter++}.tmp`)
-  yield* afs.writeWithDirs(temp, bytes)
+  const existing = yield* afs.stat(filePath).pipe(
+    Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(undefined)),
+  )
+  if (existing) yield* afs.access(filePath, { writable: true })
+  const mode = existing ? existing.mode & 0o777 : undefined
+  yield* afs.writeWithDirs(temp, bytes).pipe(
+    Effect.andThen(mode === undefined ? Effect.void : afs.chmod(temp, mode)),
+    Effect.catch((error) =>
+      afs.remove(temp).pipe(
+        Effect.catch(() => Effect.void),
+        Effect.andThen(Effect.fail(error)),
+      ),
+    ),
+  )
   yield* afs.rename(temp, filePath).pipe(
     Effect.catch((error) =>
       afs.remove(temp).pipe(
@@ -157,11 +197,11 @@ export const commitPlan = Effect.fn("EditCommit.commit")(function* (
   }
 
   yield* lsp.touchFile(plan.filePath, "document")
-  const all = yield* lsp.diagnostics()
   const key = FSUtil.normalizePath(plan.filePath)
+  const all = yield* lsp.diagnosticsFor([key])
   // D36 — scope diagnostics metadata to this file instead of shipping the
   // whole project map on every edit.
-  const scoped = { [key]: all[key] ?? [] }
+  const scoped = LSP.Diagnostic.metadataForFiles([key], all)
   const block = LSP.Diagnostic.report(plan.filePath, all[key] ?? [])
   if (block) output += `\n\nLSP errors detected in this file, please fix:\n${block}`
 
@@ -209,8 +249,8 @@ const commitLocked = Effect.fn("EditCommit.locked")(function* (
         }
         const same =
           options.fingerprint !== undefined &&
-          Fingerprint.hashContent(source.text) === options.fingerprint.hash &&
-          source.text.length === options.fingerprint.size
+          Fingerprint.hashContent(Bom.join(source.text, source.bom)) === options.fingerprint.hash &&
+          Bom.join(source.text, source.bom).length === options.fingerprint.size
         if (!same) {
           if (!options.rebuild) {
             throw new Error(

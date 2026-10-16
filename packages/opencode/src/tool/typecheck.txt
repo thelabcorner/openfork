@@ -1,6 +1,7 @@
-Fast scoped typechecking for TypeScript/TSX files. Reuses the repo's own compiler
-invocation (tsgo / tsc) against a temporary tsconfig whose `include` is narrowed
-to the target files, so scoped modes are fast and full runs are explicit.
+Fast scoped typechecking for TypeScript/TSX files. Auto-prefers Bun's native
+`bun check` type checker when the running Bun supports it, then falls back to
+the repo's tsgo / tsc compiler against a temporary tsconfig whose `include` is
+narrowed to the target files. Scoped modes stay fast and full runs are explicit.
 
 Modes (default: file|files|folder|changed — resolved from the params):
   file       — typecheck one file (filePath)
@@ -10,6 +11,10 @@ Modes (default: file|files|folder|changed — resolved from the params):
   bottomUp   — seed files + their local-import dependency closure to `depth`
   full       — run the repo's own `typecheck` script (slow; requires `reason`)
   explain    — describe a single error code (TS<code>) with a suggestion
+
+Scoped calls may set `compiler` to auto|bun|tsgo|tsc. `auto` is the default.
+`bun` fails explicitly when the current Bun runtime has no native type checker;
+`auto` safely falls back to tsgo/tsc.
 
 Every call prompts with the `typecheck` permission (patterns ["*"], always ["*"])
 — read-only analysis; no writes happen.

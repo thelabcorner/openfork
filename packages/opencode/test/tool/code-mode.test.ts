@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { CODE_MODE_TOOL, CodeModeTool, Parameters, describeCatalog } from "@/tool/code-mode"
+import { HOST_LIMITS } from "@/code/execution"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
 import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Agent } from "@/agent/agent"
@@ -10,7 +11,7 @@ import { Session } from "@/session/session"
 import { Tool } from "@/tool/tool"
 import * as Truncate from "@/tool/truncate"
 import { MessageID, SessionID } from "@/session/schema"
-import { Cause, Effect, Exit, Layer, Schema } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Schema } from "effect"
 
 const ctx: Tool.Context = {
   sessionID: SessionID.make("ses_code-mode"),
@@ -94,6 +95,14 @@ async function failure(effect: Effect.Effect<unknown>) {
 }
 
 describe("code mode execute", () => {
+  test("both Code entry points share bounded execution, tool, output, and concurrency budgets", () => {
+    expect(HOST_LIMITS.timeoutMs).toBeGreaterThan(0)
+    expect(HOST_LIMITS.timeoutMs).toBeLessThanOrEqual(10 * 60_000)
+    expect(HOST_LIMITS.maxToolCalls).toBeGreaterThan(0)
+    expect(HOST_LIMITS.maxOutputBytes).toBeGreaterThan(0)
+    expect(HOST_LIMITS.maxConcurrency).toBeGreaterThan(0)
+  })
+
   test("defines execute input with an Effect schema", async () => {
     const decode = Schema.decodeUnknownEffect(Parameters)
     await expect(Effect.runPromise(decode({ code: "return 1" }))).resolves.toEqual({ code: "return 1" })
@@ -618,6 +627,34 @@ describe("code mode execute", () => {
     expect(output.output).toBe("Execution cancelled.")
     expect(output.metadata.error).toBe(true)
     expect(output.metadata.toolCalls).toEqual([{ tool: "host.trigger", status: "running" }])
+  })
+
+  test("interrupted Code Mode cancels its physical in-flight MCP RPC", async () => {
+    let signalAborted = false
+    let started: () => void = () => {}
+    const entered = new Promise<void>((resolve) => { started = resolve })
+    const remote = {
+      ...mcpTool("wait", () => null),
+      client: {
+        callTool: (_params: unknown, _schema: unknown, options: { signal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            options.signal.addEventListener("abort", () => {
+              signalAborted = true
+              reject(new Error("remote request cancelled"))
+            }, { once: true })
+            started()
+          }),
+      } as unknown as MCP.McpTool["client"],
+    }
+
+    const tool = await build({ slow_wait: remote })
+    const fiber = Effect.runFork(tool.execute({ code: "return await tools.slow.wait({})" }, ctx))
+    try {
+      await Promise.race([entered, Bun.sleep(2_000).then(() => { throw new Error("MCP call not started") })])
+    } finally {
+      await Effect.runPromise(Fiber.interrupt(fiber))
+    }
+    expect(signalAborted).toBe(true)
   })
 
   test("a pre-aborted signal cancels before the program runs", async () => {

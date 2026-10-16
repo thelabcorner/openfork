@@ -94,6 +94,18 @@ describe("tool.write", () => {
         expect(content).toBe("relative content")
       }),
     )
+
+    it.instance("rejects an empty path instead of resolving it to the project directory", () =>
+      Effect.gen(function* () {
+        let asks = 0
+        const exit = yield* run({ filePath: "", content: "oops" }, {
+          ...ctx,
+          ask: () => Effect.sync(() => void asks++),
+        }).pipe(Effect.exit)
+        expect(exit._tag).toBe("Failure")
+        expect(asks).toBe(0)
+      }),
+    )
   })
 
   describe("existing file overwrite", () => {
@@ -214,6 +226,72 @@ describe("tool.write", () => {
 
         expect(result.metadata).toHaveProperty("filepath", filepath)
         expect(result.metadata).toHaveProperty("exists", true)
+        expect(result.metadata).toHaveProperty("diff")
+        expect(result.metadata.filediff).toMatchObject({ file: filepath, additions: 1, deletions: 1 })
+      }),
+    )
+
+    it.instance("preserves existing POSIX mode bits when the atomic write replaces the file", () =>
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "mode.txt")
+        yield* Effect.promise(() => fs.writeFile(filepath, "before", "utf-8"))
+        yield* Effect.promise(() => fs.chmod(filepath, 0o751))
+        let streamed: Record<string, unknown> | undefined
+        const result = yield* run({ filePath: filepath, content: "after" }, {
+          ...ctx,
+          metadata: ({ metadata }: { metadata: Record<string, unknown> }) =>
+            Effect.sync(() => {
+              streamed = metadata
+            }),
+        })
+        const mode = (yield* Effect.promise(() => fs.stat(filepath))).mode & 0o777
+        expect(mode).toBe(0o751)
+        expect(streamed).toEqual(result.metadata)
+      }),
+    )
+
+    it.instance("does not ask, rewrite, or emit a diff for an unchanged file", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "unchanged.txt")
+        yield* Effect.promise(() => fs.writeFile(filepath, "same\r\n", "utf-8"))
+        let asks = 0
+        const result = yield* run({ filePath: filepath, content: "same\n" }, {
+          ...ctx,
+          ask: () => Effect.sync(() => void asks++),
+        })
+        expect(asks).toBe(0)
+        expect(result.metadata).toMatchObject({ applied: 0, strategy: "write", diff: "" })
+        expect(yield* Effect.promise(() => fs.readFile(filepath, "utf8"))).toBe("same\r\n")
+      }),
+    )
+
+    it.instance("refuses to overwrite a concurrent edit made during approval", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "racing.txt")
+        yield* Effect.promise(() => fs.writeFile(filepath, "before", "utf-8"))
+        const exit = yield* run({ filePath: filepath, content: "agent version" }, {
+          ...ctx,
+          ask: () => Effect.promise(() => fs.writeFile(filepath, "external version", "utf-8")).pipe(Effect.asVoid),
+        }).pipe(Effect.exit)
+        expect(exit._tag).toBe("Failure")
+        expect(yield* Effect.promise(() => fs.readFile(filepath, "utf8"))).toBe("external version")
+      }),
+    )
+
+    it.instance("refuses to replace a file created while new-file approval was pending", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "appeared.txt")
+        const exit = yield* run({ filePath: filepath, content: "agent version" }, {
+          ...ctx,
+          ask: () => Effect.promise(() => fs.writeFile(filepath, "external version", "utf-8")).pipe(Effect.asVoid),
+        }).pipe(Effect.exit)
+        expect(exit._tag).toBe("Failure")
+        expect(yield* Effect.promise(() => fs.readFile(filepath, "utf8"))).toBe("external version")
       }),
     )
   })
