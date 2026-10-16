@@ -1,12 +1,13 @@
 export * as Ripgrep from "./ripgrep"
 
-import { Context, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { Context, Effect, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { Entry, Match } from "@opencode-ai/schema/filesystem"
 import { makeGlobalNode } from "./effect/app-node"
 import { AppProcess, collectStream, waitForAbort } from "./process"
 import { NonNegativeInt, PositiveInt, RelativePath } from "./schema"
 import { RipgrepBinary } from "./ripgrep/binary"
+import { withRipgrepSearchBudget } from "./ripgrep/budget"
 
 /**
  * Small core-owned ripgrep execution adapter. It deliberately exposes raw
@@ -60,6 +61,8 @@ export interface FindInput {
   readonly offset?: number
   readonly hidden?: boolean
   readonly follow?: boolean
+  /** Workspace-relative glob exclusions applied during traversal. */
+  readonly ignore?: readonly string[]
   readonly signal?: AbortSignal
   readonly onEntry?: (entry: Entry) => Effect.Effect<void>
 }
@@ -140,7 +143,16 @@ const layer = Layer.effect(
             Effect.map((chunk) => [...chunk]),
           )
           const truncated = rows.length > input.limit
-          if (truncated) return { items: rows.slice(0, input.limit), truncated, partial: false }
+           if (truncated) {
+             // A finite rg that has already written the requested page often
+             // exits on its own immediately. Let it finish briefly before
+             // tearing down its scoped process; Windows process-tree taskkill
+             // is orders of magnitude slower than normal exit in this case.
+             // Never delay cancellation or wait indefinitely for a broad scan.
+             const exited = yield* handle.exitCode.pipe(Effect.timeoutOption("80 millis"))
+             if (Option.isSome(exited)) yield* Fiber.join(stderrFiber)
+             return { items: rows.slice(0, input.limit), truncated, partial: false }
+           }
 
           const code = yield* handle.exitCode
           const stderr = yield* Fiber.join(stderrFiber)
@@ -154,7 +166,7 @@ const layer = Layer.effect(
         }),
       )
       const abortable = input.signal ? program.pipe(Effect.raceFirst(waitForAbort(input.signal))) : program
-      return abortable.pipe(
+      return withRipgrepSearchBudget(abortable).pipe(
         Effect.mapError((cause) =>
           cause instanceof Error || cause instanceof InvalidPatternError
             ? cause
@@ -209,6 +221,7 @@ const layer = Layer.effect(
             ...(input.hidden ? ["--hidden"] : []),
             ...(input.follow ? ["--follow"] : []),
             ...(input.pattern === "*" ? [] : [`--glob=${input.pattern}`]),
+            ...(input.ignore ?? []).map((pattern) => `--glob=!${pattern}`),
             "--glob=!**/.git/**",
             ".",
           ],

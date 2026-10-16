@@ -13,6 +13,7 @@ import { Flag } from "../flag/flag"
 import { FSUtil } from "../fs-util"
 import { Git } from "../git"
 import { Location } from "../location"
+import { RelativePath } from "../schema"
 import { lazy } from "../util/lazy"
 import { Ignore } from "./ignore"
 import { Protected } from "./protected"
@@ -34,6 +35,12 @@ const activeRoots = new Map<string, number>()
 function rootKey(directory: string) {
   const resolved = path.resolve(directory).replaceAll("\\", "/")
   return process.platform === "win32" ? resolved.toLowerCase() : resolved
+}
+
+export function isFilesystemRoot(directory: string) {
+  const resolved = path.resolve(directory)
+  const root = path.parse(resolved).root
+  return process.platform === "win32" ? resolved.toLowerCase() === root.toLowerCase() : resolved === root
 }
 
 function retainRoot(directory: string) {
@@ -119,6 +126,10 @@ const layer = Layer.effect(
 
     const backend = getBackend()
     const location = yield* Location.Service
+    if (isFilesystemRoot(location.directory)) {
+      yield* Effect.logWarning("skipping filesystem-root watcher", { directory: location.directory })
+      return Service.of({})
+    }
     if (!backend) {
       yield* Effect.logError("watcher backend not supported", {
         directory: location.directory,
@@ -211,7 +222,13 @@ const layer = Layer.effect(
     // ignored.
     let trackedWhitelist: string[] = []
     let nativeIgnore: readonly string[] = Ignore.PATTERNS
+    let gitIgnored: readonly string[] = []
     let refreshingWhitelist = false
+    let rootSubscription: ParcelWatcher.AsyncSubscription | undefined
+    let rootRelease: (() => void) | undefined
+    let rebuildRoot: Effect.Effect<boolean> | undefined
+    let refreshingGitIgnores = false
+    let gitIgnoreRefreshPending = false
     const refreshTrackedWhitelist = Effect.fnUntraced(function* () {
       if (location.vcs?.type !== "git") {
         trackedWhitelist = []
@@ -236,6 +253,77 @@ const layer = Layer.effect(
     })
     yield* refreshTrackedWhitelist().pipe(Effect.catchCause(() => Effect.void))
 
+    const refreshGitIgnored = Effect.fnUntraced(function* () {
+      if (location.vcs?.type !== "git") {
+        gitIgnored = []
+        return [] as Array<{ file: string; event: "add" | "unlink" }>
+      }
+      const repository = yield* git.repo.discover(location.directory)
+      if (!repository) {
+        gitIgnored = []
+        return [] as Array<{ file: string; event: "add" | "unlink" }>
+      }
+      const locationScope = path.relative(repository.worktree, location.directory).replaceAll("\\", "/")
+      if (locationScope === ".." || locationScope.startsWith("../") || path.isAbsolute(locationScope)) {
+        gitIgnored = []
+        return [] as Array<{ file: string; event: "add" | "unlink" }>
+      }
+      const projection = yield* git.index
+        .ignoredDirectories({
+          repository,
+          scope: locationScope ? RelativePath.make(locationScope) : undefined,
+        })
+        .pipe(Effect.catch(() => Effect.succeed({ paths: [] as readonly string[], truncated: false })))
+      if (projection.truncated || projection.paths.length > Ignore.MAX_GIT_IGNORED_PATHS) {
+        yield* Effect.logWarning("Git ignored watcher projection capped", {
+          directory: location.directory,
+          paths: projection.paths.length,
+          bytesTruncated: projection.truncated,
+          limit: Ignore.MAX_GIT_IGNORED_PATHS,
+        })
+      }
+      const previous = gitIgnored
+      const next = Ignore.boundedProjection(projection.paths)
+      gitIgnored = next
+      const old = new Set(previous)
+      const current = new Set(next)
+      return [
+        ...next.filter((item) => !old.has(item)).map((file) => ({ file: path.join(location.directory, file), event: "unlink" as const })),
+        ...previous.filter((item) => !current.has(item)).map((file) => ({ file: path.join(location.directory, file), event: "add" as const })),
+      ]
+    })
+    yield* refreshGitIgnored().pipe(Effect.catchCause(() => Effect.void))
+
+    const refreshGitIgnoredSoon = () => {
+      if (refreshingGitIgnores) {
+        gitIgnoreRefreshPending = true
+        return
+      }
+      refreshingGitIgnores = true
+      runFork(
+        refreshGitIgnored().pipe(
+          Effect.flatMap((changed) =>
+            Effect.suspend(() => rebuildRoot ?? Effect.succeed(false)).pipe(
+              Effect.flatMap((rebuilt) =>
+                rebuilt
+                  ? Effect.forEach(changed, (item) => events.publish(Event.Updated, item), { discard: true })
+                  : Effect.void,
+              ),
+            ),
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              refreshingGitIgnores = false
+              if (!gitIgnoreRefreshPending) return
+              gitIgnoreRefreshPending = false
+              refreshGitIgnoredSoon()
+            }),
+          ),
+          Effect.catchCause(() => Effect.void),
+        ),
+      )
+    }
+
     const refreshWhitelistSoon = () => {
       if (refreshingWhitelist) return
       refreshingWhitelist = true
@@ -250,7 +338,19 @@ const layer = Layer.effect(
     const callback = (gitDirectory?: string): ParcelWatcher.SubscribeCallback => (_error, updates) => {
       if (stopped) return
       if (updates.length === 0) return
-      if (gitDirectory) refreshWhitelistSoon()
+      if (gitDirectory) {
+        refreshWhitelistSoon()
+        if (
+          updates.some((update) => {
+            const relative = path.relative(gitDirectory, update.path).replaceAll("\\", "/")
+            return relative === "info/exclude" || relative === "index" || isGitControlPath(relative)
+          })
+        ) {
+          refreshGitIgnoredSoon()
+        }
+      } else if (updates.some((update) => path.basename(update.path) === ".gitignore")) {
+        refreshGitIgnoredSoon()
+      }
       // Parcel's ignore option is evaluated by the native backend, but some
       // backends still report descendants of ignored folders during a burst
       // (notably branch switches on Windows). Filter those hints at the
@@ -259,8 +359,10 @@ const layer = Layer.effect(
       // changes to refresh project state.
       const filtered = updates.filter((update) => {
         if (gitDirectory) return isGitControlPath(path.relative(gitDirectory, update.path))
+        const relative = path.relative(location.directory, update.path)
         return (
-          !Ignore.match(path.relative(location.directory, update.path), {
+          !Ignore.projectedIgnored(relative, gitIgnored) &&
+          !Ignore.match(relative, {
             extra: callbackIgnore,
             whitelist: trackedWhitelist,
           }) &&
@@ -293,13 +395,17 @@ const layer = Layer.effect(
         Effect.tap((subscription) =>
           Effect.sync(() => {
             subscriptions.push(subscription)
-            if (projectRoot) releaseRoots.push(retainRoot(directory))
+            if (projectRoot) {
+              rootSubscription = subscription
+              rootRelease = retainRoot(directory)
+              releaseRoots.push(rootRelease)
+            }
           }),
         ),
         Effect.timeout(SUBSCRIBE_TIMEOUT_MS),
         Effect.catchCause((cause) => {
           pending.then((subscription) => subscription.unsubscribe()).catch(() => {})
-          return Effect.logError("failed to subscribe", { directory, cause: Cause.pretty(cause) })
+          return Effect.logError("failed to subscribe", { directory, cause: Cause.pretty(cause) }).pipe(Effect.as(undefined))
         }),
       )
     }
@@ -309,19 +415,37 @@ const layer = Layer.effect(
       .flatMap((item) => item.info.watcher?.ignore ?? [])
     const configIgnore = new Set(config)
     callbackIgnore = [...new Set([...configIgnore, ...protecteds(location.directory)])]
+    const rebuildRootEffect = Effect.fnUntraced(function* () {
+      if (!(yield* Flag.OPENCODE_EXPERIMENTAL_FILEWATCHER)) return false
+      const previous = rootSubscription
+      const previousRelease = rootRelease
+      const projection = gitIgnored.map((item) => path.join(location.directory, item))
+      const replacement = yield* subscribe(
+        location.directory,
+        [...new Set([...nativeIgnore, ...configIgnore, ...protecteds(location.directory), ...projection])],
+        undefined,
+        true,
+      )
+      if (!replacement) return false
+      if (rootSubscription === previous) return false
+      if (rootSubscription !== previous && previous) {
+        yield* Effect.promise(() => previous.unsubscribe()).pipe(Effect.ignore)
+        previousRelease?.()
+      }
+      return true
+    })
+    rebuildRoot = rebuildRootEffect().pipe(Effect.catchCause(() => Effect.succeed(false)))
     // Watch any project root, git or not (operator decision: the old `location.vcs &&` guard
     // from f95f877e5f deliberately skipped non-git roots; do not re-add it). Ignore patterns
     // (tracked-aware subset of Ignore.PATTERNS + config `watcher.ignore` + protected paths)
     // bound event volume while keeping every tracked directory observable.
     if (yield* Flag.OPENCODE_EXPERIMENTAL_FILEWATCHER) {
-      yield* Effect.forkScoped(
-        subscribe(
-          location.directory,
-          [...new Set([...nativeIgnore, ...configIgnore, ...protecteds(location.directory)])],
-          undefined,
-          true,
-        ),
-      )
+      yield* Effect.forkScoped(subscribe(
+        location.directory,
+        [...new Set([...nativeIgnore, ...configIgnore, ...protecteds(location.directory), ...gitIgnored.map((item) => path.join(location.directory, item))])],
+        undefined,
+        true,
+      ))
     }
 
     if (location.vcs?.type === "git") {
