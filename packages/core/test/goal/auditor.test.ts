@@ -61,6 +61,7 @@ let readClockAdvanceMs = 0
 let resolveClockAdvanceMs = 0
 let defectReadPaths = new Set<string>()
 let binaryReadPaths = new Set<string>()
+let sensitiveSearchFixture = false
 
 const llmClient = Layer.succeed(
   LLMClient.Service,
@@ -81,6 +82,8 @@ const llmClient = Layer.succeed(
 )
 
 const fileEntry = FileSystem.Entry.make({ path: RelativePath.make("src/feature.ts"), type: "file" })
+const hiddenEnvEntry = FileSystem.Entry.make({ path: RelativePath.make(".env"), type: "file" })
+const hiddenGitEntry = FileSystem.Entry.make({ path: RelativePath.make(".git/config"), type: "file" })
 const filesystem = Layer.succeed(
   FileSystem.Service,
   FileSystem.Service.of({
@@ -96,6 +99,18 @@ const filesystem = Layer.succeed(
     grep: (input) => {
       grepCalls.push(input.pattern)
       return Effect.succeed([
+        ...(sensitiveSearchFixture
+          ? [
+              FileSystem.Match.make({
+                entry: hiddenEnvEntry, line: 1, offset: 0, text: "PRIVATE_SECRET_VALUE",
+                submatches: [],
+              }),
+              FileSystem.Match.make({
+                entry: hiddenGitEntry, line: 1, offset: 0, text: "PRIVATE_GIT_CONFIGURATION",
+                submatches: [],
+              }),
+            ]
+          : []),
         FileSystem.Match.make({
           entry: fileEntry,
           line: 1,
@@ -107,7 +122,7 @@ const filesystem = Layer.succeed(
     },
     glob: (input) => {
       globCalls.push(input.pattern)
-      return Effect.succeed([fileEntry])
+      return Effect.succeed(sensitiveSearchFixture ? [hiddenEnvEntry, hiddenGitEntry, fileEntry] : [fileEntry])
     },
     list: () => Effect.die("unused"),
     find: () => Effect.die("unused"),
@@ -208,6 +223,7 @@ const setup = Effect.gen(function* () {
   resolveClockAdvanceMs = 0
   defectReadPaths = new Set()
   binaryReadPaths = new Set()
+  sensitiveSearchFixture = false
 
   const { db } = yield* Database.Service
   yield* db
@@ -264,6 +280,7 @@ describe("GoalAuditor", () => {
       const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
 
       expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.retryable).toBe(true)
       expect(yield* (yield* GoalAutomation.Service).runtime(sessionID)).toBeUndefined()
     }),
   )
@@ -385,9 +402,12 @@ describe("GoalAuditor", () => {
 
       expect(result).toMatchObject({ ok: true, model: auditorRef, rounds: 2 })
       if (!result.ok) return
-      // The live lease belongs only to evaluate(); terminal success must have
-      // finalized it before the caller receives the verdict.
-      expect(yield* (yield* GoalAutomation.Service).runtime(sessionID)).toBeUndefined()
+       // A successful model verdict is NOT a committed Goal decision. The
+       // live lease persists until the host reconciles its verdict and the
+       // durable next-cycle reservation; a restart meanwhile must re-audit.
+       expect(yield* (yield* GoalAutomation.Service).runtime(sessionID)).toMatchObject({
+         phase: "auditing", auditorSessionID: result.auditorSessionID,
+       })
       expect(result.tokens).toBeGreaterThan(0)
       expect(result.tools).toEqual(["read", "grep", "glob", "audit_verdict"])
       expect(readCalls).toEqual(["src/feature.ts"])
@@ -586,8 +606,15 @@ describe("GoalAuditor", () => {
       expect(first.ok).toBe(true)
       if (!first.ok) return
 
-      generateResponses = [verdict("second", "continue", false)]
-      const second = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+       // An independent test invocation stands in for a separate settled host
+       // cycle: the caller, not evaluate(), owns the durable lease release.
+       yield* (yield* GoalAutomation.Service).endAudit({
+         sessionID,
+         auditorSessionID: first.auditorSessionID!,
+         auditStartedAt: first.auditStartedAt!,
+       })
+       generateResponses = [verdict("second", "continue", false)]
+       const second = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
       expect(second.ok).toBe(true)
       if (!second.ok) return
       expect(second.auditorSessionID).toBe(first.auditorSessionID)
@@ -658,9 +685,13 @@ describe("GoalAuditor", () => {
       const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
       expect(result.ok).toBe(false)
       if (result.ok) return
-      expect(result.error).toContain("5-minute execution budget")
-      expect(generateRequests).toHaveLength(1)
-      expect(yield* (yield* GoalAutomation.Service).runtime(sessionID)).toBeUndefined()
+       expect(result.error).toContain("5-minute execution budget")
+       expect(generateRequests).toHaveLength(1)
+       // The timeout is a returned audit outcome, not yet a durable host
+       // settlement. Crash/restart must not strand this cycle between phases.
+       expect(yield* (yield* GoalAutomation.Service).runtime(sessionID)).toMatchObject({
+         phase: "auditing", auditorSessionID: result.auditorSessionID,
+       })
     }),
   )
 
@@ -690,6 +721,107 @@ describe("GoalAuditor", () => {
       expect(result.ok).toBe(true)
       expect(readCalls).toEqual([])
       expect(JSON.stringify(generateRequests[1]!.messages)).toContain("Sensitive files are not available")
+    }),
+  )
+
+  it.effect("filters sensitive grep/glob results before the model sees its read-only tool transcript", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      sensitiveSearchFixture = true
+      generateResponses = [
+        response({ id: "grep-mixed", name: "grep", input: { pattern: "configuration" } }),
+        response({ id: "glob-mixed", name: "glob", input: { pattern: "**/*" } }),
+        verdict("safe-verdict", "continue", true),
+      ]
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(true)
+      expect(grepCalls).toEqual(["configuration"])
+      expect(globCalls).toEqual(["**/*"])
+      const transcript = JSON.stringify(generateRequests[2]!.messages)
+      expect(transcript).toContain("src/feature.ts")
+      expect(transcript).not.toContain("PRIVATE_SECRET_VALUE")
+      expect(transcript).not.toContain("PRIVATE_GIT_CONFIGURATION")
+      expect(transcript).not.toContain(".git/config")
+      expect(transcript).not.toContain('".env"')
+    }),
+  )
+
+  it.effect("rejects an explicitly sensitive grep scope without invoking the filesystem", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      generateResponses = [
+        response({ id: "grep-hidden", name: "grep", input: { pattern: "secret", path: ".git/config" } }),
+        verdict("after-rejected-grep", "continue", true),
+      ]
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(true)
+      expect(grepCalls).toEqual([])
+      expect(JSON.stringify(generateRequests[1]!.messages)).toContain("Sensitive files are not available")
+    }),
+  )
+
+  it.effect("fails before publishing provider-executed tool results into the auditor Session", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      generateResponses = [
+        LLMResponse.fromEvents([
+          LLMEvent.toolCall({ id: "unexpected-read", name: "read", input: { path: "src/feature.ts" } }),
+          LLMEvent.toolResult({
+            id: "unexpected-read",
+            name: "read",
+            providerExecuted: true,
+            result: { type: "text", value: "provider-side sensitive result" },
+          }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ])!,
+      ]
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(false)
+      expect(readCalls).toEqual([])
+      expect((yield* (yield* GoalV2.Service).focused(sessionID))?.detail.goal.status).toBe("active")
+    }),
+  )
+
+  it.effect("rejects provider-executed tools rather than accepting an accompanying audit verdict", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      generateResponses = [
+        LLMResponse.fromEvents([
+          LLMEvent.toolCall({
+            id: "provider-side-write",
+            name: "write",
+            input: { path: "src/feature.ts", content: "unsafe" },
+            providerExecuted: true,
+          }),
+          LLMEvent.toolCall({
+            id: "accompanying-verdict",
+            name: "audit_verdict",
+            input: {
+              decision: "complete",
+              rationale: "All work is done.",
+              progressMade: true,
+              criteria: currentCriteria.map((criterion) => ({
+                criterionID: criterion.id,
+                status: "passed",
+                evidence: "A provider-executed write claimed it succeeded.",
+              })),
+            },
+          }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ])!,
+      ]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.error).toContain("read-only host boundary")
+      expect(readCalls).toEqual([])
+      expect(grepCalls).toEqual([])
+      expect(globCalls).toEqual([])
+      expect((yield* (yield* GoalV2.Service).focused(sessionID))?.detail.goal.status).toBe("active")
     }),
   )
 
@@ -758,6 +890,86 @@ describe("GoalAuditor", () => {
       expect(transcript).toContain("Protocol correction")
       expect(transcript).toContain("host rejected the previous completion")
       expect(transcript).toContain("audit_verdict")
+    }),
+  )
+
+  it.effect("recovers after three malformed audit verdicts without re-running inspection", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      const missingContinuation = (id: string) =>
+        response({
+          id,
+          name: "audit_verdict",
+          input: {
+            decision: "continue",
+            rationale: "The check is failing and actionable work remains.",
+            progressMade: false,
+            criteria: currentCriteria.map((criterion) => ({
+              criterionID: criterion.id,
+              status: "failed",
+              evidence: "The check is still failing.",
+            })),
+          },
+        })
+      generateResponses = [
+        missingContinuation("bad-1"),
+        response({ id: "bad-2", name: "audit_verdict", input: {} }),
+        missingContinuation("bad-3"),
+        verdict("valid-on-fourth", "continue", false),
+      ]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.rounds).toBe(4)
+      expect(result.verdict.decision).toBe("continue")
+      expect(generateRequests).toHaveLength(4)
+      expect(generateRequests.slice(1).every((request) =>
+        request.tools.map((tool) => tool.name).join(",") === "audit_verdict",
+      )).toBe(true)
+      expect(JSON.stringify(generateRequests[1]!.messages)).toContain("non-empty continuationPrompt")
+      expect(JSON.stringify(generateRequests[2]!.messages)).toContain("empty payload")
+      expect(readCalls).toHaveLength(0)
+      expect(grepCalls).toHaveLength(0)
+      expect(globCalls).toHaveLength(0)
+    }),
+  )
+
+  it.effect("repairs an audit_verdict call with an empty payload in the same auditor conversation", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      generateResponses = [
+        response({ id: "empty-verdict", name: "audit_verdict", input: {} }),
+        verdict("after-empty-repair", "continue", true),
+      ]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(true)
+      expect(generateRequests).toHaveLength(2)
+      const repairTranscript = JSON.stringify(generateRequests[1]!.messages)
+      expect(repairTranscript).toContain("audit_verdict was called with an empty payload")
+      expect(repairTranscript).toContain("exact id from ACCEPTANCE CRITERIA")
+    }),
+  )
+
+  it.effect("exposes a flat provider-facing audit_verdict schema instead of a root union", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      generateResponses = [verdict("flat-wire-schema", "continue", true)]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(true)
+      const auditTool = generateRequests[0]!.tools.find((tool) => tool.name === "audit_verdict")
+      expect(auditTool).toBeDefined()
+      const wire = auditTool!.inputSchema as any
+      expect(wire.type).toBe("object")
+      expect(wire.anyOf).toBeUndefined()
+      expect(wire.properties?.decision).toMatchObject({ type: "string", enum: ["continue", "complete", "blocked"] })
+      expect(wire.required ?? []).toEqual(expect.arrayContaining(["decision", "rationale", "progressMade", "criteria"]))
+      expect(JSON.stringify(wire)).not.toContain("Goal.AuditorVerdict")
     }),
   )
 
@@ -850,7 +1062,7 @@ describe("GoalAuditor", () => {
             continuationPrompt: "Finish the remaining implementation.",
           },
         })
-      generateResponses = [ambiguous(), ambiguous()]
+      generateResponses = [ambiguous(), ambiguous(), ambiguous(), ambiguous()]
 
       const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
       expect(result.ok).toBe(false)
@@ -883,7 +1095,7 @@ describe("GoalAuditor", () => {
             continuationPrompt: "Finish the remaining implementation and verify the exact acceptance criterion.",
           },
         })
-      generateResponses = [typoVerdict(), typoVerdict()]
+      generateResponses = [typoVerdict(), typoVerdict(), typoVerdict(), typoVerdict()]
 
       const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
       expect(result.ok).toBe(true)
@@ -894,7 +1106,7 @@ describe("GoalAuditor", () => {
           status: "pending",
         }),
       ])
-      expect(generateRequests).toHaveLength(2)
+      expect(generateRequests).toHaveLength(4)
       expect(JSON.stringify(generateRequests[1]!.messages)).toContain(`unknown criterion ${mistypedCriterionID}`)
     }),
   )
@@ -920,7 +1132,7 @@ describe("GoalAuditor", () => {
             confidence: 4.2,
           },
         })
-      generateResponses = [noisy(), noisy(), noisy()]
+      generateResponses = [noisy(), noisy(), noisy(), noisy()]
 
       const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
       expect(result.ok).toBe(true)
@@ -954,7 +1166,7 @@ describe("GoalAuditor", () => {
             continuationPrompt: "Probe the boundary and report what is required.",
           },
         })
-      generateResponses = [missing(), missing(), missing()]
+      generateResponses = [missing(), missing(), missing(), missing()]
 
       const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
       expect(result.ok).toBe(false)
@@ -1017,14 +1229,14 @@ describe("GoalAuditor", () => {
             })),
           },
         })
-      generateResponses = [invalid(), invalid()]
+      generateResponses = [invalid(), invalid(), invalid(), invalid()]
 
       const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
       expect(result.ok).toBe(false)
       if (result.ok) return
       expect(result.error).toContain("Invalid audit_verdict payload")
       expect(result.error).toContain("after 1 auditor attempt")
-      expect(generateRequests).toHaveLength(2)
+      expect(generateRequests).toHaveLength(4)
     }),
   )
 
@@ -1032,16 +1244,16 @@ describe("GoalAuditor", () => {
     Effect.gen(function* () {
       yield* setup
       yield* focusedGoal()
-      // One full audit attempt receives exactly one same-conversation protocol
-      // repair. Extra queued responses would only be consumed by an implicit
+      // One full audit attempt receives three same-conversation protocol
+      // repairs. Extra queued responses would only be consumed by an implicit
       // whole-audit retry, which the default policy must not perform.
-      generateResponses = [response(), response(), response(), response()]
+      generateResponses = [response(), response(), response(), response(), response()]
 
       const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
       expect(result.ok).toBe(false)
       if (result.ok) return
       expect(result.error).toContain("after 1 auditor attempt")
-      expect(generateRequests).toHaveLength(2)
+      expect(generateRequests).toHaveLength(4)
     }),
   )
 
@@ -1049,17 +1261,17 @@ describe("GoalAuditor", () => {
     Effect.gen(function* () {
       yield* setup
       yield* focusedGoal({ maxAttempts: 2 })
-      // Each auditor attempt gets one bounded same-conversation repair after a
+      // Each auditor attempt gets three bounded same-conversation repairs after a
       // prose/no-tool response. Neither response is ever interpreted as a verdict.
-      generateResponses = [response(), response(), response(), response()]
+      generateResponses = Array.from({ length: 8 }, () => response())
 
       const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
       expect(result.ok).toBe(false)
       if (result.ok) return
       expect(result.error).toContain("after 2 auditor attempts")
-      expect(generateRequests).toHaveLength(4)
+      expect(generateRequests).toHaveLength(8)
       expect(JSON.stringify(generateRequests[1]!.messages)).toContain("Protocol correction")
-      expect(JSON.stringify(generateRequests[3]!.messages)).toContain("Protocol correction")
+      expect(JSON.stringify(generateRequests[7]!.messages)).toContain("Protocol correction")
     }),
   )
 

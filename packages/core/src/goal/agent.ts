@@ -100,11 +100,18 @@ const layer = Layer.effect(
             reason: "child Sessions cannot create Goals; ask the parent Session to create and own the Goal",
           })
         }
-        const objective = input.objective?.trim()
-        if (!objective) return yield* new GoalSchema.ValidationError({ reason: "create requires objective" })
+        const objective = input.objective?.trim() || input.title?.trim()
+        if (!objective) {
+          return yield* new GoalSchema.ValidationError({
+            reason: "create requires an objective or a descriptive title; do not invent work from an empty Goal",
+          })
+        }
         const criteria = (input.criteria ?? []).map((item) => item.trim()).filter(Boolean)
         if (criteria.length === 0) {
-          return yield* new GoalSchema.ValidationError({ reason: "create requires at least one acceptance criterion" })
+          // A human can request a durable Goal without writing its acceptance
+          // checklist first. Anchor the audit to the full persisted objective
+          // instead of rejecting creation or making the model fabricate details.
+          criteria.push("The complete Goal objective has been achieved and independently verified.")
         }
         const existing = yield* goals.focused(sessionID)
         const shouldStart =

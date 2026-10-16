@@ -51,6 +51,16 @@ const ownedHandles = new Map<string, Set<OwnedHandle>>()
 const cancellationFences = new Map<string, Map<bigint, number>>()
 let admissionEpoch = 0n
 
+/**
+ * The exact process-local job-admission boundary observed by an operator Stop.
+ * Taking this snapshot before asynchronous owner/SQLite work ensures a delayed
+ * Stop cannot accidentally cancel jobs admitted by a newer Session generation.
+ * This is only a job lifetime fence, not evidence of tool-effect containment.
+ */
+export function captureSessionJobCancellationCutoff(): bigint {
+  return ++admissionEpoch
+}
+
 function retainCancellationFence(key: string, epoch: bigint) {
   let fences = cancellationFences.get(key)
   if (!fences) cancellationFences.set(key, (fences = new Map()))
@@ -101,11 +111,13 @@ function unregisterOwned(handle: OwnedHandle) {
 export const cancelOwnedBySession = Effect.fn("BackgroundJob.cancelOwnedBySession")(function* (
   sessionID: string,
   afterCancel: Effect.Effect<void> = Effect.void,
+  cutoff?: bigint,
 ) {
   return yield* Effect.uninterruptible(
     Effect.gen(function* () {
       const cancelled = new Set<OwnedHandle>()
       const fence = ++admissionEpoch
+      const admittedBefore = cutoff ?? fence
       const fenced = new Set<string>([sessionID])
       for (const key of fenced) retainCancellationFence(key, fence)
       try {
@@ -116,7 +128,7 @@ export const cancelOwnedBySession = Effect.fn("BackgroundJob.cancelOwnedBySessio
             pending.delete(key)
             const candidates = [...(ownedHandles.get(key) ?? [])]
             for (const handle of candidates) {
-              if (cancelled.has(handle) || handle.admissionEpoch >= fence) continue
+               if (cancelled.has(handle) || handle.admissionEpoch >= admittedBefore) continue
               const direct = handle.id === sessionID || handle.sessionID === sessionID
               if (!direct && handle.background) continue
               cancelled.add(handle)
@@ -200,13 +212,22 @@ export type WaitResult = {
   timedOut: boolean
 }
 
+export type WaitAnyInput = {
+  readonly jobs: readonly { readonly id: string; readonly generation?: number }[]
+  readonly timeout?: number
+}
+
 export interface Interface {
   readonly list: () => Effect.Effect<Info[]>
   readonly get: (id: string) => Effect.Effect<Info | undefined>
+  /** One registry admission for many authenticated IDs, without history scans. */
+  readonly getMany: (ids: readonly string[]) => Effect.Effect<ReadonlyMap<string, Info>>
   readonly start: (input: StartInput) => Effect.Effect<Info>
   readonly tryStart: (input: StartInput) => Effect.Effect<{ info: Info; started: boolean }>
   readonly extend: (input: ExtendInput) => Effect.Effect<boolean>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
+  /** One interruptible suspension for many jobs; no one-fiber-per-job race tree. */
+  readonly waitAny: (input: WaitAnyInput) => Effect.Effect<{ timedOut: boolean }>
   readonly waitForPromotion: (id: string) => Effect.Effect<Info>
   readonly promote: (id: string) => Effect.Effect<Info | undefined>
   readonly foreground: (id: string, onPromote?: Effect.Effect<void>) => Effect.Effect<Info | undefined>
@@ -239,6 +260,16 @@ export const make = Effect.gen(function* () {
     jobs: yield* SynchronizedRef.make(new Map()),
     scope: yield* Scope.Scope,
   }
+
+  // Each batch has ONE Deferred indexed by its target job IDs. Only terminal
+  // transitions of a matching job wake the batch, without N waiting fibers.
+  const completionWaiters = new Map<string, Set<Deferred.Deferred<void>>>()
+  const notifyCompleted = (id: string) => Effect.gen(function* () {
+    const listeners = completionWaiters.get(id)
+    if (!listeners) return
+    completionWaiters.delete(id)
+    yield* Effect.forEach(listeners, (waiter) => Deferred.succeed(waiter, undefined), { discard: true })
+  })
 
   const settle = Effect.fn("BackgroundJob.settle")(function* (
     id: string,
@@ -291,7 +322,12 @@ export const make = Effect.gen(function* () {
       jobs.set(id, next)
       return [{ info: snapshot(next), done: job.done, scope: job.scope }, jobs]
     })
-    if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
+    if (result.info && result.done) {
+      // Publish both terminal wake contracts without an interruption gap.
+      yield* Effect.uninterruptible(
+        Deferred.succeed(result.done, result.info).pipe(Effect.ignore, Effect.andThen(notifyCompleted(id))),
+      )
+    }
     if (result.scope) {
       const handle = ownedByToken.get(token)
       if (handle) unregisterOwned(handle)
@@ -333,6 +369,17 @@ export const make = Effect.gen(function* () {
     })
   })
 
+  const getMany: Interface["getMany"] = Effect.fn("BackgroundJob.getMany")(function* (ids) {
+    return yield* SynchronizedRef.modify(state.jobs, (jobs) => {
+      const found = new Map<string, Info>()
+      for (const id of ids) {
+        const job = jobs.get(id)
+        if (job && !found.has(id)) found.set(id, snapshot(job))
+      }
+      return [found, jobs]
+    })
+  })
+
   const cancelToken = Effect.fn("BackgroundJob.cancelToken")(function* (id: string, token: object) {
     const completed_at = yield* Clock.currentTimeMillis
     const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
@@ -343,7 +390,11 @@ export const make = Effect.gen(function* () {
       jobs.set(id, next)
       return [{ info: snapshot(next), done: job.done, scope: job.scope }, jobs]
     })
-    if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
+    if (result.info && result.done) {
+      yield* Effect.uninterruptible(
+        Deferred.succeed(result.done, result.info).pipe(Effect.ignore, Effect.andThen(notifyCompleted(id))),
+      )
+    }
     if (result.scope) {
       const handle = ownedByToken.get(token)
       if (handle) unregisterOwned(handle)
@@ -480,6 +531,50 @@ export const make = Effect.gen(function* () {
     return { info: snapshot(job), timedOut: true }
   })
 
+  const waitAny: Interface["waitAny"] = Effect.fn("BackgroundJob.waitAny")(function* (input) {
+    const targets = [...new Map(input.jobs.map((job) => [job.id, job])).values()]
+    if (targets.length === 0) return { timedOut: false }
+    const signal = yield* Deferred.make<void>()
+    // Register before the authoritative snapshot. Any transition racing with
+    // registration is either visible in the snapshot or wakes this Deferred.
+    // Cleanup runs even if the waiting caller is interrupted.
+    const unsubscribe = Effect.sync(() => {
+      for (const target of targets) {
+        const listeners = completionWaiters.get(target.id)
+        listeners?.delete(signal)
+        if (listeners?.size === 0) completionWaiters.delete(target.id)
+      }
+    })
+    return yield* Effect.ensuring(
+      Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          for (const target of targets) {
+            let listeners = completionWaiters.get(target.id)
+            if (!listeners) completionWaiters.set(target.id, (listeners = new Set()))
+            listeners.add(signal)
+          }
+        })
+        const finished = yield* SynchronizedRef.modify(state.jobs, (jobs) => [
+          targets.some(({ id, generation }) => {
+            const job = jobs.get(id)
+            return !job || job.info.status !== "running" ||
+              (generation !== undefined && generation !== job.info.generation)
+          }),
+          jobs,
+        ])
+        if (finished) return { timedOut: false }
+        if (input.timeout !== undefined && input.timeout <= 0) return { timedOut: true }
+        if (input.timeout === undefined) {
+          yield* Deferred.await(signal)
+          return { timedOut: false }
+        }
+        const awakened = yield* Deferred.await(signal).pipe(Effect.timeoutOption(input.timeout))
+        return { timedOut: awakened._tag === "None" }
+      }),
+      unsubscribe,
+    )
+  })
+
   const waitForPromotion: Interface["waitForPromotion"] = Effect.fn("BackgroundJob.waitForPromotion")(function* (id) {
     const job = yield* SynchronizedRef.modify(state.jobs, (jobs) => [jobs.get(id), jobs])
     if (!job || job.info.status !== "running") return yield* Effect.never
@@ -547,7 +642,7 @@ export const make = Effect.gen(function* () {
     return yield* cancelToken(id, job.token)
   })
 
-  return Service.of({ list, get, start, tryStart, extend, wait, waitForPromotion, promote, foreground, cancel })
+  return Service.of({ list, get, getMany, start, tryStart, extend, wait, waitAny, waitForPromotion, promote, foreground, cancel })
 })
 
 const layer = Layer.effect(Service, make)

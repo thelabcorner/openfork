@@ -4,6 +4,7 @@ import { and, eq, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { ScheduledTask } from "@opencode-ai/schema/scheduled-task"
 import { Database } from "../database/database"
+import { retrySqliteBusyCause } from "../database/sqlite-busy"
 import { makeGlobalNode } from "../effect/app-node"
 import { hydrateRun } from "./projection"
 import { ScheduledTaskLeaseTable, ScheduledTaskRunTable, ScheduledTaskTable } from "./sql"
@@ -16,6 +17,11 @@ export const HEARTBEAT_INTERVAL_MS = 30_000
  * heartbeat is older than this is reclaimed: its owner is gone or wedged.
  */
 export const LEASE_TTL_MS = 150_000
+
+/** Maximum stale leases inspected and conditionally settled in one IMMEDIATE
+ * writer transaction. A large backlog after unclean shutdown must not hold
+ * SQLite's single WAL writer reservation for an unbounded number of rows. */
+export const STALE_RECOVERY_BATCH_SIZE = 64
 
 /**
  * Module-scoped rather than layer-scoped: V1 and V2 runtimes in the same
@@ -65,9 +71,10 @@ export interface Interface {
    * run can exist yet), unsafe for a periodic sweep because same-process
    * runtimes share one owner id and must never steal a live lease.
    */
-  readonly recoverStale: (input: {
-    readonly now: number
-    readonly includeOwn?: boolean
+   readonly recoverStale: (input: {
+     readonly now: number
+     readonly includeOwn?: boolean
+     readonly limit?: number
   }) => Effect.Effect<
     ReadonlyArray<{
       readonly taskID: ScheduledTask.ID
@@ -85,7 +92,13 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db, readDb } = yield* Database.Service
+    const { db, readDb, controlDb } = yield* Database.Service
+    // A Session historical SELECT can hold the foreground connection permit
+    // for minutes even when no WAL writer reservation is active. Live lease
+    // heartbeats and terminal release must not queue behind that unrelated
+    // connection. Reuse Core's existing memoized control writer; reclamation
+    // stays on the regular database because it may scan a backlog.
+    const livenessWriter = controlDb ?? (() => Effect.succeed(db))
 
     const claim = Effect.fn("ScheduledTaskLease.claim")(function* (input: {
       taskID: ScheduledTask.ID
@@ -136,32 +149,46 @@ const layer = Layer.effect(
       leaseID: string
       now: number
     }) {
-      const updated = yield* db
-        .update(ScheduledTaskLeaseTable)
-        .set({ heartbeat_at: input.now })
-        .where(
-          and(
-            eq(ScheduledTaskLeaseTable.lease_id, input.leaseID),
-            eq(ScheduledTaskLeaseTable.owner, PROCESS_OWNER_ID),
-          ),
-        )
-        .returning({ lease_id: ScheduledTaskLeaseTable.lease_id })
-        .get()
-        .pipe(Effect.orDie)
-      return updated !== undefined
+      // The exact owner/lease predicate makes a retry of this single update
+      // safe. Do not spin indefinitely if another process holds the WAL writer.
+      return yield* retrySqliteBusyCause(
+        () => Effect.gen(function* () {
+          const writer = yield* livenessWriter()
+          const updated = yield* writer
+            .update(ScheduledTaskLeaseTable)
+            .set({ heartbeat_at: input.now })
+            .where(
+              and(
+                eq(ScheduledTaskLeaseTable.lease_id, input.leaseID),
+                eq(ScheduledTaskLeaseTable.owner, PROCESS_OWNER_ID),
+              ),
+            )
+            .returning({ lease_id: ScheduledTaskLeaseTable.lease_id })
+            .get()
+            .pipe(Effect.orDie)
+          return updated !== undefined
+        }),
+        { maxElapsedMs: 3_000, delayMs: 40, maxDelayMs: 250 },
+      )
     })
 
     const release = Effect.fn("ScheduledTaskLease.release")(function* (input: { leaseID: string }) {
-      yield* db
-        .delete(ScheduledTaskLeaseTable)
-        .where(
-          and(
-            eq(ScheduledTaskLeaseTable.lease_id, input.leaseID),
-            eq(ScheduledTaskLeaseTable.owner, PROCESS_OWNER_ID),
-          ),
-        )
-        .run()
-        .pipe(Effect.orDie)
+      yield* retrySqliteBusyCause(
+        () => Effect.gen(function* () {
+          const writer = yield* livenessWriter()
+          yield* writer
+            .delete(ScheduledTaskLeaseTable)
+            .where(
+              and(
+                eq(ScheduledTaskLeaseTable.lease_id, input.leaseID),
+                eq(ScheduledTaskLeaseTable.owner, PROCESS_OWNER_ID),
+              ),
+            )
+            .run()
+            .pipe(Effect.orDie)
+        }),
+        { maxElapsedMs: 3_000, delayMs: 40, maxDelayMs: 250 },
+      )
     })
 
     const scheduleRetry = Effect.fn("ScheduledTaskLease.scheduleRetry")(function* (input: {
@@ -205,9 +232,13 @@ const layer = Layer.effect(
     const recoverStale = Effect.fn("ScheduledTaskLease.recoverStale")(function* (input: {
       now: number
       includeOwn?: boolean
+      limit?: number
     }) {
       const staleAt = input.now - LEASE_TTL_MS
       const stale = lt(ScheduledTaskLeaseTable.heartbeat_at, staleAt)
+      const limit = Number.isSafeInteger(input.limit)
+        ? Math.max(1, Math.min(STALE_RECOVERY_BATCH_SIZE, input.limit!))
+        : STALE_RECOVERY_BATCH_SIZE
       return yield* db
         .transaction(
           (tx) =>
@@ -229,6 +260,7 @@ const layer = Layer.effect(
                     : stale,
                 ),
               )
+              .limit(limit)
               .all()
               .pipe(Effect.orDie)
             const reclaimed: Array<{

@@ -11,7 +11,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
 import { ScheduledTaskLease } from "@opencode-ai/core/scheduled-task/lease"
 import { jitterFor, occurrencesBetween } from "@opencode-ai/core/scheduled-task/recurrence"
-import { ScheduledTaskRunTable, ScheduledTaskTable } from "@opencode-ai/core/scheduled-task/sql"
+import { ScheduledTaskLeaseTable, ScheduledTaskRunTable, ScheduledTaskTable } from "@opencode-ai/core/scheduled-task/sql"
 import { ScheduledTask as ScheduledTaskModel } from "@opencode-ai/schema/scheduled-task"
 import { Goal as GoalModel } from "@opencode-ai/schema/goal"
 import { SessionID } from "@opencode-ai/schema/session-id"
@@ -450,6 +450,43 @@ describe("ScheduledTask service — CRUD and the due cursor invariant", () => {
       expect((yield* tasks.list({ projectID: projectA })).map((task) => task.id)).toEqual([projectTask.id])
     }),
   )
+
+  it.effect("crash backlog: reclaims no more than 64 stale leases per writer transaction, with exact terminal outcomes", () =>
+    Effect.gen(function* () {
+      yield* seedProject
+      const leases = yield* ScheduledTaskLease.Service
+      const { db } = yield* Database.Service
+      for (let index = 0; index < 70; index++) {
+        const task = yield* createTask({ name: `crash-backlog-${index}` })
+        const fireFor = task.nextRunAt!
+        yield* db.insert(ScheduledTaskLeaseTable).values({
+          task_id: task.id,
+          fire_for: fireFor,
+          lease_id: `dead-generation-${index}`,
+          owner: "dead-peer",
+          acquired_at: T0 - 600_000,
+          heartbeat_at: T0 - 600_000,
+        }).run().pipe(Effect.orDie)
+        yield* db.insert(ScheduledTaskRunTable).values({
+          id: ScheduledTaskModel.RunID.create(),
+          task_id: task.id,
+          fire_for: fireFor,
+          trigger: "schedule",
+          status: "running",
+          started_at: T0 - 600_000,
+        }).run().pipe(Effect.orDie)
+      }
+      const first = yield* leases.recoverStale({ now: T0, limit: 64 })
+      expect(first).toHaveLength(64)
+      const second = yield* leases.recoverStale({ now: T0, limit: 64 })
+      expect(second).toHaveLength(6)
+      expect(new Set([...first, ...second].map((entry) => entry.taskID)).size).toBe(70)
+      expect(yield* leases.recoverStale({ now: T0, limit: 64 })).toHaveLength(0)
+      const runs = yield* db.select().from(ScheduledTaskRunTable).all().pipe(Effect.orDie)
+      expect(runs).toHaveLength(70)
+      expect(runs.every((run) => run.status === "abandoned")).toBe(true)
+    }),
+  )
 })
 
 describe("ScheduledTask service — lease protocol and idempotency", () => {
@@ -498,6 +535,70 @@ describe("ScheduledTask service — lease protocol and idempotency", () => {
       expect(second.kind).toBe("exists")
       const { db } = yield* Database.Service
       expect(yield* db.select().from(ScheduledTaskRunTable).all().pipe(Effect.orDie)).toHaveLength(1)
+    }),
+  )
+
+  it.effect("stale skip cannot delete another owner's lease or advance its cursor", () =>
+    Effect.gen(function* () {
+      yield* seedProject
+      const tasks = yield* ScheduledTask.Service
+      const leases = yield* ScheduledTaskLease.Service
+      const { db } = yield* Database.Service
+      const task = yield* createTask()
+      const fireFor = task.nextRunAt!
+      const claim = (yield* leases.claim({ taskID: task.id, fireFor, now: T0 }))!
+      yield* db.update(ScheduledTaskLeaseTable)
+        .set({ owner: "new-generation" })
+        .where(eq(ScheduledTaskLeaseTable.task_id, task.id))
+        .run().pipe(Effect.orDie)
+      yield* tasks.skipSettled({
+        taskID: task.id, fireFor, leaseID: claim.leaseID, now: T0 + 1000,
+      })
+      expect((yield* tasks.get(task.id)).nextRunAt).toBe(fireFor)
+      const remaining = yield* db.select().from(ScheduledTaskLeaseTable)
+        .where(eq(ScheduledTaskLeaseTable.task_id, task.id)).get().pipe(Effect.orDie)
+      expect(remaining?.owner).toBe("new-generation")
+    }),
+  )
+
+  it.effect("late executor cannot settle a reclaimed lease or advance another owner's cursor", () =>
+    Effect.gen(function* () {
+      yield* seedProject
+      const tasks = yield* ScheduledTask.Service
+      const leases = yield* ScheduledTaskLease.Service
+      const { db } = yield* Database.Service
+      const task = yield* createTask()
+      const fireFor = task.nextRunAt!
+      const lease = (yield* leases.claim({ taskID: task.id, fireFor, now: T0 }))!
+      const started = yield* tasks.recordRunStart({
+        taskID: task.id,
+        fireFor,
+        trigger: "schedule",
+        attempt: lease.attempt,
+        acceptExisting: "none",
+        now: T0,
+      })
+      expect(started.kind).toBe("started")
+      if (started.kind !== "started") return
+      yield* db.update(ScheduledTaskLeaseTable)
+        .set({ owner: "replacement-owner" })
+        .where(eq(ScheduledTaskLeaseTable.lease_id, lease.leaseID))
+        .run().pipe(Effect.orDie)
+      const exit = yield* Effect.exit(tasks.settleRun({
+        taskID: task.id,
+        runID: started.run.id,
+        fireFor,
+        attempt: lease.attempt,
+        leaseID: lease.leaseID,
+        status: "succeeded",
+        now: T0 + 1000,
+      }))
+      expect(exit._tag).toBe("Failure")
+      expect((yield* tasks.listRuns({ taskID: task.id }))[0]?.status).toBe("running")
+      expect((yield* tasks.get(task.id)).nextRunAt).toBe(fireFor)
+      const live = yield* db.select().from(ScheduledTaskLeaseTable)
+        .where(eq(ScheduledTaskLeaseTable.task_id, task.id)).get().pipe(Effect.orDie)
+      expect(live?.owner).toBe("replacement-owner")
     }),
   )
 
@@ -973,6 +1074,54 @@ describe("ScheduledTask service — catch-up, settlement, retry", () => {
         sessionID: "ses_attempt_2",
         attempt: 2,
       })
+    }),
+  )
+
+  it.effect("due-task keyset pages eventually expose all 140 equally due tasks without unbounded admission", () =>
+    Effect.gen(function* () {
+      yield* seedProject
+      const tasks = yield* ScheduledTask.Service
+      const fireFor = T0 + 60_000
+      const all = new Set<string>()
+      for (let index = 0; index < 140; index++) {
+        const task = yield* createTask({
+          name: `due-page-${index}`,
+          timezone: undefined,
+          schedule: { kind: "once", at: fireFor },
+        })
+        all.add(task.id)
+      }
+      const observed = new Set<string>()
+      for (let page = 0; page < 3; page++) {
+        const plans = yield* tasks.planDue(fireFor)
+        expect(plans.length).toBeLessThanOrEqual(ScheduledTask.DUE_DISPATCH_CANDIDATE_PAGE_SIZE)
+        for (const plan of plans) {
+          expect(observed.has(plan.task.id)).toBe(false)
+          observed.add(plan.task.id)
+        }
+      }
+      expect(observed).toEqual(all)
+    }),
+  )
+
+  it.effect("queued scheduling pages fairly past >64 busy overrun=queue leases", () =>
+    Effect.gen(function* () {
+      yield* seedProject
+      const tasks = yield* ScheduledTask.Service
+      const leases = yield* ScheduledTaskLease.Service
+      for (let index = 0; index < 70; index++) {
+        const blocked = yield* createTask({
+          name: `blocked-manual-${index}`,
+          policy: { overrun: "queue" },
+        })
+        yield* tasks.enqueueManualRun({ taskID: blocked.id, now: T0 + index })
+        yield* leases.claim({ taskID: blocked.id, fireFor: blocked.nextRunAt!, now: T0 + index })
+      }
+      const ready = yield* createTask({ name: "ready-after-backlog" })
+      yield* tasks.enqueueManualRun({ taskID: ready.id, now: T0 + 100 })
+      const plans = yield* tasks.planDue(T0 + 1_000)
+      expect(plans).toHaveLength(1)
+      expect(plans[0]).toMatchObject({ task: { id: ready.id }, trigger: "manual" })
     }),
   )
 

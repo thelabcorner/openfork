@@ -1,4 +1,5 @@
 import { DateTime } from "effect"
+import { Agent } from "@opencode-ai/schema/agent"
 import { Swarm } from "@opencode-ai/schema/swarm"
 import {
   SwarmBlackboardTable,
@@ -43,6 +44,13 @@ export function hydrateMember(row: typeof SwarmMemberTable.$inferSelect): Swarm.
   // instead of being silently dropped (which would weaken a real old
   // constraint) or honored as a requirement (which would strand the member).
   const normalized = Swarm.normalizeLegacyExecutionProfile(row.desired_profile)
+  // Agent mode is now fixed by the member's Swarm role. Normalize historical
+  // managed-worker rows at this single durable->contract boundary so existing
+  // persisted profiles that named build/general/explore continue to materialize
+  // as swarm-m without rewriting the provider/model selection or stored history.
+  const profile = normalized.profile && row.kind === "managed_worker"
+    ? { ...normalized.profile, agent: Agent.ID.make("swarm-m") }
+    : normalized.profile
   const legacy =
     normalized.routingTags.length === 0 && normalized.unproven.length === 0
       ? {}
@@ -59,7 +67,7 @@ export function hydrateMember(row: typeof SwarmMemberTable.$inferSelect): Swarm.
     lifecycle: row.lifecycle,
     sessionID: row.session_id ?? undefined,
     bindingGeneration: row.binding_generation,
-    desiredProfile: row.desired_profile === null ? undefined : normalized.profile,
+    desiredProfile: row.desired_profile === null ? undefined : profile,
     workspacePolicy: row.workspace_policy,
     capabilities: row.capabilities || Object.keys(legacy).length > 0
       ? ({ ...(row.capabilities ?? { tags: [] }), ...legacy } as Swarm.MemberCapabilities)

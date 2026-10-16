@@ -96,6 +96,48 @@ const setup = Effect.gen(function* () {
 })
 
 describe("Swarm.memberInbox", () => {
+  it.effect("pages by delivery timestamp and id without gaps, duplicate rows or cross-member leakage", () =>
+    Effect.gen(function* () {
+      const { service, swarm, a, b, c } = yield* setup
+      for (const [index, now] of [101, 101, 102, 103, 103].entries()) {
+        yield* service.enqueueMessage({
+          swarmID: swarm.id, senderMemberID: a.id,
+          target: { type: "member", memberID: b.id },
+          kind: "message", body: "page-" + index, now,
+        })
+      }
+      yield* service.enqueueMessage({
+        swarmID: swarm.id, senderMemberID: a.id,
+        target: { type: "member", memberID: c.id },
+        kind: "message", body: "foreign", now: 104,
+      })
+      const first = yield* service.memberInboxPage({ swarmID: swarm.id, memberID: b.id, limit: 2 })
+      expect(first.more).toBe(true)
+      expect(first.items).toHaveLength(2)
+      expect(first.next).toBeDefined()
+      const second = yield* service.memberInboxPage({
+        swarmID: swarm.id, memberID: b.id, limit: 2, before: first.next,
+      })
+      expect(second.items).toHaveLength(2)
+      expect(second.more).toBe(true)
+      const third = yield* service.memberInboxPage({
+        swarmID: swarm.id, memberID: b.id, limit: 2, before: second.next,
+      })
+      expect(third.items).toHaveLength(1)
+      expect(third.more).toBe(false)
+      expect(third.next).toBeUndefined()
+      const seen = [...first.items, ...second.items, ...third.items]
+      expect(new Set(seen.map((row) => row.delivery.id)).size).toBe(5)
+      expect(seen.map((row) => row.message.body)).toEqual(
+        (yield* service.memberInbox({ swarmID: swarm.id, memberID: b.id, limit: 10 }))
+          .map((row) => row.message.body),
+      )
+      expect(seen.every((row) => row.delivery.recipientMemberID === b.id)).toBe(true)
+      expect((yield* service.memberInboxPage({ swarmID: swarm.id, memberID: c.id, limit: 10 }))
+        .items.map((row) => row.message.body)).toEqual(["foreign"])
+    }),
+  )
+
   it.effect("returns only mail addressed to the recipient member", () =>
     Effect.gen(function* () {
       const { service, swarm, a, b, c } = yield* setup

@@ -17,12 +17,15 @@ import {
   SwarmMemberTable,
   SwarmMessageDeliveryTable,
   SwarmMessageTable,
+  SwarmTable,
 } from "./sql"
 import { commitFail, publishWithCommit } from "./transaction"
 
 export interface EnqueueMessageInput {
   readonly swarmID: Swarm.ID
   readonly senderMemberID: Swarm.MemberID
+  /** Host-authorized one-call opt-in for a same-project foreign sender. */
+  readonly force?: boolean
   readonly target: MessageTarget
   readonly kind: Swarm.MessageKind
   readonly body: string
@@ -375,7 +378,22 @@ export function makeMessagingOperations(input: {
       .orderBy(asc(SwarmMemberTable.id))
       .all()
       .pipe(Effect.orDie)
-    const sender = members.find((member) => member.id === request.senderMemberID)
+    let sender = members.find((member) => member.id === request.senderMemberID)
+    if (!sender && request.force === true) {
+      const foreign = yield* readDb
+        .select()
+        .from(SwarmMemberTable)
+        .where(eq(SwarmMemberTable.id, request.senderMemberID))
+        .get()
+        .pipe(Effect.orDie)
+      if (foreign) {
+        const [sourceProject, targetProject] = yield* Effect.all([
+          readDb.select({ id: SwarmTable.project_id }).from(SwarmTable).where(eq(SwarmTable.id, foreign.swarm_id)).get(),
+          readDb.select({ id: SwarmTable.project_id }).from(SwarmTable).where(eq(SwarmTable.id, request.swarmID)).get(),
+        ]).pipe(Effect.orDie)
+        if (sourceProject && targetProject && sourceProject.id === targetProject.id) sender = foreign
+      }
+    }
     if (!sender)
       return yield* new SwarmSchema.NotFoundError({ entity: "member", id: request.senderMemberID })
     if (sender.lifecycle === "stopping" || sender.lifecycle === "stopped")
@@ -388,7 +406,28 @@ export function makeMessagingOperations(input: {
       })
 
     let responseTo: typeof SwarmMessageTable.$inferSelect | undefined
-    if (request.responseTo) responseTo = yield* requireMessageRow(readDb, request.swarmID, request.responseTo)
+    if (request.responseTo) {
+      if (request.force === true) {
+        responseTo = yield* readDb
+          .select()
+          .from(SwarmMessageTable)
+          .where(eq(SwarmMessageTable.id, request.responseTo))
+          .get()
+          .pipe(Effect.orDie)
+        if (!responseTo)
+          return yield* new SwarmSchema.NotFoundError({ entity: "message", id: request.responseTo })
+        if (responseTo.swarm_id !== request.swarmID) {
+          const [replyOrigin, replyTarget] = yield* Effect.all([
+            readDb.select({ id: SwarmTable.project_id }).from(SwarmTable).where(eq(SwarmTable.id, responseTo.swarm_id)).get(),
+            readDb.select({ id: SwarmTable.project_id }).from(SwarmTable).where(eq(SwarmTable.id, request.swarmID)).get(),
+          ]).pipe(Effect.orDie)
+          if (!replyOrigin || !replyTarget || replyOrigin.id !== replyTarget.id)
+            return yield* new SwarmSchema.ValidationError({ reason: "Forced replies must stay within the same project." })
+        }
+      } else {
+        responseTo = yield* requireMessageRow(readDb, request.swarmID, request.responseTo)
+      }
+    }
     if (request.kind === "response" && !responseTo)
       return yield* new SwarmSchema.ValidationError({ reason: "Response messages require responseTo." })
     if (responseTo && request.target.type !== "member")
@@ -406,6 +445,7 @@ export function makeMessagingOperations(input: {
       members.map((member) => ({ id: member.id, lifecycle: member.lifecycle })),
       request.senderMemberID,
       request.target,
+      request.force === true && !members.some((member) => member.id === request.senderMemberID),
     )
     if (!expanded.ok)
       return yield* new SwarmSchema.ValidationError({ reason: `Invalid message target: ${expanded.reason}.` })
@@ -464,7 +504,22 @@ export function makeMessagingOperations(input: {
             .orderBy(asc(SwarmMemberTable.id))
             .all()
             .pipe(Effect.orDie)
-          const liveSender = liveMembers.find((member) => member.id === request.senderMemberID)
+          let liveSender = liveMembers.find((member) => member.id === request.senderMemberID)
+          if (!liveSender && request.force === true) {
+            const foreign = yield* db
+              .select()
+              .from(SwarmMemberTable)
+              .where(eq(SwarmMemberTable.id, request.senderMemberID))
+              .get()
+              .pipe(Effect.orDie)
+            if (foreign) {
+              const [sourceProject, targetProject] = yield* Effect.all([
+                db.select({ id: SwarmTable.project_id }).from(SwarmTable).where(eq(SwarmTable.id, foreign.swarm_id)).get(),
+                db.select({ id: SwarmTable.project_id }).from(SwarmTable).where(eq(SwarmTable.id, request.swarmID)).get(),
+              ]).pipe(Effect.orDie)
+              if (sourceProject && targetProject && sourceProject.id === targetProject.id) liveSender = foreign
+            }
+          }
           if (
             !liveSender ||
             liveSender.lifecycle === "stopping" ||
@@ -482,6 +537,7 @@ export function makeMessagingOperations(input: {
             liveMembers.map((member) => ({ id: member.id, lifecycle: member.lifecycle })),
             request.senderMemberID,
             request.target,
+            request.force === true && !liveMembers.some((member) => member.id === request.senderMemberID),
           )
           if (
             !liveExpansion.ok ||
@@ -498,9 +554,16 @@ export function makeMessagingOperations(input: {
               Effect.catch((error) => commitFail(error)),
             )
           if (responseTo) {
-            const original = yield* requireMessageRow(db, request.swarmID, responseTo.id).pipe(
-              Effect.catch((error) => commitFail(error)),
-            )
+            const original = responseTo.swarm_id === request.swarmID
+              ? yield* requireMessageRow(db, request.swarmID, responseTo.id).pipe(Effect.catch((error) => commitFail(error)))
+              : yield* db
+                  .select()
+                  .from(SwarmMessageTable)
+                  .where(eq(SwarmMessageTable.id, responseTo.id))
+                  .get()
+                  .pipe(Effect.orDie)
+            if (!original)
+              return yield* commitFail(new SwarmSchema.NotFoundError({ entity: "message", id: responseTo.id }))
             if (
               original.sender_member_id !== responseTo.sender_member_id ||
               original.correlation_id !== responseTo.correlation_id
@@ -870,6 +933,50 @@ export function makeMessagingOperations(input: {
     return rows.map((row) => ({ message: hydrateMessage(row.message), delivery: hydrateDelivery(row.delivery) }))
   })
 
+  /**
+   * Keyset-paged inbox for agent clients. A bounded read cannot claim
+   * completeness without a continuation route. The cursor follows the durable
+   * delivery-created timestamp/id order and is scoped to an exact member.
+   */
+  const memberInboxPage = Effect.fn("Swarm.memberInboxPage")(function* (request: {
+    readonly swarmID: Swarm.ID
+    readonly memberID: Swarm.MemberID
+    readonly limit?: number
+    readonly states?: ReadonlyArray<Swarm.DeliveryState>
+    readonly before?: { readonly createdAt: number; readonly id: Swarm.DeliveryID }
+  }) {
+    const limit = Math.min(200, Math.max(1, Math.trunc(request.limit ?? 20)))
+    const states = request.states ?? (["pending", "claimed", "admitted"] as const)
+    const rows = yield* readDb
+      .select({ message: SwarmMessageTable, delivery: SwarmMessageDeliveryTable })
+      .from(SwarmMessageDeliveryTable)
+      .innerJoin(SwarmMessageTable, eq(SwarmMessageTable.id, SwarmMessageDeliveryTable.message_id))
+      .where(and(
+        eq(SwarmMessageTable.swarm_id, request.swarmID),
+        eq(SwarmMessageDeliveryTable.recipient_member_id, request.memberID),
+        inArray(SwarmMessageDeliveryTable.state, [...states]),
+        request.before === undefined ? undefined : or(
+          lt(SwarmMessageDeliveryTable.time_created, request.before.createdAt),
+          and(
+            eq(SwarmMessageDeliveryTable.time_created, request.before.createdAt),
+            lt(SwarmMessageDeliveryTable.id, request.before.id),
+          ),
+        ),
+      ))
+      .orderBy(desc(SwarmMessageDeliveryTable.time_created), desc(SwarmMessageDeliveryTable.id))
+      .limit(limit + 1)
+      .all()
+      .pipe(Effect.orDie)
+    const more = rows.length > limit
+    const selected = rows.slice(0, limit)
+    const last = selected[selected.length - 1]?.delivery
+    return {
+      items: selected.map((row) => ({ message: hydrateMessage(row.message), delivery: hydrateDelivery(row.delivery) })),
+      more,
+      ...(more && last ? { next: { createdAt: last.time_created, id: last.id } } : {}),
+    }
+  })
+
   const deliveriesForMessage = Effect.fn("Swarm.deliveriesForMessage")(function* (messageID: Swarm.MessageID) {
     const rows = yield* readDb
       .select()
@@ -891,6 +998,7 @@ export function makeMessagingOperations(input: {
     messages,
     messageHistory,
     memberInbox,
+    memberInboxPage,
     deliveriesForMessage,
   }
 }

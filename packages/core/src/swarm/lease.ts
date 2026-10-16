@@ -3,6 +3,7 @@ import { DateTime, Effect } from "effect"
 import { Swarm } from "@opencode-ai/schema/swarm"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { EventV2 } from "../event"
+import { SessionExecutionOwnerTable } from "../session/execution-owner.sql"
 import { SessionInputTable } from "../session/sql"
 import { taskRunResultSummary } from "./bounds"
 import { canTransitionTask, isTaskTerminal, semanticRetryConsumesBudget } from "./state-machine"
@@ -477,6 +478,27 @@ export function makeLeaseOperations(input: {
               new SwarmSchema.ConflictError({
                 code: "swarm.member_changed",
                 reason: `Member ${request.memberID} changed while task ${request.taskID} was being claimed.`,
+              }),
+            )
+
+          // Candidate selection is only a projection and can race recovery.
+          // Recheck the authoritative Session execution fence inside the same
+          // write transaction that commits the task lease so a Session with a
+          // live or recovery owner can never receive a new Swarm assignment.
+          const executionOwner = yield* db
+            .select({
+              ownerID: SessionExecutionOwnerTable.owner_id,
+              recoveryOwnerID: SessionExecutionOwnerTable.recovery_owner_id,
+            })
+            .from(SessionExecutionOwnerTable)
+            .where(eq(SessionExecutionOwnerTable.session_id, ownerSessionID))
+            .get()
+            .pipe(Effect.orDie)
+          if (executionOwner?.ownerID || executionOwner?.recoveryOwnerID)
+            return yield* commitFail(
+              new SwarmSchema.ConflictError({
+                code: "swarm.session_execution_owned",
+                reason: `Session ${ownerSessionID} still has an active or recovering execution owner.`,
               }),
             )
 

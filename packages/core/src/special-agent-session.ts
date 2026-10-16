@@ -35,6 +35,14 @@ import { Hash } from "./util/hash"
  * The set is deliberately closed: adding a special agent means extending this
  * union and the session-group/V1 guards that key off it, not inventing a second
  * execution contract.
+ *
+ * Not every host-owned special built-in belongs in this transcript union.
+ * `dreamer` is a schema-classified special agent (`AgentContract
+ * .isSpecialAgentID`) that executes as a resumable background worker Session
+ * through the Task `BackgroundJob` lifecycle owner via
+ * `packages/opencode/src/special-agent/dreamer-runtime.ts`, not as a one-per-
+ * owner non-promptable transcript. Its children deliberately stay promptable
+ * (resume semantics) and therefore carry no `specialAgent` transcript metadata.
  */
 export const Kind = Schema.Literals([
   "goal_auditor",
@@ -76,11 +84,18 @@ export interface Interface {
   /** Idempotently provision the durable transcript for one (owner, agent) pair. */
   readonly provision: (input: ProvisionInput) => Effect.Effect<SessionSchema.ID, SessionHostChild.ParentNotFoundError>
   /** Deterministic Session id for an owner/agent pair, without touching storage. */
-  readonly sessionFor: (input: { readonly ownerKind: string; readonly ownerID: string; readonly agent: Kind }) => SessionSchema.ID
+  readonly sessionFor: (input: {
+    readonly ownerKind: string
+    readonly ownerID: string
+    readonly agent: Kind
+  }) => SessionSchema.ID
   /** Whether a Session id is any host-owned special-agent transcript. */
   readonly is: (sessionID: SessionSchema.ID) => Effect.Effect<boolean>
   /** Publish one durable mid-conversation system instruction into the transcript. */
-  readonly publishSystem: (input: { readonly sessionID: SessionSchema.ID; readonly text: string }) => Effect.Effect<void>
+  readonly publishSystem: (input: {
+    readonly sessionID: SessionSchema.ID
+    readonly text: string
+  }) => Effect.Effect<void>
   /** Publish the host-owned logical request that caused a special-agent operation. */
   readonly publishPrompt: (input: {
     readonly sessionID: SessionSchema.ID
@@ -203,7 +218,9 @@ const layer = Layer.effect(
       const row = yield* database.readDb
         .select({ sessionID: SessionTable.id })
         .from(SessionTable)
-        .where(sql`${SessionTable.id} = ${sessionID} AND json_type(${SessionTable.metadata}, '$.specialAgent') = 'text'`)
+        .where(
+          sql`${SessionTable.id} = ${sessionID} AND json_type(${SessionTable.metadata}, '$.specialAgent') = 'text'`,
+        )
         .get()
         .pipe(Effect.orDie)
       return row !== undefined
@@ -294,7 +311,10 @@ const layer = Layer.effect(
       return wrapped
     }
 
-    const closedTurns = new WeakMap<Publisher, { readonly type: "ended"; readonly id: SessionMessage.ID } | { readonly type: "failed" }>()
+    const closedTurns = new WeakMap<
+      Publisher,
+      { readonly type: "ended"; readonly id: SessionMessage.ID } | { readonly type: "failed" }
+    >()
 
     const failTurn = Effect.fn("SpecialAgentSession.failTurn")(function* (input: {
       readonly publisher: Publisher
@@ -321,8 +341,11 @@ const layer = Layer.effect(
             sessionID: state.sessionID,
             requestSentAt: state.requestSentAt,
             model: {
-              providerID: state.model.providerID,
-              modelID: state.model.id,
+              ...SessionTelemetry.telemetryModelIdentity({
+                providerID: state.model.providerID,
+                modelID: state.model.id,
+                ...(state.model.accountID === undefined ? {} : { accountID: state.model.accountID }),
+              }),
               ...(state.model.variant === undefined ? {} : { variant: state.model.variant }),
             },
           })
@@ -340,7 +363,8 @@ const layer = Layer.effect(
         // Provider-body completion is known here for every special-agent caller.
         // Centralizing it prevents titles/revisors/auditors from drifting on TPS
         // and generated-vs-tool timing semantics.
-        if (input.publisher.hasAssistantStarted() && !input.publisher.hasProviderError()) yield* input.publisher.streamed()
+        if (input.publisher.hasAssistantStarted() && !input.publisher.hasProviderError())
+          yield* input.publisher.streamed()
         return exit.value
       })
 
@@ -368,16 +392,16 @@ const layer = Layer.effect(
           if (closed?.type === "ended") return closed.id
           if (closed?.type === "failed") return yield* Effect.die("Cannot settle a failed special-agent provider turn")
           for (const result of input.toolResults ?? []) {
-            yield* input.publisher.publish(LLMEvent.toolResult({ id: result.id, name: result.name, result: result.result }))
+            yield* input.publisher.publish(
+              LLMEvent.toolResult({ id: result.id, name: result.name, result: result.result }),
+            )
           }
           // A special-agent turn is not durably complete while any provider tool
           // call remains unresolved. Producers should settle accepted/rejected tools
           // explicitly so replay reflects the real host decision; this shared
           // fail-safe catches omissions and future agents without scanning history
           // or duplicating tool state outside the publisher that already owns it.
-          yield* input.publisher.failUnsettledTools(
-            "Special-agent provider turn ended without a host tool settlement.",
-          )
+          yield* input.publisher.failUnsettledTools("Special-agent provider turn ended without a host tool settlement.")
           yield* input.publisher.flush()
           const assistantMessageID = yield* input.publisher.startAssistant()
           const settlement = input.publisher.stepSettlement()

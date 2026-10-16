@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { eq } from "drizzle-orm"
-import { Effect } from "effect"
+import { DateTime, Effect } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -40,7 +40,10 @@ const sessionA2 = SessionV2.ID.make("ses_goal_a2")
 const sessionOtherWorkspace = SessionV2.ID.make("ses_goal_other_workspace")
 const sessionB = SessionV2.ID.make("ses_goal_b")
 
-const continueAudit = (criteria: ReadonlyArray<Goal.Criterion>, progressMade = false): GoalAutomation.AuditOutcome => ({
+const continueAudit = (
+  criteria: ReadonlyArray<Goal.Criterion>,
+  progressMade = false,
+): Extract<GoalAutomation.AuditOutcome, { readonly ok: true }> => ({
   ok: true,
   verdict: {
     decision: "continue",
@@ -159,6 +162,69 @@ describe("Goal", () => {
       const created = (yield* goals.audit(result.goal.goal.id)).find((item) => item.type === "created")
       expect(created?.actor).toBe("agent")
       expect(created?.payload.sourceMessageID).toBe("msg_goal_agent_create")
+    }),
+  )
+
+  it.effect("creates a Goal from a human @goal mention directive", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const agent = yield* GoalAgent.Service
+      const goals = yield* GoalV2.Service
+      const result = yield* agent.execute(
+        sessionA,
+        {
+          action: "create",
+          objective: "Implement the plan end to end",
+          criteria: ["The plan is implemented end to end"],
+        },
+        {
+          userMessageID: "msg_goal_mention",
+          userText: "create a @goal and start working on implementing the plan e2e.",
+        },
+      )
+
+      expect(result.goal.goal.status).toBe("active")
+      const created = (yield* goals.audit(result.goal.goal.id)).find((item) => item.type === "created")
+      expect(created?.payload.sourceMessageID).toBe("msg_goal_mention")
+    }),
+  )
+
+  it.effect("creates and starts a naturally requested Goal without a prewritten criteria list", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const agent = yield* GoalAgent.Service
+      const goals = yield* GoalV2.Service
+      const created = yield* agent.execute(
+        sessionA,
+        { action: "create", title: "Stabilize the renderer" },
+        {
+          userMessageID: "msg_natural_goal",
+          userText: "How about making this a goal? Stabilize the renderer.",
+        },
+      )
+
+      expect(created.goal.goal.status).toBe("active")
+      expect(created.goal.goal.objective).toBe("Stabilize the renderer")
+      expect(created.goal.criteria.map((criterion) => criterion.description)).toEqual([
+        "The complete Goal objective has been achieved and independently verified.",
+      ])
+      expect((yield* goals.audit(created.goal.goal.id)).find((item) => item.type === "created")?.payload.sourceMessageID)
+        .toBe("msg_natural_goal")
+    }),
+  )
+
+  it.effect("still rejects empty Goal specifications despite human authorization", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const agent = yield* GoalAgent.Service
+      const rejected = yield* agent
+        .execute(sessionA, { action: "create" }, {
+          userMessageID: "msg_goal_without_subject",
+          userText: "Create a goal.",
+        })
+        .pipe(Effect.exit)
+      expect(rejected._tag).toBe("Failure")
+      expect(yield* (yield* GoalV2.Service).focused(sessionA)).toBeUndefined()
     }),
   )
 
@@ -946,11 +1012,15 @@ describe("Goal automation reservations", () => {
       expect(yield* automation.requestAudit(sessionA)).toMatchObject({ phase: "audit_requested" })
 
       const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
-      expect(yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })).toMatchObject({
+      const started = yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })
+      expect(started).toMatchObject({
         phase: "auditing",
         auditorSessionID,
       })
-      yield* automation.endAudit(sessionA)
+      if (started?.phase !== "auditing") return
+      yield* automation.endAudit({
+        sessionID: sessionA, auditorSessionID, auditStartedAt: DateTime.toEpochMillis(started.since),
+      })
 
       const decision = yield* automation.afterTurn({
         sessionID: sessionA,
@@ -989,7 +1059,7 @@ describe("Goal automation reservations", () => {
     }),
   )
 
-  it.effect("keeps AUDIT ERROR visible when an explicit Goal Mode audit fails", () =>
+  it.effect("keeps AUDIT ERROR visible and durably retryable when an explicit Goal Mode audit fails", () =>
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
@@ -1006,7 +1076,75 @@ describe("Goal automation reservations", () => {
         phase: "audit_error",
         error: "provider timeout",
       })
+      const pending = yield* automation.runtime(sessionA)
+      if (pending?.phase === "audit_error") expect(pending.retryAt).toBeDefined()
       expect((yield* goals.get(active.goal.id)).goal).toMatchObject({ status: "active" })
+    }),
+  )
+
+  it.effect("repeated manual audit retries preserve a completed worker reservation and its User frontier", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+
+      const first = yield* automation.afterTurn({
+        sessionID: sessionA,
+        origin: "user",
+        sourceMessageID: "msg_completed_worker_before_retry",
+        audit: continueAudit(active.criteria, true),
+      })
+      const claimed = yield* automation.claim(sessionA)
+      expect(claimed?.id).toBe(first.reservation?.id)
+      if (!claimed) return
+      const auditorSessionID = yield* goals.auditorSession({
+        parentSessionID: sessionA, goalID: active.goal.id,
+      })
+      let running = yield* automation.beginAudit({
+        sessionID: sessionA, auditorSessionID, reservationID: claimed.id,
+      })
+      expect(running?.phase).toBe("auditing")
+      if (running?.phase !== "auditing") return
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        expect(yield* automation.afterTurn({
+          sessionID: sessionA,
+          origin: "automatic",
+          reservationID: claimed.id,
+          requireAuditCursor: true,
+          audit: {
+            ok: false,
+            error: "Invalid audit_verdict payload: missing continuationPrompt",
+            retryable: true,
+            auditorSessionID,
+            auditStartedAt: DateTime.toEpochMillis(running.since),
+          },
+        })).toMatchObject({ continue: false, reason: "audit_retry_scheduled" })
+        expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "audit_error" })
+
+        // Both the first Retry click and a repeated click must be safe.
+        expect(yield* automation.requestAudit(sessionA)).toMatchObject({ phase: "audit_requested" })
+        expect(yield* automation.requestAudit(sessionA)).toMatchObject({ phase: "audit_requested" })
+        const row = yield* db.select().from(GoalAutomationTable)
+          .where(eq(GoalAutomationTable.session_id, sessionA)).get()
+        expect(row?.reservation_id).toBe(claimed.id)
+        expect(row?.continuation_source_message_id).toBe("msg_completed_worker_before_retry")
+        expect(row?.reservation_owner).toBeNull()
+        expect(row?.audit_retry_count).toBe(0)
+        expect(yield* automation.pendingSessions()).not.toContain(sessionA)
+        const recovery = yield* automation.claimAuditRecovery(sessionA)
+        expect(recovery?.reservation?.id).toBe(claimed.id)
+        running = yield* automation.beginAudit({
+          sessionID: sessionA, auditorSessionID, reservationID: claimed.id,
+        })
+        expect(running?.phase).toBe("auditing")
+        if (running?.phase !== "auditing") return
+      }
+      expect((yield* goals.get(active.goal.id)).goal.status).toBe("active")
     }),
   )
 
@@ -1091,8 +1229,8 @@ describe("Goal automation reservations", () => {
         workspaceID: workspaceA,
       })
 
-      // An explicit runtime error is intentionally not auto-retried at startup;
-      // otherwise a broken provider/catalog could create a reboot retry loop.
+      // An error does not immediately spin at startup: the persisted retry
+      // deadline bounds provider pressure while keeping the Goal live.
       yield* automation.failAudit({ sessionID: sessionA, error: "provider unavailable" })
       expect((yield* automation.runtime(sessionA))?.phase).toBe("audit_error")
       expect((yield* automation.orphanedAuditSessions()).some((item) => item.sessionID === sessionA)).toBe(false)
@@ -1421,15 +1559,16 @@ describe("Goal automation reservations", () => {
       expect(claimed?.id).toBe(decision.reservation?.id)
 
       const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
-      expect(
-        yield* automation.beginAudit({
-          sessionID: sessionA,
-          auditorSessionID,
-          reservationID: claimed!.id,
-        }),
-      ).toMatchObject({ phase: "auditing", auditorSessionID })
-
-      expect(yield* automation.deferAudit(sessionA)).toBe(true)
+      const interrupted = yield* automation.beginAudit({
+        sessionID: sessionA,
+        auditorSessionID,
+        reservationID: claimed!.id,
+      })
+      expect(interrupted).toMatchObject({ phase: "auditing", auditorSessionID })
+      if (interrupted?.phase !== "auditing") return
+      expect(yield* automation.deferAudit(sessionA, {
+        auditorSessionID, auditStartedAt: DateTime.toEpochMillis(interrupted.since),
+      })).toBe(true)
       expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "audit_requested" })
       expect(yield* automation.pendingSessions()).not.toContain(sessionA)
       expect(yield* automation.claim(sessionA)).toBeUndefined()
@@ -1440,17 +1579,108 @@ describe("Goal automation reservations", () => {
         sourceMessageID: "msg_goal_worker_root",
         prompt: claimed!.prompt,
       })
-      expect(
-        yield* automation.beginAudit({
-          sessionID: sessionA,
-          auditorSessionID,
-          reservationID: recovery!.reservation!.id,
-        }),
-      ).toMatchObject({ phase: "auditing", auditorSessionID })
-
-      yield* automation.endAudit(sessionA)
+      const resumedLease = yield* automation.beginAudit({
+        sessionID: sessionA,
+        auditorSessionID,
+        reservationID: recovery!.reservation!.id,
+      })
+      expect(resumedLease).toMatchObject({ phase: "auditing", auditorSessionID })
+      if (resumedLease?.phase !== "auditing") return
+      yield* automation.endAudit({
+        sessionID: sessionA, auditorSessionID, auditStartedAt: DateTime.toEpochMillis(resumedLease.since),
+      })
       expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "working" })
       yield* automation.release({ sessionID: sessionA, reservationID: claimed!.id })
+    }),
+  )
+
+  it.effect("releases an audit recovery claim without making completed worker tools runnable again", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const first = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", sourceMessageID: "msg_complete_worker",
+        audit: continueAudit(active.criteria),
+      })
+      const claimed = yield* automation.claim(sessionA)
+      expect(claimed?.id).toBe(first.reservation?.id)
+      if (!claimed) return
+      const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
+      const started = yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID, reservationID: claimed.id })
+      expect(started?.phase).toBe("auditing")
+      if (started?.phase !== "auditing") return
+      yield* automation.deferAudit(sessionA, {
+        auditorSessionID, auditStartedAt: DateTime.toEpochMillis(started.since),
+      })
+      const firstRecovery = yield* automation.claimAuditRecovery(sessionA)
+      expect(firstRecovery?.reservation?.id).toBe(claimed.id)
+      expect(yield* automation.claimAuditRecovery(sessionA)).toBeUndefined()
+
+      yield* automation.releaseAuditRecovery({ sessionID: sessionA, reservationID: claimed.id })
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "audit_requested" })
+      expect(yield* automation.pendingSessions()).not.toContain(sessionA)
+      expect(yield* automation.claim(sessionA)).toBeUndefined()
+      const secondRecovery = yield* automation.claimAuditRecovery(sessionA)
+      expect(secondRecovery?.reservation).toMatchObject({
+        id: claimed.id, sourceMessageID: "msg_complete_worker", prompt: claimed.prompt,
+      })
+
+      const liveLease = yield* automation.beginAudit({
+        sessionID: sessionA, auditorSessionID, reservationID: claimed.id,
+      })
+      expect(liveLease?.phase).toBe("auditing")
+      yield* automation.releaseAuditRecovery({ sessionID: sessionA, reservationID: claimed.id })
+      // An obsolete finalizer must never clear the currently executing audit.
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "auditing", auditorSessionID })
+    }),
+  )
+
+  it.effect("host audit failure preserves a completed worker reservation and retries after a durable deadline", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const first = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", sourceMessageID: "msg_finished_worker",
+        audit: continueAudit(active.criteria),
+      })
+      const claimed = yield* automation.claim(sessionA)
+      expect(claimed?.id).toBe(first.reservation?.id)
+      if (!claimed) return
+      const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
+      const lease = yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID, reservationID: claimed.id })
+      expect(lease?.phase).toBe("auditing")
+      if (lease?.phase !== "auditing") return
+
+      // A late route-level failure must never usurp a currently running
+      // auditor. Its own finalizer owns the live lease.
+      yield* automation.failAudit({ sessionID: sessionA, error: "late route failure" })
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "auditing", auditorSessionID })
+
+      yield* automation.deferAudit(sessionA, {
+        auditorSessionID, auditStartedAt: DateTime.toEpochMillis(lease.since),
+      })
+      const recovery = yield* automation.claimAuditRecovery(sessionA)
+      expect(recovery?.reservation?.id).toBe(claimed.id)
+      yield* automation.failAudit({ sessionID: sessionA, error: "audit bootstrap unavailable" })
+
+      const row = yield* db.select().from(GoalAutomationTable)
+        .where(eq(GoalAutomationTable.session_id, sessionA)).get()
+      expect(row?.reservation_id).toBe(claimed.id)
+      expect(row?.continuation_source_message_id).toBe("msg_finished_worker")
+      expect(row?.reservation_owner).toBeNull()
+      expect(row?.audit_requested_at).toBeGreaterThan(Date.now() + 40_000)
+      expect(yield* automation.pendingSessions()).not.toContain(sessionA)
+      expect(yield* automation.claimAuditRecovery(sessionA)).toBeUndefined()
+      expect((yield* goals.get(active.goal.id)).goal.status).toBe("active")
     }),
   )
 
@@ -1509,15 +1739,23 @@ describe("Goal automation reservations", () => {
 
       // Without a concurrent cancellation the same production fence permits a
       // normal audited cycle to reserve its next continuation.
-      expect(yield* automation.requestAudit(sessionA)).toMatchObject({ phase: "audit_requested" })
-      const current = yield* goals.get(created.goal.id)
-      const settled = yield* automation.afterTurn({
-        sessionID: sessionA,
-        origin: "user",
-        requireAuditCursor: true,
-        audit: continueAudit(current.criteria, true),
-      })
-      expect(settled.continue).toBe(true)
+       expect(yield* automation.requestAudit(sessionA)).toMatchObject({ phase: "audit_requested" })
+       const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
+       const lease = yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })
+       expect(lease?.phase).toBe("auditing")
+       if (lease?.phase !== "auditing") return
+       const current = yield* goals.get(created.goal.id)
+       const settled = yield* automation.afterTurn({
+         sessionID: sessionA,
+         origin: "user",
+         requireAuditCursor: true,
+         audit: {
+           ...continueAudit(current.criteria, true),
+           auditorSessionID,
+           auditStartedAt: DateTime.toEpochMillis(lease.since),
+         },
+       })
+       expect(settled.continue).toBe(true)
       expect(settled.reservation).toBeDefined()
     }),
   )
@@ -1584,7 +1822,7 @@ describe("Goal automation reservations", () => {
     }),
   )
 
-  it.effect("stops automation without manufacturing a Goal blocker when the auditor is unavailable", () =>
+  it.effect("retries auditor failure without manufacturing a Goal blocker or overruling a live lease", () =>
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
@@ -1602,18 +1840,412 @@ describe("Goal automation reservations", () => {
       expect(yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })).toBeUndefined()
       expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "auditing", auditorSessionID })
 
+      if (auditing?.phase !== "auditing") return
+
       const decision = yield* automation.afterTurn({
         sessionID: sessionA,
         origin: "user",
-        audit: { ok: false, error: "provider timeout" },
+        requireAuditCursor: true,
+        audit: {
+          ok: false, error: "provider timeout",
+          auditorSessionID,
+          auditStartedAt: DateTime.toEpochMillis(auditing.since),
+        },
       })
       expect(decision.continue).toBe(false)
-      expect(decision.reason).toContain("auditor_error:provider timeout")
+      expect(decision.reason).toBe("audit_retry_scheduled")
       expect((yield* goals.get(created.goal.id)).goal).toMatchObject({
         status: "active",
       })
       expect((yield* goals.get(created.goal.id)).goal.blocker).toBeUndefined()
-      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "audit_error", error: "provider timeout" })
+       expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "audit_error", error: "provider timeout" })
+     }),
+   )
+
+  it.effect("turn interruption retains the auditor handoff and never replays the worker reservation", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const previous = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", sourceMessageID: "msg_goal_original",
+        audit: continueAudit(active.criteria, true),
+      })
+      const claim = yield* automation.claim(sessionA)
+      expect(claim?.id).toBe(previous.reservation?.id)
+      const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
+      expect(yield* automation.beginAudit({
+        sessionID: sessionA, auditorSessionID, reservationID: claim!.id,
+      })).toMatchObject({ phase: "auditing" })
+      expect(yield* automation.requeueClaim(sessionA)).toBe(true)
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "audit_requested" })
+      expect(yield* automation.pendingSessions()).not.toContain(sessionA)
+      const recovery = yield* automation.claimAuditRecovery(sessionA)
+      expect(recovery?.reservation).toMatchObject({ id: claim!.id, sourceMessageID: "msg_goal_original" })
+      expect(yield* automation.beginAudit({
+        sessionID: sessionA, auditorSessionID, reservationID: claim!.id,
+      })).toMatchObject({ phase: "auditing" })
     }),
   )
-})
+
+  it.effect("a racing auditor without the exact lease generation cannot erase the running auditor", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
+      const owner = yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })
+      expect(owner?.phase).toBe("auditing")
+      if (owner?.phase !== "auditing") return
+      expect(yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })).toBeUndefined()
+
+      const unresolved = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user",
+        audit: { ok: false, retryable: true, error: "model catalog offline" },
+      })
+      expect(unresolved.reason).toBe("audit_superseded")
+      expect(yield* automation.runtime(sessionA)).toMatchObject({
+        phase: "auditing", auditorSessionID, since: owner.since,
+      })
+
+      // The losing evaluator knows the reused child Session ID but never
+      // acquired the lease. Neither its failure nor its retry may touch the
+      // live owner's cursor, even if it races while that owner is thinking.
+      const noLease = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", requireAuditCursor: true,
+        audit: { ok: false, error: "could not acquire audit lease", auditorSessionID },
+      })
+      expect(noLease.reason).toBe("audit_superseded")
+      expect(yield* automation.runtime(sessionA)).toMatchObject({
+        phase: "auditing", auditorSessionID, since: owner.since,
+      })
+      const wrongGeneration = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", requireAuditCursor: true,
+        audit: {
+          ok: false, error: "late retry", retryable: true, auditorSessionID,
+          auditStartedAt: DateTime.toEpochMillis(owner.since) - 1,
+        },
+      })
+      expect(wrongGeneration.reason).toBe("audit_superseded")
+      expect(yield* automation.runtime(sessionA)).toMatchObject({
+        phase: "auditing", auditorSessionID, since: owner.since,
+      })
+      const settled = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", requireAuditCursor: true,
+        audit: {
+          ...continueAudit(active.criteria), auditorSessionID,
+          auditStartedAt: DateTime.toEpochMillis(owner.since),
+        },
+      })
+      expect(settled).toMatchObject({ continue: true, reason: "goal_mode" })
+    }),
+  )
+
+  it.effect("a late auditor cannot settle or clear a newer lease for the reused auditor child Session", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
+      const first = yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })
+      expect(first?.phase).toBe("auditing")
+      if (first?.phase !== "auditing") return
+      const oldEpoch = DateTime.toEpochMillis(first.since)
+      expect(yield* automation.deferAudit(sessionA, { auditorSessionID, auditStartedAt: oldEpoch })).toBe(true)
+      const second = yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })
+      expect(second?.phase).toBe("auditing")
+      if (second?.phase !== "auditing") return
+      const newEpoch = DateTime.toEpochMillis(second.since)
+      expect(newEpoch).toBeGreaterThan(oldEpoch)
+      yield* automation.endAudit({ sessionID: sessionA, auditorSessionID, auditStartedAt: oldEpoch })
+      expect(yield* automation.runtime(sessionA)).toMatchObject({
+        phase: "auditing", auditorSessionID, since: second.since,
+      })
+      const stale = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", requireAuditCursor: true,
+        audit: { ...continueAudit(active.criteria, true), auditorSessionID, auditStartedAt: oldEpoch },
+      })
+      expect(stale).toMatchObject({ continue: false, reason: "audit_superseded" })
+      expect(yield* automation.deferAudit(sessionA, { auditorSessionID, auditStartedAt: oldEpoch })).toBe(false)
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "auditing" })
+      const fresh = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", requireAuditCursor: true,
+        audit: { ...continueAudit(active.criteria, true), auditorSessionID, auditStartedAt: newEpoch },
+      })
+      expect(fresh).toMatchObject({ continue: true, reason: "goal_mode" })
+       expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "continuation_pending" })
+     }),
+   )
+
+  it.effect("re-audits a changed Goal instead of losing its active loop to a stale verdict", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
+      const lease = yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })
+      expect(lease?.phase).toBe("auditing")
+      if (lease?.phase !== "auditing") return
+      const changed = yield* goals.update({
+        id: active.goal.id, expectedRevision: active.goal.revision, title: "Ship revised Goal Mode",
+      })
+      const stale = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", requireAuditCursor: true,
+        audit: {
+          ...continueAudit(active.criteria), goalRevision: active.goal.revision,
+          auditorSessionID, auditStartedAt: DateTime.toEpochMillis(lease.since),
+        },
+      })
+      expect(stale.reason).toBe("auditor_reconciliation_reaudit")
+      expect((yield* goals.get(created.goal.id)).goal.revision).toBe(changed.goal.revision)
+      expect((yield* goals.get(created.goal.id)).goal.status).toBe("active")
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "audit_requested" })
+      expect((yield* automation.orphanedAuditSessions()).map((item) => item.sessionID)).toContain(sessionA)
+      expect(yield* automation.pendingSessions()).not.toContain(sessionA)
+      expect(yield* automation.claimAuditRecovery(sessionA)).toEqual({})
+      const nextLease = yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })
+      expect(nextLease?.phase).toBe("auditing")
+      if (nextLease?.phase !== "auditing") return
+      const resumed = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", requireAuditCursor: true,
+        audit: {
+          ...continueAudit(changed.criteria), goalRevision: changed.goal.revision,
+          auditorSessionID, auditStartedAt: DateTime.toEpochMillis(nextLease.since),
+        },
+      })
+      expect(resumed).toMatchObject({ continue: true, reason: "goal_mode" })
+    }),
+  )
+
+  it.effect("keeps the completed worker reservation across a stale-revision re-audit", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const initial = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", sourceMessageID: "msg_original_work",
+        audit: continueAudit(active.criteria),
+      })
+      const claimed = yield* automation.claim(sessionA)
+      expect(claimed?.id).toBe(initial.reservation?.id)
+      if (!claimed) return
+      const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
+      const lease = yield* automation.beginAudit({
+        sessionID: sessionA, auditorSessionID, reservationID: claimed.id,
+      })
+      expect(lease?.phase).toBe("auditing")
+      if (lease?.phase !== "auditing") return
+      yield* goals.update({ id: active.goal.id, expectedRevision: initial.goal!.goal.revision, title: "Revised scope" })
+      const decision = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "automatic", reservationID: claimed.id,
+        requireAuditCursor: true,
+        audit: {
+          ...continueAudit(active.criteria), goalRevision: active.goal.revision,
+          auditorSessionID, auditStartedAt: DateTime.toEpochMillis(lease.since),
+        },
+      })
+      expect(decision.reason).toBe("auditor_reconciliation_reaudit")
+      expect((yield* automation.orphanedAuditSessions()).map((item) => item.sessionID)).toContain(sessionA)
+      expect(yield* automation.pendingSessions()).not.toContain(sessionA)
+      const recovery = yield* automation.claimAuditRecovery(sessionA)
+      expect(recovery?.reservation).toMatchObject({
+        id: claimed.id, sourceMessageID: "msg_original_work", prompt: claimed.prompt,
+      })
+    }),
+  )
+
+  it.effect("backs off a rejected audit payload without losing the completed worker reservation", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const first = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", sourceMessageID: "msg_original_cycle",
+        audit: continueAudit(active.criteria),
+      })
+      const claimed = yield* automation.claim(sessionA)
+      expect(claimed?.id).toBe(first.reservation?.id)
+      if (!claimed) return
+      const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
+      const lease = yield* automation.beginAudit({
+        sessionID: sessionA, auditorSessionID, reservationID: claimed.id,
+      })
+      expect(lease?.phase).toBe("auditing")
+      if (lease?.phase !== "auditing") return
+      const current = yield* goals.get(active.goal.id)
+      const rejected = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "automatic", reservationID: claimed.id,
+        requireAuditCursor: true,
+        audit: {
+          ...continueAudit([]), goalRevision: current.goal.revision,
+          auditorSessionID, auditStartedAt: DateTime.toEpochMillis(lease.since),
+        },
+      })
+      expect(rejected.reason).toBe("audit_retry_scheduled")
+      expect((yield* goals.get(created.goal.id)).goal.status).toBe("active")
+      const runtime = yield* automation.runtime(sessionA)
+      expect(runtime?.phase).toBe("audit_error")
+      if (runtime?.phase === "audit_error") expect(runtime.retryAt).toBeDefined()
+      const row = yield* db.select().from(GoalAutomationTable)
+        .where(eq(GoalAutomationTable.session_id, sessionA)).get()
+      expect(row?.reservation_id).toBe(claimed.id)
+      expect(row?.continuation_source_message_id).toBe("msg_original_cycle")
+      expect(row?.audit_retry_count).toBe(1)
+      expect(yield* automation.pendingSessions()).not.toContain(sessionA)
+    }),
+  )
+
+  it.effect("retains a completed worker reservation across durably scheduled auditor infrastructure retries", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const firstDecision = yield* automation.afterTurn({
+        sessionID: sessionA,
+        origin: "user",
+        sourceMessageID: "msg_goal_original_completed_worker",
+        audit: continueAudit(active.criteria, true),
+      })
+      const claimed = yield* automation.claim(sessionA)
+      expect(claimed?.id).toBe(firstDecision.reservation?.id)
+      if (!claimed) return
+
+      const auditorSessionID = yield* goals.auditorSession({
+        parentSessionID: sessionA, goalID: active.goal.id,
+      })
+      const running = yield* automation.beginAudit({
+        sessionID: sessionA, auditorSessionID, reservationID: claimed.id,
+      })
+      expect(running?.phase).toBe("auditing")
+      if (running?.phase !== "auditing") return
+      const firstEpoch = DateTime.toEpochMillis(running.since)
+      const beforeRetry = Date.now()
+      const outcome = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "automatic", reservationID: claimed.id,
+        requireAuditCursor: true,
+        audit: {
+          ok: false, error: "Temporary model endpoint unavailable", retryable: true,
+          auditorSessionID, auditStartedAt: firstEpoch,
+        },
+      })
+      expect(outcome).toMatchObject({ continue: false, reason: "audit_retry_scheduled" })
+      const retained = yield* db.select().from(GoalAutomationTable)
+        .where(eq(GoalAutomationTable.session_id, sessionA)).get()
+      expect(retained?.reservation_id).toBe(claimed.id)
+      expect(retained?.continuation_source_message_id).toBe("msg_goal_original_completed_worker")
+      expect(retained?.reservation_owner).toBeNull()
+      expect(retained?.audit_retry_count).toBe(1)
+      expect(retained?.audit_requested_at).toBeGreaterThan(beforeRetry + 40_000)
+      expect(retained?.audit_requested_at).toBeLessThan(beforeRetry + 90_000)
+      expect(yield* automation.runtime(sessionA)).toMatchObject({
+        phase: "audit_error", error: "Temporary model endpoint unavailable",
+      })
+      expect(yield* automation.pendingSessions()).not.toContain(sessionA)
+      expect(yield* automation.claimAuditRecovery(sessionA)).toBeUndefined()
+      expect((yield* automation.orphanedAuditSessions()).map((item) => item.sessionID)).not.toContain(sessionA)
+
+      // Simulate the persisted due time passing without waiting a minute.
+      yield* db.update(GoalAutomationTable)
+        .set({ audit_requested_at: Date.now() - 1 })
+        .where(eq(GoalAutomationTable.session_id, sessionA)).run()
+      expect((yield* automation.orphanedAuditSessions()).map((item) => item.sessionID)).toContain(sessionA)
+      const recovery = yield* automation.claimAuditRecovery(sessionA)
+      expect(recovery?.reservation).toMatchObject({
+        id: claimed.id, sourceMessageID: "msg_goal_original_completed_worker",
+      })
+      const resumed = yield* automation.beginAudit({
+        sessionID: sessionA, auditorSessionID, reservationID: claimed.id,
+      })
+      expect(resumed?.phase).toBe("auditing")
+      if (resumed?.phase !== "auditing") return
+      const second = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "automatic", reservationID: claimed.id,
+        requireAuditCursor: true,
+        audit: {
+          ok: false, error: "Temporary model endpoint still unavailable", retryable: true,
+          auditorSessionID, auditStartedAt: DateTime.toEpochMillis(resumed.since),
+        },
+      })
+      expect(second.reason).toBe("audit_retry_scheduled")
+      const further = yield* db.select().from(GoalAutomationTable)
+        .where(eq(GoalAutomationTable.session_id, sessionA)).get()
+      expect(further?.audit_retry_count).toBe(2)
+      expect(further?.reservation_id).toBe(claimed.id)
+      expect(further?.audit_requested_at).toBeGreaterThan(Date.now() + 85_000)
+    }),
+  )
+
+  it.effect("schedules a retryable first-cycle audit error without claiming an unexecuted worker", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const result = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user",
+        audit: { ok: false, retryable: true, error: "Transient provider connection reset" },
+      })
+      expect(result.reason).toBe("audit_retry_scheduled")
+      const runtime = yield* automation.runtime(sessionA)
+      expect(runtime?.phase).toBe("audit_error")
+      if (runtime?.phase !== "audit_error") return
+      expect(runtime.retryAt).toBeDefined()
+      expect((yield* goals.get(created.goal.id)).goal.status).toBe("active")
+      expect(yield* automation.pendingSessions()).not.toContain(sessionA)
+    }),
+  )
+
+  it.effect("does not retry a worker cycle superseded by newer human input", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      const decision = yield* automation.afterTurn({
+        sessionID: sessionA, origin: "user", supersededByUser: true,
+        audit: { ok: false, retryable: true, error: "Temporary provider unavailable" },
+      })
+      expect(decision.reason).toBe("superseded_by_user")
+      expect(yield* automation.runtime(sessionA)).toBeUndefined()
+      expect((yield* goals.get(created.goal.id)).goal.status).toBe("active")
+    }),
+  )
+
+  it.effect("never treats auditor infrastructure backoff as a Goal lifetime limit", () =>
+    Effect.sync(() => {
+      expect(GoalAutomation.auditRetryBackoffMs(1)).toBe(60_000)
+      expect(GoalAutomation.auditRetryBackoffMs(2)).toBe(120_000)
+      expect(GoalAutomation.auditRetryBackoffMs(3)).toBe(240_000)
+      expect(GoalAutomation.auditRetryBackoffMs(100)).toBe(6 * 60 * 60_000)
+      expect(GoalAutomation.auditRetryBackoffMs(1_000_000)).toBe(6 * 60 * 60_000)
+    }),
+  )
+
+ })

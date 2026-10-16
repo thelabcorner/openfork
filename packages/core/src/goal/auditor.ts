@@ -72,17 +72,23 @@ export type Success = {
   readonly tools: ReadonlyArray<string>
   readonly usage: ReadonlyArray<UsageSample>
   readonly auditorSessionID: SessionSchema.ID
+  /** Exact durable auditor lease start; distinguishes reused auditor Sessions across cycles. */
+  readonly auditStartedAt: number
 }
 
 export type Failure = {
   readonly ok: false
   readonly error: string
+  /** Infrastructure/protocol failures may be re-audited; missing model selection
+   * or invalid Goal authority remains a visible user-action error. */
+  readonly retryable?: boolean
   readonly model?: ModelV2.Ref
   readonly tokens?: number
   readonly rounds?: number
   readonly tools?: ReadonlyArray<string>
   readonly usage?: ReadonlyArray<UsageSample>
   readonly auditorSessionID?: SessionSchema.ID
+  readonly auditStartedAt?: number
 }
 
 export type Result = Success | Failure
@@ -182,7 +188,9 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 const MAX_WORK_CHARS = 18_000
 const MAX_EVIDENCE_ITEMS = 40
 const MAX_AUDIT_ROUNDS = 8
-const MAX_COMPLETION_RETRIES = 1
+// Correct malformed terminal calls within the SAME auditor transcript.
+// A complete re-audit is expensive; these bounded repairs do not re-run the worker.
+const MAX_COMPLETION_RETRIES = 3
 const MAX_TOOL_CALLS_PER_ROUND = 8
 const READ_BYTES = 32 * 1024
 const READ_LINES = 320
@@ -297,6 +305,44 @@ const normalizeAuditorVerdictInput = (input: unknown): unknown => {
 }
 
 /**
+ * Provider-facing parameter contract for `audit_verdict`.
+ *
+ * The durable contract remains `GoalModel.AuditorVerdict`, a
+ * decision-discriminated union. Effect Schema encodes that union as a root
+ * `anyOf` of object branches; several OpenAI-compatible function-calling routes
+ * render a root union poorly (some flatten it to a bare object, others reject
+ * it), and weaker models then call the tool with `{}`. The wire contract is one
+ * flat object every provider can render, and `validateAuditorVerdict` still
+ * enforces the canonical union's decision-specific requirements host-side:
+ * "continue" requires continuationPrompt, "blocked" requires blocker, and
+ * "complete" requires every criterion assessment to be passed.
+ */
+const AuditorVerdictParameters = Schema.Struct({
+  decision: Schema.Literals(["continue", "complete", "blocked"]),
+  rationale: Schema.String,
+  progressMade: Schema.Boolean,
+  criteria: Schema.Array(
+    Schema.Struct({
+      criterionID: Schema.String,
+      status: Schema.Literals(["pending", "passed", "failed"]),
+      evidence: Schema.String,
+    }),
+  ),
+  confidence: Schema.optional(Schema.Finite),
+  continuationPrompt: Schema.optional(Schema.String),
+  blocker: Schema.optional(Schema.String),
+})
+
+/**
+ * Host-owned reminder of the exact wire shape, appended to payload failures.
+ * The same-conversation protocol repair carries this detail back to the model,
+ * so a weak model that emitted `{}` gets the required fields verbatim instead
+ * of an opaque SchemaError dump.
+ */
+const AUDITOR_VERDICT_SHAPE_HINT =
+  'Required payload: {"decision":"continue"|"complete"|"blocked","rationale":"...","progressMade":true|false,"criteria":[{"criterionID":"<exact id from ACCEPTANCE CRITERIA>","status":"pending"|"passed"|"failed","evidence":"..."}]}. "continue" also requires continuationPrompt, "blocked" also requires blocker, and "complete" requires every criterion assessment to be passed.'
+
+/**
  * `heal` is set only on the final attempt, when no corrective retry is left.
  * It relaxes defects that carry no auditor judgment - an over-long rationale,
  * an out-of-range confidence, or an unambiguous one-edit typo in an opaque
@@ -311,8 +357,25 @@ const validateAuditorVerdict = (
   heal = false,
 ): Effect.Effect<GoalModel.AuditorVerdict, string> =>
   Effect.gen(function* () {
-    const raw = yield* Schema.decodeUnknownEffect(GoalModel.AuditorVerdict)(normalizeAuditorVerdictInput(input)).pipe(
-      Effect.mapError((error): string => `Invalid audit_verdict payload: ${String(error)}`),
+    const normalizedInput = normalizeAuditorVerdictInput(input)
+    const emptyPayload = isRecord(normalizedInput) && Object.keys(normalizedInput).length === 0
+    // Surface an actionable repair instruction instead of an opaque union
+    // SchemaError. Never invent decision-specific content on the host.
+    if (
+      isRecord(normalizedInput) &&
+      normalizedInput.decision === "continue" &&
+      (typeof normalizedInput.continuationPrompt !== "string" || !normalizedInput.continuationPrompt.trim())
+    ) {
+      return yield* Effect.fail(
+        "Invalid audit_verdict payload: decision=continue requires a non-empty continuationPrompt. Keep the verdict and criterion assessments, then supply the exact next task for the worker.",
+      )
+    }
+    const raw = yield* Schema.decodeUnknownEffect(GoalModel.AuditorVerdict)(normalizedInput).pipe(
+      Effect.mapError((error): string =>
+        emptyPayload
+          ? `Invalid audit_verdict payload: audit_verdict was called with an empty payload. ${AUDITOR_VERDICT_SHAPE_HINT}`
+          : `Invalid audit_verdict payload: ${String(error)}. ${AUDITOR_VERDICT_SHAPE_HINT}`,
+      ),
     )
     const trimmedRationale = raw.rationale.trim()
     if (!trimmedRationale) return yield* Effect.fail("Invalid audit_verdict payload: rationale cannot be empty")
@@ -419,7 +482,11 @@ const validateAuditorVerdict = (
 
 const sensitivePath = (value: string) => {
   const normalized = value.replaceAll("\\", "/").toLowerCase()
-  const name = normalized.split("/").at(-1) ?? normalized
+  const segments = normalized.split("/").filter(Boolean)
+  // Includes root-relative .git/config as well as nested /repo/.git/config.
+  // Directory denial must precede benign filename exceptions.
+  if (segments.includes(".git")) return true
+  const name = segments.at(-1) ?? normalized
   if (name === ".env.example" || name === ".env.sample") return false
   return (
     name === ".env" ||
@@ -428,8 +495,7 @@ const sensitivePath = (value: string) => {
     name === "id_ed25519" ||
     name.endsWith(".pem") ||
     name.endsWith(".p12") ||
-    name.endsWith(".pfx") ||
-    normalized.includes("/.git/")
+    name.endsWith(".pfx")
   )
 }
 
@@ -555,10 +621,9 @@ const safetyUsageEstimate = (
     }),
   )
   const output = Token.estimate(encode(response.message))
-  // Goal token budgets are safety ceilings, not billing estimates. Terminal
-  // cancellation can intentionally prevent the provider's final usage packet
-  // from arriving, so bias the fallback upward instead of undercounting an
-  // Goal Mode audit cycle.
+  // A missing provider usage packet must not undercount this physical auditor
+  // request in maintenance analytics. This estimate is accounting only: Goal
+  // Mode has no token ceiling or lifetime budget.
   const inputTokens = Math.max(1, Math.ceil(input * 1.5))
   const outputTokens = Math.max(1, Math.ceil(output * 1.5))
   return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }
@@ -626,12 +691,15 @@ const layer = Layer.effect(
         }),
         success: Schema.String,
         execute: ({ pattern, path, include }) =>
-          files.grep(new FileSystem.GrepInput({ pattern, path, include, limit: GREP_RESULTS })).pipe(
-            Effect.map((matches) =>
-              matches.length === 0
+          path && sensitivePath(path)
+            ? Effect.fail(toolFailure("Sensitive files are not available to the Goal auditor"))
+            : files.grep(new FileSystem.GrepInput({ pattern, path, include, limit: GREP_RESULTS })).pipe(
+            Effect.map((matches) => {
+              const visible = matches.filter((match) => !sensitivePath(match.entry.path))
+              return visible.length === 0
                 ? "No matches found"
-                : matches.map((match) => `${match.entry.path}:${match.line}: ${match.text.trimEnd()}`).join("\n"),
-            ),
+                : visible.map((match) => `${match.entry.path}:${match.line}: ${match.text.trimEnd()}`).join("\n")
+            }),
             Effect.mapError(() => toolFailure("Search failed")),
             Effect.catchDefect(() => Effect.fail(toolFailure("Search failed"))),
           ),
@@ -641,10 +709,13 @@ const layer = Layer.effect(
         parameters: Schema.Struct({ pattern: Schema.String, path: Schema.optional(RelativePath) }),
         success: Schema.String,
         execute: ({ pattern, path }) =>
-          files.glob(new FileSystem.GlobInput({ pattern, path, limit: GLOB_RESULTS })).pipe(
-            Effect.map((entries) =>
-              entries.length === 0 ? "No files found" : entries.map((entry) => entry.path).join("\n"),
-            ),
+          path && sensitivePath(path)
+            ? Effect.fail(toolFailure("Sensitive files are not available to the Goal auditor"))
+            : files.glob(new FileSystem.GlobInput({ pattern, path, limit: GLOB_RESULTS })).pipe(
+            Effect.map((entries) => {
+              const visible = entries.filter((entry) => !sensitivePath(entry.path))
+              return visible.length === 0 ? "No files found" : visible.map((entry) => entry.path).join("\n")
+            }),
             Effect.mapError(() => toolFailure("Glob failed")),
             Effect.catchDefect(() => Effect.fail(toolFailure("Glob failed"))),
           ),
@@ -652,7 +723,7 @@ const layer = Layer.effect(
       [AUDIT_VERDICT]: Tool.make({
         description:
           "Commit the independent Goal audit verdict. For continue, author the exact task-specific continuationPrompt for the next autonomous worker cycle. For blocked, identify the concrete blocker; blocked immediately stops autonomous Goal execution and becomes durable Goal state. Call exactly once and as the only tool call when you have enough evidence. This is the only valid way to finish an audit. IMMEDIATELY END GENERATION after this tool call; do not reason, emit prose, or call another tool afterward.",
-        parameters: GoalModel.AuditorVerdict,
+        parameters: AuditorVerdictParameters,
         success: Schema.String,
         execute: () => Effect.succeed(terminalCompletionAccepted(AUDIT_VERDICT)),
       }),
@@ -675,12 +746,16 @@ const layer = Layer.effect(
     const resolveCoreRef = Effect.fn("GoalAuditor.resolveCoreRef")(function* (
       ref: ModelV2.Ref,
       session?: SessionSchema.Info,
+      options?: { readonly explicitOverride?: boolean },
     ) {
-      if (!session) {
-        const model = yield* models.resolveRef(ref)
-        return { model }
-      }
-      const resolved = yield* models.resolveWithInfo({ ...session, model: ref })
+      // Host-owned maintenance resolution: inherit the parent Session's exact
+      // route generation for automatic candidates, or resolve one transient
+      // route for explicit overrides and no-session audits. Never selects,
+      // binds, or fails over the parent's durable ProviderRoute, and never
+      // falls back to ambient auth without consulting the route owner.
+      const resolved = yield* models.resolveMaintenanceWithInfo(session, ref, {
+        explicitOverride: options?.explicitOverride ?? false,
+      })
       const route = usageRoute(resolved.route)
       return {
         model: resolved.model,
@@ -695,7 +770,7 @@ const layer = Layer.effect(
         workerModel?: ModelV2.Ref
       },
     ) {
-      if (configured) return yield* resolveCoreRef(configured, input.session)
+      if (configured) return yield* resolveCoreRef(configured, input.session, { explicitOverride: true })
       if (input.workerModel) {
         const inherited = input.workerModel
         return yield* resolveCoreRef(inherited, input.session).pipe(
@@ -719,7 +794,9 @@ const layer = Layer.effect(
         )
       }
       if (input.session) {
-        const resolved = yield* models.resolveWithInfo(input.session)
+        // The session model may be undefined; the maintenance authority then
+        // inherits the session's current worker selection. Never worker routing.
+        const resolved = yield* models.resolveMaintenanceWithInfo(input.session, input.session.model)
         const route = usageRoute(resolved.route)
         return {
           model: resolved.model,
@@ -975,7 +1052,17 @@ const layer = Layer.effect(
                     tools,
                     toolChoice,
                     generation: { maxTokens, temperature: 0.1 },
-                    publish: (event) => current.publish(event),
+                    // Fail at the event boundary as well as validating the
+                    // assembled response below. Never materialize a provider-
+                    // executed tool result into the auditor's trusted Session
+                    // transcript before discovering that it bypassed our host
+                    // read-only tool dispatcher.
+                    publish: (event) =>
+                      (event.type === "tool-call" || event.type === "tool-result") && event.providerExecuted === true
+                        ? Effect.die(new RuntimeUnavailableError({
+                            message: "Goal auditor provider executed a tool outside its read-only host boundary",
+                          }))
+                        : current.publish(event),
                   }),
                 })
                 if (current.hasAssistantStarted()) yield* current.streamed()
@@ -1030,6 +1117,19 @@ const layer = Layer.effect(
             settled: false,
           }
           pendingTurns.add(turn)
+          // Provider-executed tools bypass the host's read-only dispatch
+          // boundary. Do not ignore such calls and accept an accompanying
+          // audit_verdict as independent verification.
+          if (generated.response.events.some((event) =>
+            (event.type === "tool-call" || event.type === "tool-result") && event.providerExecuted === true
+          )) {
+            yield* rejectPendingTurns(
+              `Goal auditor rejected provider-executed tool execution. ${AUDITOR_PROTOCOL_IDENTITY}`,
+            )
+            return yield* new RuntimeUnavailableError({
+              message: "Goal auditor provider executed a tool outside its read-only host boundary",
+            })
+          }
           return { ...generated, turn }
         })
 
@@ -1039,6 +1139,7 @@ const layer = Layer.effect(
           rounds: number
         }) {
           let seeded = true
+          const usageBeforeRepairs = usageSamples.length
           const terminal = yield* runTerminalCompletionWithTranscript<Message, GoalModel.AuditorVerdict, string>({
             messages,
             toolName: AUDIT_VERDICT,
@@ -1082,7 +1183,7 @@ const layer = Layer.effect(
               ok: false as const,
               error: terminal.cause.toString(),
               tokens,
-              rounds: inputFinish.rounds + MAX_COMPLETION_RETRIES,
+              rounds: inputFinish.rounds + Math.max(0, usageSamples.length - usageBeforeRepairs),
               tools: usedTools,
               usage: usageSamples,
             }
@@ -1220,6 +1321,12 @@ const layer = Layer.effect(
         return {
           ok: false,
           error: `Unable to resolve Goal auditor model: ${String(modelExit.cause)}`,
+          // A provider/model catalog or account can be temporarily unavailable
+          // during startup, token refresh, or service recovery. Keep the Goal
+          // alive under the durable exponential audit-retry scheduler instead
+          // of requiring a manual Retry click after every transient failure.
+          // No alternate model is silently selected.
+          retryable: true,
           ...(requested ? { model: requested } : {}),
         } satisfies Failure
       const model = modelExit.value
@@ -1234,8 +1341,9 @@ const layer = Layer.effect(
       if (auditorSession._tag === "Failure") {
         return {
           ok: false,
-          error: `Unable to provision Goal auditor Session: ${String(auditorSession.cause)}`,
-          model: ref,
+           error: `Unable to provision Goal auditor Session: ${String(auditorSession.cause)}`,
+           retryable: true,
+           model: ref,
         } satisfies Failure
       }
       const auditorSessionID = auditorSession.value
@@ -1265,7 +1373,8 @@ const layer = Layer.effect(
         } satisfies Failure
       }
 
-      const execute: Effect.Effect<Result> = Effect.gen(function* () {
+       const auditStartedAt = DateTime.toEpochMillis(running.since)
+       const execute: Effect.Effect<Result> = Effect.gen(function* () {
         let lastError = "Goal auditor failed"
         let consumedTokens = 0
         let rounds = 0
@@ -1296,23 +1405,26 @@ const layer = Layer.effect(
               tokens: consumedTokens,
               rounds,
               tools: usedTools,
-              usage,
-              auditorSessionID,
-            } satisfies Success
+               usage,
+               auditorSessionID,
+               auditStartedAt,
+             } satisfies Success
           }
           lastError = attemptResult.error
         }
 
         return {
           ok: false,
-          error: `${lastError} (after ${attempts} auditor attempt${attempts === 1 ? "" : "s"})`,
-          model: ref,
+           error: `${lastError} (after ${attempts} auditor attempt${attempts === 1 ? "" : "s"})`,
+           retryable: true,
+           model: ref,
           tokens: consumedTokens,
           rounds,
           tools: usedTools,
-          usage,
-          auditorSessionID,
-        } satisfies Failure
+           usage,
+           auditorSessionID,
+           auditStartedAt,
+         } satisfies Failure
       })
 
       // The auditor budget is execution time, not Goal lifetime and not model
@@ -1327,17 +1439,27 @@ const layer = Layer.effect(
           Effect.succeed({
             ok: false,
             error: `Goal auditor exceeded its ${Math.floor(AUDITOR_EXECUTION_TIMEOUT_MS / 60_000)}-minute execution budget`,
+            retryable: true,
             model: ref,
             auditorSessionID,
+            auditStartedAt,
           } satisfies Failure),
         Duration.millis(AUDITOR_EXECUTION_TIMEOUT_MS),
-      ).pipe(
-        Effect.onExit((exit) =>
-          Exit.isFailure(exit)
-            ? automation.deferAudit(input.sessionID).pipe(Effect.asVoid)
-            : automation.endAudit(input.sessionID),
-        ),
-      )
+       ).pipe(
+         // SUCCESS IS NOT SETTLEMENT. The returned verdict still has to pass
+         // GoalAutomation.afterTurn, including durable Goal reconciliation and
+         // continuation reservation. Clearing AUDITING here creates a crash
+         // window in which neither an audit lease nor an audit request survives:
+         // long-running Goals then silently stop after a perfectly valid audit.
+         // Keep the durable lease through the caller's settlement; on restart
+         // GoalAutomation's startup reconciliation converts it to a re-audit
+         // request without replaying the completed worker cycle.
+         Effect.onExit((exit) =>
+           Exit.isFailure(exit)
+              ? automation.deferAudit(input.sessionID, { auditorSessionID, auditStartedAt }).pipe(Effect.asVoid)
+              : Effect.void,
+         ),
+       )
     })
 
     const evaluate: Interface["evaluate"] = (input) => evaluateWith(input, coreRuntime)

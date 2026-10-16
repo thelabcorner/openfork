@@ -2,6 +2,7 @@ export * as SwarmV2 from "./index"
 
 import { and, asc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm"
 import { Context, DateTime, Effect, Layer } from "effect"
+import { Agent } from "@opencode-ai/schema/agent"
 import { Swarm as SwarmModel } from "@opencode-ai/schema/swarm"
 import type { Definition } from "@opencode-ai/schema/event"
 import { Database } from "../database/database"
@@ -10,6 +11,7 @@ import { EventV2 } from "../event"
 import { makeGlobalNode } from "../effect/app-node"
 import { ProjectTable } from "../project/sql"
 import { SessionTable } from "../session/sql"
+import { SessionExecutionOwnerTable } from "../session/execution-owner.sql"
 import { WorkspaceTable } from "../control-plane/workspace.sql"
 import { AbsolutePath } from "../schema"
 import { rankCandidates, readinessStatus, validateDependencyGraph, type DependencyEdge } from "./graph"
@@ -124,6 +126,8 @@ function taskTitle(input: string) {
 }
 
 export interface CreateInput {
+  /** Optional trusted, caller-scoped deterministic id for retry-safe creation. */
+  readonly id?: SwarmModel.ID
   readonly projectID: typeof ProjectTable.$inferSelect.id
   readonly directory: string
   readonly workspaceID?: typeof WorkspaceTable.$inferSelect.id
@@ -153,6 +157,8 @@ export interface AddMemberInput {
   readonly name: string
   readonly kind: SwarmModel.MemberKind
   readonly role: string
+  /** Optional transactional status fence for staged admission; bootstrap can add to creating Swarms. */
+  readonly allowedStatuses?: ReadonlyArray<SwarmModel.Status>
   readonly sessionID?: typeof SessionTable.$inferSelect.id
   readonly desiredProfile?: SwarmModel.MemberExecutionProfile
   readonly workspacePolicy: SwarmModel.WorkspacePolicy
@@ -216,6 +222,8 @@ export interface SummaryListInput {
 export interface CreateTaskInput {
   readonly swarmID: SwarmModel.ID
   readonly id?: SwarmModel.TaskID
+  /** Optional transaction-time admission fence; bootstrap may create tasks in creating Swarms. */
+  readonly allowedStatuses?: ReadonlyArray<SwarmModel.Status>
   readonly title: string
   readonly description?: string
   readonly priority?: number
@@ -331,6 +339,14 @@ export interface Interface
   readonly membersForSession: (
     sessionID: typeof SessionTable.$inferSelect.id,
   ) => Effect.Effect<ReadonlyArray<SwarmModel.Member>>
+  /**
+   * Compact execution-mode projection from durable membership. Coordinator role
+   * wins if a Session participates in multiple Swarms; any other member role
+   * uses the shared member mode.
+   */
+  readonly executionAgentForSession: (
+    sessionID: typeof SessionTable.$inferSelect.id,
+  ) => Effect.Effect<Agent.ID | undefined>
   readonly navigation: (input?: {
     readonly projectID?: typeof ProjectTable.$inferSelect.id
   }) => Effect.Effect<ReadonlyArray<SwarmModel.NavigationGroup>>
@@ -360,7 +376,7 @@ const layer = Layer.effect(
       const name = memberName(input.name)
       if (!name) return yield* new SwarmSchema.ValidationError({ reason: "Swarm name is required." })
       const now = input.now ?? Date.now()
-      const id = SwarmModel.ID.create()
+       const id = input.id ?? SwarmModel.ID.create()
       const info = SwarmModel.Info.make({
         id,
         projectID: input.projectID,
@@ -715,6 +731,9 @@ const layer = Layer.effect(
           reason: "Managed worker members require a desired execution profile.",
         })
       }
+      const desiredProfile = input.desiredProfile === undefined
+        ? undefined
+        : { ...input.desiredProfile, agent: Agent.ID.make("swarm-m") }
       const now = input.now ?? Date.now()
       const member = SwarmModel.Member.make({
         id: SwarmModel.MemberID.create(),
@@ -725,7 +744,7 @@ const layer = Layer.effect(
         lifecycle: "active",
         ...(input.sessionID === undefined ? {} : { sessionID: input.sessionID }),
         bindingGeneration: input.sessionID === undefined ? 0 : 1,
-        ...(input.desiredProfile === undefined ? {} : { desiredProfile: input.desiredProfile }),
+        ...(desiredProfile === undefined ? {} : { desiredProfile }),
         workspacePolicy: input.workspacePolicy,
         ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
         time: {
@@ -735,6 +754,21 @@ const layer = Layer.effect(
       })
       yield* publishWithCommit(events, Event.MemberUpdated, { swarmID: input.swarmID, member }, () =>
         Effect.gen(function* () {
+          // Recheck lifecycle inside the member-insert transaction; model
+          // preflight may have taken time while the Swarm was being closed.
+          if (input.allowedStatuses !== undefined) {
+            const current = yield* db
+              .select({ status: SwarmTable.status })
+              .from(SwarmTable)
+              .where(eq(SwarmTable.id, input.swarmID))
+              .get()
+              .pipe(Effect.orDie)
+            if (!current || !input.allowedStatuses.includes(current.status))
+              return yield* commitFail(new SwarmSchema.ConflictError({
+                code: "swarm.member_admission_status",
+                reason: `Cannot admit member ${name}: Swarm is ${current?.status ?? "missing"}; requires ${input.allowedStatuses.join(" or ")}.`,
+              }))
+          }
           if (input.sessionID) {
             const scoped = yield* validateSessionScope(db, swarm, input.sessionID).pipe(
               Effect.catch((error) => commitFail(error)),
@@ -785,7 +819,7 @@ const layer = Layer.effect(
               lifecycle: "active",
               session_id: input.sessionID,
               binding_generation: member.bindingGeneration,
-              desired_profile: input.desiredProfile,
+              desired_profile: desiredProfile,
               workspace_policy: input.workspacePolicy,
               capabilities: input.capabilities,
               time_created: now,
@@ -961,9 +995,10 @@ const layer = Layer.effect(
           reason: "Member " + input.memberID + " must be stopped and unbound before changing execution profile.",
         })
       const now = input.now ?? Date.now()
+      const desiredProfile = { ...input.desiredProfile, agent: Agent.ID.make("swarm-m") }
       const member = hydrateMember({
         ...current,
-        desired_profile: input.desiredProfile,
+        desired_profile: desiredProfile,
         workspace_policy: input.workspacePolicy,
         capabilities: input.capabilities ?? null,
         time_updated: now,
@@ -973,7 +1008,7 @@ const layer = Layer.effect(
           const changed = yield* db
             .update(SwarmMemberTable)
             .set({
-              desired_profile: input.desiredProfile,
+              desired_profile: desiredProfile,
               workspace_policy: input.workspacePolicy,
               capabilities: input.capabilities ?? null,
               time_updated: now,
@@ -1088,6 +1123,12 @@ const layer = Layer.effect(
               AND member.kind = 'managed_worker'
               AND member.lifecycle = 'active'
               AND member.session_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM session_execution_owner AS execution_owner
+                WHERE execution_owner.session_id = member.session_id
+                  AND (execution_owner.owner_id IS NOT NULL OR execution_owner.recovery_owner_id IS NOT NULL)
+              )
               AND (
                 task.reserved_member_id IS NULL
                 OR (task.reserved_until IS NOT NULL AND task.reserved_until <= ${now})
@@ -1146,11 +1187,35 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       const occupiedMembers = new Set(occupiedRows.map((row) => row.memberID))
       const occupiedSessions = new Set(occupiedRows.map((row) => row.sessionID))
+      // The raw candidate query and hydration below are intentionally backed by
+      // the same durable execution-owner source. A recovery-fenced Session may
+      // still have an active Swarm member/task, but it must not receive a new
+      // assignment until its exact execution generation has been recovered.
+      const executionOwnerRows = yield* readDb
+        .select({ sessionID: SessionExecutionOwnerTable.session_id })
+        .from(SessionExecutionOwnerTable)
+        .where(
+          and(
+            inArray(SessionExecutionOwnerTable.session_id, sessionIDs),
+            or(
+              isNotNull(SessionExecutionOwnerTable.owner_id),
+              isNotNull(SessionExecutionOwnerTable.recovery_owner_id),
+            ),
+          ),
+        )
+        .all()
+        .pipe(Effect.orDie)
+      const executionOwnedSessions = new Set(executionOwnerRows.map((row) => row.sessionID))
       const allocatedMembers = new Set<SwarmModel.MemberID>()
       const allocatedSessions = new Set<string>()
       const bySwarm = new Map<SwarmModel.ID, SwarmModel.Member[]>()
       for (const row of memberRows) {
-        if (!row.session_id || occupiedMembers.has(row.id) || occupiedSessions.has(row.session_id)) continue
+        if (
+          !row.session_id ||
+          occupiedMembers.has(row.id) ||
+          occupiedSessions.has(row.session_id) ||
+          executionOwnedSessions.has(row.session_id)
+        ) continue
         const member = hydrateMember(row)
         const list = bySwarm.get(row.swarm_id)
         if (list) list.push(member)
@@ -1279,6 +1344,19 @@ const layer = Layer.effect(
         { swarmID: input.swarmID, task, dependencies },
         () =>
           Effect.gen(function* () {
+            if (input.allowedStatuses !== undefined) {
+              const current = yield* db
+                .select({ status: SwarmTable.status })
+                .from(SwarmTable)
+                .where(eq(SwarmTable.id, input.swarmID))
+                .get()
+                .pipe(Effect.orDie)
+              if (!current || !input.allowedStatuses.includes(current.status))
+                return yield* commitFail(new SwarmSchema.ConflictError({
+                  code: "swarm.task_admission_status",
+                  reason: `Cannot admit task ${title}: Swarm is ${current?.status ?? "missing"}; requires ${input.allowedStatuses.join(" or ")}.`,
+                }))
+            }
             const existing = yield* db
               .select({ id: SwarmTaskTable.id })
               .from(SwarmTaskTable)
@@ -1559,6 +1637,22 @@ const layer = Layer.effect(
       return rows.map(hydrateMember)
     })
 
+    const executionAgentForSession = Effect.fn("Swarm.executionAgentForSession")(function* (
+      sessionID: typeof SessionTable.$inferSelect.id,
+    ) {
+      const rows = yield* readDb
+        .select({ kind: SwarmMemberTable.kind })
+        .from(SwarmMemberTable)
+        .where(eq(SwarmMemberTable.session_id, sessionID))
+        .orderBy(sql`case when ${SwarmMemberTable.kind} = 'coordinator' then 0 else 1 end`)
+        .limit(1)
+        .get()
+        .pipe(Effect.orDie)
+      if (!rows) return undefined
+      if (rows.kind === "coordinator") return Agent.ID.make("swarm-c")
+      return Agent.ID.make("swarm-m")
+    })
+
     const navigation = Effect.fn("Swarm.navigation")(function* (input?: {
       readonly projectID?: typeof ProjectTable.$inferSelect.id
     }) {
@@ -1678,6 +1772,7 @@ const layer = Layer.effect(
       dependenciesForSwarm,
       taskHandoff: handoff.taskHandoff,
       membersForSession,
+      executionAgentForSession,
       navigation,
       ...lease,
       ...messaging,

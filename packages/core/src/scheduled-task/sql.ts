@@ -177,6 +177,9 @@ export const ScheduledTaskRunTable = sqliteTable(
     // IDEMPOTENCY. The single most important constraint in the feature.
     uniqueIndex("scheduled_task_run_logical_idx").on(table.task_id, table.fire_for),
     uniqueIndex("scheduled_task_run_goal_idx").on(table.goal_id),
+    // Startup/idle reconciliation must seek the small pending queue rather
+    // than scan the entire durable history of terminal task runs.
+    index("scheduled_task_run_status_started_idx").on(table.status, table.started_at, table.id),
     index("scheduled_task_run_task_started_idx").on(table.task_id, table.started_at),
     // Global newest-first inbox scan (no acknowledged_at predicate).
     index("scheduled_task_run_started_idx").on(table.started_at, table.id),

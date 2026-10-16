@@ -1,11 +1,12 @@
 export * as GoalAutomation from "./automation"
 
-import { and, asc, eq, gt, isNotNull, isNull, ne, or } from "drizzle-orm"
+import { and, asc, eq, gt, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm"
 import { Context, DateTime, Effect, Layer } from "effect"
 import { Goal } from "./index"
 import { Goal as GoalModel } from "@opencode-ai/schema/goal"
 import { GoalAutomationTable, GoalFocusTable, GoalTable } from "./sql"
 import { Database } from "../database/database"
+import { retrySqliteBusyCause } from "../database/sqlite-busy"
 import { EventV2 } from "../event"
 import { SessionSchema } from "../session/schema"
 import { SessionInput } from "../session/input"
@@ -22,8 +23,10 @@ export type AuditOutcome =
       readonly goalRevision?: number
       readonly model?: ModelV2.Ref
       readonly auditorSessionID?: SessionSchema.ID
+      /** Durable exact audit lease generation; never inferred from the reused child Session. */
+      readonly auditStartedAt?: number
     }
-  | { readonly ok: false; readonly error: string; readonly tokens?: number }
+  | { readonly ok: false; readonly error: string; readonly retryable?: boolean; readonly tokens?: number; readonly auditorSessionID?: SessionSchema.ID; readonly auditStartedAt?: number }
 
 export interface Reservation {
   readonly id: string
@@ -65,15 +68,22 @@ export interface Interface {
     reservationID?: string
   }) => Effect.Effect<GoalModel.AutomationRuntime | undefined>
   /** Releases the live auditor execution lease on every terminal path. */
-  readonly endAudit: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+  readonly endAudit: (input: {
+    readonly sessionID: SessionSchema.ID
+    readonly auditorSessionID: SessionSchema.ID
+    readonly auditStartedAt: number
+  }) => Effect.Effect<void>
   /**
    * Converts an interrupted live auditor lease back into durable audit work.
    * Any reservation for the already-completed worker cycle is preserved and
    * released from its process owner so recovery re-audits instead of rerunning
    * worker side effects.
    */
-  readonly deferAudit: (sessionID: SessionSchema.ID) => Effect.Effect<boolean>
-  /** Stops autonomous continuation and exposes a non-domain auditor failure. */
+  readonly deferAudit: (sessionID: SessionSchema.ID, expected: {
+    readonly auditorSessionID: SessionSchema.ID
+    readonly auditStartedAt: number
+  }) => Effect.Effect<boolean>
+  /** Persist an operational auditor failure and schedule a bounded-backoff re-audit, without blocking the Goal. */
   readonly failAudit: (input: { sessionID: SessionSchema.ID; error: string }) => Effect.Effect<void>
   /**
    * Completes one logical provider cycle and atomically reserves the next
@@ -117,6 +127,15 @@ export interface Interface {
   readonly claimAuditRecovery: (
     sessionID: SessionSchema.ID,
   ) => Effect.Effect<{ readonly reservation?: Reservation } | undefined>
+  /**
+   * Release a claimed audit-recovery reservation only while its audit remains
+   * pending. Never clear a live auditor lease, and never make its completed
+   * worker cycle runnable again as a worker continuation.
+   */
+  readonly releaseAuditRecovery: (input: {
+    sessionID: SessionSchema.ID
+    reservationID: string
+  }) => Effect.Effect<void>
   /** Releases an in-flight claim after interruption/failure so it is recoverable. */
   readonly release: (input: { sessionID: SessionSchema.ID; reservationID: string }) => Effect.Effect<void>
   /**
@@ -158,6 +177,18 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
  * process's abandoned claims immediately.
  */
 const PROCESS_OWNER_ID = `goal-owner:${process.pid}:${crypto.randomUUID()}`
+
+/**
+ * Audit-provider retry frequency is not a Goal lifetime/cycle limit. Backoff
+ * is durable across process restarts and reuses the completed worker result;
+ * a permanently unavailable provider must not be hammered every scan tick.
+ */
+export const AUDIT_RETRY_INITIAL_MS = 60_000
+export const AUDIT_RETRY_MAX_MS = 6 * 60 * 60_000
+export function auditRetryBackoffMs(consecutiveFailures: number): number {
+  const exponent = Math.min(20, Math.max(0, Math.floor(consecutiveFailures) - 1))
+  return Math.min(AUDIT_RETRY_MAX_MS, AUDIT_RETRY_INITIAL_MS * 2 ** exponent)
+}
 
 export const CONTINUATION_PROMPT = [
   "[GOAL CONTINUATION — host-authored, not a new human request]",
@@ -272,6 +303,47 @@ const layer = Layer.effect(
       ) {
         return runtimeOf(existing)
       }
+      // Retrying a failed audit of a completed worker cycle is not a fresh
+      // verification request. Preserve its original reservation/User frontier;
+      // discarding those fields would lose the causal source of the re-audit.
+      // A request already pending (or claimed by recovery) is idempotent.
+      if (
+        existing?.goal_id === focused.goalID &&
+        existing.audit_requested_at !== null &&
+        existing.reservation_id !== null
+      ) {
+        if (existing.runtime_error === null || existing.reservation_owner !== null) return runtimeOf(existing)
+        const now = Date.now()
+        const retried = yield* db
+          .update(GoalAutomationTable)
+          .set({
+            audit_requested_at: now,
+            audit_retry_count: 0,
+            runtime_error: null,
+            time_updated: now,
+          })
+          .where(and(
+            eq(GoalAutomationTable.session_id, sessionID),
+            eq(GoalAutomationTable.goal_id, focused.goalID),
+            eq(GoalAutomationTable.reservation_id, existing.reservation_id),
+            eq(GoalAutomationTable.audit_requested_at, existing.audit_requested_at),
+            isNotNull(GoalAutomationTable.runtime_error),
+            isNull(GoalAutomationTable.reservation_owner),
+            isNull(GoalAutomationTable.auditing_at),
+            isNull(GoalAutomationTable.auditor_session_id),
+          ))
+          .returning()
+          .get()
+          .pipe(Effect.orDie)
+        if (retried) {
+          const next = runtimeOf(retried)
+          if (next) yield* publishRuntime(sessionID, focused.goalID, next)
+          return next
+        }
+        // Another caller won the retry/recovery race. Never fall through to
+        // the fresh-request upsert, which would destroy its reservation.
+        return yield* runtime(sessionID)
+      }
       if (existing && existing.goal_id !== focused.goalID) {
         yield* db
           .delete(GoalAutomationTable)
@@ -288,6 +360,7 @@ const layer = Layer.effect(
           session_id: sessionID,
           goal_id: focused.goalID,
           audit_requested_at: now,
+          audit_retry_count: 0,
           auditing_at: null,
           auditor_session_id: null,
           runtime_error: null,
@@ -304,6 +377,7 @@ const layer = Layer.effect(
           set: {
             goal_id: focused.goalID,
             audit_requested_at: now,
+            audit_retry_count: 0,
             auditing_at: null,
             auditor_session_id: null,
             runtime_error: null,
@@ -327,12 +401,18 @@ const layer = Layer.effect(
     const cancel = Effect.fn("GoalAutomation.cancel")(function* (sessionID: SessionSchema.ID, reservationID?: string) {
       const conditions = [eq(GoalAutomationTable.session_id, sessionID)]
       if (reservationID) conditions.push(eq(GoalAutomationTable.reservation_id, reservationID))
-      const row = yield* db
-        .delete(GoalAutomationTable)
-        .where(and(...conditions))
-        .returning({ goalID: GoalAutomationTable.goal_id })
-        .get()
-        .pipe(Effect.orDie)
+      // New user input must not fail merely because another process briefly
+      // owns SQLite's writer slot. Retry only the atomic DELETE, not the
+      // post-commit runtime publication (which must happen at most once).
+      const row = yield* retrySqliteBusyCause(
+        () => db
+          .delete(GoalAutomationTable)
+          .where(and(...conditions))
+          .returning({ goalID: GoalAutomationTable.goal_id })
+          .get()
+          .pipe(Effect.orDie),
+        { maxElapsedMs: 3_000, delayMs: 35, maxDelayMs: 250 },
+      )
       if (row) yield* publishRuntime(sessionID, row.goalID)
     })
 
@@ -368,8 +448,11 @@ const layer = Layer.effect(
           .pipe(Effect.orDie)
         yield* publishRuntime(input.sessionID, existing.goal_id)
       }
-      const now = Date.now()
-      const leaseWhere = input.reservationID
+       // The same auditor child Session is reused across cycles. Distinguish
+       // their durable leases even if a new cycle starts in the same millisecond
+       // as the previous row update, so a stale evaluator cannot settle it.
+       const now = Math.max(Date.now(), (existing?.time_updated ?? 0) + 1)
+       const leaseWhere = input.reservationID
         ? and(
             eq(GoalAutomationTable.goal_id, focused.goalID),
             eq(GoalAutomationTable.reservation_id, input.reservationID),
@@ -419,20 +502,31 @@ const layer = Layer.effect(
       return automation
     })
 
-    const endAudit = Effect.fn("GoalAutomation.endAudit")(function* (sessionID: SessionSchema.ID) {
+    const endAudit = Effect.fn("GoalAutomation.endAudit")(function* (input: {
+      sessionID: SessionSchema.ID
+      auditorSessionID: SessionSchema.ID
+      auditStartedAt: number
+    }) {
       const now = Date.now()
       const row = yield* db
         .update(GoalAutomationTable)
         .set({ audit_requested_at: null, auditing_at: null, auditor_session_id: null, time_updated: now })
-        .where(and(eq(GoalAutomationTable.session_id, sessionID), isNotNull(GoalAutomationTable.auditing_at)))
+        .where(and(
+          eq(GoalAutomationTable.session_id, input.sessionID),
+          eq(GoalAutomationTable.auditor_session_id, input.auditorSessionID),
+          eq(GoalAutomationTable.auditing_at, input.auditStartedAt),
+        ))
         .returning()
         .get()
         .pipe(Effect.orDie)
       if (!row) return
-      yield* publishRuntime(sessionID, row.goal_id, runtimeOf(row))
+      yield* publishRuntime(input.sessionID, row.goal_id, runtimeOf(row))
     })
 
-    const deferAudit = Effect.fn("GoalAutomation.deferAudit")(function* (sessionID: SessionSchema.ID) {
+    const deferAudit = Effect.fn("GoalAutomation.deferAudit")(function* (sessionID: SessionSchema.ID, expected: {
+      readonly auditorSessionID: SessionSchema.ID
+      readonly auditStartedAt: number
+    }) {
       const now = Date.now()
       const row = yield* db
         .update(GoalAutomationTable)
@@ -448,6 +542,8 @@ const layer = Layer.effect(
           and(
             eq(GoalAutomationTable.session_id, sessionID),
             or(isNotNull(GoalAutomationTable.auditing_at), isNotNull(GoalAutomationTable.auditor_session_id)),
+            eq(GoalAutomationTable.auditor_session_id, expected.auditorSessionID),
+            eq(GoalAutomationTable.auditing_at, expected.auditStartedAt),
           ),
         )
         .returning()
@@ -481,51 +577,56 @@ const layer = Layer.effect(
       if (existing && existing.goal_id !== goal.id) {
         yield* db
           .delete(GoalAutomationTable)
-          .where(eq(GoalAutomationTable.session_id, input.sessionID))
+          // A focus switch may race a late error callback. Delete only the
+          // exact obsolete cursor we read; never wipe a newer Goal's cursor.
+          .where(and(
+            eq(GoalAutomationTable.session_id, input.sessionID),
+            eq(GoalAutomationTable.goal_id, existing.goal_id),
+          ))
           .run()
           .pipe(Effect.orDie)
         yield* publishRuntime(input.sessionID, existing.goal_id)
       }
       const now = Date.now()
       const error = input.error.trim().slice(0, 4_000) || "Goal auditor failed without an error message."
+      const failures = Math.min(1_000_000, (existing?.goal_id === goal.id ? existing.audit_retry_count : 0) + 1)
+      const due = now + Math.floor(auditRetryBackoffMs(failures) * (0.9 + Math.random() * 0.2))
       const row = yield* db
         .insert(GoalAutomationTable)
         .values({
           session_id: input.sessionID,
           goal_id: goal.id,
-          audit_requested_at: null,
+          audit_requested_at: due,
+          audit_retry_count: failures,
           auditing_at: null,
           auditor_session_id: null,
           runtime_error: error,
-          reservation_id: null,
           reservation_owner: null,
-          reservation_created_at: null,
-          continuation_source_message_id: null,
-          continuation_expected_user_seq: null,
-          continuation_prompt: null,
           time_updated: now,
         })
         .onConflictDoUpdate({
           target: GoalAutomationTable.session_id,
           set: {
-            goal_id: goal.id,
-            audit_requested_at: null,
-            auditing_at: null,
-            auditor_session_id: null,
+            audit_requested_at: due,
+            audit_retry_count: failures,
             runtime_error: error,
-            reservation_id: null,
             reservation_owner: null,
-            reservation_created_at: null,
-            continuation_source_message_id: null,
-            continuation_expected_user_seq: null,
-            continuation_prompt: null,
             time_updated: now,
           },
+          // A late route/worker error cannot wipe an already-running audit,
+          // another focused Goal, or a live worker continuation. This helper
+          // is the recovery producer, not authority to preempt active work.
+          setWhere: and(
+            eq(GoalAutomationTable.goal_id, goal.id),
+            isNull(GoalAutomationTable.auditing_at),
+            isNull(GoalAutomationTable.auditor_session_id),
+            or(isNull(GoalAutomationTable.reservation_owner), isNotNull(GoalAutomationTable.audit_requested_at)),
+          ),
         })
         .returning()
         .get()
         .pipe(Effect.orDie)
-      yield* publishRuntime(input.sessionID, goal.id, runtimeOf(row))
+      if (row) yield* publishRuntime(input.sessionID, goal.id, runtimeOf(row))
     })
 
     const pendingSessions = Effect.fn("GoalAutomation.pendingSessions")(function* (input?: {
@@ -557,21 +658,28 @@ const layer = Layer.effect(
           status: GoalTable.status,
           runtimeSessionID: GoalAutomationTable.session_id,
           auditRequestedAt: GoalAutomationTable.audit_requested_at,
+          auditRetryCount: GoalAutomationTable.audit_retry_count,
           runtimeError: GoalAutomationTable.runtime_error,
         })
         .from(GoalFocusTable)
         .innerJoin(GoalTable, eq(GoalTable.id, GoalFocusTable.goal_id))
         .innerJoin(SessionTable, eq(SessionTable.id, GoalFocusTable.session_id))
         .leftJoin(GoalAutomationTable, eq(GoalAutomationTable.session_id, GoalFocusTable.session_id))
-        .where(or(eq(GoalTable.status, "verifying"), isNotNull(GoalAutomationTable.audit_requested_at)))
+        .where(or(
+          eq(GoalTable.status, "verifying"),
+          and(isNotNull(GoalAutomationTable.audit_requested_at), lte(GoalAutomationTable.audit_requested_at, Date.now())),
+        ))
         .all()
         .pipe(Effect.orDie)
 
+      const now = Date.now()
       return rows
-        .filter(
-          (row) =>
-            row.runtimeError === null &&
-            (row.auditRequestedAt !== null || (row.status === "verifying" && row.runtimeSessionID === null)),
+        .filter((row) =>
+          (row.status === "active" || row.status === "verifying") && (
+            (row.auditRequestedAt !== null && row.auditRequestedAt <= now &&
+              (row.runtimeError === null || (row.auditRetryCount ?? 0) > 0)) ||
+            (row.status === "verifying" && row.runtimeSessionID === null)
+          ),
         )
         .map((row) => ({
           sessionID: SessionSchema.ID.make(row.sessionID),
@@ -656,7 +764,8 @@ const layer = Layer.effect(
         .where(eq(GoalAutomationTable.session_id, sessionID))
         .get()
         .pipe(Effect.orDie)
-      if (!row || row.audit_requested_at === null || row.auditing_at !== null || row.auditor_session_id !== null)
+      if (!row || row.audit_requested_at === null || row.audit_requested_at > Date.now() ||
+          row.auditing_at !== null || row.auditor_session_id !== null)
         return undefined
 
       const focused = yield* goals.focusedLifecycle(sessionID)
@@ -691,6 +800,32 @@ const layer = Layer.effect(
       return claimed ? { reservation: reservation(claimed)! } : undefined
     })
 
+    const releaseAuditRecovery = Effect.fn("GoalAutomation.releaseAuditRecovery")(function* (input: {
+      sessionID: SessionSchema.ID
+      reservationID: string
+    }) {
+      // A startup audit can fail BEFORE acquiring its auditor lease (e.g. a
+      // historical worker prompt is unavailable). The claim must be released
+      // without ever exposing the completed worker as a pending continuation.
+      // The live lease is excluded by the CAS so a stale finalizer cannot
+      // interrupt another concurrent auditor or erase a newer settlement.
+      const row = yield* db
+        .update(GoalAutomationTable)
+        .set({ reservation_owner: null, time_updated: Date.now() })
+        .where(and(
+          eq(GoalAutomationTable.session_id, input.sessionID),
+          eq(GoalAutomationTable.reservation_id, input.reservationID),
+          eq(GoalAutomationTable.reservation_owner, PROCESS_OWNER_ID),
+          isNotNull(GoalAutomationTable.audit_requested_at),
+          isNull(GoalAutomationTable.auditing_at),
+          isNull(GoalAutomationTable.auditor_session_id),
+        ))
+        .returning()
+        .get()
+        .pipe(Effect.orDie)
+      if (row) yield* publishRuntime(input.sessionID, row.goal_id, runtimeOf(row))
+    })
+
     const release = Effect.fn("GoalAutomation.release")(function* (input: {
       sessionID: SessionSchema.ID
       reservationID: string
@@ -716,20 +851,45 @@ const layer = Layer.effect(
     })
 
     const requeueClaim = Effect.fn("GoalAutomation.requeueClaim")(function* (sessionID: SessionSchema.ID) {
-      const now = Date.now()
-      const row = yield* db
-        .update(GoalAutomationTable)
-        .set({ reservation_owner: null, auditing_at: null, auditor_session_id: null, time_updated: now })
-        .where(
-          and(
-            eq(GoalAutomationTable.session_id, sessionID),
-            isNotNull(GoalAutomationTable.reservation_id),
-            eq(GoalAutomationTable.reservation_owner, PROCESS_OWNER_ID),
-          ),
-        )
-        .returning()
+      // This runs as an unconditional Session runner finalizer, including for
+      // ordinary turns that have never had an automated Goal. Avoid taking a
+      // SQLite WAL writer lock for those sessions: under many concurrent exits,
+      // a zero-row UPDATE can fail with SQLITE_BUSY and mask the actual runner
+      // result before provider admission. The preflight is merely a fast
+      // negative filter, NOT authorization to clear a claim. The following
+      // atomic CAS remains the sole authority over the exact process owner.
+      const owned = yield* db
+        .select({ reservationID: GoalAutomationTable.reservation_id })
+        .from(GoalAutomationTable)
+        .where(and(
+          eq(GoalAutomationTable.session_id, sessionID),
+          isNotNull(GoalAutomationTable.reservation_id),
+          eq(GoalAutomationTable.reservation_owner, PROCESS_OWNER_ID),
+        ))
         .get()
         .pipe(Effect.orDie)
+      if (!owned) return false
+
+      const row = yield* retrySqliteBusyCause(() => db
+        .update(GoalAutomationTable)
+        // Releasing a claimed worker after interruption must not erase a
+        // completed-but-unsettled auditor. Preserve a durable audit request
+        // when the row still carries a live audit cursor. SQL CASE evaluates
+        // against the pre-update row atomically with the exact-claim CAS.
+        .set({
+          reservation_owner: null,
+          audit_requested_at: sql`CASE WHEN ${GoalAutomationTable.auditing_at} IS NOT NULL OR ${GoalAutomationTable.auditor_session_id} IS NOT NULL THEN ${Date.now()} ELSE ${GoalAutomationTable.audit_requested_at} END`,
+          auditing_at: null,
+          auditor_session_id: null,
+          time_updated: Date.now(),
+        })
+        .where(and(
+          eq(GoalAutomationTable.session_id, sessionID),
+          eq(GoalAutomationTable.reservation_id, owned.reservationID!),
+          eq(GoalAutomationTable.reservation_owner, PROCESS_OWNER_ID),
+        ))
+        .returning()
+        .get(), { maxElapsedMs: 5_000, delayMs: 25, maxDelayMs: 100 }).pipe(Effect.orDie)
       if (!row) return false
       const automation = runtimeOf(row)
       if (automation) yield* publishRuntime(sessionID, row.goal_id, automation)
@@ -760,9 +920,36 @@ const layer = Layer.effect(
         .get()
         .pipe(Effect.orDie)
 
-      if (input.requireAuditCursor && (!stored || stored.goal_id !== detail.goal.id)) {
-        return stop("audit_superseded", detail)
-      }
+      // A live auditor lease is exclusive regardless of which adapter calls
+      // afterTurn. A model-resolution failure can return before provisioning
+      // its own lease, while another audit has already begun; allowing that
+      // caller to omit requireAuditCursor would overwrite the active owner.
+      if (stored?.auditing_at !== null && stored?.auditing_at !== undefined && (
+        !input.requireAuditCursor ||
+        stored.auditor_session_id !== input.audit?.auditorSessionID ||
+        input.audit?.auditStartedAt === undefined ||
+        stored.auditing_at !== input.audit.auditStartedAt
+      )) return stop("audit_superseded", detail)
+
+       // An auditor's verdict is not settlement authority by itself. An
+       // interrupted/superseded evaluator cannot mutate a newer Goal lifecycle
+       // merely because the Session still has some GoalAutomation row. Keep
+       // the live cursor until this exact call commits the verdict/handoff.
+       if (input.requireAuditCursor && (
+         !stored ||
+         stored.goal_id !== detail.goal.id ||
+          stored.auditing_at === null ||
+          stored.auditor_session_id === null ||
+          stored.auditor_session_id !== input.audit?.auditorSessionID ||
+          // The auditor Session is reused across cycles. Its ID alone is never
+          // settlement authority: even a failed racing beginAudit knows that
+          // ID. Require the exact durable lease generation on EVERY audited
+          // settlement, including errors and recovery retries.
+          input.audit?.auditStartedAt === undefined ||
+          stored.auditing_at !== input.audit.auditStartedAt
+       )) {
+         return stop("audit_superseded", detail)
+       }
 
       if (input.origin === "automatic") {
         if (
@@ -785,12 +972,73 @@ const layer = Layer.effect(
 
       const audit = input.audit ?? ({ ok: false, error: "auditor result missing" } satisfies AuditOutcome)
 
+      // Retry failures in the auditing infrastructure without advancing or
+      // re-running the worker. This cursor persists the backoff, audit lease
+      // guard, original reservation, and User frontier across process restart.
+      const scheduleAuditRetry = (failure: string) => Effect.gen(function* () {
+        const now = Date.now()
+        const failures = Math.min(1_000_000, (stored?.audit_retry_count ?? 0) + 1)
+        const delay = auditRetryBackoffMs(failures)
+        const due = now + Math.floor(delay * (0.9 + Math.random() * 0.2))
+        const error = failure.trim().slice(0, 4_000) || "Goal auditor failed without an error message."
+        const retry = {
+          audit_requested_at: due,
+          audit_retry_count: failures,
+          auditing_at: null,
+          auditor_session_id: null,
+          reservation_owner: null,
+          runtime_error: error,
+          time_updated: now,
+        }
+        const scheduled = stored
+          ? yield* db.update(GoalAutomationTable)
+              .set(retry)
+              .where(and(
+                eq(GoalAutomationTable.session_id, input.sessionID),
+                eq(GoalAutomationTable.goal_id, detail.goal.id),
+                ...(input.requireAuditCursor ? [
+                  eq(GoalAutomationTable.auditor_session_id, audit.auditorSessionID!),
+                  eq(GoalAutomationTable.auditing_at, audit.auditStartedAt!),
+                ] : []),
+                ...(input.origin === "automatic" && input.reservationID ? [
+                  eq(GoalAutomationTable.reservation_id, input.reservationID),
+                  eq(GoalAutomationTable.reservation_owner, PROCESS_OWNER_ID),
+                ] : []),
+              ))
+              .returning()
+              .get()
+              .pipe(Effect.orDie)
+          : yield* db.insert(GoalAutomationTable)
+              .values({
+                session_id: input.sessionID,
+                goal_id: detail.goal.id,
+                ...retry,
+                reservation_id: null,
+                reservation_created_at: null,
+                continuation_source_message_id: null,
+                continuation_expected_user_seq: null,
+                continuation_prompt: null,
+              })
+              .onConflictDoNothing()
+              .returning()
+              .get()
+              .pipe(Effect.orDie)
+        if (!scheduled) return stop("audit_superseded", detail)
+        yield* publishRuntime(input.sessionID, detail.goal.id, runtimeOf(scheduled))
+        return stop("audit_retry_scheduled", detail)
+      })
+
       if (!audit.ok) {
-        yield* failAudit({ sessionID: input.sessionID, error: audit.error })
-        // Auditor/provider infrastructure failure is not a domain blocker. Stop
-        // Goal Mode execution safely, but leave the Goal lifecycle untouched
-        // so a transient catalog/auth outage cannot manufacture `blocked` state.
-        return stop(`auditor_error:${audit.error}`, detail)
+        if (input.supersededByUser) {
+          yield* cancel(input.sessionID)
+          return stop("superseded_by_user", detail)
+        }
+        // A model/account/transport failure cannot manufacture a Goal blocker
+        // or indefinitely halt intrinsic autonomy. Even an error currently
+        // classified as nonretryable can become recoverable after settings,
+        // provider availability, or a catalog change. Bound the *frequency*
+        // of attempts, never the Goal's lifetime or worker-cycle count.
+        return yield* scheduleAuditRetry(audit.error)
       }
 
       // A newer human turn owns the next decision boundary. In particular, a
@@ -817,11 +1065,32 @@ const layer = Layer.effect(
           Effect.catchTag("Goal.StaleRevisionError", () =>
             Effect.succeed({ ok: false as const, stale: true as const }),
           ),
-          Effect.catch(() => Effect.succeed({ ok: false as const, stale: false as const })),
+          Effect.catch((error) => Effect.succeed({ ok: false as const, stale: false as const, error: String(error) })),
         )
       if (!reconciled.ok) {
-        yield* cancel(input.sessionID)
-        return stop(reconciled.stale ? "auditor_stale" : "auditor_reconciliation_failed", detail)
+        // A Goal specification can legitimately change during independent
+        // auditing. Re-audit the latest revision without replaying the already
+        // completed worker or deleting its only crash-recovery cursor.
+        if (!reconciled.stale) {
+          // A semantic/storage validation fault may be persistent. Keep the
+          // completed worker's causal reservation and retry the audit on the
+          // durable infrastructure backoff rather than spinning each scan.
+          return yield* scheduleAuditRetry(`Goal audit reconciliation failed: ${reconciled.error}`)
+        }
+        if (input.requireAuditCursor && audit.auditorSessionID && audit.auditStartedAt !== undefined) {
+          const deferred = yield* deferAudit(input.sessionID, {
+            auditorSessionID: audit.auditorSessionID,
+            auditStartedAt: audit.auditStartedAt,
+          })
+          return stop(deferred ? "auditor_reconciliation_reaudit" : "audit_superseded", detail)
+        }
+        // Historical/direct callers have no audit lease to release. Never
+        // overwrite an existing reservation owned by another worker.
+        if (!stored) {
+          const requested = yield* requestAudit(input.sessionID)
+          return stop(requested ? "auditor_reconciliation_reaudit" : "audit_superseded", detail)
+        }
+        return stop("audit_superseded", detail)
       }
       detail = reconciled.value.detail
 
@@ -857,6 +1126,7 @@ const layer = Layer.effect(
         session_id: input.sessionID,
         goal_id: detail.goal.id,
         audit_requested_at: null,
+        audit_retry_count: 0,
         auditing_at: null,
         auditor_session_id: null,
         runtime_error: null,
@@ -876,6 +1146,7 @@ const layer = Layer.effect(
           set: {
             goal_id: row.goal_id,
             audit_requested_at: null,
+            audit_retry_count: 0,
             auditing_at: null,
             auditor_session_id: null,
             runtime_error: null,
@@ -920,6 +1191,7 @@ const layer = Layer.effect(
       afterTurn,
       claim,
       claimAuditRecovery,
+      releaseAuditRecovery,
       release,
       requeueClaim,
       cancel,
@@ -954,7 +1226,14 @@ function runtimeOf(row: typeof GoalAutomationTable.$inferSelect): GoalModel.Auto
     }
   }
   if (row.runtime_error) {
-    return { phase: "audit_error", since: DateTime.makeUnsafe(row.time_updated), error: row.runtime_error }
+    return {
+      phase: "audit_error",
+      since: DateTime.makeUnsafe(row.time_updated),
+      error: row.runtime_error,
+      ...(row.audit_requested_at !== null && row.audit_retry_count > 0
+        ? { retryAt: DateTime.makeUnsafe(row.audit_requested_at) }
+        : {}),
+    }
   }
   // Never manufacture AUDITING from a partial marker. A valid auditor lease is
   // identified by both its timestamp and its durable child Session id.

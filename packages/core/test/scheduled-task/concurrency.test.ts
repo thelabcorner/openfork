@@ -2,14 +2,14 @@ import { describe, expect, test } from "bun:test"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { Effect, Layer } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
 import { ScheduledTaskLease } from "@opencode-ai/core/scheduled-task/lease"
-import { ScheduledTaskRunTable } from "@opencode-ai/core/scheduled-task/sql"
+import { ScheduledTaskLeaseTable, ScheduledTaskRunTable } from "@opencode-ai/core/scheduled-task/sql"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { eq } from "drizzle-orm"
 
@@ -89,6 +89,54 @@ async function seedTask(dbPath: string, name: string) {
 }
 
 describe("scheduled task concurrency across real processes", () => {
+  test("liveness heartbeats bypass a deliberately held foreground SQLite connection permit", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "openfork-scheduled-control-"))
+    const dbPath = path.join(directory, "control.sqlite")
+    try {
+      await withDatabase(dbPath, ({ tasks, leases, db }) =>
+        Effect.gen(function* () {
+          const created = yield* tasks.create({
+            targetDirectory: "/scheduled/control",
+            name: "control-lane",
+            enabled: true,
+            schedule: { kind: "daily", times: [{ hour: 9, minute: 0 }] },
+            timezone: "UTC",
+            action: { prompt: "work" },
+            now: Date.parse("2026-06-01T00:00:00Z"),
+          })
+          const lease = yield* leases.claim({
+            taskID: created.id,
+            fireFor: created.nextRunAt!,
+            now: Date.now(),
+          })
+          expect(lease).toBeDefined()
+          const acquired = yield* Deferred.make<void>()
+          const releaseForeground = yield* Deferred.make<void>()
+          const holding = yield* db.transaction((tx) =>
+            Effect.gen(function* () {
+              yield* tx.select().from(ScheduledTaskLeaseTable).limit(1).all().pipe(Effect.orDie)
+              yield* Deferred.succeed(acquired, undefined)
+              yield* Deferred.await(releaseForeground)
+            }),
+            { behavior: "deferred" },
+          ).pipe(Effect.forkScoped)
+          yield* Deferred.await(acquired)
+          // This would time out if heartbeat still used the primary permit.
+          const beat = yield* leases.heartbeat({ leaseID: lease!.leaseID, now: Date.now() })
+            .pipe(Effect.timeoutOption("2 seconds"))
+          yield* Deferred.succeed(releaseForeground, undefined)
+          yield* Fiber.join(holding)
+          expect(Option.isSome(beat)).toBe(true)
+          if (Option.isSome(beat)) expect(beat.value).toBe(true)
+          yield* leases.release({ leaseID: lease!.leaseID })
+          expect(yield* leases.activeCount()).toBe(0)
+        }).pipe(Effect.scoped, Effect.orDie),
+      )
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    }
+  }, 20_000)
+
   test("C1/C3: two processes racing one due task produce exactly one claim and one run row", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-st-race-"))
     const dbPath = path.join(directory, "race.sqlite")

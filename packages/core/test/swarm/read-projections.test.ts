@@ -128,6 +128,38 @@ const createRunnable = Effect.fn("test.createRunnableSwarm")(function* (name: st
 })
 
 describe("Swarm bounded public read projections", () => {
+  it.effect("projects the execution agent from durable role and prioritizes coordinators", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const swarms = yield* SwarmV2.Service
+      const created = yield* createRunnable("agent-mode")
+
+      expect(String(yield* swarms.executionAgentForSession(coordinatorSession))).toBe("swarm-c")
+      expect(String(yield* swarms.executionAgentForSession(workerSession))).toBe("swarm-m")
+      expect(String(created.worker.desiredProfile?.agent)).toBe("swarm-m")
+      expect(yield* swarms.executionAgentForSession(foreignSession)).toBeUndefined()
+
+      const overlapping = yield* swarms.create({
+        projectID: projectA,
+        workspaceID: workspaceA,
+        directory: "/swarm/read/a",
+        name: "overlapping coordinator role",
+        now: 500,
+      })
+      yield* swarms.addMember({
+        swarmID: overlapping.id,
+        name: "worker's coordinator",
+        kind: "coordinator",
+        role: "Coordinator",
+        sessionID: workerSession,
+        workspacePolicy: { mode: "shared-read" },
+        now: 501,
+      })
+
+      expect(String(yield* swarms.executionAgentForSession(workerSession))).toBe("swarm-c")
+    }),
+  )
+
   it.effect("scopes summary catalogs by project/workspace/status and bounds the requested window", () =>
     Effect.gen(function* () {
       yield* setup

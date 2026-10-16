@@ -154,6 +154,9 @@ export const GoalAutomationTable = sqliteTable(
       .notNull()
       .references(() => GoalTable.id, { onDelete: "cascade" }),
     audit_requested_at: integer(),
+    /** Number of consecutive retryable auditor infrastructure failures, not
+     * worker cycles or Goal-progress attempts. Never a termination ceiling. */
+    audit_retry_count: integer().notNull().default(0),
     auditing_at: integer(),
     auditor_session_id: text().$type<typeof SessionTable.$inferSelect.id>(),
     runtime_error: text(),
