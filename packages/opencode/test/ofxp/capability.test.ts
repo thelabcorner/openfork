@@ -1,10 +1,12 @@
 import { describe, expect } from "bun:test"
 import { $ } from "bun"
 import { Database as BunDatabase } from "bun:sqlite"
+import { createHash } from "node:crypto"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { Effect, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
+import { OfxpInvocationReceiptTable } from "@opencode-ai/core/ofxp-invocation/sql"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -13,6 +15,7 @@ import { OfxpIdentity } from "@opencode-ai/core/ofxp-peer/identity"
 import { OfxpPairing } from "@opencode-ai/core/ofxp-peer/pairing"
 import { Ofxp } from "@opencode-ai/schema/ofxp"
 import { SessionID } from "@opencode-ai/schema/session-id"
+import { MAX_SOURCE_BYTES } from "../../src/code/input-admission"
 import { OfxpCapability } from "../../src/ofxp/capability"
 import { OfxpCertificate } from "../../src/ofxp/certificate"
 import { OfxpRoot } from "../../src/ofxp/root"
@@ -105,6 +108,15 @@ function nodeCommand(script: string) {
     return `"${process.execPath}" -e "${script}"`
   }
   return `${shQuote(process.execPath)} -e ${shQuote(script)}`
+}
+
+function invocationDigest(parts: readonly string[]) {
+  const hash = createHash("sha256")
+  for (const part of parts) {
+    const bytes = Buffer.byteLength(part, "utf8")
+    hash.update(String(bytes), "ascii").update(":", "ascii").update(part, "utf8")
+  }
+  return `sha256:${hash.digest("hex")}`
 }
 
 describe("OFXP capability exchange", () => {
@@ -276,6 +288,117 @@ describe("OFXP capability exchange", () => {
     expect(missingRoot.error.code).toBe("ROOT_NOT_FOUND")
   }))
 
+  it.live(
+    "executes Code Mode across the authenticated OFXP transport",
+    Effect.gen(function* () {
+      const tmp = yield* Effect.acquireRelease(Effect.promise(() => tmpdir()), (item) => Effect.promise(() => item[Symbol.asyncDispose]()))
+      const repo = path.join(tmp.path, "repo")
+      yield* Effect.promise(() => fs.mkdir(repo, { recursive: true }))
+      yield* Effect.promise(() => fs.writeFile(path.join(repo, "a.txt"), "ofxp code over tls\n"))
+
+      const source = identity("Code Source")
+      const target = identity("Code Target")
+      const peers = yield* OfxpPeer.Service
+      const roots = yield* OfxpRoot.Service
+      const capabilities = yield* OfxpCapability.Service
+      const trusted = yield* peers.trust({ identity: source.identity })
+      yield* peers.setGrant({
+        peerID: source.key.peerID,
+        expectedRevision: trusted.info.grantRevision,
+        grant: { ...Ofxp.DENY_GRANT, code: true, read: true },
+      })
+      const root = yield* roots.approve(source.key.peerID, repo, "repo")
+
+      const targetMaterial = yield* Effect.promise(() => OfxpCertificate.issue(target.key))
+      const sourceMaterial = yield* Effect.promise(() => OfxpCertificate.issue(source.key))
+      const endpoint = yield* Effect.acquireRelease(
+        Effect.promise(() =>
+          OfxpTransport.start({
+            material: targetMaterial,
+            identity: target.identity,
+            hello: hello(target.identity),
+            pairing: new OfxpPairing.Coordinator(target.identity),
+            host: "127.0.0.1",
+            application: ({ peer, method, body, signal }) => Effect.runPromise(capabilities.dispatch(peer, method, body, signal)),
+          }),
+        ),
+        (value) => Effect.promise(() => value.stop()),
+      )
+      const connection = yield* Effect.acquireRelease(
+        Effect.promise(() =>
+          OfxpTransport.ClientConnection.connect({
+            material: sourceMaterial,
+            host: endpoint.host,
+            port: endpoint.port,
+            expectedPeerID: target.key.peerID,
+          }),
+        ),
+        (value) => Effect.promise(() => value.close()),
+      )
+
+      const listed = Schema.decodeUnknownSync(Ofxp.CapabilityListResponse)(
+        yield* Effect.promise(() => connection.request<unknown>("capability.list", { rootID: root.id })),
+        { onExcessProperty: "error" },
+      )
+      expect(listed.ok).toBe(true)
+      if (!listed.ok) throw new Error(listed.error.message)
+      expect(listed.capabilities.map((item) => item.id)).toContain("code")
+
+      const descriptor = yield* Effect.promise(() => describeCapability(connection, "code"))
+      const response = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+        yield* Effect.promise(() =>
+          connection.request<unknown>(
+            "capability.call",
+            call(
+              source.key.peerID,
+              root.id,
+              { action: "run", code: 'return await call("read", { path: "a.txt" })' },
+              descriptor.contract,
+              "code",
+            ),
+          ),
+        ),
+        { onExcessProperty: "error" },
+      )
+      expect(response.ok).toBe(true)
+      if (!response.ok) throw new Error(response.error.message)
+      const codeResult = JSON.parse(response.result.output) as { ok?: boolean; value?: string }
+      expect(codeResult.ok).toBe(true)
+      expect(codeResult.value).toContain("ofxp code over tls")
+
+      const oversizedInvocation = Ofxp.InvocationID.create()
+      const rejected = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+        yield* Effect.promise(() =>
+          connection.request<unknown>(
+            "capability.call",
+            call(
+              source.key.peerID,
+              root.id,
+              { action: "run", code: "x".repeat(MAX_SOURCE_BYTES + 1) },
+              descriptor.contract,
+              "code",
+              oversizedInvocation,
+            ),
+          ),
+        ),
+        { onExcessProperty: "error" },
+      )
+      expect(rejected.ok).toBe(false)
+      if (rejected.ok) throw new Error("expected oversized Code request rejection")
+      expect(rejected.error.code).toBe("INVALID_REQUEST")
+      expect(rejected.error.message).toContain(`${MAX_SOURCE_BYTES}-byte source limit`)
+
+      const absentReceipt = Schema.decodeUnknownSync(Ofxp.ReceiptGetResponse)(
+        yield* Effect.promise(() => connection.request<unknown>("receipt.get", { invocationID: oversizedInvocation })),
+        { onExcessProperty: "error" },
+      )
+      expect(absentReceipt.ok).toBe(false)
+      if (absentReceipt.ok) throw new Error("invalid Code request must not create a receipt")
+      expect(absentReceipt.error.code).toBe("NOT_FOUND")
+    }),
+    { timeout: 20_000 },
+  )
+
   it.live("does not trust a sourcePeerID claimed in JSON when TLS authenticated a different peer", Effect.gen(function* () {
     const tmp = yield* Effect.acquireRelease(Effect.promise(() => tmpdir()), (item) => Effect.promise(() => item[Symbol.asyncDispose]()))
     const repo = path.join(tmp.path, "repo")
@@ -353,6 +476,411 @@ describe("OFXP capability exchange", () => {
     expect(parsed.ok).toBe(false)
     if (parsed.ok) throw new Error("expected authority denial")
     expect(parsed.error.code).toBe("AUTHORITY_DENIED")
+  }))
+
+  it.live("runs stateless Code without widening peer grants and preserves parent receipt safety", Effect.gen(function* () {
+    const tmp = yield* Effect.acquireRelease(Effect.promise(() => tmpdir()), (item) => Effect.promise(() => item[Symbol.asyncDispose]()))
+    const repo = path.join(tmp.path, "repo")
+    yield* Effect.promise(() => fs.mkdir(repo, { recursive: true }))
+    yield* Effect.promise(() => fs.writeFile(path.join(repo, "a.txt"), "remote code read\n"))
+
+    const source = identity("Code Peer")
+    const peers = yield* OfxpPeer.Service
+    const roots = yield* OfxpRoot.Service
+    const capabilities = yield* OfxpCapability.Service
+    const trusted = yield* peers.trust({ identity: source.identity })
+    const codeGrant = yield* peers.setGrant({
+      peerID: source.key.peerID,
+      expectedRevision: trusted.info.grantRevision,
+      grant: { ...Ofxp.DENY_GRANT, code: true },
+    })
+    const root = yield* roots.approve(source.key.peerID, repo, "repo")
+    const peer = { peerID: source.key.peerID, fingerprint: source.key.fingerprint, publicKeySpki: source.key.publicKeySpki }
+
+    const listed = Schema.decodeUnknownSync(Ofxp.CapabilityListResponse)(
+      yield* capabilities.dispatch(peer, "capability.list", { rootID: root.id }),
+      { onExcessProperty: "error" },
+    )
+    expect(listed.ok).toBe(true)
+    if (!listed.ok) throw new Error(listed.error.message)
+    expect(listed.capabilities.map((item) => item.id)).toContain("code")
+    expect(listed.capabilities.map((item) => item.id)).not.toContain("read")
+
+    const described = Schema.decodeUnknownSync(Ofxp.CapabilityDescribeResponse)(
+      yield* capabilities.dispatch(peer, "capability.describe", { capability: "code" }),
+      { onExcessProperty: "error" },
+    )
+    expect(described.ok).toBe(true)
+    if (!described.ok) throw new Error(described.error.message)
+
+    const deniedInvocation = Ofxp.InvocationID.create()
+    const denied = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+      yield* capabilities.dispatch(
+        peer,
+        "capability.call",
+        call(
+          source.key.peerID,
+          root.id,
+          { action: "run", code: 'return await call("read", { path: "a.txt" })' },
+          described.descriptor.contract,
+          "code",
+          deniedInvocation,
+        ),
+      ),
+      { onExcessProperty: "error" },
+    )
+    expect(denied.ok).toBe(true)
+    if (!denied.ok) throw new Error(denied.error.message)
+    const deniedResult = JSON.parse(denied.result.output) as { ok?: boolean; error?: { kind?: string; message?: string } }
+    expect(deniedResult.ok).toBe(false)
+    expect(deniedResult.error?.kind).toBe("ToolFailure")
+    expect(deniedResult.error?.message).toContain("not callable from Code: read")
+
+    const deniedReceipt = Schema.decodeUnknownSync(Ofxp.ReceiptGetResponse)(
+      yield* capabilities.dispatch(peer, "receipt.get", { invocationID: deniedInvocation }),
+      { onExcessProperty: "error" },
+    )
+    expect(deniedReceipt.ok).toBe(true)
+    if (!deniedReceipt.ok) throw new Error(deniedReceipt.error.message)
+    expect(deniedReceipt.receipt.state).toBe("failed")
+
+    const cancelledInvocation = Ofxp.InvocationID.create()
+    const cancelledController = new AbortController()
+    cancelledController.abort()
+    const cancelled = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+      yield* capabilities.dispatch(
+        peer,
+        "capability.call",
+        call(
+          source.key.peerID,
+          root.id,
+          { action: "run", code: "return 1" },
+          described.descriptor.contract,
+          "code",
+          cancelledInvocation,
+        ),
+        cancelledController.signal,
+      ),
+      { onExcessProperty: "error" },
+    )
+    expect(cancelled.ok).toBe(false)
+    if (cancelled.ok) throw new Error("expected cancelled Code invocation")
+    expect(cancelled.error.code).toBe("CANCELLED")
+    const cancelledReceipt = Schema.decodeUnknownSync(Ofxp.ReceiptGetResponse)(
+      yield* capabilities.dispatch(peer, "receipt.get", { invocationID: cancelledInvocation }),
+      { onExcessProperty: "error" },
+    )
+    expect(cancelledReceipt.ok).toBe(true)
+    if (!cancelledReceipt.ok) throw new Error(cancelledReceipt.error.message)
+    expect(cancelledReceipt.receipt.state).toBe("cancelled")
+
+    const readGrant = yield* peers.setGrant({
+      peerID: source.key.peerID,
+      expectedRevision: codeGrant.info.grantRevision,
+      grant: { ...Ofxp.DENY_GRANT, code: true, read: true },
+    })
+
+    const allowedInvocation = Ofxp.InvocationID.create()
+    const allowed = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+      yield* capabilities.dispatch(
+        peer,
+        "capability.call",
+        call(
+          source.key.peerID,
+          root.id,
+          { action: "run", code: 'return await call("read", { path: "a.txt" })' },
+          described.descriptor.contract,
+          "code",
+          allowedInvocation,
+        ),
+      ),
+      { onExcessProperty: "error" },
+    )
+    expect(allowed.ok).toBe(true)
+    if (!allowed.ok) throw new Error(allowed.error.message)
+    expect((JSON.parse(allowed.result.output) as { ok?: boolean }).ok).toBe(true)
+
+    const allowedReceipt = Schema.decodeUnknownSync(Ofxp.ReceiptGetResponse)(
+      yield* capabilities.dispatch(peer, "receipt.get", { invocationID: allowedInvocation }),
+      { onExcessProperty: "error" },
+    )
+    expect(allowedReceipt.ok).toBe(true)
+    if (!allowedReceipt.ok) throw new Error(allowedReceipt.error.message)
+    expect(allowedReceipt.receipt.state).toBe("committed")
+
+    const boundedInvocation = Ofxp.InvocationID.create()
+    const bounded = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+      yield* capabilities.dispatch(
+        peer,
+        "capability.call",
+        call(
+          source.key.peerID,
+          root.id,
+          { action: "run", code: `return '"'.repeat(200000)` },
+          described.descriptor.contract,
+          "code",
+          boundedInvocation,
+        ),
+      ),
+      { onExcessProperty: "error" },
+    )
+    expect(bounded.ok).toBe(true)
+    if (!bounded.ok) throw new Error(bounded.error.message)
+    expect(bounded.result.output.length).toBeLessThanOrEqual(128 * 1024)
+    const boundedResult = JSON.parse(bounded.result.output) as { truncated?: boolean; sourceHash?: string }
+    expect(boundedResult.truncated).toBe(true)
+    expect(typeof boundedResult.sourceHash).toBe("string")
+
+    const replay = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+      yield* capabilities.dispatch(
+        peer,
+        "capability.call",
+        call(
+          source.key.peerID,
+          root.id,
+          { action: "run", code: 'return await call("read", { path: "a.txt" })' },
+          described.descriptor.contract,
+          "code",
+          allowedInvocation,
+        ),
+      ),
+      { onExcessProperty: "error" },
+    )
+    expect(replay.ok).toBe(false)
+    if (replay.ok) throw new Error("expected duplicate Code invocation rejection")
+    expect(replay.error.code).toBe("CONFLICT")
+
+    yield* peers.setGrant({
+      peerID: source.key.peerID,
+      expectedRevision: readGrant.info.grantRevision,
+      grant: { ...Ofxp.DENY_GRANT, code: true, write: true },
+    })
+    const writeInvocation = Ofxp.InvocationID.create()
+    const wrote = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+      yield* capabilities.dispatch(
+        peer,
+        "capability.call",
+        call(
+          source.key.peerID,
+          root.id,
+          { action: "run", code: 'return await call("write", { path: "from-code.txt", content: "written by code\\n" })' },
+          described.descriptor.contract,
+          "code",
+          writeInvocation,
+        ),
+      ),
+      { onExcessProperty: "error" },
+    )
+    expect(wrote.ok).toBe(true)
+    if (!wrote.ok) throw new Error(wrote.error.message)
+    expect((JSON.parse(wrote.result.output) as { ok?: boolean }).ok).toBe(true)
+    expect(yield* Effect.promise(() => fs.readFile(path.join(repo, "from-code.txt"), "utf8"))).toBe("written by code\n")
+    const writeReceipt = Schema.decodeUnknownSync(Ofxp.ReceiptGetResponse)(
+      yield* capabilities.dispatch(peer, "receipt.get", { invocationID: writeInvocation }),
+      { onExcessProperty: "error" },
+    )
+    expect(writeReceipt.ok).toBe(true)
+    if (!writeReceipt.ok) throw new Error(writeReceipt.error.message)
+    expect(writeReceipt.receipt).toMatchObject({ operation: "code.run", state: "committed" })
+    // The generated write can only succeed if it used a distinct child
+    // InvocationID: reusing writeInvocation would collide with the already
+    // admitted code.run receipt before the write owner could mutate the file.
+  }))
+
+  it.live("keeps the Code parent ambiguous when cancellation follows a mutating child boundary", Effect.gen(function* () {
+    const tmp = yield* Effect.acquireRelease(Effect.promise(() => tmpdir()), (item) => Effect.promise(() => item[Symbol.asyncDispose]()))
+    const repo = path.join(tmp.path, "repo")
+    yield* Effect.promise(() => fs.mkdir(repo, { recursive: true }))
+
+    const source = identity("Cancelled Mutating Code Peer")
+    const peers = yield* OfxpPeer.Service
+    const roots = yield* OfxpRoot.Service
+    const capabilities = yield* OfxpCapability.Service
+    const trusted = yield* peers.trust({ identity: source.identity })
+    yield* peers.setGrant({
+      peerID: source.key.peerID,
+      expectedRevision: trusted.info.grantRevision,
+      grant: { ...Ofxp.DENY_GRANT, code: true, process: true },
+    })
+    const root = yield* roots.approve(source.key.peerID, repo, "repo")
+    const peer = { peerID: source.key.peerID, fingerprint: source.key.fingerprint, publicKeySpki: source.key.publicKeySpki }
+    const codeDescriptor = Schema.decodeUnknownSync(Ofxp.CapabilityDescribeResponse)(
+      yield* capabilities.dispatch(peer, "capability.describe", { capability: "code" }),
+      { onExcessProperty: "error" },
+    )
+    expect(codeDescriptor.ok).toBe(true)
+    if (!codeDescriptor.ok) throw new Error(codeDescriptor.error.message)
+
+    const sentinel = path.join(repo, "mutating-child-started.txt")
+    const childCommand = nodeCommand(
+      "require('node:fs').writeFileSync('mutating-child-started.txt','started');setTimeout(()=>{},2000)",
+    )
+    const sourceSessionID = SessionID.descending()
+    const invocationID = Ofxp.InvocationID.create()
+    const controller = new AbortController()
+    const pending = Effect.runPromise(
+      capabilities.dispatch(
+        peer,
+        "capability.call",
+        call(
+          source.key.peerID,
+          root.id,
+          {
+            action: "run",
+            code: `return await call("process", ${JSON.stringify({
+              action: "start",
+              command: childCommand,
+              mode: "foreground",
+              yieldMs: 30_000,
+            })})`,
+          },
+          codeDescriptor.descriptor.contract,
+          "code",
+          invocationID,
+          sourceSessionID,
+        ),
+        controller.signal,
+      ),
+    )
+
+    const crossedMutationBoundary = yield* Effect.promise(async () => {
+      const deadline = Date.now() + 5_000
+      while (Date.now() < deadline) {
+        try {
+          await fs.access(sentinel)
+          return true
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 20))
+        }
+      }
+      return false
+    })
+    expect(crossedMutationBoundary).toBe(true)
+    controller.abort()
+
+    const cancelled = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+      yield* Effect.promise(() => pending),
+      { onExcessProperty: "error" },
+    )
+    expect(cancelled.ok).toBe(false)
+    if (cancelled.ok) throw new Error("expected ambiguous Code cancellation")
+    expect(cancelled.error.code).toBe("AMBIGUOUS_COMMIT")
+
+    const parentReceipt = Schema.decodeUnknownSync(Ofxp.ReceiptGetResponse)(
+      yield* capabilities.dispatch(peer, "receipt.get", { invocationID }),
+      { onExcessProperty: "error" },
+    )
+    expect(parentReceipt.ok).toBe(true)
+    if (!parentReceipt.ok) throw new Error(parentReceipt.error.message)
+    expect(parentReceipt.receipt).toMatchObject({ operation: "code.run", state: "started" })
+
+    // The child process is intentionally left alive by parent cancellation:
+    // ambiguity means the mutation may have committed. Let it exit naturally
+    // before the temp-root finalizer runs so Windows can remove the directory.
+    yield* Effect.sleep("2200 millis")
+  }), 10_000)
+
+  it.live("preserves an ambiguous child mutation as an ambiguous Code parent", Effect.gen(function* () {
+    const tmp = yield* Effect.acquireRelease(Effect.promise(() => tmpdir()), (item) => Effect.promise(() => item[Symbol.asyncDispose]()))
+    const repo = path.join(tmp.path, "repo")
+    yield* Effect.promise(() => fs.mkdir(repo, { recursive: true }))
+
+    const source = identity("Ambiguous Code Peer")
+    const peers = yield* OfxpPeer.Service
+    const roots = yield* OfxpRoot.Service
+    const capabilities = yield* OfxpCapability.Service
+    const { db } = yield* Database.Service
+    const trusted = yield* peers.trust({ identity: source.identity })
+    yield* peers.setGrant({
+      peerID: source.key.peerID,
+      expectedRevision: trusted.info.grantRevision,
+      grant: { ...Ofxp.DENY_GRANT, code: true, write: true },
+    })
+    const root = yield* roots.approve(source.key.peerID, repo, "repo")
+    const peer = { peerID: source.key.peerID, fingerprint: source.key.fingerprint, publicKeySpki: source.key.publicKeySpki }
+    const described = Schema.decodeUnknownSync(Ofxp.CapabilityDescribeResponse)(
+      yield* capabilities.dispatch(peer, "capability.describe", { capability: "code" }),
+      { onExcessProperty: "error" },
+    )
+    if (!described.ok) throw new Error(described.error.message)
+
+    const childInvocation = Ofxp.InvocationID.create()
+    const parentInvocation = Ofxp.InvocationID.create()
+    const childPath = "ambiguous.txt"
+    const childContent = "maybe committed\n"
+    const now = Date.now()
+    yield* db
+      .insert(OfxpInvocationReceiptTable)
+      .values({
+        invocation_id: childInvocation,
+        source_peer_id: source.key.peerID,
+        operation: "write",
+        commit_class: "idempotent_mutation",
+        request_digest: invocationDigest(["ofxp-capability-v1", "write", root.id, childPath, childContent, ""]),
+        state: "started",
+        target_ref: "/repo/ambiguous.txt",
+        result_digest: null,
+        created_at: now,
+        settled_at: null,
+        time_updated: now,
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    const idFactory = Ofxp.InvocationID as unknown as { create: () => Ofxp.InvocationID }
+    const ambiguous = yield* Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const original = idFactory.create
+        idFactory.create = () => childInvocation
+        return original
+      }),
+      () =>
+        capabilities.dispatch(
+          peer,
+          "capability.call",
+          call(
+            source.key.peerID,
+            root.id,
+            { action: "run", code: `return await call("write", { path: ${JSON.stringify(childPath)}, content: ${JSON.stringify(childContent)} })` },
+            described.descriptor.contract,
+            "code",
+            parentInvocation,
+          ),
+        ),
+      (original) => Effect.sync(() => { idFactory.create = original }),
+    )
+    const parsed = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(ambiguous, { onExcessProperty: "error" })
+    expect(parsed.ok).toBe(false)
+    if (parsed.ok) throw new Error("expected ambiguous Code parent")
+    expect(parsed.error.code).toBe("AMBIGUOUS_COMMIT")
+    expect(parsed.error.invocationID).toBe(parentInvocation)
+
+    const parentReceipt = Schema.decodeUnknownSync(Ofxp.ReceiptGetResponse)(
+      yield* capabilities.dispatch(peer, "receipt.get", { invocationID: parentInvocation }),
+      { onExcessProperty: "error" },
+    )
+    expect(parentReceipt.ok).toBe(true)
+    if (!parentReceipt.ok) throw new Error(parentReceipt.error.message)
+    expect(parentReceipt.receipt.state).toBe("started")
+
+    const replay = Schema.decodeUnknownSync(Ofxp.CapabilityResponse)(
+      yield* capabilities.dispatch(
+        peer,
+        "capability.call",
+        call(
+          source.key.peerID,
+          root.id,
+          { action: "run", code: `return await call("write", { path: ${JSON.stringify(childPath)}, content: ${JSON.stringify(childContent)} })` },
+          described.descriptor.contract,
+          "code",
+          parentInvocation,
+        ),
+      ),
+      { onExcessProperty: "error" },
+    )
+    expect(replay.ok).toBe(false)
+    if (replay.ok) throw new Error("expected ambiguous retry rejection")
+    expect(replay.error.code).toBe("AMBIGUOUS_COMMIT")
   }))
 
   it.live("routes find and project through shared Exchange owners without leaking canonical paths", Effect.gen(function* () {

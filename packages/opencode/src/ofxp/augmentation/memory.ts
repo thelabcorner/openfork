@@ -83,6 +83,25 @@ export const execute = Effect.fn("OfxpMemoryCapability.execute")(function* (
   const root = yield* deps.roots.verify(admission)
   const grantRevision = admission.grantRevision
   const principal = OfxpPrincipal.key(peer.peerID, call.context)
+  // A peer's read grant is NOT a Session-supervision grant. Never widen
+  // authority merely because Memory federates historical conversation search.
+  const wantsHistory = input.action === "search" && input.sources !== "memory"
+  const sessionAdmission = wantsHistory
+    ? yield* deps.peers.authorize({
+        peerID: peer.peerID,
+        capability: "sessionSupervision",
+        rootID,
+        expectedGrantRevision: grantRevision,
+      }).pipe(
+        Effect.flatMap((authorized) => deps.roots.verify(authorized)),
+        Effect.map(() => true as const),
+        Effect.catch((error) =>
+          error instanceof OfxpPeer.OfxpPeerSchema.AuthorityDeniedError
+            ? Effect.succeed(false as const)
+            : Effect.fail(error),
+        ),
+      )
+    : false
 
   const revalidate = () =>
     deps.peers
@@ -145,6 +164,7 @@ export const execute = Effect.fn("OfxpMemoryCapability.execute")(function* (
   const execution = yield* ExchangeMemory.executeRuntime(input, {
     rootPath: root.rootPath,
     signal,
+    sessionSearchAuthorized: sessionAdmission,
     ...(readOnly
       ? {}
       : {
@@ -183,6 +203,16 @@ export const execute = Effect.fn("OfxpMemoryCapability.execute")(function* (
   )
 
   yield* revalidate()
+
+  if (sessionAdmission) {
+    const sessionFresh = yield* deps.peers.authorize({
+      peerID: peer.peerID,
+      capability: "sessionSupervision",
+      rootID,
+      expectedGrantRevision: grantRevision,
+    })
+    yield* deps.roots.verify(sessionFresh)
+  }
 
   if (!readOnly && receipt) {
     const resultDigest = ExchangeRequestDigest.sha256("ofxp:memory-result:v1", {

@@ -14,6 +14,8 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Ofxp } from "@opencode-ai/schema/ofxp"
 import { ExchangeError } from "@/exchange/error"
+import { ExternalCode } from "@/exchange/code"
+import { ExchangeRequestDigest } from "@/exchange/request-digest"
 import { ExchangeFind } from "@/exchange/find"
 import { ExchangeGrounding } from "@/exchange/grounding"
 import { ExchangeProject } from "@/exchange/project"
@@ -282,6 +284,16 @@ const DEFINITIONS = Object.freeze([
     commitClass: "non_idempotent_mutation",
     requiresRoot: true,
   }),
+  Object.freeze({
+    id: "code" as const,
+    description:
+      "Run stateless confined JavaScript/TypeScript orchestration over granted OFXP capabilities. Every generated leaf call keeps its own peer/root authority and receipt semantics.",
+    schema: ExternalCode.Parameters,
+    authority: "code",
+    mutation: "non-idempotent",
+    commitClass: "non_idempotent_mutation",
+    requiresRoot: false,
+  }),
 ] satisfies readonly Definition[])
 
 /**
@@ -312,6 +324,7 @@ function granted(grant: Ofxp.Grant, authority: Ofxp.CapabilityClass) {
     case "write":
     case "git":
     case "process":
+    case "code":
     case "integrations":
     case "browser":
     case "filesReceive":
@@ -320,7 +333,7 @@ function granted(grant: Ofxp.Grant, authority: Ofxp.CapabilityClass) {
     case "messaging":
     case "requestSupervision":
     case "nestedDelegation":
-      return grant[authority]
+      return grant[authority] ?? false
     case "sessionSupervision":
       return grant.sessionSupervision === "approved-roots"
     case "delegation":
@@ -1065,7 +1078,7 @@ const layer = Layer.effect(
       return undefined
     }
 
-    const dispatch = Effect.fn("OfxpCapability.dispatch")(function* (
+    const dispatch: Interface["dispatch"] = Effect.fn("OfxpCapability.dispatch")(function* (
       peer: PeerCertificateIdentity,
       method: string,
       body: unknown,
@@ -1104,6 +1117,209 @@ const layer = Layer.effect(
         const principalFailure = validatePrincipal(peer, call)
         if (principalFailure) return principalFailure
         switch (call.capability) {
+          case "code": {
+            const decoded = yield* Effect.try({
+              try: () => Schema.decodeUnknownSync(ExternalCode.Parameters)(call.args, { onExcessProperty: "error" }),
+              catch: () => new ExchangeError.InvalidArgument({ detail: "OFXP Code arguments are invalid" }),
+            })
+            const params = yield* Effect.try({
+              try: () => ExternalCode.validate(decoded),
+              catch: (cause) =>
+                cause instanceof ExternalCode.InvalidRequest
+                  ? new ExchangeError.InvalidArgument({ detail: cause.detail })
+                  : new ExchangeError.InvalidArgument({ detail: "OFXP Code arguments are invalid" }),
+            })
+            const codeAdmission = yield* peers.authorize({ peerID: peer.peerID, capability: "code" })
+            const access = yield* peers.access(peer.peerID)
+
+            let parentReceipt: Ofxp.InvocationReceipt | undefined
+            if (params.action === "run") {
+              const requestDigest = ExchangeRequestDigest.sha256("ofxp:code:v1", {
+                rootID: call.rootID ?? null,
+                params,
+              })
+              const admitted = yield* invocations.admit({
+                invocationID: call.context.invocationID,
+                sourcePeerID: peer.peerID,
+                operation: "code.run",
+                commitClass: "non_idempotent_mutation",
+                requestDigest,
+                targetRef: call.rootID ? `code:${call.rootID}` : "code:global",
+              })
+              if (!admitted.fresh && admitted.receipt.state !== "admitted") {
+                if (admitted.receipt.state === "cancelled") {
+                  return failure("CANCELLED", `OFXP Code invocation ${admitted.receipt.invocationID} was already cancelled`, admitted.receipt.invocationID)
+                }
+                if (admitted.receipt.state === "started") {
+                  return failure("AMBIGUOUS_COMMIT", `OFXP Code invocation ${admitted.receipt.invocationID} already crossed its execution boundary; do not rerun it blindly`, admitted.receipt.invocationID)
+                }
+                return failure("CONFLICT", `OFXP Code invocation ${admitted.receipt.invocationID} already settled as ${admitted.receipt.state}; use a new invocation ID`, admitted.receipt.invocationID)
+              }
+              const claimed = yield* invocations.claimStart({
+                invocationID: call.context.invocationID,
+                targetRef: call.rootID ? `code:${call.rootID}` : "code:global",
+              })
+              if (!claimed.fresh) {
+                return failure(
+                  "AMBIGUOUS_COMMIT",
+                  `OFXP Code invocation ${claimed.receipt.invocationID} already crossed its execution boundary; do not rerun it blindly`,
+                  claimed.receipt.invocationID,
+                )
+              }
+              parentReceipt = claimed.receipt
+            }
+
+            let ambiguousChild: Ofxp.ErrorEnvelope | undefined
+            let mutatingLeafStarted = false
+            const executeExternal = ExternalCode.execute(params, {
+              list: () =>
+                Effect.succeed(
+                  definitions
+                    .filter((item) => item.id !== "code" && discoverable(access.grant, item))
+                    .map((item) => ({ ref: item.id, description: item.description })),
+                ),
+              describe: (ref) =>
+                Effect.gen(function* () {
+                  const item = definitionByID.get(ref as Ofxp.CapabilityID)
+                  if (!item || item.id === "code" || !discoverable(access.grant, item)) {
+                    return yield* new ExchangeError.NotFound({ detail: `OFXP capability is not available to Code: ${ref}` })
+                  }
+                  const descriptor = descriptorOf(item, descriptors)
+                  return { ref: item.id, description: item.description, inputSchema: descriptor.inputSchema }
+                }),
+              call: (ref, args) =>
+                Effect.gen(function* () {
+                  if (call.context.hopCount >= 16) {
+                    return yield* new ExchangeError.InvalidArgument({ detail: "OFXP Code nested invocation depth exceeded." })
+                  }
+                  const item = definitionByID.get(ref as Ofxp.CapabilityID)
+                  if (!item || item.id === "code" || !discoverable(access.grant, item)) {
+                    return yield* new ExchangeError.NotFound({ detail: `OFXP capability is not callable from Code: ${ref}` })
+                  }
+                  if (item.mutation !== "none") mutatingLeafStarted = true
+                  const descriptor = descriptorOf(item, descriptors)
+                  const child: Ofxp.CapabilityCall = {
+                    context: {
+                      ...call.context,
+                      invocationID: Ofxp.InvocationID.create(),
+                      parentInvocationID: call.context.invocationID,
+                      hopCount: call.context.hopCount + 1,
+                    },
+                    ...(call.rootID ? { rootID: call.rootID } : {}),
+                    capability: item.id,
+                    contract: descriptor.contract,
+                    args,
+                  }
+                  const response = (yield* dispatch(peer, "capability.call", child, signal)) as Ofxp.CapabilityResponse
+                  if (!response.ok) {
+                    if (response.error.code === "AMBIGUOUS_COMMIT" && !ambiguousChild) {
+                      ambiguousChild = response.error
+                    }
+                    return yield* Effect.fail(new Error(`${response.error.code}: ${response.error.message}`))
+                  }
+                  return {
+                    value: response.result.output,
+                    ...(response.result.attachments?.length ? { attachments: response.result.attachments } : {}),
+                  }
+                }),
+            }).pipe(
+              Effect.mapError((error) =>
+                error instanceof ExternalCode.InvalidRequest
+                  ? new ExchangeError.InvalidArgument({ detail: error.detail })
+                  : error,
+              ),
+            )
+            const settleCancelled = () =>
+              params.action === "run"
+                ? invocations
+                    .settle({
+                      invocationID: call.context.invocationID,
+                      state: "cancelled",
+                      targetRef: call.rootID ? `code:${call.rootID}` : "code:global",
+                    })
+                    .pipe(Effect.catch(() => Effect.void), Effect.asVoid)
+                : Effect.void
+            if (signal?.aborted) {
+              if (mutatingLeafStarted) {
+                return yield* new ExchangeError.AmbiguousCommit({
+                  detail: `OFXP Code invocation ${call.context.invocationID} was cancelled after a mutating leaf crossed its dispatch boundary`,
+                  targetRef: call.rootID ? `code:${call.rootID}` : "code:global",
+                })
+              }
+              yield* settleCancelled()
+              return yield* new ExchangeError.Cancelled({
+                detail: `OFXP Code invocation ${call.context.invocationID} was cancelled`,
+              })
+            }
+            const cancellation = signal
+              ? AppProcess.waitForAbort(signal).pipe(
+                  Effect.mapError(
+                    () =>
+                      new ExchangeError.Cancelled({
+                        detail: `OFXP Code invocation ${call.context.invocationID} was cancelled`,
+                      }),
+                  ),
+                )
+              : undefined
+            const external = yield* (cancellation ? executeExternal.pipe(Effect.raceFirst(cancellation)) : executeExternal).pipe(
+              Effect.mapError((error) =>
+                error instanceof ExchangeError.Cancelled && mutatingLeafStarted
+                  ? new ExchangeError.AmbiguousCommit({
+                      detail: `OFXP Code invocation ${call.context.invocationID} was cancelled after a mutating leaf crossed its dispatch boundary`,
+                      targetRef: call.rootID ? `code:${call.rootID}` : "code:global",
+                    })
+                  : error,
+              ),
+              Effect.tapError((error) =>
+                error instanceof ExchangeError.Cancelled && !mutatingLeafStarted ? settleCancelled() : Effect.void,
+              ),
+            )
+            if (ambiguousChild) {
+              return failure(
+                "AMBIGUOUS_COMMIT",
+                ambiguousChild.message,
+                call.context.invocationID,
+              )
+            }
+
+            let settled = parentReceipt
+            if (params.action === "run") {
+              settled = yield* invocations.settle({
+                invocationID: call.context.invocationID,
+                state: external.ok ? "committed" : "failed",
+                targetRef: call.rootID ? `code:${call.rootID}` : "code:global",
+              })
+            }
+            const attachmentCount = external.action === "run" ? (external.attachments?.length ?? 0) : 0
+            const projectedAttachments =
+              external.action === "run" && attachmentCount > 0 ? external.attachments!.slice(0, 16) : undefined
+            const outputPayload = external.action === "run" ? { ...external, attachments: undefined } : external
+            const serialized = JSON.stringify(outputPayload)
+            const outputTruncated = serialized.length > 128 * 1024
+            const output = outputTruncated
+              ? JSON.stringify({
+                  action: external.action,
+                  ok: external.ok,
+                  truncated: true,
+                  ...(external.action === "run" ? { sourceHash: external.sourceHash } : {}),
+                  message: "Serialized Code result exceeded the OFXP 128 KiB result envelope and was omitted.",
+                })
+              : serialized
+            return success("code", call.rootID, codeAdmission.grantRevision, {
+              title: `Code ${params.action}`,
+              output,
+              ...(projectedAttachments?.length ? { attachments: projectedAttachments } : {}),
+              metadata: {
+                action: params.action,
+                stateless: true,
+                ...(settled ? { receipt: settled } : {}),
+                ...(outputTruncated ? { outputTruncated: true } : {}),
+                ...(attachmentCount > 16
+                  ? { attachmentCount, attachmentsTruncated: attachmentCount - 16 }
+                  : {}),
+              },
+            })
+          }
           case "read":
             return yield* read(peer, call, signal)
           case "find":

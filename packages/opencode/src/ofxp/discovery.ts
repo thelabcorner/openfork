@@ -1,6 +1,7 @@
 export * as OfxpDiscovery from "./discovery"
 
 import { Bonjour, type Browser, type Service } from "bonjour-service"
+import { randomUUID } from "node:crypto"
 import { Ofxp } from "@opencode-ai/schema/ofxp"
 import { OfxpMetrics } from "./metrics"
 
@@ -399,7 +400,11 @@ export class Mdns {
     const bonjour = new Bonjour(undefined, (error: unknown) => this.options.onError?.(error))
     try {
       const published = bonjour.publish({
-        name: `openfork-${this.options.peerID.slice(-12)}`,
+        // Peer identity is the TXT field, not the publisher's DNS name. Runtime
+        // refresh can overlap discovery publishers for the same durable peer;
+        // a unique publication name avoids Bonjour's asynchronous name-conflict
+        // failure taking down the candidate (or another live publisher).
+        name: `openfork-${this.options.peerID.slice(-12)}-${randomUUID().slice(0, 8)}`,
         type: MDNS_SERVICE_TYPE,
         protocol: "tcp",
         port: this.options.port,
@@ -454,4 +459,3 @@ export class Mdns {
     }
   }
 }
-

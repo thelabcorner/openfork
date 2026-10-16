@@ -73,7 +73,9 @@ export function execute<E>(
       const codeText = params.filePath?.replace(/\D/g, "")
       const code = codeText ? Number.parseInt(codeText, 10) : Number.NaN
       if (!Number.isFinite(code) || code <= 0) {
-        return yield* new ExchangeError.InvalidArgument({ detail: "typecheck explain requires a TS error code in filePath" })
+        return yield* new ExchangeError.InvalidArgument({
+          detail: "typecheck explain requires a TS error code in filePath",
+        })
       }
       const info = TypecheckScope.explainCode(code)
       yield* hooks.revalidate()
@@ -119,10 +121,7 @@ export function execute<E>(
     // semantics there, so avoid an extra owned subprocess on every scoped check.
     // Keep Git discovery for changed/bottomUp and implicit-config checks where
     // the worktree can affect file selection or upward config/compiler lookup.
-    const needsGitDiscovery =
-      params.tsconfig === undefined ||
-      mode === "changed" ||
-      mode === "bottomUp"
+    const needsGitDiscovery = params.tsconfig === undefined || mode === "changed" || mode === "bottomUp"
     const gitProbe = needsGitDiscovery
       ? yield* runOwned({
           cwd: directory,
@@ -134,7 +133,9 @@ export function execute<E>(
     const gitRoot = gitRootRaw && contained(rootPath, path.resolve(gitRootRaw)) ? path.resolve(gitRootRaw) : undefined
     const worktree = gitRoot ?? directory
     if (mode === "changed" && !gitRoot) {
-      return yield* new ExchangeError.InvalidArgument({ detail: "typecheck changed requires a Git worktree inside the approved root" })
+      return yield* new ExchangeError.InvalidArgument({
+        detail: "typecheck changed requires a Git worktree inside the approved root",
+      })
     }
 
     const filePath = params.filePath ? yield* authorizeInput(params.filePath) : undefined
@@ -147,35 +148,40 @@ export function execute<E>(
       runOwned({ cwd, argv: ["git", ...GIT_ARGS, ...args], timeoutMs: 15_000 }).pipe(
         Effect.map((result) =>
           result.exitCode === 0
-            ? result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+            ? result.stdout
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter(Boolean)
             : [],
         ),
       )
     const validatePath = (file: string) => Effect.runPromise(hooks.authorizePath(file).pipe(Effect.asVoid))
 
-    const scope = mode === "full"
-      ? []
-      : yield* TypecheckScope.computeScope({
-          mode: mode as TypecheckScope.ScopeMode,
-          worktree,
-          directory,
-          filePath,
-          files,
-          folder,
-          maxFiles: params.maxFiles,
-          depth: params.depth,
-          includeTests: params.includeTests,
-          includeUntracked: params.includeUntracked,
-          includeImporters: params.includeImporters,
-          runGit,
-          validatePath,
-        }).pipe(
-          Effect.mapError((error) =>
-            new ExchangeError.InvalidArgument({
-              detail: error instanceof Error ? error.message : "Unable to resolve typecheck scope",
-            }),
-          ),
-        )
+    const scope =
+      mode === "full"
+        ? []
+        : yield* TypecheckScope.computeScope({
+            mode: mode as TypecheckScope.ScopeMode,
+            worktree,
+            directory,
+            filePath,
+            files,
+            folder,
+            maxFiles: params.maxFiles,
+            depth: params.depth,
+            includeTests: params.includeTests,
+            includeUntracked: params.includeUntracked,
+            includeImporters: params.includeImporters,
+            runGit,
+            validatePath,
+          }).pipe(
+            Effect.mapError(
+              (error) =>
+                new ExchangeError.InvalidArgument({
+                  detail: error instanceof Error ? error.message : "Unable to resolve typecheck scope",
+                }),
+            ),
+          )
     if (mode !== "full" && scope.length === 0) {
       return yield* new ExchangeError.InvalidArgument({ detail: "No files selected to typecheck" })
     }
@@ -186,14 +192,15 @@ export function execute<E>(
     let exitCode: number
     let truncated: boolean
     let timedOut: boolean
-    let bin: "tsgo" | "tsc"
+    let bin: TypecheckScope.TypecheckOutcome["bin"]
     let tsconfigPath: string | undefined
     let diagnosticCwd = directory
 
     if (mode === "full") {
       const scriptDir = yield* Effect.tryPromise({
         try: () => TypecheckScope.findTypecheckScriptDir(directory, worktree),
-        catch: () => new ExchangeError.DependencyUnavailable({ detail: "Unable to resolve the package typecheck script" }),
+        catch: () =>
+          new ExchangeError.DependencyUnavailable({ detail: "Unable to resolve the package typecheck script" }),
       })
       yield* hooks.authorizePath(scriptDir)
       const full = yield* runOwned({
@@ -205,25 +212,40 @@ export function execute<E>(
       exitCode = full.timedOut ? 124 : (full.exitCode ?? 1)
       truncated = full.truncated
       timedOut = full.timedOut
-      bin = "tsc"
+      const scriptText = yield* Effect.promise(() =>
+        fs
+          .readFile(path.join(scriptDir, "package.json"), "utf8")
+          .then((text) => (JSON.parse(text) as { scripts?: Record<string, string> }).scripts?.typecheck ?? "")
+          .catch(() => ""),
+      )
+      bin = /(^|\s)bun\s+check(?:\s|$)/.test(scriptText)
+        ? "bun"
+        : /(^|\s)tsgo(?:\s|$)/.test(scriptText)
+          ? "tsgo"
+          : /(^|\s)tsc(?:\s|$)/.test(scriptText)
+            ? "tsc"
+            : "script"
       diagnosticCwd = scriptDir
     } else {
       const firstDir = path.dirname(scope[0]!)
       tsconfigPath = params.tsconfig
         ? yield* authorizeInput(params.tsconfig)
-        : (yield* Effect.tryPromise({
+        : ((yield* Effect.tryPromise({
             try: () => TypecheckScope.findNearestTsconfigFile(firstDir, worktree),
             catch: () => new ExchangeError.DependencyUnavailable({ detail: "Unable to search for tsconfig" }),
           })) ??
           (yield* Effect.tryPromise({
             try: () => TypecheckScope.findNearestTsconfigFile(directory, worktree),
             catch: () => new ExchangeError.DependencyUnavailable({ detail: "Unable to search for tsconfig" }),
-          }))
-      if (!tsconfigPath) return yield* new ExchangeError.InvalidArgument({ detail: "No tsconfig found for the selected typecheck scope" })
+          })))
+      if (!tsconfigPath)
+        return yield* new ExchangeError.InvalidArgument({
+          detail: "No tsconfig found for the selected typecheck scope",
+        })
       tsconfigPath = yield* hooks.authorizePath(tsconfigPath)
       const tsconfigDir = path.dirname(tsconfigPath)
       const compiler = yield* Effect.tryPromise({
-        try: () => TypecheckScope.resolveCompiler(tsconfigDir, worktree),
+        try: () => TypecheckScope.resolveCompiler(tsconfigDir, worktree, params.compiler),
         catch: (error) =>
           new ExchangeError.DependencyUnavailable({
             detail: error instanceof Error ? error.message : "No TypeScript compiler is available",
@@ -235,14 +257,19 @@ export function execute<E>(
       })
       const scoped = yield* Effect.gen(function* () {
         const tempConfig = path.join(scratch, "tsconfig.json")
-        const configText = TypecheckScope.scopedConfigText({ baseTsconfig: tsconfigPath!, tempDir: scratch, files: scope })
+        const configText = TypecheckScope.scopedConfigText({
+          baseTsconfig: tsconfigPath!,
+          tempDir: scratch,
+          files: scope,
+        })
         yield* Effect.tryPromise({
           try: () => fs.writeFile(tempConfig, configText, "utf8"),
           catch: () => new ExchangeError.DependencyUnavailable({ detail: "Unable to write typecheck scratch config" }),
         })
+        const argv = TypecheckScope.compilerInvocation(compiler, tempConfig)
         return yield* runOwned({
           cwd: tsconfigDir,
-          argv: ["node", compiler.path, "--project", tempConfig, "--noEmit", "--pretty", "false"],
+          argv,
           timeoutMs,
         })
       }).pipe(
@@ -250,7 +277,10 @@ export function execute<E>(
           Effect.promise(() => fs.rm(scratch, { recursive: true, force: true })).pipe(Effect.catch(() => Effect.void)),
         ),
       )
-      diagnostics = TypecheckScope.parseDiagnostics(scoped.stdout || scoped.stderr, maxErrors)
+      diagnostics = TypecheckScope.parseDiagnostics(
+        [scoped.stdout, scoped.stderr].filter(Boolean).join("\n"),
+        maxErrors,
+      )
       exitCode = scoped.timedOut ? 124 : (scoped.exitCode ?? 1)
       truncated = scoped.truncated
       timedOut = scoped.timedOut
@@ -263,7 +293,9 @@ export function execute<E>(
       path.isAbsolute(file) ? path.resolve(file) : path.resolve(diagnosticCwd, file)
     const safeDiagnosticPath = (file: string) => {
       const absolute = diagnosticAbsolutePath(file)
-      return contained(rootPath, absolute) ? safeVirtual(hooks as Hooks<unknown>, absolute) : `<external>/${path.basename(absolute)}`
+      return contained(rootPath, absolute)
+        ? safeVirtual(hooks as Hooks<unknown>, absolute)
+        : `<external>/${path.basename(absolute)}`
     }
     const pathKey = (file: string) => {
       const resolved = path.resolve(file)
@@ -290,7 +322,9 @@ export function execute<E>(
       `  <scope files="${scope.length}">`,
       ...scope.map((file) => `    <file>${escapeXml(hooks.toVirtualPath(file))}</file>`),
       "  </scope>",
-      tsconfigPath ? `  <tsconfig>${escapeXml(hooks.toVirtualPath(tsconfigPath))}</tsconfig>` : "  <tsconfig>package typecheck script</tsconfig>",
+      tsconfigPath
+        ? `  <tsconfig>${escapeXml(hooks.toVirtualPath(tsconfigPath))}</tsconfig>`
+        : "  <tsconfig>package typecheck script</tsconfig>",
       `  <summary status="${status}" errors="${diagnostics.length}" targetErrors="${targetDiagnostics.length}" transitiveErrors="${transitiveDiagnostics.length}" bin="${bin}" exit="${exitCode}" />`,
       "  <triage>",
       `    <p0>${counts.P0 ?? 0}</p0>`,
@@ -335,4 +369,3 @@ export function execute<E>(
     } satisfies Result
   })
 }
-

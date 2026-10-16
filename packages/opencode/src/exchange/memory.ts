@@ -5,6 +5,11 @@ import { Memory } from "@opencode-ai/core/memory"
 import { MemorySchema } from "@opencode-ai/core/memory/schema"
 import { ExchangeError } from "./error"
 import { ExchangeRuntimeV1 } from "./runtime-v1"
+import { ExchangeMemorySession } from "./memory-session"
+import { ExchangeMemoryQuery } from "./memory-query"
+import { MemoryAnchors } from "@opencode-ai/core/memory/anchors"
+import { MemoryEvidence } from "./memory-evidence"
+import type { DatabaseShape } from "@opencode-ai/core/database/database"
 
 const KIND_VALUES = [
   "user_preference",
@@ -74,6 +79,12 @@ export const Parameters = Schema.Struct({
   includeHistory: Schema.optional(Schema.Boolean).annotate({
     description: "search: include superseded and quarantined rows (default false)",
   }),
+  sources: Schema.optional(Schema.Literals(["both", "fallback", "memory"])).annotate({
+    description: "search: both (default) queries saved memory AND recent indexed Session history; fallback queries Sessions only when memory misses; memory skips Session recall.",
+  }),
+  sessionRanking: Schema.optional(Schema.Literals(["recent", "relevance"])).annotate({
+    description: "search: Session evidence recent (default) or relevance (historical/text-focused). Does not alter curated memory scoring.",
+  }),
   content: Schema.optional(Schema.String).annotate({
     description: "remember: the durable fact or lesson, including WHY. One self-contained statement; no secrets.",
   }),
@@ -97,7 +108,12 @@ export type Input = Schema.Schema.Type<typeof Parameters>
 
 export type Metadata = {
   action: string
+  runtimeTimingMs?: { identity: number; operation: number }
+  savedQueryUsed?: string
+  savedBroadened?: boolean
   count?: number
+  sessionCount?: number
+  sessionCoverageComplete?: boolean
   topics?: number
   topic?: string
   id?: string
@@ -115,16 +131,37 @@ export interface Result {
 }
 
 export interface Hooks {
+  /** Host-side read-only invocation: bypass access-counter write side effects. */
+  readonly trackAccess?: boolean
   readonly beforeMutation?: () => Effect.Effect<void, Error>
+  /** Optional host-owned referential-integrity guard; required for native/remote admission. */
+  readonly verifySessionEvidence?: (
+    evidence: NonNullable<MemorySchema.RememberInput["evidence"]>,
+    scope: MemorySchema.Scope,
+  ) => Effect.Effect<void, Error>
+  /** Caller-owned authorization/scope; never query sessions without a proven scope. */
+  readonly searchSessions?: (query: string, limit: number, ranking: "recent" | "relevance") => Effect.Effect<ExchangeMemorySession.Result, Error>
+  readonly sessionSearchStatus?: "not_authorized"
 }
 
 export interface RuntimeContext extends Hooks {
   readonly rootPath: string
   readonly signal?: AbortSignal
+  /** Must be set only after independent Session supervision authorization. */
+  readonly sessionSearchAuthorized?: boolean
 }
+
+type SessionEvidenceLookup =
+  | (ExchangeMemorySession.Result & {
+      readonly status: "ok"
+      readonly queryUsed: string
+      readonly broadened: boolean
+    })
+  | { readonly status: "skipped" | "not_connected" | "not_authorized" | "unavailable" }
 
 function escapeXml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&apos;")
 }
 
 function iso(ms: number): string {
@@ -150,7 +187,7 @@ const renderHit = (hit: MemorySchema.SearchHit) => {
     `    <kind>${hit.kind}</kind><origin>${hit.origin}</origin><scope>${hit.scope}</scope>`,
     `    <title>${escapeXml(hit.title)}</title>`,
     `    <summary>${escapeXml(hit.snippet)}</summary>`,
-    `    <evidence count="${hit.evidenceCount}" /><updated>${iso(hit.time_updated)}</updated>`,
+    `    <evidence count="${hit.evidenceCount}" /><updated>${new Date(hit.time_updated).toISOString()}</updated>`,
     `  </hit>${anchors ? `\n  ${anchors.trim()}` : ""}`,
   ].join("\n")
 }
@@ -212,7 +249,7 @@ export function execute(
     const action = params.action
 
     if (action === "map") {
-      const [map, topics] = yield* Effect.all([memory.map(scope), memory.topics(scope)])
+      const { map, topics } = yield* memory.mapDetails(scope)
       const output = !map
         ? '<memory-map empty="true" />\nNo durable memory yet for this project.\nUse action="remember" to persist a decision, correction, or lesson worth keeping.'
         : `${map}\n\n${HINTS.map}`
@@ -227,31 +264,119 @@ export function execute(
 
     if (action === "search") {
       if (!params.query?.trim()) return yield* invalid('search requires query. Example: {"action":"search","query":"console-message electron"}')
-      const hits = yield* memory.search({
-        query: params.query,
+      const queryPlan = ExchangeMemoryQuery.plan(params.query)
+      const savedInput = {
+        query: queryPlan.focused,
         context: scope,
         scope: params.scope,
         kinds: params.kinds,
         limit: params.limit,
         includeHistory: params.includeHistory,
-      })
+        trackAccess: hooks.trackAccess,
+      }
+      const primary = yield* memory.search(savedInput)
+      // A long conversational question is an implicit AND of up to twelve
+      // expanded terms in Core Memory. Use the same bounded, labeled recovery
+      // as Session evidence; never silently replace the user's query with one
+      // high-frequency word.
+      const savedBroadened = primary.length === 0 && !!queryPlan.relaxed
+      const hits = savedBroadened
+        ? yield* memory.search({ ...savedInput, query: queryPlan.relaxed! })
+        : primary
+      const savedQueryUsed = savedBroadened ? queryPlan.relaxed! : queryPlan.focused
+      const sources = params.sources ?? "both"
+      // OPENCODE_DISABLE_MEMORY is a feature-level opt-out: do not silently
+      // resurrect historical recall through this tool when Memory is disabled.
+      const includeSessions = Memory.enabled() &&
+        (sources === "both" || (sources === "fallback" && hits.length === 0))
+      const sessionLimit = Math.min(5, params.limit ?? 10)
+      const searchSessions = hooks.searchSessions
+      const relaxedQuery = queryPlan.relaxed
+      const sessionRanking = params.sessionRanking ?? "recent"
+      const sessionResult: SessionEvidenceLookup = includeSessions && searchSessions
+        ? yield* searchSessions(queryPlan.focused, sessionLimit, sessionRanking).pipe(
+            Effect.flatMap((first) =>
+              first.hits.length === 0 && relaxedQuery
+                ? searchSessions(relaxedQuery, sessionLimit, sessionRanking).pipe(
+                    Effect.map((second) => ({
+                      status: "ok" as const,
+                      ...second,
+                      queryUsed: relaxedQuery,
+                      broadened: true,
+                      // Both attempts saw incomplete index coverage if either did.
+                      complete: first.complete && second.complete,
+                    })),
+                  )
+                : Effect.succeed({
+                    status: "ok" as const,
+                    ...first,
+                    queryUsed: queryPlan.focused,
+                    broadened: false,
+                  }),
+            ),
+            Effect.catch(() => Effect.succeed({ status: "unavailable" as const })),
+          )
+        : { status: includeSessions ? (hooks.sessionSearchStatus ?? "not_connected") : "skipped" }
+      const sessionHits = "hits" in sessionResult
+        ? sessionResult.hits.map((hit) => {
+            // Cheap exact-anchor cross-reference, NEVER an evidence/entailment claim.
+            const seen = new Set(MemoryAnchors.extract(`${hit.title} ${hit.snippet}`).map((anchor) => anchor.normalized))
+            const related = hits
+              .filter((memoryHit) => memoryHit.anchors.some((anchor) => {
+                const normalized = MemoryAnchors.normalize(anchor.replace(/^[a-z]+:/, ""))
+                return normalized.length >= 5 && seen.has(normalized)
+              }))
+              .slice(0, 3)
+            const lexicalMemoryIds = related.map((memoryHit) => memoryHit.id)
+            // Chronology warning only: a later matching message is worth
+            // inspecting, not proof the earlier saved memory was superseded.
+            const newerThanMemoryIds = hit.timeBasis === "message_created"
+              ? related.filter((memoryHit) => hit.occurredAt > memoryHit.time_updated).map((memoryHit) => memoryHit.id)
+              : []
+            return { ...hit, lexicalMemoryIds, newerThanMemoryIds }
+          })
+        : []
+      const renderedMemory = hits.length === 0
+        ? '<saved-memory results="0" />'
+        : ['<saved-memory>', ...hits.map(renderHit), '</saved-memory>'].join("\n")
+      const renderedSessions = sessionResult.status === "ok"
+        ? [
+            `<session-evidence results="${sessionHits.length}" unique-sessions="${new Set(sessionHits.map((hit) => hit.sessionId)).size}" ranking="${sessionRanking}" index-complete="${sessionResult.complete}"${sessionResult.indexCoverage ? ` v1-parts-ready="${sessionResult.indexCoverage.v1PartIndexReady}" v2-messages-ready="${sessionResult.indexCoverage.v2MessageIndexReady}"` : ""} truncated="${sessionResult.truncated}" query-used="${escapeXml(sessionResult.queryUsed)}" broadened="${sessionResult.broadened}">`,
+            ...sessionHits.map((hit) =>
+              `  <hit source="${hit.source}" session="${escapeXml(hit.sessionId)}"${hit.messageId ? ` message="${escapeXml(hit.messageId)}"` : ""} occurred="${hit.occurredAtIso}" basis="${hit.timeBasis}"${hit.lexicalMemoryIds.length ? ` lexical-memory-ids="${hit.lexicalMemoryIds.join(",")}"` : ""}${hit.newerThanMemoryIds.length ? ` newer-than-memory-ids="${hit.newerThanMemoryIds.join(",")}"` : ""}><title>${escapeXml(hit.title)}</title><summary>${escapeXml(hit.snippet)}</summary></hit>`),
+            '</session-evidence>',
+          ].join("\n")
+        : `<session-evidence status="${sessionResult.status}" />`
       const output =
-        hits.length === 0
-          ? [
-              `<memory-search query="${escapeXml(params.query)}" results="0" />`,
-              "No match. Try: a real identifier (symbol, path, error code), a topic from map, or includeHistory:true for superseded rows.",
-            ].join("\n")
-          : [
-              `<memory-search query="${escapeXml(params.query)}" results="${hits.length}">`,
-              ...hits.map(renderHit),
-              "</memory-search>",
-              HINTS.search,
-            ].join("\n")
+        [
+          `<memory-search query="${escapeXml(params.query)}" saved="${hits.length}" saved-query-used="${escapeXml(savedQueryUsed)}" saved-broadened="${savedBroadened}" session-evidence="${sessionHits.length}" retrieved="${new Date().toISOString()}">`,
+          renderedMemory,
+          renderedSessions,
+          '</memory-search>',
+          'Saved memories are curated but may be stale. Session hits are historical conversation evidence, NOT promoted memories or live state. Prefer newer event timestamps when reconstructing mutable work; verify against the live codebase.',
+          'lexical-memory-ids is an exact anchor overlap hint only, NOT corroboration or proof.',
+          'newer-than-memory-ids flags later conversation evidence for review; it does NOT imply semantic contradiction, supersession, or authority.',
+          sessionResult.status === "ok" && !sessionResult.complete
+            ? 'Session index coverage is incomplete; missing matches do not prove absence.'
+            : '',
+          sessionResult.status === "unavailable" || sessionResult.status === "not_connected" || sessionResult.status === "not_authorized"
+            ? 'Session evidence was not available; this is NOT a combined-search negative.'
+            : '',
+          HINTS.search,
+        ].filter(Boolean).join("\n")
       return {
-        title: hits.length ? `memory search (${hits.length})` : "memory search",
+        title: `memory search (${hits.length} saved, ${sessionHits.length} historical)`,
         output,
-        metadata: { action, count: hits.length, truncated: false },
-        structured: { action, hits },
+        metadata: {
+          action,
+          count: hits.length,
+          savedQueryUsed,
+          savedBroadened,
+          sessionCount: sessionHits.length,
+          ...("complete" in sessionResult ? { sessionCoverageComplete: sessionResult.complete } : {}),
+          truncated: "truncated" in sessionResult ? sessionResult.truncated : false,
+        },
+        structured: { action, sources, hits, savedQueryUsed, savedBroadened, sessionEvidence: sessionResult },
         mutation: { attempted: false, committed: false },
       } satisfies Result
     }
@@ -270,7 +395,7 @@ export function execute(
 
     if (action === "get") {
       const id = yield* resolveID(params.id)
-      const entry = yield* memory.get({ id, context: scope })
+      const entry = yield* memory.get({ id, context: scope, trackAccess: hooks.trackAccess })
       const evidence = yield* memory.evidence(entry.id)
       const output = [
         `<memory id="${entry.id}" status="${entry.status}">`,
@@ -287,7 +412,13 @@ export function execute(
           (item) =>
             `    <source type="${item.source_type}"${item.path ? ` path="${escapeXml(item.path)}"` : ""}${
               item.commit_sha ? ` commit="${escapeXml(item.commit_sha)}"` : ""
-            }${item.session_id ? ` session="${escapeXml(item.session_id)}"` : ""} />`,
+            }${item.session_id ? ` session="${escapeXml(item.session_id)}"` : ""}${
+              item.message_id ? ` message="${escapeXml(item.message_id)}"` : ""
+            }${item.part_id ? ` part="${escapeXml(item.part_id)}"` : ""}${
+              item.source_hash ? ` hash="${escapeXml(item.source_hash)}"` : ""
+            }${item.line_start !== null ? ` line-start="${item.line_start}"` : ""}${
+              item.line_end !== null ? ` line-end="${item.line_end}"` : ""
+            } observed="${new Date(item.observed_at).toISOString()}" />`,
         ),
         "  </evidence>",
         "</memory>",
@@ -343,6 +474,8 @@ export function execute(
       }
       if (hooks.beforeMutation) yield* hooks.beforeMutation()
       yield* cancelled(signal)
+      if (hooks.verifySessionEvidence)
+        yield* hooks.verifySessionEvidence(params.evidence ?? [], params.scope ?? "project")
       const entry = yield* memory.remember({
         context: scope,
         content: params.content,
@@ -403,13 +536,37 @@ export function execute(
 }
 
 export function executeRuntime(input: Input, context: RuntimeContext): Effect.Effect<Result, Error> {
+  // Durable reads are Tier 1 and do not need the V1 execution Instance,
+  // its config/plugin gate, tool reload, or speculative warmup. Keep the
+  // canonical V1 runtime for mutation and the rare project-ID migration.
+  if (
+    input.action === "map" ||
+    input.action === "search" ||
+    input.action === "open" ||
+    input.action === "get" ||
+    input.action === "timeline"
+  ) {
+    return Effect.tryPromise({
+      try: async () => {
+        const { execute } = await import("./memory-read-runtime")
+        return execute(input, context)
+      },
+      catch: (cause) => mapMemoryError(cause, context.signal),
+    })
+  }
+  return executeRuntimeLegacy(input, context)
+}
+
+/** V1 bootstrap is required for writes and for migration of legacy project IDs. */
+export function executeRuntimeLegacy(input: Input, context: RuntimeContext): Effect.Effect<Result, Error> {
   return ExchangeRuntimeV1.enter(
     { directory: context.rootPath, signal: context.signal },
     async () => {
-      const [{ Memory }, { MemorySchema }, { InstanceState }] = await Promise.all([
+      const [{ Memory }, { MemorySchema }, { InstanceState }, { Database }] = await Promise.all([
         import("@opencode-ai/core/memory"),
         import("@opencode-ai/core/memory/schema"),
         import("@/effect/instance-state"),
+        import("@opencode-ai/core/database/database"),
       ])
       return Effect.gen(function* () {
         const memory = yield* Memory.Service
@@ -419,7 +576,24 @@ export function executeRuntime(input: Input, context: RuntimeContext): Effect.Ef
           projectID: instance.project.id,
           workspaceID: workspaceID ?? null,
         })
-        return yield* execute(memory, scope, input, { beforeMutation: context.beforeMutation }, context.signal)
+        const { db, scanDb, withScanDb } = yield* Database.Service
+        const readSearch = withScanDb ?? (<A, E, R>(
+          run: (reader: DatabaseShape) => Effect.Effect<A, E, R>,
+        ) => Effect.flatMap(scanDb(), run))
+        return yield* execute(memory, scope, input, {
+          beforeMutation: context.beforeMutation,
+          verifySessionEvidence: (evidence, entryScope) => MemoryEvidence.verify(db, scope, evidence, entryScope),
+          sessionSearchStatus: context.sessionSearchAuthorized ? undefined : "not_authorized",
+          ...(context.sessionSearchAuthorized ? {
+            searchSessions: (query: string, limit: number, ranking: "recent" | "relevance") =>
+              readSearch((reader) => ExchangeMemorySession.search(reader, {
+                query,
+                limit,
+                ranking,
+                directoryPrefixes: [context.rootPath],
+              })),
+          } : {}),
+        }, context.signal)
       })
     },
     "OpenFork memory runtime operation failed",

@@ -27,6 +27,8 @@ export interface Hooks<E = never> {
 
 export interface Metadata {
   readonly count: number
+  /** Source rows requested per recall channel; kept out of the model-facing structured payload. */
+  readonly candidateLimit: number
   readonly titleHits: number
   readonly contentHits: number
   readonly partHits: number
@@ -60,6 +62,8 @@ export function execute<E>(
   return Effect.gen(function* () {
     const query = input.query?.trim()
     const tool = input.tool?.trim()
+    const ranking = input.ranking ?? "recent"
+    const retrievedAt = Date.now()
     if (!query && !tool) {
       return yield* new ExchangeError.InvalidArgument({ detail: "Session search requires query or tool" })
     }
@@ -77,8 +81,14 @@ export function execute<E>(
       repair = yield* hooks.repairIndex()
     }
 
+    // The owning Core query now applies temporal/relevance ordering before
+    // materializing wide result rows. Keep source demand equal to caller demand:
+    // Exchange must not inflate a 20-result recall into 100 hydrated hits.
+    const recallLimit = normalizedLimit(input.limit)
     const result = yield* SessionRecall.recall(db, {
       ...input,
+      limit: recallLimit,
+      ranking,
       ...(query ? { query } : { query: undefined }),
       ...(tool ? { tool } : { tool: undefined }),
     }).pipe(
@@ -103,7 +113,9 @@ export function execute<E>(
           ...(session.location.workspaceID ? { workspaceID: String(session.location.workspaceID) } : {}),
           ...(session.parentID ? { parentId: String(session.parentID) } : {}),
           createdAt: DateTime.toEpochMillis(session.time.created),
+          createdAtIso: new Date(DateTime.toEpochMillis(session.time.created)).toISOString(),
           updatedAt: DateTime.toEpochMillis(session.time.updated),
+          updatedAtIso: new Date(DateTime.toEpochMillis(session.time.updated)).toISOString(),
           archived: session.time.archived !== undefined,
         })),
       ),
@@ -119,6 +131,7 @@ export function execute<E>(
           directory,
           type: match.type,
           createdAt: match.time.created,
+          createdAtIso: new Date(match.time.created).toISOString(),
           snippet: match.snippet,
           matchedTerms: match.matchedTerms,
         })),
@@ -137,6 +150,7 @@ export function execute<E>(
           directory,
           role: match.role,
           createdAt: match.time.created,
+          createdAtIso: new Date(match.time.created).toISOString(),
           snippet: match.snippet,
           matchedTerms: match.matchedTerms,
         })),
@@ -155,21 +169,24 @@ export function execute<E>(
           tool: match.tool,
           source: match.source,
           createdAt: match.time.created,
+          createdAtIso: new Date(match.time.created).toISOString(),
           snippet: match.snippet,
           matchedTerms: match.matchedTerms,
         })),
       ),
     )
 
-    const bySession = new Map<string, {
+    type SessionEvidence = {
       sessionId: string
       title: string
       projectID: string
       directory: string
       matchedBy: Set<"title" | "content" | "part" | "tool">
       snippets: string[]
-      latestAt: number
-    }>()
+      titleRecordAt?: number
+      matchedEvidenceAt?: number
+    }
+    const bySession = new Map<string, SessionEvidence>()
     const add = (hit: {
       sessionId: string
       title: string
@@ -180,16 +197,16 @@ export function execute<E>(
       at: number
     }) => {
       const existing = bySession.get(hit.sessionId)
-      const row = existing ?? {
+      const row: SessionEvidence = existing ?? {
         sessionId: hit.sessionId,
         title: hit.title,
         projectID: hit.projectID,
         directory: hit.directory,
         matchedBy: new Set<"title" | "content" | "part" | "tool">(),
         snippets: [],
-        latestAt: hit.at,
       }
-      row.latestAt = Math.max(row.latestAt, hit.at)
+      if (hit.kind === "title") row.titleRecordAt = Math.max(row.titleRecordAt ?? hit.at, hit.at)
+      else row.matchedEvidenceAt = Math.max(row.matchedEvidenceAt ?? hit.at, hit.at)
       row.matchedBy.add(hit.kind)
       if (hit.snippet && row.snippets.length < 3 && !row.snippets.includes(hit.snippet)) row.snippets.push(hit.snippet)
       bySession.set(hit.sessionId, row)
@@ -199,48 +216,84 @@ export function execute<E>(
     for (const hit of parts) add({ ...hit, kind: "part", snippet: hit.snippet, at: hit.createdAt })
     for (const hit of tools) add({ ...hit, kind: "tool", snippet: hit.snippet, at: hit.createdAt })
 
-    const limit = normalizedLimit(input.limit)
+    const latestEvidenceAt = (row: SessionEvidence) => row.matchedEvidenceAt ?? row.titleRecordAt ?? 0
+    const hasConversationEvidence = (row: SessionEvidence) =>
+      row.matchedBy.has("content") || row.matchedBy.has("part") || row.matchedBy.has("tool")
+
+    const limit = recallLimit
     const sessions = [...bySession.values()]
       .sort((a, b) => {
-        // Exact structural tool evidence is the strongest routing signal when
-        // the caller explicitly requested a tool. Otherwise corroboration
-        // across independent channels wins, followed by granular evidence and
-        // recency. This is in-memory over O(limit * channels), never a DB pass.
+        // Exact structural tool evidence is a hard semantic signal when the
+        // caller explicitly asked for a tool.
         if (tool) {
           const toolDelta = Number(b.matchedBy.has("tool")) - Number(a.matchedBy.has("tool"))
           if (toolDelta !== 0) return toolDelta
         }
+        if (ranking === "recent") {
+          // Conversation/tool evidence has an event timestamp with the semantics
+          // recall actually cares about. A title-only Session row has only a
+          // record-mutation timestamp, which may move for unrelated metadata.
+          // Never let that weaker clock outrank real matching conversation time.
+          const evidenceDelta = Number(hasConversationEvidence(b)) - Number(hasConversationEvidence(a))
+          if (evidenceDelta !== 0) return evidenceDelta
+          const timeDelta = latestEvidenceAt(b) - latestEvidenceAt(a)
+          if (timeDelta !== 0) return timeDelta
+        }
+        // Relevance mode preserves corroboration-first historical recall.
         const channelDelta = b.matchedBy.size - a.matchedBy.size
         if (channelDelta !== 0) return channelDelta
         const partDelta = Number(b.matchedBy.has("part")) - Number(a.matchedBy.has("part"))
         if (partDelta !== 0) return partDelta
         const titleDelta = Number(b.matchedBy.has("title")) - Number(a.matchedBy.has("title"))
         if (titleDelta !== 0) return titleDelta
-        if (b.latestAt !== a.latestAt) return b.latestAt - a.latestAt
+        const timeDelta = latestEvidenceAt(b) - latestEvidenceAt(a)
+        if (timeDelta !== 0) return timeDelta
         return a.sessionId.localeCompare(b.sessionId)
       })
       .slice(0, limit)
-      .map((row) => ({
-      sessionId: row.sessionId,
-      title: row.title,
-      projectID: row.projectID,
-      directory: row.directory,
-      matchedBy: [...row.matchedBy],
-      snippets: row.snippets,
-    }))
+      .map((row) => {
+        const latestAt = latestEvidenceAt(row)
+        return {
+          sessionId: row.sessionId,
+          title: row.title,
+          projectID: row.projectID,
+          directory: row.directory,
+          matchedBy: [...row.matchedBy],
+          snippets: row.snippets,
+          latestAt,
+          latestAtIso: new Date(latestAt).toISOString(),
+          latestAtBasis: row.matchedEvidenceAt !== undefined
+            ? "matched_conversation_evidence"
+            : "session_record_updated_fallback",
+        }
+      })
 
     const truncated =
       titles.length >= limit ||
       content.length >= limit ||
       parts.length >= limit ||
       tools.length >= limit ||
-      result.coverage.v1ToolCandidatesTruncated ||
-      result.coverage.v2ToolCandidatesTruncated
+      result.coverage.toolResultsTruncated
 
     const structured = {
       ...(input.scopeLabel ? { scope: input.scopeLabel } : {}),
       ...(query ? { query } : {}),
       ...(tool ? { tool } : {}),
+      temporal: {
+        ranking,
+        retrievedAt,
+        retrievedAtIso: new Date(retrievedAt).toISOString(),
+        newestFirst: ranking === "recent",
+        timestampBasis: {
+          titleUpdatedAt: "session_record_updated",
+          contentCreatedAt: "message_created",
+          partCreatedAt: "message_created",
+          toolCreatedAt: "tool_call_created",
+        },
+        note: ranking === "recent"
+          ? "Newer matching conversation evidence wins; recalled state is historical, while mutable live state remains authoritative."
+          : "Relevance wins; inspect timestamps before treating older evidence as current state.",
+      },
       coverage: result.coverage,
       ...(repair ? { repair } : {}),
       sessions,
@@ -248,6 +301,7 @@ export function execute<E>(
     }
     const metadata: Metadata = {
       count: sessions.length,
+      candidateLimit: recallLimit,
       titleHits: titles.length,
       contentHits: content.length,
       partHits: parts.length,
@@ -257,7 +311,11 @@ export function execute<E>(
       ...(repair ? { repairTimedOut: repair.timedOut } : {}),
       ...(repair
         ? {
-            repairedRows: repair.sessionMessages.processed + repair.parts.processed,
+            repairedRows:
+              repair.sessionMessages.processed +
+              repair.parts.processed +
+              repair.toolRecallV1.processed +
+              repair.toolRecallV2.processed,
           }
         : {}),
     }

@@ -131,14 +131,32 @@ export const execute = Effect.fn("OfxpBrowserCapability.execute")(function* (
   yield* revalidate()
   yield* deps.invocations.prepare({ invocationID: call.context.invocationID, targetRef })
 
+  // A failure the exchange layer could prove never reached the host keeps its own
+  // taxonomy: no browser effect occurred, so `AmbiguousCommit` would be a lie and
+  // would needlessly block the invocation. Everything else may have executed.
+  const provablyNotDispatched = (error: unknown) =>
+    error instanceof ExchangeError.InvalidArgument ||
+    error instanceof ExchangeError.AuthorityDenied ||
+    error instanceof ExchangeError.PathEscape ||
+    error instanceof ExchangeError.NotFound
+
   const result = yield* ExchangeBrowser.execute(input, context).pipe(
-    Effect.mapError(
-      () =>
-        new ExchangeError.AmbiguousCommit({
-          detail: `OFXP browser invocation ${call.context.invocationID} may have changed browser state; inspect its receipt/browser state before retrying`,
-          targetRef,
-        }),
+    Effect.tapError((error) =>
+      // Honest durable receipt for a provable non-effect: `failed`, not `started`,
+      // so the invocation is never recorded as a possible browser mutation.
+      provablyNotDispatched(error)
+        ? deps.invocations
+            .settle({ invocationID: call.context.invocationID, state: "failed", targetRef })
+            .pipe(Effect.catch(() => Effect.void))
+        : Effect.void,
     ),
+    Effect.mapError((error) => {
+      if (provablyNotDispatched(error)) return error
+      return new ExchangeError.AmbiguousCommit({
+        detail: `OFXP browser invocation ${call.context.invocationID} may have changed browser state; inspect its receipt/browser state before retrying`,
+        targetRef,
+      })
+    }),
   )
 
   const receipt = yield* deps.invocations

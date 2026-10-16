@@ -254,6 +254,19 @@ export function execute<E>(
           catch: (error) => new ExchangeError.Conflict({ detail: error instanceof Error ? error.message : String(error) }),
         })
         if (hunk.type === "delete") {
+          if (hunk.chunks !== undefined) {
+            const verified = yield* Effect.try({
+              try: () => deriveContent(old.text, hunk.chunks!, source.displayPath),
+              catch: (error) => new ExchangeError.Conflict({
+                detail: `Git deletion does not match the complete current file ${source.displayPath}: ${error instanceof Error ? error.message : String(error)}`,
+              }),
+            })
+            if (verified.content !== "") {
+              return yield* new ExchangeError.Conflict({
+                detail: `Git deletion hunks do not account for all current content in ${source.displayPath}`,
+              })
+            }
+          }
           const diff = Core.trimDiff(createTwoFilesPatch(source.displayPath, source.displayPath, old.text, ""))
           return {
             status: "planned" as const,
@@ -599,4 +612,3 @@ export function execute<E>(
     }
   })
 }
-
