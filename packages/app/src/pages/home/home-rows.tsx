@@ -1,5 +1,5 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
-import { type Accessor, createMemo, type JSX, Show, splitProps } from "solid-js"
+import { type Accessor, createMemo, createSignal, lazy, type JSX, Show, splitProps, Suspense } from "solid-js"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
@@ -13,8 +13,14 @@ import { sessionTitle } from "@/utils/session-title"
 import { getRelativeTime } from "@/utils/time"
 import { shouldOpenSessionInBackground } from "../home-session-open"
 import { HomeSessionStatusController } from "./home-session-status-controller"
+import { contextMenuPosition } from "@/components/context-menu-position"
 import type { HomeSessionRecord, OpenSessionOptions } from "./home-session-types"
-import { SessionContextMenu } from "@/components/session-menu/session-context-menu"
+
+// Keep every session row free of the dialog/provider/Kobalte menu owner graph.
+// Only the row receiving a right-click pays the cost of a full menu.
+const HomeSessionContextMenu = lazy(() =>
+  import("@/components/session-menu/session-context-menu").then((module) => ({ default: module.SessionContextMenu })),
+)
 
 // Shared home row/list-item presentation, consumed by HomeProjectsView,
 // HomeSessionsView (NewHome) and the future mobile sessions tab. Presentation
@@ -111,18 +117,17 @@ export type HomeSessionRowProps = {
 export function HomeSessionRow(props: HomeSessionRowProps) {
   const title = createMemo(() => sessionTitle(props.record.session.title) || props.record.session.id)
   const showProjectName = () => props.showProjectName() && props.record.projectName
+  const [cursor, setCursor] = createSignal<{ x: number; y: number }>()
 
   return (
-    <SessionContextMenu
-      where="home"
-      session={props.record.session}
-      server={props.server()}
-      inGroupId={props.inGroupId}
-      onOpen={(opts) => props.onOpenSession(props.record.session, { background: !!opts?.background })}
-      onArchive={() => void props.onArchiveSession(props.record.session)}
-      onAddToGroup={(groupId) => props.onAddToGroup(props.record.session.id, groupId)}
-      onRemoveFromGroup={() => props.onRemoveFromGroup(props.record.session.id)}
-      onCreateGroup={(name) => void props.onCreateGroup(name, [props.record.session.id])}
+    <div
+      class="block h-full w-full min-w-0"
+      data-model-picker-open={cursor() ? "" : undefined}
+      onContextMenu={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        setCursor(contextMenuPosition(event, event.currentTarget))
+      }}
     >
       <div
         class="group/session relative flex h-10 min-w-0 items-center rounded-[6px]"
@@ -193,7 +198,28 @@ export function HomeSessionRow(props: HomeSessionRowProps) {
           </div>
         </Show>
       </div>
-    </SessionContextMenu>
+      <Show when={cursor()} keyed>
+        {(position) => (
+          <Suspense fallback={null}>
+            <HomeSessionContextMenu
+              cursor={position}
+              where="home"
+              session={props.record.session}
+              server={props.server()}
+              inGroupId={props.inGroupId}
+              onOpen={(opts) => props.onOpenSession(props.record.session, { background: !!opts?.background })}
+              onArchive={() => void props.onArchiveSession(props.record.session)}
+              onAddToGroup={(groupId) => props.onAddToGroup(props.record.session.id, groupId)}
+              onRemoveFromGroup={() => props.onRemoveFromGroup(props.record.session.id)}
+              onCreateGroup={(name) => void props.onCreateGroup(name, [props.record.session.id])}
+              onOpenChange={(open) => {
+                if (!open && cursor() === position) setCursor(undefined)
+              }}
+            />
+          </Suspense>
+        )}
+      </Show>
+    </div>
   )
 }
 

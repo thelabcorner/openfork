@@ -6,10 +6,100 @@ import {
   rankPaidUsageYield,
   compareModelsByUsageYield,
   FALLBACK_WORKLOAD_CORPUS,
+  compilePricingRegimes,
+  priceWorkload,
+  priceWorkloadExpected,
 } from "./model-usage-yield"
 import type { UsageProfile } from "./model-usage-profile"
 
 describe("model-usage-yield", () => {
+  test("flat regime compilation skips native tier construction without bypassing explicit thresholds", () => {
+    const model = { id: "vendor/model", provider: { id: "vendor" } }
+    const base = { input: 1, output: 2, cache: { read: 0.1, write: 0.2 } }
+    expect(compilePricingRegimes(model, base)).toEqual([{ kind: "flat", prices: base }])
+    expect(compilePricingRegimes(model, { ...base, tiers: [] })).toEqual([{ kind: "flat", prices: { ...base, tiers: [] } }])
+    const dual = [
+      { thresholdTokens: 128_000, operator: "<=" as const, cost: base },
+      { thresholdTokens: 128_000, operator: ">" as const, cost: { ...base, input: 5 } },
+    ]
+    expect(compilePricingRegimes(model, base, dual).map((r) => r.kind)).toEqual([
+      "context-threshold",
+      "context-threshold",
+    ])
+    expect(compilePricingRegimes(model, { ...base, experimentalOver200K: { ...base, input: 7 } })[0]?.kind).toBe("native-context")
+    expect(compilePricingRegimes(model, {
+      ...base,
+      tiers: [{ tier: { type: "context" as const, size: 128_000 }, ...base }],
+    })[0]?.kind).toBe("native-context")
+  })
+
+  test("expected-only ranking pricer exactly matches canonical pricing across flat and complex regimes", () => {
+    const flatModel = { id: "vendor/model", provider: { id: "vendor" } }
+    const flat = compilePricingRegimes(flatModel, { input: 2.21, output: 9.7, cache: { read: 0.13, write: 2.9 } })
+    const legacy = compilePricingRegimes(flatModel, { input: 2.21, output: 9.7 } as never)
+    const tiered = compilePricingRegimes(flatModel, {
+      input: 2.21,
+      output: 9.7,
+      cache: { read: 0.13, write: 2.9 },
+      tiers: [{ tier: { type: "context", size: 20_000 }, input: 5, output: 14, cache: { read: 0.5, write: 6 } }],
+    })
+    const deepSeek = compilePricingRegimes(
+      { id: "deepseek-v4-flash", provider: { id: "opencode" } },
+      { input: 2, output: 5, cache: { read: 0.12, write: 0 } },
+    )
+    const rates = [undefined, 0, 0.1, 0.75, 1, 1.5, 24, 100, 120, Number.NaN, Number.POSITIVE_INFINITY]
+    let seed = 0xf0edbabe
+    const next = () => {
+      seed ^= seed << 13
+      seed ^= seed >>> 17
+      seed ^= seed << 5
+      return seed >>> 0
+    }
+    for (let i = 0; i < 500; i++) {
+      const freshInputTokens = next() % 150_000
+      const cachedReadTokens = next() % 150_000
+      const cacheWriteTokens = next() % 10_000
+      const workload = {
+        freshInputTokens,
+        cachedReadTokens,
+        cacheWriteTokens,
+        outputTokens: next() % 15_000,
+        contextTokens: freshInputTokens + cachedReadTokens + cacheWriteTokens,
+      }
+      for (const regimes of [flat, legacy, tiered, deepSeek]) {
+        for (const rate of rates) {
+          expect(priceWorkloadExpected(workload, regimes, rate)).toBe(priceWorkload(workload, regimes, rate).expected)
+        }
+      }
+    }
+  })
+
+  test("bulk selector's single-regime pricing fast path preserves flat and native context semantics", () => {
+    const workload = {
+      freshInputTokens: 1_000,
+      cachedReadTokens: 10_000,
+      outputTokens: 100,
+      contextTokens: 11_000,
+    }
+    const model = { id: "vendor/model", provider: { id: "vendor" } }
+    const flat = { input: 2, output: 4, cache: { read: 1, write: 0 } }
+    const flatPrice = priceWorkload(workload, compilePricingRegimes(model, flat))
+    expect(flatPrice.expected).toBeCloseTo((1_000 * 2 + 10_000 * 1 + 100 * 4) / 1_000_000)
+    expect(flatPrice.regimeLabel).toBeUndefined()
+
+    const tiered = {
+      ...flat,
+      tiers: [{ tier: { type: "context" as const, size: 5_000 }, input: 4, output: 8, cache: { read: 2, write: 0 } }],
+    }
+    const nativePrice = priceWorkload(workload, compilePricingRegimes(model, tiered))
+    expect(nativePrice.expected).toBeCloseTo((1_000 * 4 + 10_000 * 2 + 100 * 8) / 1_000_000)
+    expect(nativePrice.regimeLabel).toBe("> 5,000")
+
+    const legacy = { input: 2, output: 4, tiers: [{ tier: { type: "context" as const, size: 5_000 }, input: 4, output: 8 }] }
+    const conservativePrice = priceWorkload(workload, compilePricingRegimes(model, legacy as never))
+    expect(conservativePrice.expected).toBeCloseTo((1_000 * 4 + 10_000 * 4 + 100 * 8) / 1_000_000)
+  })
+
   test("buildStandardWorkloadCorpus deduplicates", () => {
     const profiles: UsageProfile[] = [
       { input: 390, cached: 32_500, output: 120 },

@@ -32,7 +32,11 @@ type CompatibleSessionApi = Omit<
   "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove"
 > & {
   prompt: (input: SessionPromptInput & LegacyPrompt) => Promise<SessionPromptOutput>
-  command: (input: SessionCommandInput) => Promise<SessionCommandOutput>
+  command: (
+    input: SessionCommandInput & {
+      routeIntent?: import("@opencode-ai/schema/model-select/provider-route-intent").Info
+    },
+  ) => Promise<SessionCommandOutput>
   shell: (input: SessionShellInput & LegacyPrompt) => Promise<SessionShellOutput>
   compact: (input: SessionCompactInput & { model?: LegacyPrompt["model"] }) => Promise<SessionCompactOutput>
   rename: (input: Parameters<SessionApi["rename"]>[0] & LegacyLocation) => ReturnType<SessionApi["rename"]>
@@ -98,6 +102,12 @@ type CompatiblePromptRevisorInput = {
   guidance?: string
   model?: { providerID: string; id: string; accountID?: string; variant?: string }
   fallbackModel?: { providerID: string; id: string; accountID?: string; variant?: string }
+  /**
+   * Client-owned correlation id for live advisory revision progress. Serialized
+   * with the revise request so the composer can poll `progress` for exactly this
+   * operation. Never persisted client-side.
+   */
+  operationID?: string
   location?: { directory?: string }
   /** Client-owned lifetime for the long-running revision request. Never serialized. */
   signal?: AbortSignal
@@ -139,11 +149,57 @@ type CompatiblePromptRevisorApi = {
         rounds: number
       }
   >
+  progress: (input: {
+    operationID: string
+    signal?: AbortSignal
+  }) => Promise<CompatibleRevisionProgress | null>
+  /**
+   * Process-global lifecycle read for a detached revision run. `null` means
+   * untracked: never started, already settled and consumed, explicitly
+   * cancelled, or an older server without the route. Presentation must degrade
+   * to "no run info" in every one of those cases.
+   */
+  runStatus: (input: {
+    kind: CompatibleRevisionDraftArtifact["kind"]
+    key: string
+    signal?: AbortSignal
+  }) => Promise<CompatibleRevisionRunStatus | null>
+  /**
+   * Explicit first-class cancellation of a detached run. Returns `false` when
+   * no run was in flight or an older server has no cancel route; callers may
+   * then abandon the local request, which is cancellation on legacy
+   * request-scoped servers.
+   */
+  cancel: (input: {
+    kind: CompatibleRevisionDraftArtifact["kind"]
+    key: string
+    operationID?: string
+  }) => Promise<boolean>
 }
 type PromptRevisorWireBody = NonNullable<PromptReviseData["body"]> & {
   target?: CompatiblePromptRevisorInput["target"]
 }
 type CompatiblePromptRevisorResult = Awaited<ReturnType<CompatiblePromptRevisorApi["revise"]>>
+export type CompatibleRevisionProgress = {
+  operationID: string
+  percent: number
+  phase?: string
+  note?: string
+  updatedAt: number
+}
+export type CompatibleRevisionRunStatus =
+  | {
+      state: "running"
+      sourceFingerprint: string
+      operationID?: string
+      startedAt: number
+    }
+  | {
+      state: "failed"
+      sourceFingerprint: string
+      message: string
+      at: number
+    }
 export type CompatibleRevisionDraftArtifact = {
   id: string
   directory: string
@@ -199,6 +255,7 @@ type CompatibleInput = {
   server: ServerConnection.HttpBase
   fetch?: typeof globalThis.fetch
   directory?: string
+  scheduleControl?: <T>(kind: string, run: () => Promise<T>) => Promise<T>
 }
 
 function mime(uri: string) {
@@ -211,10 +268,11 @@ function promptRevisorBody(value: CompatiblePromptRevisorInput): PromptRevisorWi
   return body satisfies PromptRevisorWireBody
 }
 
-function sessionInfo(session: Session): SessionInfo {
+function sessionInfo(session: Session): SessionInfo & { humanInterjection?: boolean } {
   return {
     id: session.id,
     parentID: session.parentID,
+    humanInterjection: session.humanInterjection,
     projectID: session.projectID,
     agent: session.agent,
     model: session.model && {
@@ -295,6 +353,10 @@ function overlayApi<T extends object, U extends object>(base: T, overrides: U): 
 function createCurrentApi(input: CompatibleInput): CompatibleApi {
   return overlayApi(input.current, {
     session: overlayApi(input.current.session, {
+      async interrupt(value: Parameters<ServerApi["session"]["interrupt"]>[0]) {
+        const run = () => input.current.session.interrupt(value)
+        return input.scheduleControl ? input.scheduleControl("session-interrupt", run) : run()
+      },
       async pause(value: Parameters<CompatibleSessionApi["pause"]>[0]) {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/pause`)
       },
@@ -305,7 +367,7 @@ function createCurrentApi(input: CompatibleInput): CompatibleApi {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/title/regenerate`, {
           model: value.model,
           prompt: value.prompt,
-        })
+        }, "session-title")
       },
     }),
     question: overlayApi(input.current.question, {
@@ -327,6 +389,9 @@ function createCurrentApi(input: CompatibleInput): CompatibleApi {
         const path = `/prompt/revise${directory ? `?directory=${encodeURIComponent(directory)}` : ""}`
         return promptRevisorResult(await postJSON<unknown>(input, path, promptRevisorBody(value), value.signal))
       },
+      progress: (value: Parameters<CompatiblePromptRevisorApi["progress"]>[0]) => promptRevisorProgress(input, value),
+      runStatus: (value: Parameters<CompatiblePromptRevisorApi["runStatus"]>[0]) => promptRevisorRunStatus(input, value),
+      cancel: (value: Parameters<CompatiblePromptRevisorApi["cancel"]>[0]) => promptRevisorCancel(input, value),
     },
     revisionDraft: {
       recover(value: Parameters<CompatibleRevisionDraftApi["recover"]>[0]) {
@@ -339,7 +404,7 @@ function createCurrentApi(input: CompatibleInput): CompatibleApi {
   }) as CompatibleApi
 }
 
-async function post(input: CompatibleInput, path: string, body?: unknown) {
+async function post(input: CompatibleInput, path: string, body?: unknown, errorService?: "session-title") {
   const headers = new Headers()
   if (body !== undefined) headers.set("content-type", "application/json")
   if (input.server.password) {
@@ -354,7 +419,21 @@ async function post(input: CompatibleInput, path: string, body?: unknown) {
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   if (!response.ok) {
-    const detail = serverErrorDetail(await response.text().catch(() => ""))
+    const payload = await response.text().catch(() => "")
+    const detail = serverErrorDetail(payload)
+    if (errorService) {
+      // A typed error from our own title endpoint is safe to display.
+      // Plain text (including reverse-proxy responses) is not trusted.
+      let trusted: { service: string; message: string } | undefined
+      try {
+        const value = JSON.parse(payload) as unknown
+        if (value && typeof value === "object" && "service" in value && value.service === errorService &&
+            "message" in value && typeof value.message === "string") {
+          trusted = { service: errorService, message: value.message }
+        }
+      } catch {}
+      if (trusted) throw Object.assign(new Error(trusted.message), { data: trusted })
+    }
     throw new Error(detail || `POST ${path} failed: ${response.status}`)
   }
   try {
@@ -383,6 +462,121 @@ async function postJSON<T>(input: CompatibleInput, path: string, body?: unknown,
     throw new Error(detail || `POST ${path} failed: ${response.status}`)
   }
   return (await response.json()) as T
+}
+
+/**
+ * Advisory reads are deliberately tolerant: an older server without the route,
+ * a dropped connection, or a malformed body is "no update yet", never a
+ * user-visible failure. Progress is display-only state for one in-flight
+ * revision, so a failed poll simply lets the bounded cadence try again.
+ */
+async function getJSON<T>(input: CompatibleInput, path: string, signal?: AbortSignal): Promise<T | null> {
+  const headers = new Headers()
+  if (input.server.password) {
+    headers.set(
+      "authorization",
+      `Basic ${authTokenFromCredentials({ username: input.server.username, password: input.server.password })}`,
+    )
+  }
+  let response: Response
+  try {
+    response = await (input.fetch ?? globalThis.fetch)(new URL(path, input.server.url), {
+      method: "GET",
+      headers,
+      signal,
+    })
+  } catch {
+    return null
+  }
+  if (!response.ok) {
+    try {
+      await response.body?.cancel()
+    } catch {
+      // Nothing else to release; an already-drained body is fine.
+    }
+    return null
+  }
+  try {
+    return (await response.json()) as T
+  } catch {
+    return null
+  }
+}
+
+function revisionProgressSnapshot(value: unknown): CompatibleRevisionProgress | null {
+  if (!value || typeof value !== "object") return null
+  const record = value as Partial<CompatibleRevisionProgress>
+  if (typeof record.operationID !== "string" || typeof record.percent !== "number") return null
+  if (!Number.isFinite(record.percent)) return null
+  return record as CompatibleRevisionProgress
+}
+
+async function promptRevisorProgress(
+  input: CompatibleInput,
+  value: { operationID: string; signal?: AbortSignal },
+): Promise<CompatibleRevisionProgress | null> {
+  const raw = await getJSON<unknown>(
+    input,
+    `/prompt/revise/progress?operationID=${encodeURIComponent(value.operationID)}`,
+    value.signal,
+  )
+  return revisionProgressSnapshot(raw)
+}
+
+function revisionRunStatus(value: unknown): CompatibleRevisionRunStatus | null {
+  if (!value || typeof value !== "object") return null
+  const record = value as Record<string, unknown>
+  if (record.state === "running") {
+    if (typeof record.sourceFingerprint !== "string" || typeof record.startedAt !== "number") return null
+    if (record.operationID !== undefined && typeof record.operationID !== "string") return null
+    return {
+      state: "running",
+      sourceFingerprint: record.sourceFingerprint,
+      startedAt: record.startedAt,
+      ...(record.operationID === undefined ? {} : { operationID: record.operationID }),
+    }
+  }
+  if (record.state === "failed") {
+    if (typeof record.sourceFingerprint !== "string") return null
+    if (typeof record.message !== "string" || typeof record.at !== "number") return null
+    return {
+      state: "failed",
+      sourceFingerprint: record.sourceFingerprint,
+      message: record.message,
+      at: record.at,
+    }
+  }
+  return null
+}
+
+/**
+ * Lifecycle reads are tolerant like progress reads: a missing route, dropped
+ * connection, or malformed body is "no run info", never a user-visible failure.
+ */
+async function promptRevisorRunStatus(
+  input: CompatibleInput,
+  value: { kind: CompatibleRevisionDraftArtifact["kind"]; key: string; signal?: AbortSignal },
+): Promise<CompatibleRevisionRunStatus | null> {
+  const query = `kind=${encodeURIComponent(value.kind)}&key=${encodeURIComponent(value.key)}`
+  return revisionRunStatus(await getJSON<unknown>(input, `/prompt/revise/run?${query}`, value.signal))
+}
+
+async function promptRevisorCancel(
+  input: CompatibleInput,
+  value: { kind: CompatibleRevisionDraftArtifact["kind"]; key: string; operationID?: string },
+): Promise<boolean> {
+  try {
+    const result = await postJSON<unknown>(input, "/prompt/revise/cancel", {
+      kind: value.kind,
+      key: value.key,
+      ...(value.operationID === undefined ? {} : { operationID: value.operationID }),
+    })
+    return result === true
+  } catch {
+    // An older server has no first-class cancel route; there the run is
+    // request-scoped, so the caller's local abort remains true cancellation.
+    return false
+  }
 }
 
 /**
@@ -464,11 +658,15 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           return await input.current.session.active()
         } catch {}
         const result = await legacy().session.status()
-        return Object.fromEntries(
-          Object.entries(result.data ?? {}).flatMap(([sessionID, status]) =>
-            status.type === "idle" ? [] : [[sessionID, { type: "running" as const }]],
-          ),
-        )
+        const projected: Array<[string, { type: "running" | "interrupted" }]> = []
+        for (const [sessionID, status] of Object.entries(result.data ?? {})) {
+          if (status.type === "busy" || status.type === "retry")
+            projected.push([sessionID, { type: "running" }])
+          // A fenced, unverified lease is actionable recovery, not a spinner.
+          else if (status.type === "interrupted")
+            projected.push([sessionID, { type: "interrupted" }])
+        }
+        return Object.fromEntries(projected)
       },
       async rename(value: Parameters<ServerApi["session"]["rename"]>[0] & LegacyLocation) {
         await legacy(value).session.update({ sessionID: value.sessionID, title: value.title })
@@ -485,7 +683,8 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         return sessionInfo(result.data)
       },
       async interrupt(value: Parameters<ServerApi["session"]["interrupt"]>[0]) {
-        const result = await legacy().session.abort(value)
+        const run = () => legacy().session.abort(value)
+        const result = await (input.scheduleControl ? input.scheduleControl("session-interrupt", run) : run())
         if (result.data !== true) throw new Error("Session abort was superseded by a newer execution")
       },
       async pause(value: Parameters<CompatibleSessionApi["pause"]>[0]) {
@@ -498,7 +697,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/title/regenerate`, {
           model: value.model,
           prompt: value.prompt,
-        })
+        }, "session-title")
       },
       async prompt(value: SessionPromptInput & LegacyPrompt) {
         await legacy().session.promptAsync({
@@ -542,7 +741,11 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           delivery: value.delivery ?? "steer",
         }
       },
-      async command(value: SessionCommandInput) {
+      async command(
+        value: SessionCommandInput & {
+          routeIntent?: import("@opencode-ai/schema/model-select/provider-route-intent").Info
+        },
+      ) {
         await legacy().session.command({
           sessionID: value.sessionID,
           messageID: value.id ?? undefined,
@@ -551,6 +754,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           agent: value.agent ?? undefined,
           model: value.model ? `${value.model.providerID}/${value.model.id}` : undefined,
           variant: value.model?.variant,
+          routeIntent: value.routeIntent,
           parts: value.files?.map((file) => ({
             type: "file" as const,
             mime: mime(file.uri),
@@ -608,6 +812,9 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         const path = `/prompt/revise${target ? `?directory=${encodeURIComponent(target)}` : ""}`
         return promptRevisorResult(await postJSON<unknown>(input, path, promptRevisorBody(value), value.signal))
       },
+      progress: (value: Parameters<CompatiblePromptRevisorApi["progress"]>[0]) => promptRevisorProgress(input, value),
+      runStatus: (value: Parameters<CompatiblePromptRevisorApi["runStatus"]>[0]) => promptRevisorRunStatus(input, value),
+      cancel: (value: Parameters<CompatiblePromptRevisorApi["cancel"]>[0]) => promptRevisorCancel(input, value),
     },
     revisionDraft: {
       recover(value: Parameters<CompatibleRevisionDraftApi["recover"]>[0]) {

@@ -18,8 +18,15 @@ const CONTROL_PATHS = [
   /^\/api\/session\/[^/]+\/(?:prompt|interrupt|pause|resume|permission\/[^/]+\/reply|question\/[^/]+\/(?:reply|reject))$/,
 ]
 const METHOD_CONTROL_PATHS: ReadonlyArray<{ method: string; path: RegExp }> = [
+  // Explicit-ID metadata resolution is part of prompt admission after a cache
+  // miss. It is Tier 1 and must remain reachable when renderer SSE sockets fill.
+  { method: "GET", path: /^\/global\/session\/ses_[^/]+$/ },
   { method: "PUT", path: /^\/session\/[^/]+\/goal$/ },
   { method: "DELETE", path: /^\/session\/[^/]+\/goal$/ },
+  // Permission policy synchronization is part of prompt admission. Keep it on
+  // the isolated urgent sidecar transport so a saturated renderer HTTP pool
+  // cannot strand every prompt before it reaches the runtime.
+  { method: "PUT", path: /^\/permission\/auto-accept$/ },
 ]
 
 export function isLoopbackHttpOrigin(value: string) {
@@ -34,7 +41,7 @@ export function isLoopbackHttpOrigin(value: string) {
   }
 }
 
-/** Routes whose admission or lifecycle response changes live session control. */
+/** Routes required for explicit session admission or lifecycle control. */
 export function isSidecarControlFetch(input: RequestInfo | URL, init?: RequestInit) {
   let url: URL
   let method: string

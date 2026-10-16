@@ -1,6 +1,7 @@
 import type { ServerConnection } from "./server"
 import type { Tab } from "./tabs"
 import { isAppTabPage, normalizeAppTabHref } from "./app-tabs"
+import { isAbsoluteWorkspaceDirectory } from "@/utils/path-key"
 
 export function migrateTabs(value: unknown, fallback: ServerConnection.Key): Tab[] {
   if (!Array.isArray(value)) return []
@@ -19,7 +20,7 @@ export function migrateTabs(value: unknown, fallback: ServerConnection.Key): Tab
     if (
       tab.type === "draft" &&
       typeof tab.draftID === "string" &&
-      typeof tab.directory === "string" &&
+      isAbsoluteWorkspaceDirectory(tab.directory) &&
       (tab.worktree === undefined || typeof tab.worktree === "string")
     ) {
       return [{ type: tab.type, server, draftID: tab.draftID, directory: tab.directory, worktree: tab.worktree }]

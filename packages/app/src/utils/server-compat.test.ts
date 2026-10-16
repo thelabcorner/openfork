@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import { createApiForServer, createSdkForServer } from "./server"
+import { normalizeSessionInfo } from "./session"
+import { sessionTitleErrorMessage } from "../components/session-title-error"
 import {
   createCompatibleApi,
   LegacyPromptRevisorProtocolError,
   type CompatibleRevisionDraftArtifact,
+  type CompatibleRevisionRunStatus,
 } from "./server-compat"
 
 function setup(
@@ -11,10 +14,16 @@ function setup(
   responses?: {
     vcs?: { branch: string; default_branch: string }
     reviseError?: Response
+    titleError?: Response
     reviseResult?: unknown
     revisionDraft?: unknown
+    revisionProgress?: unknown
+    revisionRunStatus?: unknown
+    cancelResult?: unknown
     abortAccepted?: boolean
+    session?: unknown
   },
+  scheduleControl?: <T>(kind: string, run: () => Promise<T>) => Promise<T>,
 ) {
   const requests: Request[] = []
   const fetcher = Object.assign(
@@ -36,6 +45,8 @@ function setup(
         return new Response(undefined, { status: 204 })
       if (request.method === "POST" && request.url.endsWith("/abort"))
         return Response.json(responses?.abortAccepted ?? true)
+      if (request.method === "POST" && new URL(request.url).pathname.endsWith("/title/regenerate"))
+        return responses?.titleError ?? new Response(undefined, { status: 204 })
       if (request.method === "POST" && request.url.endsWith("/prompt")) {
         return Response.json({
           admittedSeq: 1,
@@ -62,8 +73,21 @@ function setup(
         return Response.json(responses?.revisionDraft ?? null)
       if (request.method === "POST" && new URL(request.url).pathname === "/revision-draft/consume")
         return new Response(undefined, { status: 204 })
+      if (request.method === "GET" && new URL(request.url).pathname === "/prompt/revise/progress") {
+        if (responses && "revisionProgress" in responses) return Response.json(responses.revisionProgress)
+        return new Response(undefined, { status: 404 })
+      }
+      if (request.method === "GET" && new URL(request.url).pathname === "/prompt/revise/run") {
+        if (responses && "revisionRunStatus" in responses) return Response.json(responses.revisionRunStatus)
+        return new Response(undefined, { status: 404 })
+      }
+      if (request.method === "POST" && new URL(request.url).pathname === "/prompt/revise/cancel") {
+        if (responses && "cancelResult" in responses) return Response.json(responses.cancelResult)
+        return new Response(undefined, { status: 404 })
+      }
       if (request.method === "GET" && new URL(request.url).pathname === "/vcs")
         return Response.json(responses?.vcs ?? {})
+      if (request.method === "GET" && responses?.session) return Response.json(responses.session)
       if (request.method === "GET") return Response.json([])
       return new Response(undefined, { status: 204 })
     },
@@ -77,14 +101,71 @@ function setup(
     server,
     fetch: fetcher,
     directory: "/repo",
+    scheduleControl,
   })
   return { api, requests }
 }
 
 describe("createCompatibleApi", () => {
+  for (const protocol of ["v1", "v2"] as const) {
+    test(`preserves safe title error detail through ${protocol} compatibility`, async () => {
+      const { api } = setup(protocol, {
+        titleError: Response.json(
+          { _tag: "ServiceUnavailableError", service: "session-title", message: "The title model hit a usage limit." },
+          { status: 503 },
+        ),
+      })
+      const error = await api.session.regenerateTitle({ sessionID: "ses_1" }).catch((value: unknown) => value)
+      expect(sessionTitleErrorMessage(error)).toBe("The title model hit a usage limit.")
+    })
+
+    test(`does not trust arbitrary title failure text through ${protocol} compatibility`, async () => {
+      const { api } = setup(protocol, {
+        titleError: new Response("upstream leaked provider secret", { status: 502 }),
+      })
+      const error = await api.session.regenerateTitle({ sessionID: "ses_1" }).catch((value: unknown) => value)
+      expect(sessionTitleErrorMessage(error)).toBeUndefined()
+    })
+  }
+  test("preserves server-owned worker interjection through V1 adaptation and normalization", async () => {
+    const { api, requests } = setup("v1", {
+      session: {
+        id: "ses_worker",
+        slug: "worker",
+        parentID: "ses_parent",
+        projectID: "project",
+        directory: "/repo",
+        title: "Worker",
+        version: "1",
+        humanInterjection: true,
+        time: { created: 1, updated: 1 },
+      },
+    })
+    const session = normalizeSessionInfo(await api.session.get({ sessionID: "ses_worker" }))
+    expect(session.humanInterjection).toBe(true)
+    expect(session.parentID).toBe("ses_parent")
+    expect(requests).toHaveLength(1)
+  })
   test("rejects a V1 interrupt when generation fencing supersedes the abort", async () => {
-    const { api } = setup("v1", { abortAccepted: false })
+    const controlKinds: string[] = []
+    const { api } = setup("v1", { abortAccepted: false }, (kind, run) => {
+      controlKinds.push(kind)
+      return run()
+    })
     await expect(api.session.interrupt({ sessionID: "ses_1" })).rejects.toThrow("superseded by a newer execution")
+    expect(controlKinds).toEqual(["session-interrupt"])
+  })
+
+  test("routes current-protocol interrupts through control admission", async () => {
+    const controlKinds: string[] = []
+    const { api, requests } = setup("v2", undefined, (kind, run) => {
+      controlKinds.push(kind)
+      return run()
+    })
+    await api.session.interrupt({ sessionID: "ses_1" })
+
+    expect(controlKinds).toEqual(["session-interrupt"])
+    expect(new URL(requests.at(-1)!.url).pathname).toContain("/interrupt")
   })
 
   test("preserves structured question details on current protocol", async () => {
@@ -215,6 +296,93 @@ describe("createCompatibleApi", () => {
         variant: "high",
       },
     })
+  })
+
+  test("correlates live Prompt Revisor progress by the client-owned operation id", async () => {
+    const snapshot = { operationID: "op-1", percent: 42, phase: "reading", updatedAt: 7 }
+    const { api, requests } = setup("v2", { revisionProgress: snapshot })
+
+    expect(await api.promptRevisor.progress({ operationID: "op-1" })).toEqual(snapshot)
+    const request = requests.at(-1)!
+    const url = new URL(request.url)
+    expect(request.method).toBe("GET")
+    expect(url.pathname).toBe("/prompt/revise/progress")
+    expect(url.searchParams.get("operationID")).toBe("op-1")
+  })
+
+  test("sends the operation correlation id with the revise payload", async () => {
+    const { api, requests } = setup("v2")
+    await api.promptRevisor.revise({ prompt: "Improve this.", operationID: "op-7" })
+
+    const body = await requests.at(-1)!.json()
+    expect(body).toMatchObject({ prompt: "Improve this.", operationID: "op-7" })
+  })
+
+  test("treats a missing progress route or malformed body as no update", async () => {
+    const missing = setup("v2")
+    expect(await missing.api.promptRevisor.progress({ operationID: "op-1" })).toBeNull()
+
+    const malformed = setup("v2", { revisionProgress: [] })
+    expect(await malformed.api.promptRevisor.progress({ operationID: "op-1" })).toBeNull()
+
+    const invalidPercent = setup("v2", {
+      revisionProgress: { operationID: "op-1", percent: Number.NaN },
+    })
+    expect(await invalidPercent.api.promptRevisor.progress({ operationID: "op-1" })).toBeNull()
+  })
+
+  test("keeps progress reads available on the V1 protocol path too", async () => {
+    const snapshot = { operationID: "op-2", percent: 15, updatedAt: 3 }
+    const { api, requests } = setup("v1", { revisionProgress: snapshot })
+
+    expect(await api.promptRevisor.progress({ operationID: "op-2" })).toEqual(snapshot)
+    expect(new URL(requests.at(-1)!.url).pathname).toBe("/prompt/revise/progress")
+  })
+
+  test("reads detached revision run status by locator on both protocol paths", async () => {
+    const status: CompatibleRevisionRunStatus = { state: "running", sourceFingerprint: "fp", operationID: "op-3", startedAt: 11 }
+    for (const protocol of ["v1", "v2"] as const) {
+      const { api, requests } = setup(protocol, { revisionRunStatus: status })
+      expect(await api.promptRevisor.runStatus({ kind: "prompt", key: "session:ses_1" })).toEqual(status)
+      const request = requests.at(-1)!
+      const url = new URL(request.url)
+      expect(request.method).toBe("GET")
+      expect(url.pathname).toBe("/prompt/revise/run")
+      expect(url.searchParams.get("kind")).toBe("prompt")
+      expect(url.searchParams.get("key")).toBe("session:ses_1")
+    }
+  })
+
+  test("treats a missing or malformed run status as no run info", async () => {
+    const missing = setup("v2")
+    expect(await missing.api.promptRevisor.runStatus({ kind: "prompt", key: "session:ses_1" })).toBeNull()
+
+    const malformed = setup("v2", { revisionRunStatus: { state: "running" } })
+    expect(await malformed.api.promptRevisor.runStatus({ kind: "prompt", key: "session:ses_1" })).toBeNull()
+
+    const failed = setup("v2", {
+      revisionRunStatus: { state: "failed", sourceFingerprint: "fp", message: "boom", at: 5 },
+    })
+    expect(await failed.api.promptRevisor.runStatus({ kind: "prompt", key: "session:ses_1" })).toEqual({
+      state: "failed",
+      sourceFingerprint: "fp",
+      message: "boom",
+      at: 5,
+    })
+  })
+
+  test("cancels a detached run first-class and tolerates servers without the route", async () => {
+    const { api, requests } = setup("v2", { cancelResult: true })
+    expect(
+      await api.promptRevisor.cancel({ kind: "prompt", key: "session:ses_1", operationID: "op-9" }),
+    ).toBe(true)
+    const request = requests.at(-1)!
+    expect(request.method).toBe("POST")
+    expect(new URL(request.url).pathname).toBe("/prompt/revise/cancel")
+    expect(await request.json()).toEqual({ kind: "prompt", key: "session:ses_1", operationID: "op-9" })
+
+    const legacy = setup("v1")
+    expect(await legacy.api.promptRevisor.cancel({ kind: "prompt", key: "session:ses_1" })).toBe(false)
   })
 
   test("round-trips durable revision mailbox recovery and immutable acknowledgement", async () => {

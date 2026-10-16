@@ -3,10 +3,14 @@ import { isSidecarControlFetch, sidecarControlLane } from "./sidecar-control-req
 
 describe("isSidecarControlFetch", () => {
   test("keeps runtime admission out of the urgent control pool", () => {
+    expect(sidecarControlLane("http://127.0.0.1:4096/global/session/ses_1")).toBe("urgent")
     for (const path of ["/api/session", "/session/ses_1/prompt_async", "/api/session/ses_1/prompt", "/session/ses_1/goal/dispatch"])
       expect(sidecarControlLane(`http://127.0.0.1:4096${path}`, { method: "POST" })).toBe("admission")
     for (const path of ["/session", "/global/event/interest", "/session/ses_1/abort", "/permission/per_1/reply", "/question/que_1/reply"])
       expect(sidecarControlLane(`http://127.0.0.1:4096${path}`, { method: "POST" })).toBe("urgent")
+    expect(
+      sidecarControlLane("http://127.0.0.1:4096/permission/auto-accept", { method: "PUT" }),
+    ).toBe("urgent")
     expect(sidecarControlLane("http://127.0.0.1:4096/provider")).toBeUndefined()
   })
   test("classifies only the finite session-control POST routes", () => {
@@ -30,12 +34,19 @@ describe("isSidecarControlFetch", () => {
       expect(isSidecarControlFetch(`http://127.0.0.1:4096${path}`, { method: "POST" })).toBe(true)
     expect(isSidecarControlFetch("http://127.0.0.1:4096/session/ses_1/goal", { method: "PUT" })).toBe(true)
     expect(isSidecarControlFetch("http://127.0.0.1:4096/session/ses_1/goal", { method: "DELETE" })).toBe(true)
+    expect(isSidecarControlFetch("http://127.0.0.1:4096/permission/auto-accept", { method: "PUT" })).toBe(true)
     expect(isSidecarControlFetch("http://127.0.0.1:4096/session/ses_1/goal", { method: "POST" })).toBe(false)
+    expect(isSidecarControlFetch("http://127.0.0.1:4096/permission/auto-accept", { method: "POST" })).toBe(false)
+    expect(isSidecarControlFetch("http://127.0.0.1:4096/permission/auto-accept-extra", { method: "PUT" })).toBe(false)
   })
 
   test("does not classify reads, catalog traffic, lookalike paths, or other methods", () => {
     for (const [path, method] of [
       ["/session/ses_1/message", "GET"],
+      ["/global/session/roots", "GET"],
+      ["/global/session/telemetry", "GET"],
+      ["/global/session/ses_1/message", "GET"],
+      ["/global/session/ses_1", "POST"],
       ["/session/ses_1/message", "POST"],
       ["/session/ses_1/command", "POST"],
       ["/session/ses_1/children", "POST"],

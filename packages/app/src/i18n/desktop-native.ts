@@ -103,7 +103,14 @@ export const DESKTOP_NATIVE_ENGLISH = {
     "OpenFork detected that the local runtime stopped responding. Diagnostics are available while OpenFork waits for recovery.",
   "desktop.sidecar.recovered.title": "Local server recovered",
   "desktop.sidecar.recovered.description": "The local runtime is responding again.",
+  "desktop.sidecar.stopped.title": "Local server stopped",
+  "desktop.sidecar.stopped.description":
+    "The local runtime exited. Relaunch OpenFork to restore local sessions and sending.",
   "desktop.oxp.tray.open": "Open OpenFork",
+  "desktop.oxp.tunnel.serviceUnavailable":
+    "OpenAI's tunnel service is temporarily unavailable. Last verified handshake {{handshake}}. The tunnel keeps retrying automatically.",
+  "desktop.oxp.tunnel.rateLimited":
+    "OpenAI's tunnel service is rate limiting requests. Last verified handshake {{handshake}}. The tunnel keeps retrying automatically.",
   "desktop.oxp.tray.quit": "Quit OpenFork",
   "desktop.oxp.dialog.chooseFolder": "Choose an approved OXP folder",
   "desktop.oxp.dialog.importLocalMcp": "Choose localMCP-chat.json",

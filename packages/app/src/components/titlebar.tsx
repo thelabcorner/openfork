@@ -37,7 +37,7 @@ import { useGlobal } from "@/context/global"
 import { ServerConnection, useServer } from "@/context/server"
 import { tabKey, useTabs } from "@/context/tabs"
 import type { PromptSession } from "@/context/prompt"
-import { isAppTabPage } from "@/context/app-tabs"
+import { appTabKey, isAppTabPage } from "@/context/app-tabs"
 import "./titlebar.css"
 import { newTabTooltipKeybind } from "./command-tooltip-keybind"
 import { normalizeSessionInfo } from "@/utils/session"
@@ -251,6 +251,11 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
             const matchRoute = (route: LayoutRoute | undefined) => {
               if (!route) return
               if (route.type === "home") return
+              if (route.type === "oxp") {
+                const href = route.activityID ? `/oxp/activity/${encodeURIComponent(route.activityID)}` : "/oxp"
+                const key = appTabKey("oxp", href)
+                return tabsStore.find((item) => item.type === "app" && tabKey(item) === key)
+              }
               if (isAppTabPage(route.type)) {
                 return tabsStore.find((item) => item.type === "app" && item.page === route.type)
               }

@@ -100,11 +100,17 @@ export function ContextPanel(props: {
           >
             <Show when={visited.context} fallback={<TabFallback />}>
               <ErrorBoundary
-                fallback={(error) => (
-                  <div class="flex h-full flex-col items-center justify-center gap-1 px-3 text-center">
-                    <span class="text-[10px] font-[600] uppercase leading-3 text-v2-state-fg-danger">{String(error)}</span>
-                  </div>
-                )}
+                fallback={(error) => {
+                  console.error(
+                    "[context-panel] context tab render error",
+                    error instanceof Error ? error.stack ?? error.message : String(error),
+                  )
+                  return (
+                    <div class="flex h-full flex-col items-center justify-center gap-1 px-3 text-center">
+                      <span class="text-[10px] font-[600] uppercase leading-3 text-v2-state-fg-danger">{String(error)}</span>
+                    </div>
+                  )
+                }}
               >
                 <Suspense fallback={<TabFallback />}>
                   <SessionContextTab active={contextActive} />
@@ -119,11 +125,17 @@ export function ContextPanel(props: {
           >
             <Show when={visited.limits} fallback={<TabFallback />}>
               <ErrorBoundary
-                fallback={(error) => (
-                  <div class="flex h-full flex-col items-center justify-center gap-1 px-3 text-center">
-                    <span class="text-[10px] font-[600] uppercase leading-3 text-v2-state-fg-danger">{String(error)}</span>
-                  </div>
-                )}
+                fallback={(error) => {
+                  console.error(
+                    "[context-panel] limits tab render error",
+                    error instanceof Error ? error.stack ?? error.message : String(error),
+                  )
+                  return (
+                    <div class="flex h-full flex-col items-center justify-center gap-1 px-3 text-center">
+                      <span class="text-[10px] font-[600] uppercase leading-3 text-v2-state-fg-danger">{String(error)}</span>
+                    </div>
+                  )
+                }}
               >
                 <Suspense fallback={<TabFallback />}>
                   <LimitsPanelContent active={limitsActive} />

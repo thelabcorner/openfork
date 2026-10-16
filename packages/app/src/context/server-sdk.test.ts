@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  adaptLegacySessionEvent,
   adaptServerEvent,
   coalesceServerEvents,
   createServerEventQueue,
@@ -9,11 +10,13 @@ import {
   resumeStreamAfterPageShow,
   shouldDispatchSessionStreamFrame,
   streamContentSessionsForVisibility,
+  repairActiveSessionContentAfterGap,
   streamInterestUpdatePriority,
 } from "./server-sdk"
 import type { OpenCodeEvent } from "@opencode-ai/client/promise"
 import type { SessionMessageInfo } from "@/utils/session-message-info"
 import type { Event } from "@opencode-ai/sdk/v2/client"
+import type * as SessionEvent from "@opencode-ai/schema/session-event"
 import { createV2SessionReducer } from "./server-session-v2-reducer"
 
 describe("resumeStreamAfterPageShow", () => {
@@ -36,10 +39,29 @@ describe("streamContentSessionsForVisibility", () => {
   })
 })
 
+describe("repairActiveSessionContentAfterGap", () => {
+  test("repairs only the sessions advertised to the live content stream", () => {
+    const repaired: Array<{ sessionID: string; repair: boolean }> = []
+    const active = new Set(["ses_visible_a", "ses_visible_b"])
+
+    repairActiveSessionContentAfterGap(active, (sessionID, repair) => repaired.push({ sessionID, repair }))
+
+    expect(repaired).toEqual([
+      { sessionID: "ses_visible_a", repair: true },
+      { sessionID: "ses_visible_b", repair: true },
+    ])
+  })
+
+  test("does not invent repairs when no content owner is registered", () => {
+    const active = new Set(["ses_visible"])
+    expect(() => repairActiveSessionContentAfterGap(active, undefined)).not.toThrow()
+  })
+})
+
 describe("streamInterestUpdatePriority", () => {
-  test("reserves critical admission for activation and interest release", () => {
-    expect(streamInterestUpdatePriority(["ses_visible"])).toBe("critical")
-    expect(streamInterestUpdatePriority([])).toBe("critical")
+  test("uses independent control admission for activation and interest release", () => {
+    expect(streamInterestUpdatePriority(["ses_visible"])).toBe("control")
+    expect(streamInterestUpdatePriority([])).toBe("control")
   })
 })
 
@@ -87,6 +109,72 @@ describe("adaptServerEvent", () => {
       properties: { id: "perm_1", sessionID: "ses_1", permission: "read", patterns: ["src/**"] },
       current,
     })
+  })
+
+  test("keeps V1 part deltas legacy-only while native stream deltas retain their current envelope", () => {
+    const legacy = adaptLegacySessionEvent({
+      id: "evt_v1_delta",
+      type: "message.part.delta",
+      properties: { sessionID: "ses_1", messageID: "msg_1", partID: "prt_1", field: "text", delta: "x" },
+    } as Event)
+    const native = adaptServerEvent({
+      id: "evt_native_delta",
+      created: 1,
+      type: "session.text.delta",
+      data: { sessionID: "ses_1", assistantMessageID: "msg_1", ordinal: 0, delta: "x" },
+    } as unknown as OpenCodeEvent)
+
+    expect(legacy.type).toBe("message.part.delta")
+    expect(legacy.current).toBeUndefined()
+    expect(native.type as string).toBe("session.text.delta")
+    expect((native.current as { type?: string } | undefined)?.type).toBe("session.text.delta")
+  })
+
+  test("restores native session.next events from the legacy envelope without changing provenance", () => {
+    const reducer = createV2SessionReducer()
+    const prompted = adaptLegacySessionEvent({
+      id: "evt_prompted",
+      type: "session.next.prompted",
+      properties: {
+        sessionID: "ses_1",
+        messageID: "msg_user",
+        timestamp: 10,
+        prompt: { text: "start work" },
+        delivery: "steer",
+        provenance: { owner: "user", source: "user.prompt" },
+      },
+    } as Event)
+    const synthetic = adaptLegacySessionEvent({
+      id: "evt_synthetic",
+      type: "session.next.synthetic",
+      properties: {
+        sessionID: "ses_1",
+        messageID: "msg_host",
+        timestamp: 11,
+        text: "continue the goal",
+        provenance: { owner: "host", source: "goal.continuation" },
+      },
+    } as Event)
+
+    expect(prompted.current?.type).toBe("session.next.prompted")
+    expect(synthetic.current?.type).toBe("session.next.synthetic")
+    const first = reducer.reduce([], prompted.current as typeof SessionEvent.All.Encoded)
+    const next = reducer.reduce(
+      first?.kind === "messages" ? first.messages : [],
+      synthetic.current as typeof SessionEvent.All.Encoded,
+    )
+
+    expect(next?.kind).toBe("messages")
+    if (next?.kind !== "messages") return
+    expect(
+      next.messages.map((item) => ({
+        type: item.type,
+        provenance: item.type === "user" || item.type === "synthetic" ? item.provenance : undefined,
+      })),
+    ).toEqual([
+      { type: "user", provenance: { owner: "user", source: "user.prompt" } },
+      { type: "synthetic", provenance: { owner: "host", source: "goal.continuation" } },
+    ])
   })
 })
 

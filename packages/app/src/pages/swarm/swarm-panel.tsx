@@ -338,7 +338,6 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
 
   const [configMemberID, setConfigMemberID] = createSignal<string>()
   const [config, setConfig] = createStore({
-    agent: "",
     providerID: "",
     modelID: "",
     accountID: undefined as string | undefined,
@@ -353,7 +352,6 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
     const profile = member.desiredProfile
     if (!profile) return
     setConfig({
-      agent: profile.agent,
       providerID: profile.model.providerID,
       modelID: profile.model.id,
       accountID: profile.model.accountID,
@@ -391,7 +389,7 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
         ? { mode: "worktree", ...(config.baseRef.trim() ? { baseRef: config.baseRef.trim() } : {}) }
         : { mode: config.workspaceMode }
     const desiredProfile: SwarmMemberExecutionProfile = {
-      agent: config.agent.trim(),
+      agent: "swarm-m",
       model: {
         providerID: config.providerID.trim(),
         id: config.modelID.trim(),
@@ -423,7 +421,6 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
   const [newMember, setNewMember] = createStore({
     name: "",
     role: "",
-    agent: "build",
     providerID: "",
     modelID: "",
     workspaceMode: "shared-read" as "shared-read" | "shared-write" | "worktree",
@@ -437,7 +434,7 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
           name: newMember.name.trim(),
           role: newMember.role.trim(),
           desiredProfile: {
-            agent: newMember.agent.trim() || "build",
+            agent: "swarm-m",
             model: { providerID: newMember.providerID.trim(), id: newMember.modelID.trim() },
             permissionBoundary: [],
           },
@@ -445,7 +442,7 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
         },
         { throwOnError: true },
       )
-      setNewMember({ name: "", role: "", agent: "build", providerID: "", modelID: "", workspaceMode: "shared-read" })
+      setNewMember({ name: "", role: "", providerID: "", modelID: "", workspaceMode: "shared-read" })
       setAddingMember(false)
     })
   }
@@ -644,7 +641,10 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
                   <div class="grid grid-cols-2 gap-2">
                     <Field label={language.t("swarm.panel.memberName")} value={newMember.name} onInput={(value) => setNewMember("name", value)} />
                     <Field label={language.t("swarm.panel.memberRole")} value={newMember.role} onInput={(value) => setNewMember("role", value)} />
-                    <Field label={language.t("swarm.panel.agent")} value={newMember.agent} onInput={(value) => setNewMember("agent", value)} />
+                    <div class="flex flex-col gap-1">
+                      <span class="text-[9px] font-[550] uppercase tracking-[0.05em] text-v2-text-text-faint">{language.t("swarm.panel.agent")}</span>
+                      <span class="panel-input text-v2-text-text-muted">swarm-m</span>
+                    </div>
                     <Field label={language.t("swarm.panel.provider")} value={newMember.providerID} onInput={(value) => setNewMember("providerID", value)} />
                     <Field label={language.t("swarm.panel.model")} value={newMember.modelID} onInput={(value) => setNewMember("modelID", value)} />
                     <label class="flex flex-col gap-1">
@@ -668,6 +668,11 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
                   <For each={detail()?.members ?? []}>
                     {(member) => {
                       const telemetry = () => member.sessionID ? serverSync().telemetry.get(member.sessionID) : undefined
+                      // Telemetry can retain 'generating' after a crash. A
+                      // pulsing worker indicator requires the server's live
+                      // execution projection, never a stale provider phase.
+                      const provenWorking = () => !!member.sessionID &&
+                        serverSync().session.data.session_working(member.sessionID)
                       const currentModel = () => telemetry()?.model ?? telemetry()?.context?.model
                       const permissionCount = () => member.sessionID ? (serverSync().session.data.permission[member.sessionID]?.length ?? 0) : 0
                       const questionCount = () => member.sessionID ? (serverSync().session.data.question[member.sessionID]?.length ?? 0) : 0
@@ -675,7 +680,7 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
                       return (
                         <div class="rounded-lg border border-v2-border-border-base/70 bg-v2-background-bg-layer-01 p-2">
                           <div class="flex items-start gap-2">
-                            <div class="mt-1 size-2 shrink-0 rounded-full bg-v2-icon-icon-muted" classList={{ "animate-pulse bg-v2-state-fg-success": telemetry()?.phase !== undefined && telemetry()?.phase !== "idle" }} />
+                             <div class="mt-1 size-2 shrink-0 rounded-full bg-v2-icon-icon-muted" classList={{ "animate-pulse bg-v2-state-fg-success": provenWorking() }} />
                             <div class="min-w-0 flex-1">
                               <div class="flex items-center gap-1.5">
                                 <span class="truncate text-[11px] font-[600] text-v2-text-text-base">{member.name}</span>
@@ -684,7 +689,7 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
                               <div class="mt-0.5 truncate text-[10px] text-v2-text-text-muted">{member.role}</div>
                               <div class="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[9px] text-v2-text-text-faint">
                                 <span>{memberLifecycle(member.lifecycle)}</span>
-                                <span>{telemetryPhase(telemetry()?.phase)}</span>
+                                 <span>{telemetryPhase(provenWorking() ? telemetry()?.phase : undefined)}</span>
                                 <Show when={member.desiredProfile}><span>{language.t("swarm.panel.desiredModel")}: {member.desiredProfile!.model.providerID}/{member.desiredProfile!.model.id}</span></Show>
                                 <Show when={currentModel()}>{(model) => <span>{language.t("swarm.panel.currentSessionModel")}: {model().providerID}/{model().modelID}</span>}</Show>
                                 <Show when={permissionCount() > 0}><span>{language.t("swarm.panel.permissions")}: {permissionCount()}</span></Show>
@@ -708,7 +713,10 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
                             <div class="mt-2 border-t border-v2-border-border-muted/50 pt-2">
                               <p class="mb-2 text-[9px] leading-relaxed text-v2-text-text-faint">{language.t("swarm.panel.profileStoppedHint")}</p>
                               <div class="grid grid-cols-2 gap-2">
-                                <Field label={language.t("swarm.panel.agent")} value={config.agent} onInput={(value) => setConfig("agent", value)} />
+                                <div class="flex flex-col gap-1">
+                                  <span class="text-[9px] font-[550] uppercase tracking-[0.05em] text-v2-text-text-faint">{language.t("swarm.panel.agent")}</span>
+                                  <span class="panel-input text-v2-text-text-muted">swarm-m</span>
+                                </div>
                                 <label class="flex flex-col gap-1">
                                   <span class="text-[9px] font-[550] uppercase tracking-[0.05em] text-v2-text-text-faint">{language.t("swarm.panel.model")}</span>
                                   <select

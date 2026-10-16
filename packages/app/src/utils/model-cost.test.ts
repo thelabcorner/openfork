@@ -5,6 +5,7 @@ import {
   buildPricingFallbackMap,
   compareByCheapness,
   mergePricingFallbacks,
+  medianCost,
   sortByCheapness,
   type CheapnessModel,
 } from "./model-cost"
@@ -55,6 +56,33 @@ function bruteFuzzy(models: CheapnessModel[], threshold = 0.75) {
 }
 
 describe("model-cost fallback", () => {
+  test("median selection agrees with full numeric sort for odd/even, duplicate and extreme corpora", () => {
+    const reference = (values: number[]) => {
+      if (values.length === 0) return 0
+      const sorted = [...values].sort((a, b) => a - b)
+      const m = sorted.length >> 1
+      return sorted.length % 2 ? sorted[m]! : (sorted[m - 1]! + sorted[m]!) / 2
+    }
+    let state = 0x71e7c0de
+    const next = () => {
+      state ^= state << 13
+      state ^= state >>> 17
+      state ^= state << 5
+      return state >>> 0
+    }
+    for (const count of [0, 1, 2, 3, 4, 15, 16, 17, 63, 64, 65, 100]) {
+      for (let iteration = 0; iteration < 150; iteration++) {
+        const input = Array.from({ length: count }, () => {
+          const bits = next()
+          return bits % 43 === 0 ? Number.POSITIVE_INFINITY : bits % 23 === 0 ? 0 : (bits % 101) / 17
+        })
+        expect(medianCost(input.slice())).toBe(reference(input))
+      }
+    }
+    expect(medianCost([Number.NaN, 2, 10])).toBe(reference([Number.NaN, 2, 10]))
+    expect(medianCost([Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY])).toBe(Number.POSITIVE_INFINITY)
+  })
+
   test("legacy pricing without a cache object stays rankable", () => {
     const legacy = {
       id: "legacy",
@@ -73,6 +101,28 @@ describe("model-cost fallback", () => {
     expect(compareByCheapness(legacy as never, expensive as never)).toBeLessThan(0)
   })
 
+  test("legacy native context tiers use input prices when a cache discount is missing", () => {
+    const legacy = {
+      id: "legacy-tier",
+      name: "Legacy Tier",
+      provider: { id: "vendor" },
+      cost: {
+        input: 2,
+        output: 4,
+        tiers: [{ tier: { type: "context" as const, size: 32_000 }, input: 3, output: 6 }],
+        experimentalOver200K: { input: 5, output: 10 },
+      },
+    }
+    const baseline = {
+      id: "expensive",
+      name: "Expensive",
+      provider: { id: "vendor" },
+      cost: { input: 100, output: 200 },
+    }
+    expect(() => sortByCheapness([legacy, baseline] as never)).not.toThrow()
+    expect(sortByCheapness([legacy, baseline] as never)[0]?.id).toBe("legacy-tier")
+  })
+
   test("pricing fallback prefers non-openrouter and shares across providers", () => {
     const models = [
       { id: "claude-sonnet", name: "Claude Sonnet", provider: { id: "anthropic" }, cost: { input: 3, output: 15, cache: { read: 0.3, write: 0 } } },
@@ -89,6 +139,50 @@ describe("model-cost fallback", () => {
     expect(compareByCheapness(a as never, b as never)).toBeGreaterThan(0)
     // With fallback, a should be considered priced and outrank expensive
     expect(compareByCheapness(a as never, b as never, undefined, undefined, undefined, map as never)).toBeLessThan(0)
+  })
+
+  test("merged fuzzy preparation skips exact-covered IDs without losing any inferred price", () => {
+    const models: CheapnessModel[] = [
+      { id: "same-id", name: "Orion", provider: { id: "vendor" }, cost: published(3) },
+      { id: "same-id", name: "Orion (Free)", provider: { id: "openrouter" }, cost: unpriced() },
+      { id: "fuzzy-donor", name: "Atlas", provider: { id: "vendor" }, cost: published(5) },
+      { id: "atlas:free", name: "Atlas (Free)", provider: { id: "openrouter" }, cost: unpriced() },
+    ]
+    const exact = buildPricingFallbackMap(models)
+    const complete = mergePricingFallbacks(exact, buildFuzzyPricingFallbackMap(models))
+    const selective = mergePricingFallbacks(exact, buildFuzzyPricingFallbackMap(models, 0.75, exact))
+    expect([...selective!.entries()]).toEqual([...complete!.entries()])
+    expect(selective?.get("same-id")?.input).toBe(3)
+    expect(selective?.get("atlas:free")?.input).toBe(5)
+    expect(buildFuzzyPricingFallbackMap(models).has("same-id")).toBe(true)
+    expect(buildFuzzyPricingFallbackMap(models, 0.75, exact).has("same-id")).toBe(false)
+  })
+
+  test("exact-covered pruning preserves the full merged result on randomized provider replicas", () => {
+    let seed = 0xabcdef01
+    const random = () => {
+      seed ^= seed << 13
+      seed ^= seed >>> 17
+      seed ^= seed << 5
+      return seed >>> 0
+    }
+    for (let trial = 0; trial < 48; trial++) {
+      const entries: CheapnessModel[] = []
+      for (let i = 0; i < 140; i++) {
+        const group = random() % 45
+        const suffix = random() % 4
+        entries.push({
+          id: `candidate-${group}`,
+          name: `Catalog ${group} ${suffix === 0 ? "Pro" : suffix === 1 ? "Preview" : "Free"}`,
+          provider: { id: random() % 3 === 0 ? "openrouter" : "vendor" },
+          cost: random() % 3 === 0 ? published(1 + (random() % 7)) : unpriced(),
+        })
+      }
+      const exact = buildPricingFallbackMap(entries)
+      const all = mergePricingFallbacks(exact, buildFuzzyPricingFallbackMap(entries))
+      const pruned = mergePricingFallbacks(exact, buildFuzzyPricingFallbackMap(entries, 0.75, exact))
+      expect([...pruned?.entries() ?? []]).toEqual([...all?.entries() ?? []])
+    }
   })
 
   test("personal fallback shares usage across providers for same model", () => {
@@ -180,5 +274,63 @@ describe("model-cost fallback", () => {
     const expected = bruteFuzzy(models)
     const actual = buildFuzzyPricingFallbackMap(models)
     expect([...actual.entries()]).toEqual([...expected.entries()])
+  })
+
+  test("inverted-overlap fuzzy matching preserves exhaustive scores and donor ties across thresholds", () => {
+    let seed = 0x31415926
+    const random = () => {
+      seed ^= seed << 13
+      seed ^= seed >>> 17
+      seed ^= seed << 5
+      return seed >>> 0
+    }
+    const alphabet = ["Alpha", "Alph", "Alpha-", "Atlas", "Atlass", "Beta", "Bett", "Gamma", "Gama", "X", "Y"]
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const models: CheapnessModel[] = []
+      for (let i = 0; i < 110; i++) {
+        const marker = random() % 14
+        const prefix = alphabet[random() % alphabet.length]!
+        const name = `${prefix}${marker}${random() % 4 ? " Pro" : " Preview"}`
+        const isPaid = random() % 3 === 0
+        models.push({
+          id: `sample-${attempt}-${i}`,
+          name,
+          provider: { id: random() % 3 === 0 ? "openrouter" : "vendor" },
+          cost: isPaid ? published(1 + (random() % 8)) : unpriced(),
+        })
+      }
+      for (const threshold of [0, 0.25, 0.5, 0.75, 0.9, 1, 1.25]) {
+        const actual = buildFuzzyPricingFallbackMap(models, threshold)
+        const expected = bruteFuzzy(models, threshold)
+        expect([...actual.entries()]).toEqual([...expected.entries()])
+      }
+    }
+  })
+
+  test("perfect-name fast path preserves Dice-anagram and provider-preference tie breaking", () => {
+    const openingDonor: CheapnessModel = {
+      id: "first-anagram",
+      name: "Babab",
+      provider: { id: "openrouter" },
+      cost: published(3),
+    }
+    const exactDonor: CheapnessModel = {
+      id: "exact",
+      name: "Ababa",
+      provider: { id: "vendor" },
+      cost: published(5),
+    }
+    const free: CheapnessModel = {
+      id: "free-variant",
+      name: "Ababa (Free)",
+      provider: { id: "openrouter" },
+      cost: unpriced(),
+    }
+    expect(buildFuzzyPricingFallbackMap([openingDonor, exactDonor, free]).get(free.id)?.donorId).toBe("exact")
+    const sameProvider = { ...openingDonor, provider: { id: "vendor" } }
+    expect(buildFuzzyPricingFallbackMap([sameProvider, exactDonor, free]).get(free.id)?.donorId).toBe(
+      "first-anagram",
+    )
+    expect(buildFuzzyPricingFallbackMap([openingDonor, free]).get(free.id)?.donorId).toBe("first-anagram")
   })
 })

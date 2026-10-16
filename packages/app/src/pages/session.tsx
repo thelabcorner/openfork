@@ -41,6 +41,7 @@ import { createAutoScroll } from "@opencode-ai/ui/hooks"
 import { previewSelectedLines } from "@opencode-ai/session-ui/pierre/selection-bridge"
 import { FileSearchBar } from "@opencode-ai/session-ui/file-search"
 import { showToast } from "@/utils/toast"
+import { stopSession } from "@/utils/session-stop"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { useLocation, useNavigate, useParams, useSearchParams, type RouteSectionProps } from "@solidjs/router"
 import { NewSessionView, SessionHeader } from "@/components/session"
@@ -49,7 +50,12 @@ import { CommentsProvider, useComments } from "@/context/comments"
 import { useCommand } from "@/context/command"
 import { DirectoryDataProvider } from "@/pages/directory-layout"
 import { useServerSync } from "@/context/server-sync"
-import { basename, isAbbreviatedPath, pathCandidates, setMarkdownPathResolver } from "@/components/markdown-path-resolve"
+import {
+  basename,
+  isAbbreviatedPath,
+  pathCandidates,
+  setMarkdownPathResolver,
+} from "@/components/markdown-path-resolve"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
 import { ModelsProvider } from "@/context/models"
@@ -80,13 +86,16 @@ import {
 } from "@/pages/session/composer"
 import { createSessionTabs, createSizing, shouldShowFileTree, createSwitchGate } from "@/pages/session/helpers"
 import { safeQueryData } from "@/utils/safe-query-data"
+import { isReadOnlyChild } from "@/pages/session/composer/human-interjection"
 import { createSessionVcsRefreshController } from "@/pages/session/session-vcs-refresh"
-import { pathKey } from "@/utils/path-key"
+import { isAbsoluteWorkspaceDirectory, pathKey } from "@/utils/path-key"
 import { MessageTimeline } from "@/pages/session/timeline/message-timeline"
 import { createTimelineModel } from "@/pages/session/timeline/model"
+import { initialTimelineHydration } from "@/pages/session/timeline/initial-hydration"
 import { createSessionFindBarPosition, createSessionFindMatcher } from "@/pages/session/session-find"
 import "@/pages/session/session-find.css"
 import { createSessionTextHighlighter } from "@/pages/session/session-text-highlighter"
+import { sessionStatusIsWorking } from "@/utils/session-status"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { restorePromptModel, syncPromptModel, syncSessionModel } from "@/pages/session/session-model-helpers"
 import {
@@ -385,7 +394,16 @@ function ResolvedTargetSessionRoute(props: { variant?: SessionPageVariant; suppr
     // on same-workspace session-id switches). Warm targets resolve sync from
     // cache → instant keep-alive. See TargetSessionPage workspace key + now
     // workspaceKey()-keyed panel shell (no remount of composer/panels on id change).
-    <Show when={directory()} fallback={<SessionLoadingFallback language={language} sessionID={params.id} />}>
+    <Show
+      when={directory() && isAbsoluteWorkspaceDirectory(directory())}
+      fallback={
+        directory() ? (
+          <ErrorPage error={new Error("Session metadata has no explicit absolute workspace directory")} />
+        ) : (
+          <SessionLoadingFallback language={language} sessionID={params.id} />
+        )
+      }
+    >
       <SDKProvider directory={targetDirectory}>
         <DirectoryDataProvider directory={targetDirectory} server={serverKey}>
           <TargetSessionPage variant={props.variant} suppressMobileTabs={props.suppressMobileTabs} />
@@ -402,9 +420,7 @@ function SessionLoadingFallback(props: { language: ReturnType<typeof useLanguage
         <Spinner class="size-8" style={{ color: "var(--icon-weak)" }} />
         <div class="flex flex-col items-center gap-1 max-w-md">
           <div class="text-14-medium text-text-weak">{props.language.t("session.loading")}</div>
-          <div class="text-12-regular text-text-faint">
-            {props.language.t("session.loading.description")}
-          </div>
+          <div class="text-12-regular text-text-faint">{props.language.t("session.loading.description")}</div>
         </div>
       </div>
     </div>
@@ -422,11 +438,15 @@ function TargetSessionPage(props: { variant?: SessionPageVariant; suppressMobile
   const sdk = useSDK()
   const serverSDK = useServerSDK()
   return (
-    <Show when={`${serverSDK().scope}\0${pathKey(sdk().directory)}`} keyed fallback={
-      <div class="flex-1 min-h-0 overflow-hidden flex items-center justify-center p-6">
-        <Spinner class="size-6" style={{ color: "var(--icon-weak)" }} />
-      </div>
-    }>
+    <Show
+      when={`${serverSDK().scope}\0${pathKey(sdk().directory)}`}
+      keyed
+      fallback={
+        <div class="flex-1 min-h-0 overflow-hidden flex items-center justify-center p-6">
+          <Spinner class="size-6" style={{ color: "var(--icon-weak)" }} />
+        </div>
+      }
+    >
       <SessionPage variant={props.variant} suppressMobileTabs={props.suppressMobileTabs} />
     </Show>
   )
@@ -673,10 +693,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   const desktopSidePanelOpen = createMemo(() => desktopSessionResizeOpen() || desktopFileTreeOpen())
   const desktopSessionSiblingOpen = createMemo(
     () =>
-      desktopSidePanelOpen() ||
-      desktopProjectExplorerOpen() ||
-      desktopContextPanelOpen() ||
-      desktopModelsPanelOpen(),
+      desktopSidePanelOpen() || desktopProjectExplorerOpen() || desktopContextPanelOpen() || desktopModelsPanelOpen(),
   )
   const sessionPanelGapCount = createMemo(
     () =>
@@ -780,7 +797,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       context: desktopContextPanelOpen(),
       usage: false,
       models: desktopModelsPanelOpen(),
-        limits: false,
+      limits: false,
     }),
   )
 
@@ -928,7 +945,8 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   }
 
   const info = createMemo(() => (params.id ? sync().session.get(params.id) : undefined))
-  const isChildSession = createMemo(() => !!info()?.parentID)
+  const readOnlyChild = createMemo(() => isReadOnlyChild(info()))
+  const humanInterjection = createMemo(() => info()?.humanInterjection === true)
   const tabState = createSessionTabs({
     tabs,
     pathFromTab: file.pathFromTab,
@@ -946,21 +964,30 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   const userMessages = timeline.userMessages
   const visibleUserMessages = timeline.visibleUserMessages
 
-  // A session with no cached data yet renders zero timeline rows until the first fetch
-  // resolves -- the panel sits blank, then the whole timeline pops in at once, which reads
-  // as a flash. A hot session (already cached) has messagesReady() true immediately, so
-  // this never engages for it. For a genuinely cold one, debounce BEFORE showing the
-  // indicator (not after) so loads that resolve inside the window never show it either --
-  // only a load slow enough to actually need one gets a smooth "loading" state instead of
-  // sitting blank.
+  // The centered loader is ONLY for the first cold hydration of a session.
+  // Refresh, pagination, stream repair and temporary cache misses do not
+  // resurrect it once a session has ever produced paintable content. The gate
+  // survives route/panel remounts and includes server scope in its identity.
+  const initialTimelineLoadingEligible = createMemo(() =>
+    initialTimelineHydration.eligible(
+      params.id ? `${serverSDK().scope}\0${params.id}` : undefined,
+      messagesReady(),
+      messages().length > 0,
+    ),
+  )
   const [showTimelineLoading, setShowTimelineLoading] = createSignal(false)
   createEffect(() => {
     const id = params.id
-    if (!id || messagesReady()) {
+    const eligible = initialTimelineLoadingEligible()
+    if (!id || !eligible) {
       setShowTimelineLoading(false)
       return
     }
-    const timer = window.setTimeout(() => setShowTimelineLoading(true), 150)
+    // Fast initial hydration never shows an indicator. Recheck eligibility
+    // when the timer fires: its session may have become paintable meanwhile.
+    const timer = window.setTimeout(() => {
+      if (params.id === id && initialTimelineLoadingEligible()) setShowTimelineLoading(true)
+    }, 150)
     onCleanup(() => window.clearTimeout(timer))
   })
 
@@ -1056,9 +1083,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   // separately-gated git-status store; this accessor is intentionally limited
   // to surfaces that actually render `vcsDiffs()`.
   const vcsConsumerVisible = createMemo(
-    () =>
-      wantsVcs() &&
-      (mobileChanges() || (desktopFileTreeOpen() && layout.fileTree.tab() === "changes")),
+    () => wantsVcs() && (mobileChanges() || (desktopFileTreeOpen() && layout.fileTree.tab() === "changes")),
   )
   const vcsKey = createMemo(
     () =>
@@ -1070,7 +1095,10 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   // that a static placeholder can never observe.
   const vcsQuery = createQuery(() => ({
     queryKey: [...vcsKey(), "git"] as const,
-    queryFn: () => sdk().api.vcs.diff({ location: { directory: sdk().directory }, mode: "working" }).then((r) => r.data),
+    queryFn: () =>
+      sdk()
+        .api.vcs.diff({ location: { directory: sdk().directory }, mode: "working" })
+        .then((r) => r.data),
     enabled: false,
     staleTime: 0,
   }))
@@ -1082,15 +1110,16 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       const directory = sdk().directory
       return queryClient.fetchQuery({
         queryKey: [...key, "git"] as const,
-        queryFn: () => sdk().api.vcs.diff({ location: { directory }, mode: "working" }).then((r) => r.data),
+        queryFn: () =>
+          sdk()
+            .api.vcs.diff({ location: { directory }, mode: "working" })
+            .then((r) => r.data),
         staleTime: 0,
       })
     },
   })
   const invalidateVcs = () => vcsRefresh.invalidate()
-  createEffect(
-    on(vcsConsumerVisible, () => vcsRefresh.visibleChanged()),
-  )
+  createEffect(on(vcsConsumerVisible, () => vcsRefresh.visibleChanged()))
   createEffect(
     on(
       vcsKey,
@@ -1358,16 +1387,18 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
         todoFrame = undefined
         todoTimer = undefined
         if (!id) return
-        if (status === "idle" && !blocked) return
-        const cached = untrack(() => sync().data.todo[id] !== undefined)
-
+        if (!sessionStatusIsWorking(status) && !blocked) return
         todoFrame = requestAnimationFrame(() => {
           todoFrame = undefined
           todoTimer = window.setTimeout(() => {
             todoTimer = undefined
             if (sdk().directory !== dir || params.id !== id) return
             untrack(() => {
-              void sync().session.todo(id, cached ? { force: true } : undefined)
+              // The Todo owner emits the complete `todo.updated` snapshot.
+              // Hydrate only when this session has no projection yet; forcing a
+              // read on every running/idle transition added one DB request per
+              // model turn without improving the event-updated state.
+              void sync().session.todo(id)
             })
           }, 0)
         })
@@ -1520,7 +1551,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
     }
 
     if (event.key.length === 1 && event.key !== "Unidentified" && !(event.ctrlKey || event.metaKey)) {
-      if (composer.blocked() || isChildSession()) return
+      if ((composer.blocked() && !humanInterjection()) || readOnlyChild()) return
       const input = inputRef
       if (!input) return
       input.focus()
@@ -1548,7 +1579,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   }
 
   const focusInput = () => {
-    if (isChildSession()) return
+    if (readOnlyChild()) return
     inputRef?.focus()
   }
 
@@ -1557,6 +1588,10 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
     navigateMessageByOffset,
     setActiveMessage,
     focusInput,
+    // Command eligibility consumes the timeline owner's memoized projection;
+    // it must not rescan message history from a separate reactive owner.
+    hasVisibleUserMessage: () => visibleUserMessages().length > 0,
+    userMessages: () => userMessages(),
     fileBrowser: () => newSessionDesign() && isDesktop() && !!params.id,
     find: {
       open: () => {
@@ -1630,6 +1665,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
     working: () => true,
     overflowAnchor: "none",
     scrollOwner: "external",
+    hasScrollGesture,
   })
   createEffect(
     on(
@@ -1893,6 +1929,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
         sync: sync(),
         serverSync: serverSync(),
         draft: item,
+        isCurrent: () => owner.current(),
         optimisticBusy: item.sessionDirectory === sdk().directory,
         prepare: async (next) => {
           if (!next.goal) return
@@ -1925,7 +1962,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   const queueEnabled = createMemo(() => {
     const id = params.id
     if (!id) return false
-    return settings.general.followup() === "queue" && busy(id) && !composer.blocked() && !isChildSession()
+    return settings.general.followup() === "queue" && busy(id) && !composer.blocked() && !readOnlyChild()
   })
 
   const followupText = (item: FollowupDraft) => {
@@ -1957,7 +1994,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   const followupDock = createMemo(() => queuedFollowups().map((item) => ({ id: item.id, text: followupText(item) })))
 
   const sendFollowup = (sessionID: string, id: string, opts?: { manual?: boolean }) => {
-    if (sync().session.get(sessionID)?.parentID) return Promise.resolve()
+    if (isReadOnlyChild(sync().session.get(sessionID))) return Promise.resolve()
     const item = (followup.items[sessionID] ?? []).find((entry) => entry.id === id)
     if (!item) return Promise.resolve()
     if (followupBusy(sessionID)) return Promise.resolve()
@@ -1989,8 +2026,8 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   }
 
   const halt = (sessionID: string) =>
-    busy(sessionID)
-      ? sdk().api.session.interrupt({ sessionID })
+    busy(sessionID) || sync().data.session_status[sessionID]?.type === "interrupted"
+      ? stopSession(sdk().api.session, sessionID)
       : Promise.resolve()
 
   const revertMutation = useMutation(() => ({
@@ -2104,22 +2141,36 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       const client = sdk().client as unknown as {
         session: { fork: (p: Record<string, unknown>) => Promise<{ data: { id: string } } | { id: string }> }
       }
-      const forked = await client.session.fork({ sessionID: input.sessionID, messageID: input.messageID, edge, kind: "manual" })
+      const forked = await client.session.fork({
+        sessionID: input.sessionID,
+        messageID: input.messageID,
+        edge,
+        kind: "manual",
+      })
       const raw = forked as unknown as { data?: { id: string }; id?: string }
       const id = raw.data?.id ?? raw.id
       if (!id) throw new Error("fork did not return id")
       prompt.set(restored as never, undefined, { dir, id })
       navigate(`/${dir}/session/${id}`)
     } catch (err) {
-      showToast({ title: language.t("common.requestFailed"), description: err instanceof Error ? err.message : String(err), variant: "error" })
+      showToast({
+        title: language.t("common.requestFailed"),
+        description: err instanceof Error ? err.message : String(err),
+        variant: "error",
+      })
     }
   }
 
   const exclude = async (input: { sessionID: string; messageID: string }) => {
     try {
-      await (sdk().client as unknown as {
-        sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
-      }).sessionContext.applyOps({ sessionID: input.sessionID, operations: [{ type: "message.exclude", messageID: input.messageID }] })
+      await (
+        sdk().client as unknown as {
+          sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
+        }
+      ).sessionContext.applyOps({
+        sessionID: input.sessionID,
+        operations: [{ type: "message.exclude", messageID: input.messageID }],
+      })
       showToast({ title: language.t("context.ledger.removed"), variant: "success" })
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -2131,12 +2182,21 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
 
   const pin = async (input: { sessionID: string; messageID: string }) => {
     try {
-      await (sdk().client as unknown as {
-        sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
-      }).sessionContext.applyOps({ sessionID: input.sessionID, operations: [{ type: "message.pin", messageID: input.messageID }] })
+      await (
+        sdk().client as unknown as {
+          sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
+        }
+      ).sessionContext.applyOps({
+        sessionID: input.sessionID,
+        operations: [{ type: "message.pin", messageID: input.messageID }],
+      })
       showToast({ title: language.t("context.ledger.pinned"), variant: "success" })
     } catch (err) {
-      showToast({ title: language.t("common.requestFailed"), description: err instanceof Error ? err.message : String(err), variant: "error" })
+      showToast({
+        title: language.t("common.requestFailed"),
+        description: err instanceof Error ? err.message : String(err),
+        variant: "error",
+      })
     }
   }
 
@@ -2151,7 +2211,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
     if (followupBusy(sessionID)) return
     if (followup.failed[sessionID] === item.id) return
     if (followup.paused[sessionID]) return
-    if (isChildSession()) return
+    if (readOnlyChild()) return
     if (composer.blocked()) return
     if (busy(sessionID)) return
 
@@ -2276,7 +2336,11 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
     <>
       <Show
         when={
-          !isDesktop() && !!params.id && settings.general.newLayoutDesigns() && !mobileTabsBottom() && !props.suppressMobileTabs
+          !isDesktop() &&
+          !!params.id &&
+          settings.general.newLayoutDesigns() &&
+          !mobileTabsBottom() &&
+          !props.suppressMobileTabs
         }
       >
         {mobileTabs(true)}
@@ -2286,9 +2350,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
           <Match when={params.id && mobileChanges()}>
             <div class="relative h-full overflow-hidden">
               <div class="h-full pb-64 -mt-4 flex flex-col items-center justify-center text-center gap-6">
-                <div class="text-14-regular text-text-weak max-w-56">
-                  {language.t("session.changes.noChanges")}
-                </div>
+                <div class="text-14-regular text-text-weak max-w-56">{language.t("session.changes.noChanges")}</div>
               </div>
             </div>
           </Match>
@@ -2300,14 +2362,15 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
                   scroll={ui.scroll}
                   onResumeScroll={resumeScroll}
                   setScrollRef={setScrollRef}
-                   onScheduleScrollState={scheduleScrollState}
-                   onAutoScrollHandleScroll={autoScroll.handleScroll}
-                   onAutoScrollProgrammatic={autoScroll.markProgrammatic}
+                  onScheduleScrollState={scheduleScrollState}
+                  onAutoScrollHandleScroll={autoScroll.handleScroll}
+                  onAutoScrollProgrammatic={autoScroll.markProgrammatic}
                   onMarkScrollGesture={markScrollGesture}
                   hasScrollGesture={hasScrollGesture}
                   onUserScroll={markUserScroll}
                   onHistoryScroll={onHistoryScroll}
                   onAutoScrollInteraction={autoScroll.handleInteraction}
+                  onPauseScrollFollow={autoScroll.pause}
                   shouldAnchorBottom={() =>
                     !location.hash && !store.messageId && !ui.pendingMessage && !autoScroll.userScrolled()
                   }
@@ -2406,7 +2469,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
               onToggle: () => view().todoCollapsed.set(!view().todoCollapsed.get()),
             },
             followup: () =>
-              params.id && !isChildSession()
+              params.id && !readOnlyChild()
                 ? {
                     items: followupDock(),
                     sending: sendingFollowup(),
@@ -2511,9 +2574,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
           )
         }}
       </Show>
-      <Show when={!!params.id && mobileTabsBottom() && !props.suppressMobileTabs}>
-        {mobileTabs(true, true)}
-      </Show>
+      <Show when={!!params.id && mobileTabsBottom() && !props.suppressMobileTabs}>{mobileTabs(true, true)}</Show>
     </>
   )
 
@@ -2646,10 +2707,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
           <Show when={isDesktop() ? desktopV2PanelLayout().visible : terminalOpen()}>
             <Show
               when={
-                (isDesktop() &&
-                  (desktopFileTreeOpen() ||
-                    desktopContextPanelOpen() ||
-                     desktopModelsPanelOpen())) ||
+                (isDesktop() && (desktopFileTreeOpen() || desktopContextPanelOpen() || desktopModelsPanelOpen())) ||
                 terminalOpen()
               }
             >
@@ -2667,46 +2725,41 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
                 }}
               >
                 <Show
-                  when={
-                    isDesktop() &&
-                    (desktopFileTreeOpen() ||
-                      desktopContextPanelOpen() ||
-                       desktopModelsPanelOpen())
-                  }
+                  when={isDesktop() && (desktopFileTreeOpen() || desktopContextPanelOpen() || desktopModelsPanelOpen())}
                 >
-              <div class="min-h-0 flex-1 flex flex-row gap-2">
-                <Show when={desktopFileTreeOpen()}>
-                  <Suspense fallback={<RouteLoadingFallback />}>
-                    <SessionSidePanel
-                      diffs={vcsDiffs}
-                      diffsReady={vcsReady}
-                      empty={() => ""}
-                      hasChanges={hasVcsChanges}
-                      changeCount={vcsCount}
-                      activeDiff={undefined}
-                      focusChangeDiff={() => {}}
-                      size={size}
-                      pair={dividerBefore("fileTree")}
-                    />
-                  </Suspense>
-                </Show>
-                <Show when={desktopModelsPanelOpen()}>
-                  <ModelsPanel
-                    state={modelsPanelState}
-                    opened={desktopModelsPanelOpen()}
-                    onClose={() => layout.models.close()}
-                    pair={dividerBefore("models")}
-                  />
-                </Show>
-                <Show when={desktopContextPanelOpen()}>
-                  <ContextPanel
-                    state={contextPanelState}
-                    opened={desktopContextPanelOpen()}
-                    onClose={() => layout.sessionContext.close()}
-                    pair={dividerBefore("context")}
-                  />
-                </Show>
-              </div>
+                  <div class="min-h-0 flex-1 flex flex-row gap-2">
+                    <Show when={desktopFileTreeOpen()}>
+                      <Suspense fallback={<RouteLoadingFallback />}>
+                        <SessionSidePanel
+                          diffs={vcsDiffs}
+                          diffsReady={vcsReady}
+                          empty={() => ""}
+                          hasChanges={hasVcsChanges}
+                          changeCount={vcsCount}
+                          activeDiff={undefined}
+                          focusChangeDiff={() => {}}
+                          size={size}
+                          pair={dividerBefore("fileTree")}
+                        />
+                      </Suspense>
+                    </Show>
+                    <Show when={desktopModelsPanelOpen()}>
+                      <ModelsPanel
+                        state={modelsPanelState}
+                        opened={desktopModelsPanelOpen()}
+                        onClose={() => layout.models.close()}
+                        pair={dividerBefore("models")}
+                      />
+                    </Show>
+                    <Show when={desktopContextPanelOpen()}>
+                      <ContextPanel
+                        state={contextPanelState}
+                        opened={desktopContextPanelOpen()}
+                        onClose={() => layout.sessionContext.close()}
+                        pair={dividerBefore("context")}
+                      />
+                    </Show>
+                  </div>
                 </Show>
                 <Show when={desktopV2PanelLayout().stacked}>
                   <div class="relative h-2 shrink-0" onPointerDown={() => size.start()}>

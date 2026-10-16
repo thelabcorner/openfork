@@ -12,6 +12,7 @@ export type OxpGrant = {
   read: boolean
   write: boolean
   process: boolean
+  code: boolean
   git: boolean
   integrations: boolean
   browser: boolean
@@ -90,6 +91,14 @@ export type OxpDesktopState = {
     lastHandshakeAt?: number
     detail?: string
   }
+  cloudflare: {
+    state: OxpConnectionState
+    hostname: string
+    autoConnect: boolean
+    endpointUrl?: string
+    tunnelTokenPresent: boolean
+    detail?: string
+  }
   openai: {
     apiKeyPresent: boolean
   }
@@ -135,6 +144,10 @@ export interface OxpPlatform {
   removeRoot(rootID: string): Promise<OxpDesktopState>
   revealRoot(rootID: string): Promise<boolean>
   setTunnelID(value: string): Promise<OxpDesktopState>
+  setCloudflareHostname(value: string): Promise<OxpDesktopState>
+  setCloudflareTunnelToken(value: string): Promise<OxpDesktopState>
+  connectCloudflare(): Promise<OxpDesktopState>
+  disconnectCloudflare(): Promise<OxpDesktopState>
   setOpenAiApiKey(value: string): Promise<OxpDesktopState>
   clearOpenAiApiKey(): Promise<OxpDesktopState>
   resetUnreadableCredentialStore(): Promise<OxpDesktopState>
@@ -161,6 +174,10 @@ const requiredOxpPlatformMethods = [
   "removeRoot",
   "revealRoot",
   "setTunnelID",
+  "setCloudflareHostname",
+  "setCloudflareTunnelToken",
+  "connectCloudflare",
+  "disconnectCloudflare",
   "setOpenAiApiKey",
   "clearOpenAiApiKey",
   "resetUnreadableCredentialStore",

@@ -170,3 +170,4 @@ if (root instanceof HTMLElement) {
     )
   })
 }
+// hmr-full-reload-probe
