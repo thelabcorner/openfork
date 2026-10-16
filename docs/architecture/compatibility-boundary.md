@@ -35,6 +35,45 @@ When upstream changes one of those remote contracts, OpenFork must adapt its loc
 adapter. Do not "improve" a remote wire contract in a way the upstream service does
 not accept.
 
+### Hosted free-tier eligibility for special agents
+
+OpenCode's hosted Public/free-tier model transport is restricted to the official
+OpenCode client. It is **not** an acceptable execution route for OpenFork-owned
+special agents. OpenFork must not spoof upstream client identity or retry an
+upstream eligibility rejection as a transient network error.
+
+The canonical built-in special-agent class is defined in
+`packages/schema/src/agent.ts`; V1 also has request-local Goal Auditor/Goal
+Revisor/SPAD Auditor identities. The V1 production host checks that class via
+`packages/opencode/src/special-agent/hosted-route-policy.ts`.
+Title, prompt/goal revision, Goal audit, SPAD, compaction, Dreamer, Summary and
+other built-in special operations must use an **account-backed** hosted route
+or fail before dispatch with an actionable provider-route error. Normal
+interactive worker routing is not changed by this restriction.
+
+The V1 production `Provider` service owns hosted Public eligibility: callers
+identify internal maintenance with `executionPurpose: "special-agent"`, and
+that purpose prohibits Public even if a legacy caller supplies
+`allowPublic: true`. The enforcement chain includes independent dispatch
+guards:
+
+- Core `SessionRunnerModel.resolveMaintenanceWithInfo` excludes Public for
+  maintenance, without mutating a committed parent route;
+- V1 `session/maintenance-route.ts`, Goal/Prompt Revisor runtimes, compaction
+  and Agent generation exclude Public when resolving hosted routes;
+- the ordinary V1 Session prompt resolver excludes Public for canonical
+  built-in special-agent sessions (notably Dreamer and Summary);
+- V1 `session/llm.ts` rejects any hosted special-agent stream lacking an
+  account-backed committed route, including mock/provider misrouting.
+
+Explicit account identity is respected. A hosted Public parent route cannot
+be inherited as a special-agent transport or rebound by maintenance. Instead,
+the special-agent request may resolve an independently eligible transient
+account route under the existing account-selection policy, without changing
+the parent's durable route. No eligible account means a visible unavailable
+error. Account credentials remain transport-only and are never embedded in
+public usage attribution.
+
 This is the repository's meaningful **1:1 fidelity requirement**.
 
 ## What is explicitly not an OpenCode compatibility target

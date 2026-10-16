@@ -34,13 +34,26 @@ docs/                 documentation
 | Browser visual capture support | `packages/browser-visual/src` |
 | Mobile client | `packages/mobile/src` |
 | Current durable session/domain behavior | `packages/core/src/session` |
+| Cross-generation V1/V2 historical FTS ranking and read-only evidence fusion | `packages/core/src/session/{search,recall}.ts`, `packages/core/test/session-search.test.ts`, `docs/perf/2026-10-09-oxp-memory-recall-fidelity.md` |
 | Current built-in tool contracts | `packages/core/src/tool` |
 | Durable DB schema/migrations | `packages/core/src/**/*.sql.ts`, `packages/core/src/database` |
 | V1 session/prompt execution | `packages/opencode/src/session` |
 | V1/fork-rich tools | `packages/opencode/src/tool` |
+| Background Dreamer and historical memory integrity | `packages/opencode/src/tool/dream.ts`, `packages/opencode/src/special-agent/dreamer-runtime.ts`, `packages/opencode/src/agent/prompt/dreamer.txt`, `packages/opencode/src/session/subagent-delegation.ts`, `packages/schema/src/agent.ts`, `packages/core/src/memory/{index,store}.ts`, `docs/architecture/dreamer-background-agent.md` |
+| Fast scoped Memory reads, index repair and recall fidelity | `packages/opencode/src/exchange/{memory,memory-query,memory-session,memory-read-runtime}.ts`, `packages/opencode/src/oxp/memory.ts`, `packages/core/src/memory/{index,store,projection,migrate-project}.ts`, `packages/opencode/script/{bench-memory-runtime,inspect-memory-session-index,repair-memory-session-index}.ts`, `packages/core/test/session-search-repair.test.ts`, `packages/opencode/test/exchange/{memory-fidelity,memory-repair-script}.test.ts`, `docs/perf/2026-10-09-oxp-memory-{latency,recall-fidelity}.md` |
+| Native Swarm creation, staged partial admission, retry receipts | `packages/opencode/src/swarm/command.ts` (shared host workflow), `packages/opencode/src/swarm/task-batch.ts` (staged tasks), `packages/opencode/src/swarm/ax-projection.ts` (bounded creation receipt), `packages/opencode/src/tool/swarm-create.ts` (eager flat creation), `packages/opencode/src/tool/swarm.ts` (lazy coordinator), `packages/opencode/src/tool/swarm-member.ts` (worker AX/continuations), `packages/opencode/src/oxp/swarm.ts` (approved-root connector adapter), `packages/core/src/swarm/messaging.ts` (durable inbox paging) |
+| Repository-local custom tool scripts | `.openfork/tool` (see its `AGENTS.md`) |
+| Plugin tool contracts and registration APIs | `packages/plugin/src` (see its `AGENTS.md`) |
+| Cross-surface executable tool mapping / disposition (not proof of dispatch) | `packages/opencode/src/exchange/tool-coverage.ts` |
+| Native + lazy tool exposure policy | `packages/opencode/src/tool/registry.ts`, `packages/opencode/src/tool/exposure.ts` |
+| Code search/describe/run gateway | `packages/opencode/src/tool/code.ts`, `packages/codemode` |
 | Full local HTTP API composition | `packages/opencode/src/server/routes/instance/httpapi` |
 | OXP external-agent semantics / MCP endpoint / parent-tool continuity | `packages/opencode/src/oxp` |
-| OXP tunnel, secure credentials, tray/autostart, standalone migration | `packages/desktop/src/main/oxp`, `packages/desktop/src/main/sidecar.ts` |
+| Swarm AX-focused OXP broker schemas / contract compression | `packages/opencode/src/oxp/schema-projection.ts` (reviewed flat action focus plus discriminated unions), `packages/opencode/src/oxp/capability.ts` (per-action Swarm field inventory and action-bound contract), `docs/architecture/swarm-agent-experience-audit-2026-10-09.md` (AX test ledger) |
+| OFXP peer capability dispatcher | `packages/opencode/src/ofxp`, `packages/core/src/ofxp-*` |
+| ACP agent/editor tool bridge | `packages/opencode/src/acp` |
+| MCP tool importing/invocation and explicit export boundaries | `packages/opencode/src/mcp` |
+| OXP OpenAI and Cloudflare transports, loopback relay, secure credentials, tray/autostart, standalone migration | `packages/desktop/src/main/oxp`, `packages/desktop/scripts/fetch-cloudflared.ts`, `packages/desktop/src/main/sidecar.ts` |
 | Upstream-current API contract (donor/transitional, not OpenFork target) | `packages/protocol/src` |
 | Shared server middleware/handlers | `packages/server/src` |
 | Generated upstream-current Protocol client (retained only where needed) | `packages/client` |
@@ -123,6 +136,13 @@ The app is hybrid. A `v2` component or route directory describes UI generation, 
 necessarily API/runtime generation. See [v1-v2.md](./v1-v2.md).
 
 ## Tests and evidence
+
+Universal tool parity is defined in
+[`docs/architecture/tool-surface-parity.md`](../architecture/tool-surface-parity.md).
+The OXP-only regression entry point is
+`packages/opencode/script/verify-oxp-native-parity.ts`: its success
+does **not** certify OFXP, ACP, MCP, or Code-mode execution paths. Every
+applicable dispatcher needs actual execution/authorization tests.
 
 Tests generally live adjacent to their owning package:
 

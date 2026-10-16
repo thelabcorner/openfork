@@ -199,5 +199,15 @@ Any future truncation change should preserve these negative invariants:
 - no streaming-retention initialization failure can terminate or stop draining
   the producer output stream;
 - no streaming producer requires unbounded resident output after spill;
+- no ownerless/direct tool execution turns a semantically successful oversized
+  result into a Session failure merely because no durable ToolPart identity
+  exists;
+- no provider projection overwrites a completed producer-owned timeline
+  retention for the same durable tool call;
+- no streaming timeline recovery is advertised before its completion header is
+  durably finalized;
 - no semantic selection policy is inferred from tool prose when the producer can
   state that structure directly.
+- no provider tool call executes without an admitted durable ToolPart;
+- `timelineOutput === true` implies `SessionToolOutput.page(owner)` returns a
+  complete page; ownerless host execution never advertises timeline recovery.

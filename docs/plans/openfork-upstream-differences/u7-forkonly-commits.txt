@@ -1,0 +1,452 @@
+1d96902911 test(core): align hosted identity header expectation
+75303d5b75 fix: close upstream v1.18.34 sync verification
+62b53deaeb merge: sync upstream v1.18.34
+545fc0eb98 docs(swarm): record post-flatten verification results
+b897a18ce9 chore(coordination): record implementation ledger
+5452242c83 docs: refresh architecture, plans, handoffs, and performance ledgers
+220ce756d2 test(app): add OXP activity lab entrypoint
+94f4569a1a perf(capacity): add bounded provider projection benchmark
+6a46779cc8 test(runtime): preserve semantic executor denial typing
+7d00885f8a chore(sdk): regenerate clients for expanded runtime APIs
+9cd63e8822 feat(app): integrate provider capacity, session sync, agents, and OXP surfaces
+e9bccf5fb9 perf(ui): harden markdown streaming and projection lifecycle
+1befb5a69a feat(desktop): harden sidecar control and Electron lifecycle
+3f0f425293 feat(runtime): integrate routing, OXP control, swarm, and session supervision
+9dd9ceac86 feat(core): add durable routing, autonomy, execution, and swarm state
+5c5491faf7 chore(build): align OpenFork packaging and hosted compatibility
+d49ff96b70 fix(codemode): preserve host cancellation semantics
+b7930a2920 docs: refresh T3 compatibility audit
+fcf0e660e5 test: preserve T3 session status compatibility
+8157e62f1f fix: mark OpenFork launchers executable
+60d29f98fb feat: add T3 Code compatibility facade
+e2bbf2bfd8 fix(wakatime): prepare CLI when enabling
+b812cf5d94 fix(wakatime): fail closed on stale v1 backend
+b73812e002 fix(desktop): retry stale sidecar builds
+c064f22057 fix(wakatime): handle stale desktop backend
+61d86c8ae5 feat(wakatime): add first-party process-global telemetry
+ac08136011 fix(snapshot): bound capture and paginate checkpoint retention
+8420ac3335 feat(codemode): default MCP orchestration to Code Mode
+4fb4799281 feat(desktop): package worktree-store sidecar with fail-closed pinning
+03fa9b037a docs: adopt Code Mode and supersede Custom Runtime
+058f728b33 fix(goal): recover continuation across compaction and restart
+3d8ed51fe8 chore: refresh generated SDK, dependency lock, and fork planning docs
+cb7505ae1c feat(core): add session telemetry ownership, storage reset, and goal reconciliation
+55f1b45c9d feat(desktop): add transactional OXP runtime refresh and node sidecar watch
+7f0fa68158 feat(app): integrate quota agenda, OXP activity, and shared presentation surfaces
+41321312c7 feat(app): add model catalog scope, OXP activity detail, and split i18n modules
+9e8cf06688 refactor(mobile): rebuild mobile client as a thin PWA shell over the app
+a02fbfbe74 feat(app): add installable PWA runtime with bounded event streaming
+dc6baaa046 feat(oxp): add invocation detail, runtime refresh, and delegated worker control
+82ae65e983 feat(provider): add authoritative account resolution and routing metadata
+de8c435f63 feat(usage): add quota reset agenda, capacity priors, and yield statistics
+46c94739cd fix: residual branding and language-model eligibility comment fixes
+cc9ebd724d docs: add architecture contracts, handoff notes, and research ledgers
+3f8068d62b docs: refresh architecture, map, and plan documents for OpenFork
+39cae16f9c chore: refresh publish scripts, tooling, and root config
+be128a399e feat(app/desktop): add send-control lab harness and refresh SDK v2 types
+1474b2ecfd refactor(app): apply OpenFork branding across settings, dialogs, and pages
+2a04d94cc2 refactor(app): modernize global-sync, server-session, and context layer
+ce8a6e7e14 feat(app): add revision-draft durability and refine goal/prompt composer
+a653d39aff feat(app): align timeline projection with V1 provenance taxonomy
+f582377322 refactor(desktop): apply OpenFork branding and harden browser/extension bridge
+3601ee21d2 refactor(mobile): apply OpenFork branding to mobile client
+5b0c38ec2d feat(session-ui): surface provenance presentation and tool visual media
+3038ce8251 refactor(tui): apply OpenFork branding and refine session-message utilities
+e08a45706f refactor(ui): apply OpenFork branding to shared UI assets and theme
+ec88097070 feat(schema): extend goal/model schema and event manifest
+a8cb6ca06d build(core): add luxon dependency for OXP activity timestamps
+e4285cce19 feat(core): harden browser host broker contract
+a159e97a50 refactor(core): expose language-model primitive and catalog helpers
+8f57bb57d6 build(opencode): add MCP client/server, asn1js, and bson dev/runtime dependencies
+c5c3d4ace5 test(oxp/session): cover OXP session control, ingress gate, and V1 title/reminder provenance
+8857e3e48b feat(effect): compose runtime with coalesced drain and single-owned timers
+9976d01ba7 chore: add migration/diagnostic scripts, specs, and agent documentation
+33e9ace9b7 refactor(plugin): apply OpenFork branding to plugins and refine quota/genspark
+c9a0dac6bd refactor(cli/config): migrate storage namespace to OpenFork and modernize CLI/config
+3ad033da0a feat(snapshot/share): harden snapshot capture and next-gen share flow
+407b196073 feat(mcp/skill): refine catalog lifecycle, OAuth discovery, and skill indexing
+433cf4e10e feat(session): apply V1 provenance taxonomy across session, import, and tools
+49ef7ef174 fix(scheduled-task): do not inject Goal continuation limits into scheduled goals
+6b848044e3 fix(auth): serialize auth.json writes with atomic temp-file rename
+7e88254ce5 feat(provider): expand account models, add agent catalog, and refine ACP directory snapshot
+ec74f59404 feat(provider): expand account models, add agent catalog, and refine ACP directory snapshot
+904b491d24 feat(oxp): record OXP parent activity with privacy-preserving projection
+dd3973d839 feat(oxp): harden OXP caller boundaries, remove delegation gate, and record external actor in questions
+f7def5b750 feat(oxp/ofxp): add OFXP network discovery, runtime reconciliation, and settings bridge
+e75237555f test(core): align residual fixtures with committed decision-fetch and typed-path contracts
+30c02fcae6 chore(core): complete OpenFork branding on user-visible surfaces and provider attribution
+57840f691c refactor(core): move reference/skill guidance onto the render-only SystemContext contract
+130b017b35 feat(core): harden shell source transport, lock admission, and ripgrep parsing limits
+b9a219206b feat(db): fence reference-capable ChunkDB at v5 and retire the delta_ref writer
+0fb97e805a feat(session): generalize V2 input admission with typed provenance and host Synthetic turns
+7c96e42b15 feat(goal): add user-turn reactivation, idempotent bookkeeping, and auditor-owned verification policy
+14a3b8f1bd feat(llm): add OpenAI explicit prompt-cache controls and a compile-once transport seam
+10d1c48f1d feat(sdk): harden generator portability, fork branding, and provenance contract
+024a1a8ade feat(db): harden chunkdb framing, migration checksums, and busy retry
+0a83bc9dbe chore(sdk): regenerate unified SDK and OpenAPI for fork route groups
+84e6a532a6 feat(server): compose fork API groups and publish service identity
+42332d524e refactor(tool): route capability tools through the shared exchange layer
+9121794dae feat(tool): harden shell, background, and process execution boundaries
+42c2b1071f feat(revisor): add prompt revisor runtime and durable revision drafts
+cc491bf744 feat(goal): add durable Goal projection, auditor, and creation policy
+62bb43fbe6 feat(session): harden V1 prompt execution, run state, and session grouping
+34019df192 feat(core): add bounded tool-output projection and retention storage
+f4e89602bb feat(session): add checkpoint read projection, snapshot retention, and permission boundary
+fe8443deef feat(system-one): add Jev semantic-inference primitive and provider system capability
+e1c0695859 feat(session): establish durable turn provenance and semantic message kinds
+2a5974d05c feat(swarm): add native first-party swarm collaboration runtime
+e55357bb75 feat(oxp): add OXP/OFXP external-agent adapters and capability broker
+b090343f68 feat(exchange): add shared capability implementation layer
+89b373bb50 feat(ofxp): add durable OFXP peer identity, trust, and invocation receipts
+c04390d930 feat(desktop): add OXP native tunnel, credentials, and sidecar protocol
+1e407aa5df feat(scheduled-task): add durable cross-process scheduled tasks
+c37e2855b4 feat(installation): restrict self-update to fork-owned direct installs
+fc67ed41bc feat(core): add fork-owned storage identity and brand contracts
+63fa5cccb9 chore(fork): migrate fork-owned config namespace to .openfork and pin OpenFork distribution boundaries
+9ac758441a feat(reviser): add durable revision draft mailbox
+fa9832d5ef fix(tui): ignore transport control frames in domain event subscriptions
+bbb9e049fe test(chunkdb): cover rebuild compatibility after read-connection split
+1460b20690 feat(session): add durable provenance and execution ownership
+8dca2ee09f feat(system): formalize semantic system-surface projection
+8e1133560f perf(chunkdb): harden event payload storage and background sealing
+5489cd7531 feat(database): harden migrations and converge orchestration storage
+903d6314ab feat(schema): add durable orchestration and provenance contracts
+5f714f63dd docs: define OpenFork product and compatibility boundaries
+0cddae1397 fix(git): make repository line endings deterministic
+4a24b33b41 docs: add OXP architecture ledger
+973489724d docs: make OpenFork V1-first across local APIs
+f2691d7943 docs: define OpenFork V1 backport policy
+058bd679c0 docs: map OpenFork architecture
+e24a303979 fix(app): resolve abbreviated markdown paths
+73db635b22 fix(desktop): configure fork publish feed and repository so installers package
+cb55954f7b ci(release): cross-build all CLI platforms and bundle fork CLI in desktop dev builds
+db75ce946a docs(audit): record work-tree audit and commit slicing
+d2dbaf0495 chore(release): add GitHub-hosted dev pre-release workflow and build/fork-sync updates
+2a1212c129 feat(opencode): add Tier-0 provider-settings/usage API and bound snapshot/inventory work
+98d9499d55 refactor(opencode): finish Claude bridge ownership and abort proven reasoning runaways
+b03f85a3fe fix(workbuddy): present first-party identity and classify account-forbidden auth
+b6c44405a8 perf(app): trim sidebar, menu, tooltip, and markdown-target reactive work
+ea60dd53d8 feat(app): rebuild Goal Mode as an inline composer shelf
+3b5950ad07 feat(app): project model sections and add provider/auto-accept settings
+c64e8aff8b feat(app): consume server telemetry and usage projections instead of message history
+b1d422d9cb feat(goal): authorize creation from turn provenance and host auditor sessions
+8dd23c4dc3 feat(core): own event/location scope, project inventory, and special-agent sessions
+8458e95ead feat(core): add SessionTelemetry projection and UsageRecord ledger
+ba1ea2fb8d docs(plans): add scheduled-tasks, macroturn-mode, and snapeye planning docs
+9ced217a22 docs(governance): add root ownership contract, playbook, and AGENTS enforcement
+4200678786 chore(repo): ignore root-level SPAD scratch analysis scripts
+68ad438c36 feat(app): manage provider credential accounts
+72a159f5c9 refactor(app): route settings as full-screen surface
+1f4757f5a4 fix(browser-visual): include gifenc in lockfile
+8638b4aa5a docs(startup): record sidebar optimization evidence
+0e5a58ba4c perf(desktop): prebuild renderer shell and cache Tailwind CSS
+e3634cf4cc perf(markdown): resolve path targets with bounded probes
+b792805aa9 refactor(settings): share server management state
+e91d46e024 perf(models): defer usage and model selector work
+53aefa8002 perf(app): split shell and context menu startup work
+e3e54b6a39 perf(project-explorer): cache visible file-tree startup state
+d8e3e4a47e perf(app): coordinate startup session hydration
+0a4e1c56c5 perf(startup): add backend session root fast paths
+4f2aba496c perf(transport): add interest-aware event streams
+3364b5ae1c feat(browser): add first-party SnapEye visual observation
+b140857e56 docs: add hosted multitenant serve implementation plan
+01830d4644 fix(readme): rebalance OpenFork hero mark
+8aaf61d15d fix(readme): inset OpenFork hero mark
+9bdcb91c41 fix(readme): pad OpenFork wordmark
+5b269ad5d9 docs(readme): overhaul OpenFork project overview
+0d1add3fed perf(models): keep selector ranking off first paint
+ad7ac317fb test(app): narrow session source assertions
+95974664cc test(models): make selector benchmark exercise the real open path
+90e3a62aaf perf(limits): reuse fresh quota snapshots and bound pane admission
+74203e0fad docs(desktop): update custom runtime architecture review
+d7a8788778 fix(usage): refresh fork quotas only on repair reconnect
+602036e9fc perf(session-ui): tighten message parts and question output
+1e5ce73301 feat(settings): expose safe local-data reset
+fe515cc4f3 test(models): harden limits and selector browser fixtures
+e8db43e2bc feat(markdown): add path-aware target actions
+cf75cdaeb1 chore(i18n): add target-action and reset copy
+5d4530ff59 chore(sdk): sync generated v2 surfaces
+f1ba7ea7a8 fix(limits): route usage arc to the mounted pane
+f354effda1 perf(mobile): isolate PWA transport and rendering work
+69b1abec97 perf(models): optimize usage limits and selector paths
+fa12e9377a perf(app): isolate concurrent renderer workloads
+34ea2a2787 perf(markdown): make streaming projection incremental
+53e51f82da feat(storage): add safe local reset and bound global replay
+499246953b perf(concurrency): isolate persistence and event hot paths
+85d6a99a1b fix(browser): harden webview lifecycle ownership
+d6fd778dfb perf(browser): reduce desktop extension bridge contention
+538051f754 perf(chrome): reduce extension bridge overhead
+5e064bf224 perf(shell): separate I/O and heavy admission
+162701e31a fix(tools): preserve surrounding line endings
+82f1dac094 Merge v1.18.30 into main
+bba6980d03 fix(chunkdb): gate semantic writes behind sealer
+6e286e58f6 fix(tools): harden coalesced broker arguments
+c8af8f0ca4 fix(tools): preserve find auto-healing at provider boundary
+cd639edaa9 fix(tools): harden healed find payload correlation
+84b9e02905 fix(tools): harden legacy find call healing
+3a7420b1ec feat(composer): integrate questions with the main prompt
+d3ba7e3290 feat(composer): complete reusable question response primitives
+22205aaae0 fix(tools): auto-heal legacy glob and grep calls
+870b3e6adf refactor(composer): add reusable question response primitives
+a9231382a9 refactor(tools): collapse provider capabilities into compact gateways
+d43f888645 refactor(tools): route apply_patch through the hardened patch engine
+a0bcf1ff76 feat(background): unify task and monitor lifecycle
+00c9e4ce71 perf(session): suspend prefetched background stream projection
+c1538c2c80 feat(spad): harden supervision and enable the bounded auditor
+8582f3e98a chore(repo): ignore local analysis artifacts
+efbf56ef77 fix(session-ui): freeze markdown blocks before fast append
+88d1cdaaa0 fix(session-ui): stabilize nested streamed lists
+f9cfe7f909 chore(sync): recognize lazy tool broker
+fa43dadf3d chore(sdk): refresh generated clients
+b0f6e698c2 feat(session-ui): standardize tool output scrollbars
+642430cfbd feat(usage): surface maintenance overhead
+da0746a51c feat(composer): integrate goals, revision send, and tool mentions
+11ebcbcbe6 feat(usage): track maintenance agent costs
+898e83b50f fix(agents): harden terminal completion protocols
+451df2ffdc feat(tools): broker low-frequency tools lazily
+3e673e26f0 feat(tools): batch reads and track session file freshness
+84a397dbbd fix(desktop): preserve live sidecar parser assets
+0af38f5bad feat(session): persist agent and model selection
+14d59cda83 fix(app): surface structured server errors
+21c981f6f8 feat(browser): add existing Chrome control lane
+4969d23c2b docs(browser): capture Chrome attach architecture research
+07a7a5a35f feat(markdown): add interactive Mermaid diagrams
+0c80a61b7e fix(search): preserve directory metadata semantics
+8188132ff5 fix(session): resume cached streams on activation
+3104c1428e release: v1.18.30
+e576031b4f chore(sdk): regenerate clients and database artifacts
+096ed59107 chore(sync): curate fork rules and custom runtime docs
+4389281f59 feat(app): integrate chat project, endpoints and settings
+33e79a7a65 feat(exec): harden process and shell concurrency
+209afde155 feat(search): improve mention ranking and composer mentions
+5d8230fe40 feat(session): add grouping with tab previews and tree
+6ca5ac866e feat(revisor): add prompt revisor with shared completion
+b8ab26b145 feat(goal): add auditor semantic gate for continuations
+2a01b3e967 fix(core): keep semantic prune backfill draining
+7369474e22 feat(core): add semantic ChunkDB compaction
+7cd1b421b3 fix(core): harden ChunkDB delta and space reclaim
+41fc49ab62 refactor(ui): prompt input v2 wiring, goal strings and popover fix
+4307b1e9d4 chore(sdk): regenerate v2 client from updated openapi including goal routes
+a0a1d3eb0b fix(sync): workspace curation, fork:sync pipeline and custom runtime docs
+9a10224b14 feat(goal): goal mode with automation recovery, composer shelf and HTTP API
+337520184d refactor(session): prompt grouping, local execution and event manifest wiring
+09e154fc65 refactor(tool): split edit/patch with resolve/rollback and file locking
+8008c6bb72 refactor(core): harden chunkdb sealing with cooling and hot-tail gates
+4975f2a55d fix(sync): harden fork:sync verify + mandate pipeline in skill/FORK.md
+bc26fb41ee fix(sync): curated workspaces, fork:sync pipeline, rebuilt lock after v1.18.29
+1ded086eea fix(sync): restore fork ./memory export lost in v1.18.29 package.json union
+8a55c41e7b Merge v1.18.29 into main
+6e4c0846f7 docs(bench): event-loop concurrency audit, handoff, workbuddy repro harness
+77e785c7a8 fix(sdk): tolerate prettier-wrapped SSE reader shape in codegen patch
+400632d615 refactor(session-ui): harden markdown worker stream with trace hooks
+1a059a2dbb refactor(app): stale-drain file tree, phase tracing, session-cache gating
+93525276f0 fix(server,opencode): gate legacy bridge on connected subscribers, cache wire projection
+da1010dff9 refactor(core): instrument event queue/replay/coalescer with EventTrace budgets
+4dbb8b69be test(core): cover EventV2 byte-bounded queue and concurrent-session saturation
+06a73a88ef chore: CI, lint and FORK ownership doc updates
+74360ef13f chore(schema,httpapi-codegen,mobile): event manifest, codegen and PWA build config
+db5fd95665 refactor(opencode): session/quota/tools and server-route hardening
+a1392111ec refactor(core): bound internal concurrency and regenerate schema
+f279639809 chore: regenerate client/SDK/generated types from schema
+400e7b4258 refactor(app): session/global-sync context, tabs, usage and server-sdk updates
+b56ff80e8f test(app): persistent event-stream server and performance harness updates
+946ff1b274 feat(app): hosted-browser annotation persistence and v2 pane polish
+d93ebde745 perf(app): indexed v2 session reducer for O(1) streaming-delta lookup
+310e4e4988 feat(console): zen usage graphs, training-consent and workspace migration
+7a5e11cac7 perf(app): file-tree avoids full DFS on every mutation; tree-store generation API
+0e923639ec perf(session-ui): markdown worker queueing, transport and caching
+5c5bc022f5 feat(opencode): concurrency-bounded shell tool and PowerShell heredoc handling
+6a526712b5 feat(server): event serialization, instance pinning and SSE transport
+2f7059b912 refactor(core): event bus coalescing and replay support
+b4add93b41 feat(desktop): browser annotation geometry/trust plus server health and log throttling
+8d02f19b43 feat(session): locked session-group memberships and subagent auto-grouping
+bc26e6c19b feat(session): measure assistant-message throughput at the stream boundary
+d69640b58e feat(mobile): bind PWA to verified instance, shared model selector, tool UI
+4f68724d1d refactor(app,opencode): re-export model-selector logic from shared schema
+2536a75085 feat(schema): extract shared model-select logic for desktop and PWA
+16747470f9 release: v1.18.29
+1db8f7163e chore(ui): match genspark/workbuddy icons to sprite conventions
+36a3dbf8c2 chore: remaining manifest, formatting and Effect type casts
+ca097c24db chore(i18n): credential default-key and notification copy strings
+65306c0566 test(workbuddy): namespace the injected request id by agent purpose
+6a4c4e3142 chore(mobile): add the PWA icon assets referenced by the webmanifest
+4330c6072e chore(ui): add workbuddy and genspark provider icons
+8b2c699e8d fix(desktop): alias the app workspace for the renderer build
+a250e790f5 feat(mobile): bind to a verified instance and clear state on rebind
+a081bd6733 fix(tui): empty prompt hint, Dynamic import source, pinned diff queries
+462542aa43 test: provide filesystem layers and adapt fixtures to the new server auth config
+ebb4a012bd refactor(providers): trim the azure plugin and drop verdent env-token support
+c096c51acd fix(workbuddy): bind the local proxy to a stable port and make it self-healing
+e73e90c8ee feat(usage): provider and model time series in the usage summary
+fd138280fd feat(session): attribute zen spend per routed key and log dropped thinking blocks
+1c2ab54d4f fix(opencode): effect boundary hardening and session error translation
+911bd8ad75 fix(tools): project summary action, skill path recovery, job kind and BSON buffer
+9c240897dd feat(mobile): verify the dev proxy target's identity before forwarding
+0ed4afcc4e feat(push): session-aware notification copy and an SVG icon default
+2bee1c814b feat(session-ui): bounded output, skill notices and renderers for lsp and refactor
+defd825a0d feat(session-ui): render tool output as text instead of pushing it through markdown
+6b222de157 feat(fork): rename credential select to setDefault, expose the routed default
+c2e725ad40 refactor(zen): replace the per-key governor with a unified account pool
+c5b676d656 feat(provider): send anthropic thinking block binding controls
+15d013854d feat(claude): expose OpenCode tools to the Agent SDK over an in-process MCP server
+f306603714 chore(cli): drop the --conditions=browser export condition from dev entrypoints
+561a4451e9 chore(deps): bump ai-sdk anthropic/bedrock, pin patches, drop fff-bun patch
+72d437d198 chore: checkpoint in-progress fork work before upstream v1.18.27 sync
+1d0c0877e1 cleanup: remove unused InstanceState imports from shell-job, monitor-delivery
+9e3f6a2ee0 feat(quota): workbuddy limit snapshot, limits-format, schema updates
+6b5eda7516 fix(workbuddy): account router model admission, live quota snapshot
+ec39458ffc fix(workbuddy): governor model entitlement updates (missed from group B)
+3cda3ebecd chore(docs/scripts): workbuddy scripts, docs, test cache, lockfile
+b50c7eca75 chore(sdk): regenerate v2 SDK types
+a6559be483 feat(background): shell-job service with Truncate layer, background/monitor registry updates
+88afc245b5 feat(workbuddy): plugin, monitor delivery, ingress, quota provider
+833009037b feat(quota): provider quotas, limits UI, format updates
+1dbfc47683 fix(limits): always show OpenCode Zen free quota
+c8257aa91b chore: docs, handoffs and lockfile
+4a81d99cfb feat(ui): improve auto-scroll and filtered list
+1d851c23a2 feat(opencode): quota, provider and server hardening
+59a8b8b747 feat(mobile): refresh PWA shell and app
+d0cfe8bcea feat(desktop): trim main process and browser surface
+3a0ffc0b38 feat(core): harden filesystem index and device handling
+90998fbd9d feat(app): improve prompt input and command palette
+7d7242379a feat(app): unify context, usage and limits into context panel
+1a57843a63 Merge remote-tracking branch 'origin/feat/zen-free-usage-limits-v2'
+48742bfde4 Merge remote-tracking branch 'origin/main'
+fe398f4605 Update HANDOFF-zen-free-usage-limits.md
+1a0cea54da docs(handoff): document Zen free quota implementation
+f2dce08fbc test(usage): count Zen provider requests from step-finish parts
+abaa4226cf test(quota): cover Zen free limit learning
+21fea9ee4b fix(quota): import Zen usage service namespace
+316bb0969a feat(quota): register first-party Zen usage source
+7a17528de2 feat(quota): add OpenCode Zen quota adapter
+434dcd5ec9 feat(usage): scan persisted Zen free request history
+f16fdd776e ci: route OpenFork validation through homelab
+72650860ad chore: merge upstream v1.18.24 into openfork
+9c8c558d25 chore: remove stale STATS doc, add cleanup script and HANDOFF
+1441f56bda fix(opencode): prevent ScopedCache poisoning from aborted requests
+fa4fe7e42e chore(sdk): regenerate v2 SDK client and types
+33bd67ee08 feat(opencode): widen Google schema transform and update quota adapters
+d2c7d272de feat(desktop): update main process, renderer, and onboarding
+c3b4b25966 feat(ui): update provider icon, spinner, and tooltip styles
+dd2cd4c4a3 feat(session-ui): rework prompt-input machine and store
+02fec8adb9 feat(app): add model cost and usage analytics utilities
+7e0dd26752 feat(app): rework session UI, composer, and limits panel
+9070611b48 feat(app): extend settings v2 (devices, pairing, local scope)
+227704f3a3 feat(app): rework model selection and provider dialogs
+807e824a02 feat(opencode): improve device pairing handler
+7bd15ff72e feat(opencode): update session compaction and message handling
+d15b6a3993 feat(core): extend config, compaction, and project APIs
+1cd45834b5 feat(opencode): rework skill system registry
+ee3e0f6564 feat(opencode): harden SPAD supervisor loop
+5d9c7974fc feat(opencode): rewrite read/skill/json/checkpoint tools
+52db58e410 feat(opencode): add first-party Claude provider
+d69d3b0f7e feat(mobile): add PWA mobile client package
+83cc5f0765 feat(core): add push notification infrastructure
+57e8055697 release: v1.18.24
+9b41ac25a3 Delete backup-graphic-design.ps1
+b7a1286243 Delete backup-graphic-design-remote.ps1
+ef182507d4 Merge remote-tracking branch 'origin/main'
+98dd5e5ffc chore: reorganize docs
+b988a43de5 Delete artifacts/glm52-rise-video directory
+ba87335ea5 test(opencode): cover nvidia manual rate tracking
+2366ab7ccb feat(opencode): track nvidia requests against 40 rpm window
+bb4e23058c bench: export pipeline harness and baseline results
+dcabecfda2 chore(i18n): sync en strings for sidebar, menus and dialogs
+41563d4e68 feat(desktop): store, ipc and background-cli updates
+2b0749cc41 fix(app): session export edge cases
+f9a2cc53f4 perf(app): timeline virtualization and shell tab persistence
+f10a50dd12 refactor(app): rework model and provider dialogs
+9a56ce1e3c feat(app): text selection toolbar and session menu system
+c976bc3c4d feat(protocol): browser open-devtools and extensions-list schemas
+eb75c20c63 feat(opencode): nvidia quota provider with manual rate tracking
+93b9707c98 feat(app): sidebar pinning and home session rework
+10dd1bd0ea feat(app): refresh limits panel and usage hooks
+71b3bbf23a chore(opencode): sqlite worker, swarm tool and probe script touch-ups
+23d0b3b7c9 chore(core): search/sql/tool/config touch-ups and compaction shape guard
+088ae8299f feat: session unarchive contract via nullable archived timestamp
+bef5dc6ee2 perf(opencode): cache session-group listings behind backfill connection
+0c622bebe5 fix(events): scope SSE to instance directory and batch listener dispatch
+10b4cdd3d5 chore(opencode): register checkpoint and browser devtools tools
+93db4eb5ac feat(opencode): browser devtools and extensions-list tools
+5b62247090 feat(opencode): harden quota providers and openrouter free usage
+6b49bea3a7 feat(opencode): session checkpoint tool with turn/baseline capture
+cbab772244 feat(core): durable session pause/resume and title regeneration
+8bf3195fb8 Merge remote-tracking branch 'origin/main'
+8bf35c98c0 fix(opencode): register project init listener before INIT dispatch
+55e75d5ad0 fix(opencode): interrupt instance warmup on disposal; steady flaky instance tests
+834fc9b3dc feat(app): batch session-group detail fetches behind one request
+bdd5d01e95 perf(app): paint timeline from cache before session.sync resolves
+6252efcf99 feat(opencode): batched session-group details endpoint
+dbcf69a473 perf(opencode): unblock instance loads before eager service warmup
+2eb39b47cf feat(app): honest route-loading diagnostics and sync perf marks
+dd80e99cab fix(opencode): close unclosed paren in xai quota adapter
+16f64acab3 chore(opencode): log per-init bootstrap timings and instance-load waits
+b9ca71ead7 feat(app): add show-fewer-chats control to sidebar
+f71fd3b756 chore: ignore cpuprofile summaries
+c7ba96f88c feat(app): add show-less-recent action to chat sidebar state
+3b9c0d8a3f chore: ignore local run artifacts and probe logs
+c4abf69dab docs: add pane resizing handoff and SPAD live research notes
+6ba1cdb8b2 docs(perf): add startup investigation notes and profiling harness
+63c41c612f docs: add swarm port plan
+0637d27b3c docs(limits): add plan-limits specs, provider matrix and tasks
+a413ea567d docs(fork): add openfork isolation plan and tasks
+2d60567e59 test(app): cover limits formatting
+3130583ecc fix(opencode): annotate xai quota fetch effect type
+26fb2af7b4 perf(app): isolate working-state reads and dedupe sidebar grouping passes
+cf6d7aa2e9 chore(tooling): update deps, e2e and bench harnesses
+5a67d1646c feat(ui): pane geometry, resize handle and sheet components
+372f627989 feat(app): refresh desktop chrome and session workspace
+46a76de5b3 feat(app): add PWA mobile shell and device pairing
+ff66aa87c6 feat(opencode): pairing/device API, quota providers and SPAD expansion
+bccc238438 feat(core): add session search FTS and device registry
+18d96710c7 docs(fork): clarify protocol vs unified SDK and workspace boundaries
+cf20e52955 chore(i18n): prune non-English translations, keep en-only
+73b863d2d7 perf(app): stabilize chat sidebar row identity and scope reactive updates
+087966ae04 Delete dedupe-graphic-design.ps1
+99bed6e723 chore: remove anomalyco SaaS and publish workflows
+9e937cfa12 chore: prune SaaS trees; allowlist desktop workspace
+3cbf187bd7 docs: list case-by-case class in upstream-sync skill
+eab5c9d715 docs: record v1.18.21 case-by-case conflict paths in FORK.md
+3540a81170 chore(desktop): disable official updater on OpenFork
+9a04164c0f docs: add OpenFork AGENTS, ownership map, and upstream-sync skill
+d24ef852bb chore: checkpoint fork work before isolating thelabcorner/openfork
+a747d51764 chore: merge upstream v1.18.21 into openfork
+fccc8b3385 chore: checkpoint search/matcher perf probes before merge window
+5374a0963b chore: checkpoint in-progress fork work before upstream v1.18.21 sync
+826d9ad46a release: v1.18.21
+4667437f74 docs: add design docs, agent handoffs, live generation rate, desktop storage, and firecrawl
+da8ef3217a chore: update package deps, bootstrap, plugin, and CLI session
+d4a0e8772c chore(core): update database, filesystem search, file-mutation, and config
+f45c9301e8 feat(session-ui): add tool output components, message part styling, and TUI updates
+4a5fa7fc17 feat(app): polish tabs, titlebar, prompt input, context tabs, layout, and session commands
+ca012c08b7 i18n: add project explorer, browser chrome, session groups, and usage keys to all locales
+fdbd5d865b chore: regenerate client/SDK types, update schema and protocol, and add file/tool/session API routes
+1f07bd3608 feat(session): add SPAD supervisor, session processor improvements, and background shell jobs
+fbf7534841 feat(browser): overhaul hosted browser with broker, chrome menu, IPC, and element annotation
+9e8e2cd59c feat(app): add context panel, models panel, usage tracking, and model pricing
+81fbbdd576 feat(app): add project explorer with file tree, viewers, editor, and git status
+41b3b2bcbc feat(session): add session groups with schema, core, API, and app support
+b9fb1b0640 feat(tool): improve edit, shell, skill, websearch, read, write tools and refactor registry
+7a5085cb48 feat(tool): add json, background, sqlite, git, typecheck, project, symbols, test, refactor, sympy, patch, and custom tool support
+93e423f1d2 feat(search): tune backfill chunk size and add env gate
+dc75db6959 chore: update account/config/plugin, sdk clients, and dev guidance
+751a39ddaa feat(app): server-compat session actions and search controller polish
+6f3ed5fcf3 feat(session-ui): tool output display and error card polish
+f3879466bd chore: regenerate client and sdk-next generated types
+5ba6f7a561 feat(core): add session title regeneration with paused_at migration
+764479682e feat(tool): add archive tool with zip/tar/decompress support
+6a2bdfc9f8 feat(browser): hosted browser panel with element annotation overlay
+379cb4d993 i18n: add tab session-state and regenerate-title keys to locales
+b3ab0b5e54 feat(app): tab session controls with pause/resume/regenerate actions
+6410cd3995 feat(session): add V1 pause/resume/regenerate-title API
+05e969fc9d docs: add swarm design handoffs and cross-doc reviews
+6b6bdb93a0 docs: add ChunkDB storage architecture research and plan
+fc19430c2c fix: align openfork with upstream sdk updates
+108709d816 Merge tag 'v1.18.18' into openfork
+9c360d0583 feat: checkpoint openfork changes
+31406ccc51 release: v1.18.18
+daa6086511 feat(app): shared realtime OpenCode Go usage controller
+951fb780a8 feat(opencode): two-layer usage cache with 5m official gate
+4570504eec feat(app): add tab context menu i18n keys to locales
+26917b333c feat(app): add tab context menu close actions
+a3647eb025 release: v1.18.16

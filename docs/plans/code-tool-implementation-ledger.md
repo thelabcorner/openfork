@@ -1,9 +1,13 @@
 # OpenFork `code` Tool Implementation Ledger
 
-> Status: planning ledger for `docs/plans/code-tool-architecture.md`.
+> Status: living implementation/release ledger for `docs/plans/code-tool-architecture.md`.
 >
-> No implementation is implied by this file. Each work package has an explicit
-> architectural objective, likely files, dependencies, tests, and exit gates.
+> The core five-action implementation and atomic `execute` -> `code` cutover have
+ > landed, including the deterministic WP17 release gates, compatibility migration,
+ > schema-owned UI/trace projection, and measured performance baseline recorded below.
+ > Remaining later sections are optional/future product work rather than blockers for
+ > the initial `execute` -> `code` replacement; historical implementation steps are
+ > retained as design rationale.
 >
 > Product decision: the provider-visible `execute` tool is replaced by `code`.
 > `@opencode-ai/codemode` remains the default confined JS/TS execution engine.
@@ -13,7 +17,7 @@
 The project is complete only when all of the following are true:
 
 1. provider-visible `execute` no longer exists in the normal OpenFork tool manifest;
-2. one byte-stable provider tool named `code` provides `search | run | save | call`;
+2. one byte-stable provider tool named `code` provides `search | describe | run | save | call`;
 3. `code.run` can programmatically invoke every eligible capability the same agent
    could invoke through the normal V1 tool system, excluding only meta-recursive
    surfaces such as `code`, `tool`, and `invalid`;
@@ -34,27 +38,29 @@ The project is complete only when all of the following are true:
 
 ## 1. Architectural decisions frozen before implementation
 
-### D1 — four provider actions
+### D1 — five provider actions
 
 ```text
 search
+describe
 run
 save
 call
 ```
 
-There is no provider-facing `describe` action. Exact inspection is
-`search({ ref })`.
+`search` is broad discovery and returns compact candidates. `describe` is exact
+inspection and returns the complete callable contract for one host-issued ref.
 
 The runtime surface is intentionally smaller than the provider surface:
 
 ```text
-provider: search | run | save | call
+provider: search | describe | run | save | call
 runtime:  call(ref, input)
 ```
 
-P0 executing programs cannot recursively invoke provider-level `run`, `save`, or
-`search`. Saved code is itself a capability and is composed through `call(...)`.
+P0 executing programs cannot recursively invoke provider-level `run`, `save`,
+`search`, or `describe`. Saved code is itself a capability and is composed through
+`call(...)`.
 
 ### D2 — flat provider schema
 
@@ -240,16 +246,18 @@ Likely Effect schema shape:
 
 ```ts
 const Parameters = Schema.Struct({
-  action: Schema.Literals(["search", "run", "save", "call"]),
+  action: Schema.Literals(["search", "describe", "run", "save", "call"]),
 
   // search
   query: Schema.optional(Schema.String),
-  ref: Schema.optional(Schema.String),
   target: Schema.optional(
     Schema.Literals(["callable", "capabilities", "saved", "runs"]),
   ),
   limit: Schema.optional(Schema.Number),
   cursor: Schema.optional(Schema.String),
+
+  // describe
+  ref: Schema.optional(Schema.String),
 
   // run / replay
   code: Schema.optional(Schema.String),
@@ -271,9 +279,9 @@ excuse to make the provider guess action semantics:
 
 | field | provider description requirement |
 |---|---|
-| `action` | Required. One of `search`, `run`, `save`, `call`; determines which remaining fields are valid. |
-| `query` | `search` only. Broad lexical query. Omit with `ref` for exact inspection. |
-| `ref` | `search` only. Exact host-issued capability/saved/run ref returned by prior discovery. |
+| `action` | Required. One of `search`, `describe`, `run`, `save`, `call`; determines which remaining fields are valid. |
+| `query` | `search` only. Optional broad lexical query; omit for bounded browse. |
+| `ref` | `describe` only. Exact host-issued capability/saved/run ref returned by prior discovery. |
 | `target` | `search` only. Defaults to `callable`; `runs` is explicit so history does not pollute capability discovery. |
 | `limit` / `cursor` | `search` only. Bounded deterministic pagination. |
 | `code` | `run` only. Inline JavaScript/TypeScript source. Mutually exclusive with `runID`. Dirty saved working copies are read through ordinary filesystem authority and passed here; there is no separate working-copy execution field. |
@@ -290,14 +298,15 @@ Validation table:
 
 | action | required | forbidden / XOR |
 |---|---|---|
-| search | one of `query/ref` optional for browse | run/save/call fields ignored only if absent; reject contradictory fields |
+| search | none; optional `query` for ranked discovery | `ref` and run/save/call fields forbidden |
+| describe | `ref` | search/run/save/call fields forbidden |
 | run | exactly one of `code/runID` | the other source selector is invalid |
 | save | `runID`, `save` | no `code` |
 | call | saved canonical ID, explicit scoped alias, or immutable revision handle in `tool` | no run source fields |
 
 For `run`, `save` is allowed as an atomic post-success promotion request.
 
-Search with neither `query` nor `ref` is a bounded browse operation. `target`
+Search with no `query` is a bounded browse operation. `target`
 defaults to `callable`, which includes current native/lazy/MCP capabilities plus
 saved tools but excludes historical runs.
 
@@ -585,18 +594,19 @@ packages/codemode/test/**
 - current provider description mutation;
 - direct MCP Snapshot mutation guard vs nested Code Mode behavior.
 
-### Existing baseline coverage audit
+### Historical baseline coverage audit (pre-cutover)
 
-Do not duplicate coverage already present in `test/tool/code-mode.test.ts`. The live
-suite already exercises structured MCP content, media attachment stripping/collection,
-parallel `Promise.all`, per-child permission checks, before/after plugin hooks,
-catchable child/hook failures, active/pre-aborted cancellation, catalog rendering and
-runtime search, and permission visibility.
+At WP0, `test/tool/code-mode.test.ts` exercised structured MCP content, media
+attachment stripping/collection, parallel `Promise.all`, per-child permission checks,
+before/after plugin hooks, catchable child/hook failures, active/pre-aborted
+cancellation, catalog rendering/runtime search, and permission visibility. Those
+legacy-adapter tests were later replaced by gateway/provider/runtime coverage when the
+adapter was deleted.
 
-`test/tool/registry.test.ts` also captures the current provider-visible `execute`
-registration and dynamic MCP-catalog description behavior. Those assertions are
-baseline evidence; later commits deliberately flip the provider-description invariant
-rather than deleting the evidence without replacement.
+At WP0, `test/tool/registry.test.ts` captured provider-visible `execute` registration
+and dynamic MCP-catalog description behavior. The current inverse regressions assert
+that `code` is the sole provider surface and that its serialized definition remains
+stable across capability/catalog changes.
 
 The remaining WP0 gaps are cross-layer rather than interpreter-unit gaps:
 
@@ -626,7 +636,7 @@ Add a fully-resolved provider-manifest snapshot helper for at least two model fa
 snapshotting the raw Tool.Def is insufficient because provider schema transforms and
 `tool.definition` shaping happen later.
 
-### Known defects to assert, then fix
+### Historical defects asserted at WP0, then fixed
 
 | defect asserted in WP0 | cleared by |
 |---|---|
@@ -863,14 +873,15 @@ processor-owned `markWorkspaceMutation()` callback carried in the invocation con
 This is conservative on failed mutating attempts but preserves the existing post-step
 snapshot/diff/SPAD safety contract without falsely marking pure-read Code runs.
 
-### Exit gate
+### Historical WP2 exit gate
 
-Current direct MCP and current `execute` MCP can both be expressed through the
-gateway with equivalent or stricter correctness.
+At WP2, direct MCP and the then-current `execute` MCP path both had to be expressible
+through the gateway with equivalent or stricter correctness.
 
-Authorization parity is explicit: direct provider invocation, lazy `tool` broker
-invocation, and `code` invocation of the same target produce the same explicit-deny
-result. Add a regression for the current lazy-broker target-deny hole before fixing it.
+Authorization parity was made explicit: direct provider invocation, lazy `tool`
+broker invocation, and `code` invocation of the same target produce the same
+explicit-deny result. The pre-existing lazy-broker target-deny hole was captured by
+regression coverage before being fixed.
 
 Also explicitly prove the pre-existing semantic drift is removed:
 
@@ -1031,37 +1042,37 @@ expect a string/number/array. Validation/coercion is target-schema-aware.
 
 Existing `@opencode-ai/codemode`.
 
-### Rollout
+### Historical branch rollout
 
-Do not co-expose `code` and `execute` to the provider. During branch development,
-add one temporary fork-owned selector in `RuntimeFlags`, e.g.
-`OPENCODE_EXPERIMENTAL_CODE_TOOL` (default false):
+During branch development, `code` and `execute` were not co-exposed to the provider.
+One temporary fork-owned selector in `RuntimeFlags` controlled the branch rollout:
 
 ```text
 false -> legacy `execute` selection + legacy MCP exposure policy
 true  -> `code` selected, `execute` absent, direct MCP tools hidden by the Code surface
 ```
 
-When this selector is true, legacy `OPENCODE_EXPERIMENTAL_CODE_MODE=false` must **not**
-re-expose direct MCP tools. The new selector owns both responsibilities. Internal tests
-may instantiate both implementations, but a provider turn sees exactly one.
+When that selector chose `code`, legacy `OPENCODE_EXPERIMENTAL_CODE_MODE=false`
+did not re-expose direct MCP tools. Internal tests could instantiate both
+implementations, but a provider turn still saw exactly one.
 
-At WP15 final cutover, delete the temporary selector and make `code` the sole surface;
-retire/deprecate the legacy Code Mode flag rather than carrying a permanent dual-mode
+WP15 then deleted the temporary selector and made `code` the sole surface; the
+legacy Code Mode flag remains compatibility input rather than a permanent dual-mode
 architecture.
 
 `code` is provider-visible on the new branch even when no MCP servers are connected
 because it can orchestrate native/lazy capabilities.
 
-### Exit gate
+### Historical WP4 exit gate
 
 - `code.run` can call native + lazy + MCP capabilities through one gateway;
 - every expected program/tool failure returns the structured outer `CodeResult`
   (`ok:false`, `error.kind`, actionable `error.recovery`) rather than an opaque thrown
   provider-tool error; genuine host defects remain defects;
-- selector=false never exposes `code`; selector=true never exposes `execute` or direct MCP;
-- toggling legacy `OPENCODE_EXPERIMENTAL_CODE_MODE` cannot create a mixed surface when
-  the new selector chooses `code`.
+- the temporary selector's legacy branch never exposed `code`, while its new branch
+  never exposed `execute` or direct MCP;
+- toggling legacy `OPENCODE_EXPERIMENTAL_CODE_MODE` could not create a mixed surface
+  while the temporary selector chose `code`.
 
 ## 14. WP5 — catalog/search service
 
@@ -1987,6 +1998,52 @@ calls, and cancellation, but keep absolute timing thresholds report-only until s
 baselines exist. Ratio/scaling regressions may become blocking earlier when they are
 low-noise.
 
+### 2026-10-04 measured/structural closeout baseline
+
+Fresh `bench:code -- --json` / `bench:code:prepare` measurements on the current
+development workstation establish a report-only baseline; absolute timing is not a CI
+threshold yet:
+
+| synthetic descriptors | inventory build | exact lookup mean | cold search p50 / p95 | reconstructed warm p50 / p95 |
+|---:|---:|---:|---:|---:|
+| 100 | 1.430 ms | 0.0455 µs | 0.186 / 2.205 ms | 0.0017 / 0.0067 ms |
+| 1k | 5.835 ms | 0.0244 µs | 1.398 / 2.706 ms | 0.0012 / 0.0032 ms |
+| 10k | 49.896 ms | 0.0050 µs | 16.569 / 32.346 ms | 0.0030 / 0.0099 ms |
+| 50k | 223.020 ms | 0.0100 µs | 94.297 / 115.685 ms | 0.0011 / 0.0028 ms |
+
+Provider `code` footprint at this baseline is 1,112 description bytes, 2,518
+parameter-schema bytes, and 3,674 bytes for the serialized static description/schema
+contract. The refreshed preparation benchmark measured 6.410 ms cold JavaScript prepare,
+94.813 ms cold TypeScript fallback, and 0.522 µs/op mean prepared-cache hit. The mixed
+Code benchmark measured a 93.719 ms cold TypeScript prepare and 0.358 µs/op cache hit.
+
+Deterministic release gates verified in the same closeout:
+
+- provider definition byte stability is covered across custom-capability refresh, MCP
+  catalog churn, permission churn, and saved-tool churn;
+- exact-ref lookup uses the precomputed map and broad search caches compact
+  `SearchItem` rows by content-derived search generation, including reuse across
+  reconstructed inventory objects;
+- the search cache is bounded to 16 queries × 8 generations and never retains
+  capability execution closures merely for pagination;
+- prepared programs are bounded to 128 entries / 4 MiB retained source, enforce LRU
+  eviction, and expose a prepare-call counter proving cache hits perform zero additional
+  `CodeMode.prepare` work;
+- live generated Code passes both the static process-authority scan and a runtime
+  `Bun.spawn` / `Bun.spawnSync` trap with zero subprocess calls;
+- 1-leaf and 100-leaf Code roots both persist progress through exactly one provider
+  ToolPart identity; nested capability frames create no child ToolPart identity;
+- saved immutable handles exact-resolve/re-hash/reverify admission and dependency
+  contracts on first use per root, then reuse the root-local verified program for
+  repeated same-handle calls;
+- gateway fan-out overlaps to the configured concurrency cap, and the bounded
+  schema-owned trace remains the only durable nested-call projection.
+
+The synthetic 50k cold linear ranking result is intentionally retained as a scaling
+baseline, not treated as a blocker. Per WP5, add a postings accelerator only if real
+catalog size/latency data establishes a product p95 budget that linear scoring misses;
+the reconstructed warm path is already effectively constant-time at this scale.
+
 ## 27. WP18 — optional Bun/Node module profile
 
 This is deliberately after `execute` replacement.
@@ -2205,3 +2262,201 @@ Planning is complete enough to start WP0/WP1 when:
 At that point, the first coding sequence is WP0 baseline tests -> WP0.25 permission
 precedence repair -> WP0.5 semantic-executor split, then CapabilityInventory/Gateway.
 Do not start with `code.ts` UI/schema work.
+
+## 34. 2026-10-04 transport-parity closeout
+
+Code is now a real semantic capability across native/ACP, OXP, and OFXP rather
+than a parity-table alias for a generic broker.
+
+### Native Sessions / ACP
+
+Native Sessions and ACP retain the complete Session-owned five-action provider
+surface: `search`, `describe`, `run`, `save`, and `call`. ACP obtains that surface
+through the ordinary `ToolRegistry`/Session path, so CodeRun ToolParts, replay, saved
+revisions, permissions, traces, and attachments keep their native owners. Regression
+coverage proves ACP exposes `code`, never legacy `execute`, advertises all five
+actions, and preserves schema-owned `CodeRunTrace` metadata through ACP projection.
+
+### OXP
+
+OXP has a dedicated default-off `code` authority and a real brokered capability named
+`code`. Because an OXP external principal has no implicit OpenFork Session, this
+projection intentionally exposes only stateless `search`, `describe`, and `run`; it
+does not fabricate native `save`, replay, or saved `call` durability.
+
+Generated Code leaf calls reuse the existing OXP capability/MCP owners and are
+independently re-authorized. The `code` grant therefore enables only the confined
+interpreter and does not imply read/write/process/Git/browser/integrations authority.
+An approved top-level OXP root is inherited only by leaf contracts that accept a
+root. Root-scoped MCP refs remain separately integrations-gated and re-resolve the
+current broker contract immediately before execution.
+
+External Code also reuses native Code request admission: source is capped at 128 KiB,
+invocation input at 512 KiB, and the complete request at 768 KiB before parsing or
+execution. OXP projects admission failures through its ordinary
+`OXP_INVALID_ARGUMENT` boundary rather than treating them as internal defects.
+
+Code remains behind OXP's permanent `capability` broker instead of adding a redundant
+direct MCP tool. This preserves progressive disclosure and the permanent-manifest
+budget while both the direct broker prose and OXP server instructions explicitly teach
+`describe code` then `call code`. After removing duplicated instruction prose, the
+measured fixed manifest is 13 direct tools / 39,399 bytes, leaving 601 bytes below the
+40,000-byte ceiling. Gate C now enforces a 39,500-byte limit so at least 500 bytes of
+headroom remain deliberate rather than accidental.
+
+A real MCP transport regression starts a fresh OXP endpoint, verifies `code` is not a
+duplicate direct tool, describes broker capability `code`, and executes
+`return input.value + 2` through `capability.call` with result `42`.
+
+### OFXP
+
+OFXP exposes executable capability `code` under a dedicated default-off peer grant.
+The wire grant field is optional for backward compatibility and normalizes missing
+legacy values to deny without a SQL migration.
+
+`code.run` is receipt-backed as a non-idempotent parent invocation. Every generated
+leaf re-enters the ordinary OFXP dispatcher with a fresh child InvocationID,
+`parentInvocationID` pointing at the Code parent, the same trace/source provenance,
+and its exact live descriptor contract. This preserves ordinary peer grants, approved
+roots, mutation receipts, and ambiguous-commit behavior. A parent that crossed the
+execution boundary cannot be blindly replayed; an ambiguous child mutation keeps the
+parent ambiguous rather than collapsing uncertainty into an ordinary ToolFailure.
+
+A real authenticated OFXP TLS regression pairs peers, grants only `code + read`,
+describes `code`, executes Code that calls remote `read`, and proves the confined
+result crosses the authenticated transport successfully.
+
+OFXP performs the same shared request admission before admitting/preparing the
+non-idempotent parent receipt. Invalid or oversized Code therefore returns
+`INVALID_REQUEST` with no receipt, while parser/runtime execution failures cross the
+execution boundary and settle the parent normally.
+
+### Verification snapshot - earlier transport checkpoint
+
+Fresh focused verification on the live worktree:
+
+- shared external Code projection: 5/5;
+- native Code provider discovery UX: 7/7;
+- `@opencode-ai/codemode`: 288/288;
+- registry / ACP / OXP+OFXP executable parity: 49/49;
+- ACP result projection: 10/10;
+- OXP Gate-C boundary/performance: 18/18;
+- OXP server, including real brokered-Code MCP e2e: 13/13;
+- OXP config: 9/9; OXP authority: 10/10;
+- OFXP protocol schema: 4/4; selected core OFXP peer/invocation/grant-expiry tests: 24/24;
+- targeted OFXP Code direct + authenticated-TLS + ambiguous-child tests: 3/3;
+- desktop sidecar protocol: 3/3; SDK OFXP settings contract: 1/1;
+- focused Code/OXP/OFXP/ACP suites are green; full package typechecks are currently blocked by unrelated concurrent drift in `packages/core/src/npm.ts` and compatibility-test typing, so they are not claimed clean at this checkpoint.
+
+The broad OpenCode package typecheck is not currently globally clean because of
+pre-existing concurrent test diagnostics outside this transport tranche:
+`canonical-openfork-isolation` narrowing, branded provider-map indexing in
+`t3code-account-alias`, readonly-array typing in `t3code-adversarial-negative`,
+one optional legacy-envelope string, and a widened session-actions permission literal.
+No current diagnostic points at the Code/OXP/OFXP/ACP transport files changed here.
+
+Two failures observed in the broad OFXP capability file are environment/unrelated
+to Code: one existing TLS test exceeded its 5-second Effect-test harness timeout
+during slow plugin bootstrap, and the SymPy test host does not have SymPy installed.
+The broad OXP capability file likewise has pre-existing concurrent `system-one`
+lazy/default expectation drift (32/35 overall) while all Code-specific OXP behavior
+is green. The broad OFXP file is 19/21 overall for the two environment failures above.
+
+The already-running developer OXP connector may still advertise the previous catalog
+until the rebuilt backend/app is restarted; source-level transport tests start fresh
+endpoints from this tree and therefore validate the shipped implementation rather
+than the lifetime of an older resident connector process.
+
+### Verification snapshot - 2026-10-04 live realignment
+
+Fresh verification was rerun from the authoritative dirty main worktree after realigning with the live OXP runtime rather than trusting the interrupted checkpoint.
+
+- shared external stateless Code projection: 7/7;
+- `@opencode-ai/codemode`: 288/288, including no ambient subprocess authority;
+- affected registry/OXP-authority/Gate-C/external-Code sweep: 71/71 (registry 49/49, OXP authority 11/11, Gate-C 4/4, external Code 7/7);
+- exact ACP provider action enum is `search | describe | run | save | call`, with no legacy `execute`;
+- ACP tool/event projection in the fresh cross-transport batch: 28/28;
+- OXP Code transport seam: 4/4 across broker execution, MCP leaf composition, ambiguous external mutation preservation, and real MCP HTTP e2e;
+- OFXP Code direct/authenticated-TLS/ambiguous-child cases: 3/3;
+- OFXP Code client timeout policy: 1/1, proving a 125,000 ms request budget for `code.run`;
+- durable OFXP invocation receipts: 6/6, including concurrent exactly-once execution-boundary claim;
+- OFXP protocol schema: 4/4; desktop sidecar protocol: 3/3; SDK OFXP settings contract: 1/1;
+- OXP Gate-C remains 13 permanent tools / 39,399 bytes.
+
+Snapshot classification now treats only native `code.search` and `code.describe` as workspace-read-only. `run`, `save`, `call`, missing actions, and unknown actions remain conservatively mutating.
+
+Package typechecks are clean for `packages/core`, `packages/codemode`, `packages/schema`, `packages/app`, `packages/desktop`, and `packages/sdk/js`. `packages/opencode` still has only unrelated concurrent diagnostics in compatibility/session-action tests; no current diagnostic points at this Code/OXP/OFXP/ACP tranche.
+
+A broad nine-file OpenCode transport/regression batch produced 130/136 passing. The six failures are outside this Code cutover: four OFXP tests exceeded their internal 5-second fixture/bootstrap budget (read, typed Git, typecheck, archive), the host lacks SymPy, and the semantic-client exact catalog assertion is stale because the concurrent tree now legitimately exposes `refactor`. The Code-specific cases from those files all pass in isolation.
+
+The canonical OXP/OFXP architecture documents now include `code` in their grant models: external Code is independent, default-off and rootless at the interpreter layer; every generated leaf retains ordinary capability/root authority; native replay/save/call durability remains native/ACP.
+
+### Verification snapshot - 2026-10-04 accepted live OXP deployment
+
+The previously observed source/runtime mismatch is closed. The root cause was operational rather than architectural: `runtime.refresh` intentionally activates an already-built mutable `dist/node` artifact and does not compile source itself. A no-op refresh therefore correctly left the older accepted backend unchanged until the canonical sidecar build was run.
+
+- canonical candidate build: `bun script/build-node.ts` from `packages/opencode`, completed successfully;
+- transactional refresh moved the accepted backend from runtime `sha256:25ac0e06f4ac2e51e711fb8bf425268c5d1971d038cf2a20605e0c4919037ee5` to accepted generation 2 runtime `sha256:9c87552313835d666043699f70fa8fa297bb8734d1c6380495504db62a643fce`;
+- the live OXP schema fingerprint changed from `5c86f23e24dfd9bc69b2ba81b2c73446f2e8839892d40aba55f47c229d8d29ce` to `6e9d46a863f80bd6569c6bbb2c9550a9a80680c8038041647e62074d6fd4c112`, proving the rebuilt source graph became authoritative;
+- `openfork_info capabilities` on the accepted runtime now advertises brokered capability `code` with authority `code`, workspace tier 3, and no duplicate direct MCP tool;
+- the live connector exposes the independent `code` grant. Its product/default policy remains deny-by-default; this restarted developer connector currently has `code:true`, proving explicit enablement without changing leaf grants;
+- focused OpenCode transport verification: 129/133 across external Code, OXP authority/capability, OFXP capability, ACP projection, and registry. All Code-owned cases pass; the four failures are unrelated current-tree drift (one missing host SymPy installation and three stale `system-one` lazy/default expectations);
+- focused OFXP Code/receipt/cancellation/timeout selection: 9/9;
+- durable core OFXP invocation/recent receipt suites: 9/9, including the atomic exactly-once execution-boundary claim;
+- OXP Gate-C endpoint boundary: 14/14;
+- OXP Gate-C performance: 4/4 with 13 direct tools, 39,399 manifest bytes, warm pagination median 0.375 ms and p95 0.560 ms over 2,000 samples;
+- scoped typecheck over `exchange/code.ts`, OXP Code/capability/authority/schema, and OFXP capability reports zero target-file diagnostics. Six transitive diagnostics remain outside this tranche (Photon/tree-sitter WASM resolution and `seek-bzip` declarations).
+
+This closes the deployment half of the transport cutover: native/ACP retains the durable five-action Session-owned Code surface, OXP now actually serves the stateless three-action broker from the accepted live backend, and OFXP retains receipt-backed stateless Code over authenticated peer authority.
+
+#### Concurrent watcher advancement after deployment check
+
+A deliberate post-promotion freshness check detected that the dev sidecar watcher had rebuilt `dist/node` again while unrelated backend work continued in the shared dirty worktree. Transactional refresh therefore correctly produced and accepted generation 3 runtime `sha256:d62611f1afc0a8c15695d08743bb219adb5f67ac22bef8a1f0d8fab040f9aad1` instead of reporting a false no-op. The model-visible schema fingerprint remained `6e9d46a863f80bd6569c6bbb2c9550a9a80680c8038041647e62074d6fd4c112`.
+
+- the accepted runtime remains stable and advertises brokered `code`; the grant is default-off by policy but may be explicitly enabled per connector (the current restarted developer connector is enabled);
+- generation-3 critical Code revalidation: 30/30 across shared external Code, OXP Code authority/broker, OFXP authenticated Code/receipt/ambiguity/timeout behavior, native Code discovery, and ACP projection;
+- post-promotion native Code/ACP focused suites: 17/17;
+- post-promotion `@opencode-ai/codemode`: 288/288, including the static and runtime no-subprocess-authority gates.
+
+Generation 3 supersedes generation 2 as the final resident runtime observed by this closeout; generation 2 remains recorded above as the first successful source-to-live cutover event.
+
+### Verification snapshot - 2026-10-04 restarted connector and SDK metadata compatibility
+
+A later restart was realigned from memory against the authoritative dirty main worktree before trusting the previous deployment checkpoint. The accepted backend still reports runtime `sha256:d62611f1afc0a8c15695d08743bb219adb5f67ac22bef8a1f0d8fab040f9aad1`, advertises brokered `code`, and exposes the explicit developer `code:true` grant.
+
+- live broker smoke is green across `code.search`, exact `code.describe`, and confined `code.run` invoking the ordinary root-authorized `read` leaf; an initial root-aware search returned one transient backend error, then the identical retry and the remaining live sequence succeeded;
+- focused ACP/OXP/OFXP/registry batch: 107/109. The two failures are outside Code ownership: the workstation lacks SymPy, and the OFXP semantic-client exact catalog expectation has not yet absorbed the concurrently added `refactor` capability;
+- permanent OXP broker composition: 1/1; real OXP MCP transport composition: 1/1;
+- durable OFXP invocation receipt suite: 6/6, including the atomic exactly-once execution claim; OFXP protocol compatibility: 4/4;
+- Gate-C: 18/18, 13 permanent tools, 39,399 manifest bytes, warm pagination median 0.2225 ms / p95 0.4208 ms over 2,000 samples. The 39.5 KiB gate therefore retains only 101 bytes of headroom.
+
+The final certification exposed one in-scope observability compatibility defect that earlier focused Code tests did not catch. `ToolMetadata` intentionally uses an open-ended `StructWithRest` so schema-owned `trace` metadata can coexist with legacy fields such as `output`, `files`, `exit`, `sessionId`, and `providerState`; however, the current Effect JSON-Schema emitter drops the rest record from that shape. The generated V2 SDK therefore narrowed all Tool metadata to `{ trace?: CodeRunTrace }`, breaking App/Desktop/TUI consumers even though the runtime schema remained permissive.
+
+The public OpenAPI compatibility projection now explicitly publishes `additionalProperties: {}` for `ToolStateRunning`, `ToolStateCompleted`, `ToolStateError`, and `ToolPart` metadata while retaining the typed `trace` property. The checked-in V2 SDK types preserve both `trace?: CodeRunTrace` and `[key: string]: unknown`, and a public-OpenAPI regression locks that contract.
+
+- public OpenAPI contract: 22/22;
+- SDK, App, Desktop, CodeMode, Session UI, and Schema typechecks: green;
+- the previous Tool-metadata diagnostics disappear completely from the OpenFork package typecheck;
+- remaining full-package typecheck failures are current unrelated owners: Core Skill admission typing, support-bundle CLI arguments, model-variant branding, browser certainty fixtures, and compatibility-test drift. TUI is otherwise clean but inherits the Core Skill diagnostics.
+
+No reset, stash, clean, broad checkout, rebase, generated-file regeneration, or unrelated source rewrite was performed. The SDK fix was intentionally surgical because its generated file already contains substantial concurrent changes from other campaigns.
+
+
+### Verification snapshot - 2026-10-04 post-restart adversarial closeout
+
+The OXP connector was restarted again and reconciled against the live dirty `main` worktree at `1d9690291159d425a6efc8bb8bf39fb02d3cf22e` before trusting earlier closeout state. The newly resident runtime is stable at `sha256:5327daa6af8741fcf5e77e7b25f6e5c9f482fab43f0fe56388ce885ce701302a`, retains schema fingerprint `6e9d46a863f80bd6569c6bbb2c9550a9a80680c8038041647e62074d6fd4c112`, publishes brokered `code`, and exposes the explicit developer `code:true` grant.
+
+A recovered OXP adversarial worker identified one still-live correctness defect in the shared stateless Code projection: search cursors were bound only to catalog generation, so a cursor issued for query A could be reused under query B and reinterpret its offset against a different ranked result set. The shared projection now includes the normalized query in the opaque cursor scope and rejects cross-query reuse as stale. A focused regression forces a real second page and proves both same-query continuation and cross-query rejection.
+
+Fresh post-repair evidence:
+
+- shared external Code projection: 7/7, including query-scoped cursor pagination and native Code request admission;
+- combined external Code + ACP + OXP authority/capability + OFXP capability batch: 84/85; the sole failure is the already-known host environment gap where SymPy is not installed, while all Code-owned cases pass;
+- OXP Gate-C boundary/performance: 18/18, still exactly 13 permanent tools / 39,399 manifest bytes; warm pagination median 0.2241 ms / p95 0.375 ms over 2,000 samples;
+- the cursor repair touched only the shared stateless projection and its focused regression; it does not alter provider schema, authority, root inheritance, receipt semantics, or permanent OXP manifest size;
+- the worker's older request-size, attachment/output-bound, denial-detail, and mutation-ambiguity concerns are superseded by the later transport closeout already recorded above; its progressive-load observation is not treated as a correctness defect because the shared external projection deliberately owns transport-neutral discovery/ranking rather than exposing OXP-specific load policy.
+
+The shared external Code source and focused test are currently untracked additions in this intentionally dirty concurrent worktree, so ordinary tracked-file `git diff` does not display their bytes. Their current contents were re-read after the repair and the focused tests executed those exact bytes. No reset, stash, clean, restore, broad checkout, rebase, mass-format, or unrelated rewrite was performed.
+
+
+Final live-runtime revalidation on the restarted backend is green: brokered `code.search("project")` returned the current inventory, exact `code.describe("project")` returned the typed callable contract, and confined `code.run` evaluated `return input.value + 2` with `{ value: 40 }` to `42`. The complete `@opencode-ai/codemode` package suite is also freshly green at 288/288, including prepared-program reuse, shared budgets, bounded concurrency/intermediate data, host-failure classification, and the static/runtime no-subprocess-authority gates.

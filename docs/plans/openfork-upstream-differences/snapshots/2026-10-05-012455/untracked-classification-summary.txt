@@ -1,0 +1,9 @@
+﻿8555	generated-e2e-debris
+475	generated-desktop-build
+84	meaningful-source-config
+77	meaningful-test
+70	temp-runtime-debris
+32	temp-probe-debris
+17	meaningful-doc-or-evidence
+14	audit-evidence
+5	shell-quoting-debris

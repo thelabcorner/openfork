@@ -12,15 +12,22 @@ ProofGate policy specification and it does not make Jev a correctness oracle.
 
 ## Upstream findings
 
-The relevant upstream OpenCode work landed on upstream `dev` after the local
-`v1.18.30` baseline. The donor series includes the Jev hosted-proxy support beginning
-with `1573a7b608` and later endpoint/documentation fixes. It was not part of the
-`v1.18.31` release tag inspected during this work.
+The current OpenFork sync comparator is stock OpenCode **v1.18.34**
+(`aec0b9a6d8898f68f923aaf08b7306d931fd9d76`). By that release, upstream already
+contains the hosted Console/Zen System One proxy and Jev documentation, including
+`/zen/v1/systemone` and `/zen/go/v1/systemone` forwarding.
 
-That upstream work primarily teaches the hosted OpenCode Console/Zen proxy how to
-forward System One traffic. It does **not** make the local OpenCode/OpenFork runtime
-understand that Jev is a non-generative computational primitive. Selectively adapting
-the remote-contract knowledge was therefore safer than merging the donor branch.
+That upstream support is a **hosted-service boundary**, not the local-runtime
+architecture implemented by OpenFork. Stock v1.18.34 teaches the hosted OpenCode
+backend how to proxy System One traffic; it does not give the local OpenCode runtime
+OpenFork's browser-safe `system-one` primitive, local typed inference contract,
+provider/account orchestration, Tier-2 `systemOne.infer` API, generated local SDK
+surface, or fail-closed separation from conversational model selection.
+
+OpenFork therefore preserves the upstream remote wire contract while owning a
+separate local semantic-inference integration. Older research in this repository
+used v1.18.30/v1.18.31 while that upstream work was still landing; those versions are
+historical investigation context, not the present fork comparator.
 
 The public models.dev catalog also does not yet carry a System One discriminator for
 Jev and can make the OpenCode Jev entries look like ordinary OpenAI-compatible text

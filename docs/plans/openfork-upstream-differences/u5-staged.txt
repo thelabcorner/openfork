@@ -1,0 +1,1 @@
+# staged universe: EXPLICIT ZERO. Command: git diff --cached --name-only -> 0 paths. Snapshot 2026-10-04.

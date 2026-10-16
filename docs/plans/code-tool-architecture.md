@@ -1,9 +1,9 @@
 # OpenFork `code` Tool Architecture Plan
 
-> Status: **proposed architecture; not yet implemented**.
+> Status: **implemented architecture; retained as the detailed design/history record**.
 >
-> This plan replaces the provider-visible `execute` Code Mode tool with a richer,
-> stable `code` tool while preserving the current confined JavaScript execution
+> This plan records the design that replaced the former provider-visible `execute`
+> Code Mode tool with the stable `code` tool while preserving the confined JavaScript execution
 > engine as the zero-startup hot path. It deliberately does **not** revive the
 > superseded Python/Jupyter Custom Runtime design.
 >
@@ -12,7 +12,7 @@
 
 ## 1. Decision
 
-OpenFork should replace the current MCP-only provider tool:
+OpenFork replaced the former MCP-only provider tool:
 
 ```text
 execute({ code })
@@ -22,7 +22,8 @@ with one stable programmable capability surface:
 
 ```text
 code
-  search   discover exact capability paths, saved code tools, and prior runs
+  search   discover capability/saved-tool/run refs
+  describe inspect the exact callable contract for one discovered ref
   run      execute new JS/TS or replay a prior run
   save     promote a successful run into a revisioned reusable code tool
   call     invoke a saved code tool
@@ -63,7 +64,10 @@ footprint roughly constant.
 OpenFork already has most of the difficult primitives:
 
 - `packages/codemode/**`: confined Effect-native JS/TS execution without `eval`;
-- `packages/opencode/src/tool/code-mode.ts`: current MCP Code Mode adapter;
+- `packages/opencode/src/tool/code.ts` + `packages/opencode/src/code/**`: the
+  adopted static provider surface, replay/save/call services, and saved catalog;
+- `packages/opencode/src/session/capability-invocation-gateway.ts`: the shared
+  host invocation gateway extracted from the historical split paths;
 - `packages/opencode/src/tool/access.ts`: stable lazy `tool` broker and descriptor
   contract pattern;
 - `packages/opencode/src/tool/registry.ts`: authoritative V1 tool registry,
@@ -125,6 +129,37 @@ boundary**. OpenFork-specific ideas in this plan — durable `CodeRun` artifacts
 to OpenFork sessions, revisioned filesystem-backed saved tools, native OpenFork
 capability access, dependency execution contracts, and revision-bound saved-tool
 trust — are local product architecture, not claims about Cloudflare's implementation.
+
+### 2.2 Scenario parity target and intentional differences
+
+Cloudflare's current Code Mode surface is useful as a scenario checklist, not as an
+implementation contract. OpenFork should support the same important agent workflows
+where they fit the product, while keeping OpenFork's existing V1 authority/session
+semantics as the owner.
+
+| scenario | OpenFork analogue / requirement |
+|---|---|
+| dependent multi-tool composition | **Required / implemented foundation.** `code.run` executes one confined program and `call(ref, input)` routes every leaf through `CapabilityInvocationGateway`. |
+| loops, branching, filtering, aggregation, result shaping | **Required / runtime-supported.** Keep intermediate values inside the confined interpreter and return only the model-relevant result. |
+| parallel fan-out | **Required / runtime-supported.** Independent calls may start together and use `Promise.all`, subject to the root concurrency/call budgets. |
+| progressive discovery over a large catalog | **Required.** `code.search` returns compact ranked refs without full signatures/source; it is bounded and generation-cached. |
+| focused API/type inspection | **Required.** `code.describe({ ref })` returns the exact descriptor, JSDoc-rich TypeScript `call(...)` signature/example, and raw input/output schemas. Agents should search → describe → author rather than guess arguments. |
+| MCP composition | **Required / implemented foundation.** Exact MCP identity, MCP resources, structured results, attachments, permissions, cancellation, and plugin hooks use the shared capability inventory/gateway. |
+| OpenAPI-backed APIs | **Engine capability retained.** `@opencode-ai/codemode` keeps its OpenAPI adapter; OpenFork host integrations still expose external authority as capabilities rather than ambient authenticated `fetch`. A dedicated OpenAPI connector is optional product surface, not authority required by Code. |
+| browser-owned/browser-session operations | **Required capability parity.** The existing Browser broker remains the semantic owner and can be called as a native Code capability; Code must not create a second browser implementation. |
+| another agent / durable delegator as a tool | **Required capability parity.** Task, Swarm, background/session-style delegators remain ordinary semantic capabilities with their existing lifecycle ownership; Code only composes them. |
+| durable execution identity/history | **Required.** Reuse the durable V1 root ToolPart as CodeRun identity; do not create a second execution database. |
+| replay of successful source | **Required.** `code.run({ runID })` performs a fresh replay of retained source with explicit input semantics. |
+| reusable snippets/programs | **Required before final cutover.** `code.save` + revisioned project/global saved tools + `code.call` provide the OpenFork analogue, with stronger revision-bound trust and reviewable filesystem source. |
+| approval-gated side effects | **Required, but OpenFork-native.** Leaf permissions remain live and run-scoped inside the gateway; a live run can suspend on the ordinary permission owner rather than inventing Code-specific approval policy. Crash/restart replay of a paused approval is a separate durability enhancement, not permission authority. |
+| compensating rollback | **Do not claim generic parity.** Snapshot protects workspace ordering/state observation but is not rollback for arbitrary external MCP/API side effects. A future reversible-capability contract must be explicit per leaf; P0 must not pretend arbitrary external effects can be undone. |
+| discovery from inside the running sandbox | **Intentional P0 difference.** Provider-level `search` / `describe` gives the authoring agent exact specs before execution; the runtime surface stays only `input` + `call(ref,input)`. Add runtime discovery only if a concrete dynamic-discovery workflow proves it is worth the extra surface. |
+| resource lifetimes | **Required.** Capability registrations classify inline vs durable lifetime; the owning tool/runtime manages browser sessions, workers, transactions, or other durable resources rather than Code retaining ambient handles. |
+
+The user-facing/agent-facing quality bar is therefore not “Cloudflare-compatible.”
+It is: every major Code Mode workflow is either supported through an existing
+OpenFork semantic owner, deliberately implemented before cutover, or explicitly
+documented as a non-goal instead of being accidentally absent.
 
 ## 3. Non-negotiable invariants
 
@@ -319,16 +354,16 @@ Rules:
   alias (`project/find_todos` / `global/find_todos`), or an immutable saved-revision
   handle. Alias calls resolve atomically to one revision at call admission and pin
   that revision for the whole run; the result echoes the resolved immutable handle;
-- `search` is the single discovery primitive for capabilities, saved tools, and
+- `search` is the broad discovery primitive for capabilities, saved tools, and
   run history;
 - `search.target` defaults to `callable` (native/lazy/MCP + saved tools) so old run
   history never pollutes ordinary capability discovery; run lookup is explicit.
-- `search.ref` is exact inspection: it accepts the host-issued ref returned by search
-  (including `native:*`, `mcp:*`, `saved:*`, and `run:*`) and returns the complete
-  descriptor/signature/metadata for that one object. It replaces a separate
-  provider-facing `describe` action.
-- broad `search.query` returns compact ranked candidates; an exact canonical ref hit
-  deterministically returns the same full descriptor as `search.ref`.
+- `describe.ref` is exact inspection: it accepts the host-issued ref returned by
+  search (including `native:*`, `mcp:*`, `saved:*`, and `run:*`) and returns the
+  complete descriptor/signature/metadata for that one object.
+- broad `search.query` returns compact ranked candidates and intentionally omits
+  full signatures/source so discovery remains cheap; agents use `describe` when they
+  need an exact API contract before authoring.
 
 `input` defaulting is action/source-specific and deterministic:
 
@@ -367,14 +402,16 @@ the ID in P0, not a second durable identity field.
 The description itself should be short, operational, and stable. A good target:
 
 ```text
-Write and run JavaScript/TypeScript that composes OpenFork capabilities through a
-host-controlled `call(ref, input)` bridge, search capability/saved-tool/run history,
-replay prior source, and save successful programs as reusable versioned tools. Use
-direct tools for simple one-step work; use code for predictable composition,
-branching, loops, filtering, fan-out, or reusable logic. Discover capability refs with
-provider-level `code.search` before authoring when needed. The default runtime is
-confined: filesystem/process/network/import authority is available only through
-`call(...)`. Capability calls still enforce their normal permissions.
+Programmable OpenFork orchestration. `code.search` finds candidate refs;
+`code.describe` returns the exact input/output contract for one ref; `code.run`
+executes confined JS/TS where external work happens only through
+`await call(ref, input)`; `code.save` promotes a successful run; and `code.call`
+invokes a saved tool. Prefer direct tools for one simple known operation. For
+unfamiliar capabilities, search then describe instead of guessing arguments. Use
+`code.run` for predictable branching, loops, filtering, aggregation, or fan-out;
+start independent calls together and await them with `Promise.all`. The runtime has
+no ambient filesystem/process/network/import/credential/warm-state authority; normal
+leaf permissions still apply.
 ```
 
 Do **not** append:
@@ -386,8 +423,9 @@ Do **not** append:
 - recent run names;
 - examples containing real current capabilities.
 
-All dynamic catalog information belongs behind provider-level `code.search`. P0 does
-not expose catalog search/describe from inside an executing program.
+All dynamic catalog information belongs behind provider-level `code.search` and
+`code.describe`. P0 does not expose catalog search/describe from inside an executing
+program.
 
 ### Agent decision heuristic
 
@@ -397,7 +435,7 @@ The model-facing instructions should make the selection rule extremely obvious:
 1 operation you already know -> call the direct tool
 multiple predictable dependent operations / filtering / loops / fan-out -> code.run
 intermediate result needs fresh semantic/model judgment -> stay in the direct agent loop
-unknown capability -> code.search, then code.run with returned refs
+unknown capability -> code.search, code.describe the chosen ref, then code.run
 known saved abstraction -> code.call
 successful orchestration worth reusing -> code.save
 ```
@@ -578,17 +616,17 @@ evaluator lifecycle semantics.
 
 ## 6. The central refactor: CapabilityInvocationGateway
 
-The current execution semantics are split across:
+The pre-refactor execution semantics were split across:
 
 - `SessionTools.resolve` for native tools;
 - `tool/access.ts` for lazy broker delegation;
-- `tool/code-mode.ts` for nested MCP;
+-- the now-deleted `tool/code-mode.ts` adapter for nested MCP;
 - the direct-MCP fallback in `session/tools.ts`.
 
-That split becomes increasingly dangerous once `code` can call native + lazy + MCP
-+ saved capabilities.
+That split was the migration baseline and became increasingly dangerous once `code`
+needed to call native + lazy + MCP + saved capabilities.
 
-Introduce one host-owned gateway beneath all programmable invocation:
+The adopted implementation introduced one host-owned gateway beneath all programmable invocation:
 
 ```ts
 interface CapabilityInvocationGateway {
@@ -744,11 +782,11 @@ Phase the extraction to avoid a flag day:
 The goal is one semantic registration/authority owner, not one universal outer
 transport. The migration must not destabilize the mature V1 provider loop.
 
-There is already concrete semantic drift proving this extraction is needed:
+Historical semantic drift proved why this extraction was needed:
 `session/tools.ts` wraps direct MCP execution in `snapshot.withMutation(...)`,
-while the current nested MCP path in `tool/code-mode.ts` invokes the MCP client
-directly and does not apply that same Snapshot mutation ordering. The gateway should
-make this class of divergence structurally difficult: one capability descriptor owns
+while the former nested MCP path in `tool/code-mode.ts` invoked the MCP client
+directly and did not apply that same Snapshot mutation ordering. The adopted gateway
+makes this class of divergence structurally difficult: one capability descriptor owns
 its mutation classification and one invocation path applies it.
 
 ### Registry ownership: do not rebuild the graph ad hoc in `code`
@@ -2003,7 +2041,7 @@ Permission ownership is deliberately non-duplicative:
 
 | operation | outer Code permission | leaf permission |
 |---|---|---|
-| `search` | no prompt; explicit `code = deny` still disables the surface | none |
+| `search` / `describe` | no prompt; explicit `code = deny` still disables the surface | none |
 | `run` | no generic prompt; explicit `code = deny` still blocks it | every called leaf evaluates normally |
 | `save` / `run.save` | `permission="code", pattern="save:<scope>:<id>"` | origin run already evaluated its leaves |
 | `call` | revision-bound `permission="code", pattern="call:<scope>:<id>@<revision>"` | every called leaf evaluates normally |
@@ -2791,11 +2829,17 @@ complicate trust semantics.
 If later telemetry shows strong value in direct lazy-tool promotion, it can be added
 as an explicit projection of the same saved revision.
 
-## 25. Migration from `execute`
+## 25. Migration from `execute` — completed historical sequence
 
-### Step M0: tests before rename
+> **Current state:** the migration below is complete. Provider-visible `execute`
+> and its adapter are gone; `code` is the sole orchestration surface, the temporary
+> selector was removed, direct MCP provider exposure remains hidden behind Code, and
+> deprecated `execute` permission config is normalized to `code` before runtime
+> permission projection. The steps are retained only as implementation history.
 
-Add regression tests proving:
+### Step M0: tests before rename — completed historical step
+
+The migration first added regression tests proving:
 
 - current MCP Code Mode execution behavior;
 - attachment behavior;
@@ -2806,17 +2850,16 @@ Add regression tests proving:
 - dynamic description currently changes (document the bug) and the new `code`
   replacement does not.
 
-### Step M1: gateway extraction
+### Step M1: gateway extraction — completed historical step
 
-Introduce `CapabilityInvocationGateway` and move current MCP child execution onto
-it without changing `execute` externally.
+The migration introduced `CapabilityInvocationGateway` and moved MCP child execution
+onto it before changing the provider-visible surface.
 
-### Step M2: static `code` alternate implementation
+### Step M2: static `code` alternate implementation — completed historical step
 
-Register `code` behind one **temporary development selector**, e.g.
-`OPENCODE_EXPERIMENTAL_CODE_TOOL`, but never expose `code` and `execute`
-simultaneously to the same provider turn. The selector owns both orchestration-tool
-choice and direct-MCP hiding:
+During branch development, `code` was registered behind one temporary development
+selector and was never co-exposed with `execute` in one provider turn. That
+temporary selector owned both orchestration-tool choice and direct-MCP hiding:
 
 ```text
 legacy branch -> execute visible, MCP direct tools hidden by legacy Code Mode policy
@@ -2826,39 +2869,38 @@ new branch    -> code visible, execute absent, MCP direct tools hidden by Code p
 Internal tests may instantiate both implementations; the model should not have two
 overlapping orchestration tools competing for calls.
 
-Initially:
+That intermediate branch initially provided:
 
-- `search` over MCP + native capabilities;
+- `search` over MCP + native capabilities plus exact `describe`;
 - `run` through confined runtime;
 - native + lazy + MCP invocation through gateway;
 - no persistence yet.
 
-### Step M3: CodeRun + replay
+### Step M3: CodeRun + replay — completed historical step
 
-Use the existing durable root ToolPart as the authoritative CodeRun record. For
+The implementation adopted the existing durable root ToolPart as the authoritative CodeRun record. For
 `action:"run"`, inline `code` creates a new source-bearing run and `runID` selects
 fresh replay over an existing source-bearing identity. Dirty saved working source is
 read through ordinary filesystem authority and supplied as inline `code`; there is no
 third run-source selector. Do not add duplicate run/source tables merely for Code Mode.
 
-### Step M4: saved tools
+### Step M4: saved tools — completed historical step
 
-Add filesystem catalog, save/call, immutable revision handles, dependency contracts,
-provenance, project/global scope, cycle/depth protection.
+The implementation added the filesystem catalog, save/call, immutable revision
+handles, dependency contracts, provenance, project/global scope, and cycle/depth
+protection.
 
-### Step M5: replace `execute`
+### Step M5: replace `execute` — completed
 
-Make `code` the default and remove provider-visible `execute`.
+`code` is now the sole provider orchestration surface and provider-visible `execute`
+has been removed.
 
-At final cutover, remove the temporary selector and make `code` the sole orchestration
-surface. Retire/deprecate legacy `OPENCODE_EXPERIMENTAL_CODE_MODE` semantics rather
-than preserving a misleading permanent dual mode merely because the flag came from
-upstream.
+The final cutover removed the temporary selector. Legacy
+`OPENCODE_EXPERIMENTAL_CODE_MODE` is retained only as compatibility input and no
+longer selects a provider surface.
 
-While the temporary selector chooses `code`, legacy
-`OPENCODE_EXPERIMENTAL_CODE_MODE=false` must not re-expose direct MCP tools. The new
-selector is the single authority for both provider tool selection and MCP-manifest
-hiding.
+Legacy `OPENCODE_EXPERIMENTAL_CODE_MODE=false` does not re-expose direct MCP tools;
+the static `code` surface remains authoritative for programmable MCP access.
 
 The provider-tool rename is also permission-sensitive. Existing explicit
 `execute = deny` configuration must not silently become permission to use `code`.
@@ -2870,17 +2912,21 @@ on object insertion order / `findLast` accidents. Tests must prove `execute=deny
 alone denies `code`, while `execute=deny` plus explicit `code=allow` allows it. Remove
 this compatibility normalization through the normal config-migration policy.
 
-### Step M6: delete obsolete adapter/catalog generation
+### Step M6: delete obsolete adapter/catalog generation — completed
 
-Once parity is proven:
+Completed cutover work:
 
 - delete the dynamic `describeCodeMode` provider-description path;
 - remove `CODE_MODE_TOOL = "execute"`;
 - keep generic `packages/codemode` as the confined engine;
-- update `docs/architecture/code-mode.md` from current adopted `execute` semantics
-  to the new adopted `code` architecture.
+- update `docs/architecture/code-mode.md` to the adopted `code` architecture.
 
-## 26. Proposed source layout
+## 26. Historical proposed source layout
+
+This section records the planning-time decomposition only. The live implementation
+coalesced several proposed modules into the current `packages/opencode/src/code/**`
+owners; use the live tree and `docs/architecture/code-mode.md` as the authoritative
+runtime map.
 
 Host-owned architecture:
 

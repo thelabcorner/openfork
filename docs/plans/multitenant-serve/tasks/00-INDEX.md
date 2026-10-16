@@ -1,5 +1,7 @@
 # OpenFork hosted multi-tenant serve implementation task graph
 
+> **PAUSED (2026-10-14).** This task graph is retained as historical research, not an active work queue. No Txx implementation or hosted integration work should be resumed without an explicit user decision supported by cloud deployment necessity. See `../README.md` for hold scope and reactivation gates. Local-first OpenFork/PresGen work remains active.
+
 This folder decomposes `../README.md` into mergeable implementation tasks for
 OpenFork (`/webstormprojects/opencode`) and PresGen
 (`/webstormprojects/presGEN_v2`).

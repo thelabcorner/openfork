@@ -1,5 +1,7 @@
 # Hosted multi-tenant implementation task contract
 
+> **HOLD OVERRIDE — 2026-10-14.** The user paused PresGen/OpenFork cloud-hosted multi-tenancy until demonstrated necessity. No agent may claim, implement, merge, or execute this historical Txx work plan absent explicit user reactivation. The remainder of this document applies only after reactivation. Preservation and source archival are permitted; local ACP, native tooling, and desktop integrations are outside this hold.
+
 This directory contains the executable implementation plan for `../README.md`.
 These instructions apply to every taskfile below this directory.
 

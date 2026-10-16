@@ -9,10 +9,26 @@
 | Mobile PWA | `packages/mobile` + `packages/app/src/pwa-*.tsx` | Fork product surface | Independently hosted PWA shell around the authoritative shared application runtime, with pairing/OFXP identity pinning and verified sidecar transport at the host boundary. |
 | TUI | `packages/tui` + embedded CLI references in `packages/opencode` | **Not an OpenFork product** | Retained coupling dependency required by inherited embedded CLI code. |
 | Local server/sidecar | `packages/opencode`, `packages/server`, `packages/core` | Internal client runtime | Sessions, tools, providers, persistence, local APIs, workspace execution. |
-| OXP / ChatGPT external-agent surface | `packages/opencode/src/oxp` + `packages/desktop/src/main/oxp` | First-party OpenFork integration surface | Secure-MCP augmentation, Session supervision, durable worker delegation, file exchange, tunnel lifecycle, and parent-tool-epoch continuity guidance. |
+| OXP / ChatGPT external-agent surface | `packages/opencode/src/oxp` + `packages/desktop/src/main/oxp` | First-party OpenFork integration surface | Secure-MCP augmentation, Session supervision, durable worker delegation, file exchange, independent OpenAI/Cloudflare tunnel transports, and parent-tool-epoch continuity guidance. |
+| OFXP / OpenFork peer exchange | `packages/opencode/src/ofxp` + `packages/core/src/ofxp-*` | First-party peer integration | Peer-authenticated tool execution, supervision and delegation where supported; actual dispatcher defines availability. |
+| ACP editor/agent bridge | `packages/opencode/src/acp` | Agent protocol adapter | Native Session-backed tool execution through ACP; no independent leaf implementation. |
+| Code tool / Code Mode | `packages/opencode/src/tool/code.ts` + `packages/codemode` | Native tool invocation gateway | Search, describe and invoke eligible tools under host-provided authority; a searchable entry alone is not an executable guarantee. |
+| MCP integrations | `packages/opencode/src/mcp` + dedicated endpoint adapters | Inbound/outbound integration boundary | Importing external MCP tools is distinct from explicitly authorized MCP exposure of OpenFork capabilities. |
 | Native Swarm | `packages/core/src/swarm` + `packages/opencode/src/swarm` + `packages/app/src/pages/swarm` | **First-party OpenFork product/domain surface** | Durable multi-Session collaboration, DAG work, peer mail, claims/deliverables, process-global orchestration, Tier-0 API, and lazy premium control UI. |
 | Standalone upstream CLI package | `packages/cli` upstream only | Pruned | Not shipped/maintained as an OpenFork package. |
 | Hosted SaaS/web console | upstream console/web/stats/etc. | Pruned | Explicitly outside fork product scope. |
+
+### Tool-callability is an execution contract, not a catalog
+
+Where a tool class is intentionally callable from a normal chat/worker Session,
+Code Mode, OXP, OFXP, ACP, MCP, or another supported route, that route must
+execute semantically equivalent actions through the authoritative owner.
+Presentation clients can use an existing Session gateway; they do not need
+independent tool protocols. A missing permission, unsupported action,
+nonexistent endpoint or unimplemented dispatcher must be represented
+explicitly, never counted as full parity. External export must not inherit
+native Session credentials or turn MCP imports into implicit exports.
+See [tool-surface parity](../architecture/tool-surface-parity.md).
 
 ## GUI
 
@@ -72,9 +88,24 @@ work does not execute inside the sandboxed renderer.
 
 OXP is not another browser/client API for the GUI. It is the first-party
 ChatGPT/OpenAI external-agent adapter. Electron main owns the native tunnel,
-secure-credential, tray/autostart, and replacement lifecycle. The sidecar owns the
+Cloudflare relay, secure-credential, tray/autostart, and replacement lifecycle.
+OpenAI and Cloudflare are independent connectors; ChatGPT selects between them
+and OpenFork does not perform client-side automatic failover. The sidecar owns the
 dedicated OXP MCP endpoint and projects OpenFork-owned capabilities rather than
 duplicating their implementations.
+
+The GUI presents each ChatGPT **parent activity** as an independent, durable
+titlebar tab. Tab identity is the OXP activity ID (the internal route
+`/oxp/activity/:activityID`), **not** the singleton `oxp` application-page
+identifier. Sidebar clicks, context-menu opens, direct links and restored URLs
+all converge through the shared `tabs` route watcher. Reopening an activity
+selects its existing tab; separate activities coexist and use the native tab
+strip's selection, reorder, close and reopen semantics. Tabs and their compact
+display titles are client-persisted; the OXP server remains authoritative for
+activity identity, title, archived/deleted state and invocation history.
+Deleting an activity purges its open tab and closed-tab history. Tab chrome
+reads the shared summary projection in `context/oxp-activity.ts`; it **never**
+hydrates invocation transcripts or starts per-tab polling to resolve labels.
 
 ChatGPT parent access to OXP is host-time-bounded. The current architecture treats
 each parent session as having an observed, non-renewing 25-minute

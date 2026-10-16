@@ -238,6 +238,40 @@ construction, records the first failure, tears down the peer stream, and makes
 close() rethrow the recorded failure only after both owners settle. This both
 prevents an unhandled stream error and bounds failure-path finalization.
 
+### 4.7 Durable-owner absence and retention-authority replacement
+
+A later V1 timeline-retention integration accidentally promoted durable recovery
+from an optional capability into a precondition for semantic tool success.
+`Truncate.output()` defected whenever an oversized result had no durable
+session/message/tool-call owner. That assumption is invalid for legitimate
+direct/host-owned execution paths, including internal/special-agent-adjacent
+tool use where `Tool.Context.callID` is intentionally optional.
+
+The same integration exposed a second ownership bug for streaming producers.
+Shell can retain the complete raw stream before returning its bounded semantic
+result. If the outer provider projection later needed another cut, re-persisting
+under the same owner could delete that richer producer retention and replace it
+with the already-bounded result.
+
+Resolution:
+
+- ownerless oversized results still cross the hard provider envelope and remain
+  successful; timeline retention is best effort and is advertised only when it
+  actually exists;
+- producer-owned completed timeline retention is explicitly preserved across
+  the outer provider projection;
+- completed retention for one durable tool-call owner is first-writer
+  authoritative, while incomplete crash residue may be restarted;
+- Core read-before-write retention transitions use IMMEDIATE SQLite
+  transactions, matching the repository's multi-writer ownership rule;
+- streaming progress metadata does not advertise full timeline recovery before
+  `finish()` durably marks the retained stream complete.
+- provider-facing execution is admitted only with a real provider tool-call ID;
+  a missing ID fails admission, and no call site may fabricate an owner
+  (`""`, tool name, or non-ToolPart ID);
+- a retention owner must match a durable ToolPart; mismatches refuse retention
+  (best-effort, never a tool failure) instead of writing orphan rows.
+
 ## 5. External prior art / comparison
 
 These sources were reviewed as architecture evidence, not copied as product
