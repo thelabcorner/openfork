@@ -4,6 +4,7 @@ import { Icon } from "@opencode-ai/ui/v2/icon"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import type { AccountVariant, AccountModelItem } from "./dialog-select-model-accounts"
+import type { Strategy as ProviderRouteStrategy } from "@opencode-ai/schema/model-select/provider-route-intent"
 import type { ForkCapacityPredictiveRange } from "@/utils/fork-client"
 import { stretchHeadroom, stretchTone } from "./model-stretch-bar"
 import { toneForRemaining } from "@/utils/limits-format"
@@ -45,8 +46,10 @@ export function accountLabelForVariant<T extends AccountModelItem>(
 /**
  * Account picker body for the multi-account model submenu. Rendered under the
  * embedded model inspector in the same visual language (model-inspector.css):
- * a Routing section with the Auto policy, then an Accounts section whose rows
- * mirror the Session preview card's member rows — state dot, title, headroom
+ * a Routing section for hosted session strategies (Adaptive/Round-robin), or
+ * a provider-default catalog selection for legacy variant-backed providers,
+ * followed by an Accounts section whose rows mirror the Session preview
+ * card's member rows — state dot, title, headroom
  * meter, request estimate, accent rail on the selected account.
  *
  * Every per-row value is an O(1) read of the Capacity projection the parent
@@ -57,6 +60,9 @@ export function AccountOptionList<T extends AccountModelItem>(props: {
   auto?: T
   selectedAuto?: boolean
   onSelectAuto?: () => void
+  routingOptions?: readonly ProviderRouteStrategy[]
+  selectedRoutingStrategy?: ProviderRouteStrategy
+  onSelectRoutingStrategy?: (strategy: ProviderRouteStrategy) => void
   selectedAccountID?: string
   usageForAccount?: (accountID: string) => AccountOptionUsage | undefined
   accountLabels?: Readonly<Record<string, string>> | ReadonlyMap<string, string>
@@ -65,30 +71,72 @@ export function AccountOptionList<T extends AccountModelItem>(props: {
   const language = useLanguage()
   return (
     <>
-      <Show when={props.auto && props.onSelectAuto}>
+      <Show when={(props.auto && props.onSelectAuto) || props.routingOptions}>
         <div data-slot="pick-section">
           <div data-slot="section-head">
             <Icon name="status" size="small" class="size-3 shrink-0" />
-            <span data-slot="section-label">{language.t("dialog.model.account.section.routing")}</span>
+            <span data-slot="section-label">
+              {language.t(props.routingOptions ? "dialog.model.account.section.routing" : "dialog.model.account.section.default")}
+            </span>
           </div>
           <div data-slot="pick-list">
-            <MenuV2.Item
-              data-slot="pick-row"
-              data-selected={props.selectedAuto ? true : undefined}
-              aria-label={language.t("dialog.model.account.auto")}
-              onSelect={props.onSelectAuto}
-            >
-              <span data-slot="pick-state" aria-hidden="true">
-                <i data-slot="dot" />
-              </span>
-              <span data-slot="pick-title">{language.t("dialog.model.account.auto")}</span>
-              <Show when={props.selectedAuto}>
-                <Icon name="check" size="small" data-slot="pick-check" />
-              </Show>
-            </MenuV2.Item>
+            <Show when={props.routingOptions}>
+              {(options) => (
+                <For each={options()}>
+                  {(strategy) => {
+                    const adaptive = strategy === "adaptive"
+                    const label = () =>
+                      language.t(
+                        adaptive ? "dialog.model.account.adaptive" : "dialog.model.account.roundRobin",
+                      )
+                    const description = () =>
+                      language.t(
+                        adaptive
+                          ? "dialog.model.account.adaptiveDescription"
+                          : "dialog.model.account.roundRobinDescription",
+                      )
+                    const selected = () => props.selectedRoutingStrategy === strategy
+                    return (
+                      <MenuV2.Item
+                        data-slot="pick-row"
+                        data-selected={selected() ? true : undefined}
+                        aria-label={`${label()}. ${description()}`}
+                        title={description()}
+                        onSelect={() => props.onSelectRoutingStrategy?.(strategy)}
+                      >
+                        <span data-slot="pick-state" aria-hidden="true">
+                          <i data-slot="dot" />
+                        </span>
+                        <span data-slot="pick-title">{label()}</span>
+                        <Show when={selected()}>
+                          <Icon name="check" size="small" data-slot="pick-check" />
+                        </Show>
+                      </MenuV2.Item>
+                    )
+                  }}
+                </For>
+              )}
+            </Show>
+            <Show when={!props.routingOptions && props.auto && props.onSelectAuto}>
+              <MenuV2.Item
+                data-slot="pick-row"
+                data-selected={props.selectedAuto ? true : undefined}
+                aria-label={language.t("dialog.model.account.providerDefault")}
+                onSelect={props.onSelectAuto}
+              >
+                <span data-slot="pick-state" aria-hidden="true">
+                  <i data-slot="dot" />
+                </span>
+                <span data-slot="pick-title">{language.t("dialog.model.account.providerDefault")}</span>
+                <Show when={props.selectedAuto}>
+                  <Icon name="check" size="small" data-slot="pick-check" />
+                </Show>
+              </MenuV2.Item>
+            </Show>
           </div>
         </div>
       </Show>
+      <Show when={props.variants.length > 0}>
       <div data-slot="pick-section" data-grow>
         <div data-slot="section-head">
           <Icon name="layers" size="small" class="size-3 shrink-0" />
@@ -201,6 +249,7 @@ export function AccountOptionList<T extends AccountModelItem>(props: {
           </div>
         </ScrollView>
       </div>
+      </Show>
     </>
   )
 }

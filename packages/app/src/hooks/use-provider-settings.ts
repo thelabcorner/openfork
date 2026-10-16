@@ -81,7 +81,7 @@ export function useProviderSettings(options: { enabled?: Accessor<boolean> } = {
        * their method projection; callers must not synthesize a workspace.
        */
       methods: (providerID: string): readonly ProviderSettingsConnectMethod[] =>
-        get(providerID) ? KEY_ONLY_METHODS : [],
+        providerID === "workbuddy" ? [] : get(providerID) ? KEY_ONLY_METHODS : [],
       loading: () => query.isLoading,
     },
     connectKey: (input: { providerID: string; key: string; label?: string }) =>
