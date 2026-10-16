@@ -7,6 +7,13 @@ const muse = { providerID: "opencode-go", api: { id: "muse-spark-1.3-contributor
 const other = { providerID: "opencode-go", api: { id: "deepseek-v4.1-flash" } } as any
 const sample = { description: "Execute the tool" } as any
 
+const toolCallID = (part: unknown): string => {
+  if (typeof part !== "object" || part === null || !("toolCallId" in part) || typeof part.toolCallId !== "string") {
+    throw new Error("expected a tool-call or tool-result part with a string call ID")
+  }
+  return part.toolCallId
+}
+
 describe("Muse Spark tool name lowering", () => {
   test("aliases overlong names without changing execute identity or stored history", () => {
     const long = "some-remote-service_".repeat(4) + "execute"
@@ -84,7 +91,7 @@ describe("Muse Spark tool name lowering", () => {
     expect(parts[0].toolCallId).toBe(parts[1].toolCallId)
     expect(parts[0].toolCallId.length).toBeLessThanOrEqual(64)
     expect(parts[0].toolCallId.length).toBeGreaterThan(0)
-    expect(normalizeMuseToolNames(muse, { [name]: sample }, messages).messages[0].content[0].toolCallId).toBe(parts[0].toolCallId)
+    expect(toolCallID(normalizeMuseToolNames(muse, { [name]: sample }, messages).messages[0].content[0])).toBe(parts[0].toolCallId)
     expect(messages).toEqual(original)
     expect(normalizeMuseToolNames(other, { [name]: sample }, messages).messages).toBe(messages)
   })
@@ -98,10 +105,10 @@ describe("Muse Spark tool name lowering", () => {
     const normalized = normalizeMuseToolNames(muse, tools, messages)
     expect(normalized.tools).toBe(tools)
     expect(normalized.messages.map((message) => (message.content[0] as any).toolCallId)).toEqual([
-      normalized.messages[0].content[0].toolCallId,
-      normalized.messages[0].content[0].toolCallId,
+      toolCallID(normalized.messages[0].content[0]),
+      toolCallID(normalized.messages[0].content[0]),
     ])
-    expect(normalized.messages[0].content[0].toolCallId).not.toBe("")
+    expect(toolCallID(normalized.messages[0].content[0])).not.toBe("")
     expect((messages[0].content as any)[0].toolCallId).toBe("")
   })
 
