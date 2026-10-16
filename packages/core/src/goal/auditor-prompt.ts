@@ -59,6 +59,8 @@ audit_verdict contract:
 - decision="continue" MUST include a non-empty continuationPrompt. Author it as the next worker cycle's task-specific continuation instruction.
 - decision="blocked" MUST include a non-empty blocker and MUST NOT include a continuationPrompt. The host stops autonomous execution immediately and records durable blocked Goal state.
 - decision="complete" is valid only when every criterion assessment is passed. Core remains the authoritative owner of durable evidence, criterion state, and the final verification transition.
+- Payload shape: one JSON object with decision, rationale, progressMade, criteria, and the decision-specific field (continuationPrompt for continue, blocker for blocked). Example:
+  {"decision":"continue","rationale":"...","progressMade":true,"criteria":[{"criterionID":"<exact criterion id>","status":"pending","evidence":"..."}],"continuationPrompt":"..."}
 
 - rationale explains why the decision is correct; continuationPrompt tells the worker what to do next. Keep those responsibilities separate.
 - progressMade refers only to the just-finished worker cycle.

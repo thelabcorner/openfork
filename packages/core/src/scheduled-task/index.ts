@@ -1,6 +1,6 @@
 export * as ScheduledTask from "./index"
 
-import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm"
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm"
 import { Context, DateTime, Effect, Layer } from "effect"
 import { ScheduledTask as ScheduledTaskModel } from "@opencode-ai/schema/scheduled-task"
 import { Database } from "../database/database"
@@ -18,6 +18,7 @@ import {
   retryableAttempts,
 } from "./policy"
 import { hydrateRun } from "./projection"
+import { PROCESS_OWNER_ID } from "./lease"
 import { jitterFor, nextOccurrence, occurrencesBetween, resolveScheduleInput, validateSchedule } from "./recurrence"
 import {
   ScheduledTaskControlTable,
@@ -65,6 +66,13 @@ export { ScheduledTaskSchema, ScheduledTaskPolicy }
 export type Error = ScheduledTaskSchema.Error
 
 export const CIRCUIT_BREAKER_THRESHOLD = 5
+/** Bounded manual-run admissions per scheduler wake. Each settlement wakes
+ * another pass; persistent overrun=queue leases do not block later work. */
+export const QUEUED_DISPATCH_PAGE_SIZE = 64
+/** Due-task planning must not fully materialize a years-old catch-up backlog
+ * into one host wake. Keyset paging guarantees eventual coverage, even when
+ * preceding tasks are jittered or still leased by another host. */
+export const DUE_DISPATCH_CANDIDATE_PAGE_SIZE = 64
 
 export interface CreateInput {
   readonly projectID?: typeof ProjectTable.$inferSelect.id
@@ -275,6 +283,7 @@ export interface Interface {
     readonly taskID: ID
     readonly fireFor: number
     readonly now: number
+    readonly leaseID: string
     readonly nextRunAt?: number
   }) => Effect.Effect<void>
   readonly markRunStatus: (input: {
@@ -1014,25 +1023,64 @@ const layer = Layer.effect(
       if (task) yield* events.publish(Event.Updated, { taskID: input.taskID, info: hydrateInfo(task) })
     })
 
+    // A cursor belongs to the shared Core task service, not to each HTTP
+    // request. It is an optimization only; after reaching the end we wrap to
+    // the oldest due task. A crash loses this hint, not durable task state.
+    let dueCandidateCursor: { at: number; id: ID } | undefined
+    const dueCandidates = Effect.fnUntraced(function* (now: number, cursor?: { at: number; id: ID }) {
+      return yield* readDb
+        .select({ task: ScheduledTaskTable, lease: ScheduledTaskLeaseTable })
+        .from(ScheduledTaskTable)
+        .leftJoin(ScheduledTaskLeaseTable, eq(ScheduledTaskLeaseTable.task_id, ScheduledTaskTable.id))
+        .where(and(
+          eq(ScheduledTaskTable.enabled, true),
+          isNotNull(ScheduledTaskTable.next_run_at),
+          sql`${ScheduledTaskTable.next_run_at} <= ${now}`,
+          // Exclude still-held work BEFORE pagination. An active 100-worker
+          // Swarm cannot obscure later ready scheduled tasks in a small page.
+          isNull(ScheduledTaskLeaseTable.owner),
+          cursor
+            ? or(
+                gt(ScheduledTaskTable.next_run_at, cursor.at),
+                and(
+                  eq(ScheduledTaskTable.next_run_at, cursor.at),
+                  gt(ScheduledTaskTable.id, cursor.id),
+                ),
+              )
+            : undefined,
+        ))
+        .orderBy(asc(ScheduledTaskTable.next_run_at), asc(ScheduledTaskTable.id))
+        .limit(DUE_DISPATCH_CANDIDATE_PAGE_SIZE)
+        .all()
+        .pipe(Effect.orDie)
+    })
+
     const planDue = Effect.fn("ScheduledTask.planDue")(function* (now: number) {
       if (yield* paused()) return []
       const plans: FiringPlan[] = []
 
       // 1. Queued manual runs are independent of the cursor.
       const queued = yield* readDb
-        .select({ run: ScheduledTaskRunTable, task: ScheduledTaskTable })
+        .select({ run: ScheduledTaskRunTable, task: ScheduledTaskTable, lease: ScheduledTaskLeaseTable })
         .from(ScheduledTaskRunTable)
         .innerJoin(ScheduledTaskTable, eq(ScheduledTaskTable.id, ScheduledTaskRunTable.task_id))
-        .where(eq(ScheduledTaskRunTable.status, "queued"))
+        .leftJoin(ScheduledTaskLeaseTable, eq(ScheduledTaskLeaseTable.task_id, ScheduledTaskRunTable.task_id))
+        .where(and(
+          eq(ScheduledTaskRunTable.status, "queued"),
+          or(
+            isNull(ScheduledTaskLeaseTable.owner),
+            // A held lease with overrun=queue is not runnable yet. Filter it
+            // before LIMIT so many queued entries for a busy peer cannot
+            // permanently starve later ready tasks.
+            sql`json_extract(${ScheduledTaskTable.policy}, '$.overrun') <> 'queue'`,
+          ),
+        ))
+        .orderBy(asc(ScheduledTaskRunTable.started_at), asc(ScheduledTaskRunTable.id))
+        .limit(QUEUED_DISPATCH_PAGE_SIZE)
         .all()
         .pipe(Effect.orDie)
       for (const item of queued) {
-        const lease = yield* readDb
-          .select()
-          .from(ScheduledTaskLeaseTable)
-          .where(eq(ScheduledTaskLeaseTable.task_id, item.run.task_id))
-          .get()
-          .pipe(Effect.orDie)
+        const lease = item.lease
         if (lease?.owner) {
           // Overrun policy owns the conflict. `queue` leaves it pending;
           // everything else records a visible skip.
@@ -1051,19 +1099,20 @@ const layer = Layer.effect(
       }
 
       // 2. Due cursors, including pending-retry and recovered leases.
-      const rows = yield* dueRows(now)
-      if (rows.length === 0) return plans
-      const leases = yield* readDb
-        .select()
-        .from(ScheduledTaskLeaseTable)
-        .where(inArray(ScheduledTaskLeaseTable.task_id, rows.map((row) => row.id)))
-        .all()
-        .pipe(Effect.orDie)
-      const leaseByTask = new Map(leases.map((lease) => [lease.task_id, lease]))
-      for (const row of rows) {
+      let candidates = yield* dueCandidates(now, dueCandidateCursor)
+      if (candidates.length === 0 && dueCandidateCursor) {
+        dueCandidateCursor = undefined
+        candidates = yield* dueCandidates(now)
+      }
+      const tail = candidates.at(-1)?.task
+      dueCandidateCursor = tail && candidates.length === DUE_DISPATCH_CANDIDATE_PAGE_SIZE
+        ? { at: tail.next_run_at!, id: tail.id }
+        : undefined
+      for (const candidate of candidates) {
+        const row = candidate.task
         const effective = row.next_run_at! + jitterFor(row.id, row.next_run_at!, row.policy.jitterMs)
         if (effective > now) continue
-        const lease = leaseByTask.get(row.id)
+        const lease = candidate.lease
         // A held lease means an active run owns this task; settlement will
         // advance the cursor. Never plan a second firing over a live claim.
         if (lease && lease.owner !== null) continue
@@ -1264,6 +1313,29 @@ const layer = Layer.effect(
                 status: run.status,
               })
             }
+            // The runner's lease is its authority to publish an outcome.
+            // Checking run status/attempt alone is insufficient: a delayed
+            // executor can finish after another host has reclaimed its lease.
+            // Verify exact claim + process generation INSIDE the same
+            // IMMEDIATE transaction as settlement, before changing run,
+            // recurrence cursor, or deleting any lease.
+            if (input.leaseID) {
+              const owned = yield* tx
+                .select({ leaseID: ScheduledTaskLeaseTable.lease_id })
+                .from(ScheduledTaskLeaseTable)
+                .where(and(
+                  eq(ScheduledTaskLeaseTable.task_id, input.taskID),
+                  eq(ScheduledTaskLeaseTable.lease_id, input.leaseID),
+                  eq(ScheduledTaskLeaseTable.owner, PROCESS_OWNER_ID),
+                  eq(ScheduledTaskLeaseTable.fire_for, input.fireFor),
+                  eq(ScheduledTaskLeaseTable.attempt, input.attempt),
+                ))
+                .get()
+                .pipe(Effect.orDie)
+              if (!owned) return yield* Effect.die(
+                new Error("ScheduledTask.settleRun refused stale or lost exact lease ownership"),
+              )
+            }
             const policy = task.policy
 
             // Bounded retry: same logical instant, updated row, cursor moved to
@@ -1459,6 +1531,7 @@ const layer = Layer.effect(
       taskID: ID
       fireFor: number
       now: number
+      leaseID: string
       nextRunAt?: number
     }) {
       const changed = yield* db
@@ -1466,9 +1539,25 @@ const layer = Layer.effect(
           (tx) =>
             Effect.gen(function* () {
             const task = yield* requireRow(tx, input.taskID)
+            const owned = yield* tx
+              .select({ leaseID: ScheduledTaskLeaseTable.lease_id })
+              .from(ScheduledTaskLeaseTable)
+              .where(and(
+                eq(ScheduledTaskLeaseTable.task_id, input.taskID),
+                eq(ScheduledTaskLeaseTable.lease_id, input.leaseID),
+                eq(ScheduledTaskLeaseTable.owner, PROCESS_OWNER_ID),
+                eq(ScheduledTaskLeaseTable.fire_for, input.fireFor),
+              ))
+              .get()
+              .pipe(Effect.orDie)
+            if (!owned) return undefined
             yield* tx
               .delete(ScheduledTaskLeaseTable)
-              .where(eq(ScheduledTaskLeaseTable.task_id, input.taskID))
+              .where(and(
+                eq(ScheduledTaskLeaseTable.task_id, input.taskID),
+                eq(ScheduledTaskLeaseTable.lease_id, input.leaseID),
+                eq(ScheduledTaskLeaseTable.owner, PROCESS_OWNER_ID),
+              ))
               .run()
               .pipe(Effect.orDie)
             const next =
@@ -1507,6 +1596,7 @@ const layer = Layer.effect(
       taskID: ID
       fireFor: number
       now: number
+      leaseID: string
       nextRunAt?: number
     }) {
       yield* skipSettled(input).pipe(Effect.catchTag("ScheduledTask.NotFoundError", () => Effect.void))

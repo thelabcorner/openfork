@@ -14,7 +14,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SwarmSessionProjector } from "@opencode-ai/core/swarm-session-projector"
-import { SwarmMessageDeliveryTable } from "@opencode-ai/core/swarm/sql"
+import { SwarmMessageDeliveryTable, SwarmMemberTable } from "@opencode-ai/core/swarm/sql"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { SessionTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
 import { Swarm } from "@opencode-ai/schema/swarm"
@@ -102,6 +102,31 @@ const setup = Effect.gen(function* () {
 })
 
 describe("Swarm runtime projections", () => {
+  for (const count of [1, 3, 6]) {
+    it.effect(`does not schedule impossible renewals for stale active bindings (${count} sessions)`, () =>
+      Effect.gen(function* () {
+        const { db, service, swarm } = yield* setup
+        for (let index = 0; index < count; index++) {
+          const sessionID = SessionV2.ID.make(`ses_retirement_timer_${index}`)
+          yield* db.insert(SessionTable).values(sessionRow(sessionID)).run().pipe(Effect.orDie)
+          const member = yield* service.addMember({ swarmID: swarm.id, name: `retired-${index}`, kind: "managed_worker", role: "worker",
+            desiredProfile: managedProfile, sessionID, workspacePolicy: { mode: "shared-read" }, now: 20 })
+          const task = yield* service.createTask({ swarmID: swarm.id, title: `retired-${index}`, now: 100 })
+          const claim = yield* service.claimTask({ swarmID: swarm.id, taskID: task.id, memberID: member.id,
+            processOwner: "timer-owner", leaseMs: 1_000, now: 110 })
+          // Simulate a persisted rebind before the retirement owner reconciles it.
+          yield* db.update(SwarmMemberTable).set({ binding_generation: member.bindingGeneration + 1 })
+            .where(eq(SwarmMemberTable.id, member.id)).run().pipe(Effect.orDie)
+        }
+        // Every lease is present and within the renewal window, but renewal
+        // would fail its binding fence. Expiry/retirement own its next progress.
+        expect(yield* service.leaseRenewalTargets({ processOwner: "timer-owner", now: 950, renewBefore: 1_200 })).toEqual([])
+        expect(yield* service.nextRuntimeDeadline({ processOwner: "timer-owner", now: 950, leaseRenewAheadMs: 300 })).toEqual({ at: 1110, hasRetiring: false, dispatchDue: false })
+        expect(yield* service.retirementRequiredTargets({ limit: 10 })).toHaveLength(count)
+      }),
+    )
+  }
+
   it.effect("returns exact process-owned renewal and expiry tokens", () =>
     Effect.gen(function* () {
       const { service, swarm, a } = yield* setup
@@ -310,6 +335,105 @@ describe("Swarm runtime projections", () => {
       })
       expect(target?.runs[0]?.input?.promotedSeq).toBeUndefined()
       expect(target?.runs[0]?.input?.revokedSeq).toBeUndefined()
+    }),
+  )
+
+  it.effect("keyset-pages retiring leases so blocked head rows cannot starve later work", () =>
+    Effect.gen(function* () {
+      const { service, swarm, a, b } = yield* setup
+      const firstTask = yield* service.createTask({ swarmID: swarm.id, title: "retiring page a", now: 100 })
+      const firstLease = yield* service.claimTask({
+        swarmID: swarm.id,
+        taskID: firstTask.id,
+        memberID: a.id,
+        processOwner: "runtime-owner-a",
+        leaseMs: 10_000,
+        now: 110,
+      })
+      const secondTask = yield* service.createTask({ swarmID: swarm.id, title: "retiring page b", now: 120 })
+      const secondLease = yield* service.claimTask({
+        swarmID: swarm.id,
+        taskID: secondTask.id,
+        memberID: b.id,
+        processOwner: "runtime-owner-b",
+        leaseMs: 10_000,
+        now: 130,
+      })
+      yield* service.requestTaskRetirement({ token: firstLease.token, reason: "operator_release", now: 140 })
+      yield* service.requestTaskRetirement({ token: secondLease.token, reason: "operator_release", now: 150 })
+
+      const firstPage = yield* service.retiringTargets({ limit: 1 })
+      expect(firstPage).toHaveLength(1)
+      const secondPage = yield* service.retiringTargets({
+        limit: 1,
+        afterTaskID: firstPage[0]!.token.taskID,
+      })
+      expect(secondPage).toHaveLength(1)
+      expect(secondPage[0]!.token.taskID).not.toBe(firstPage[0]!.token.taskID)
+      expect(new Set([firstPage[0]!.token.taskID, secondPage[0]!.token.taskID])).toEqual(
+        new Set([firstTask.id, secondTask.id]),
+      )
+    }),
+  )
+
+  it.effect("scopes retiring lease queries before applying the result limit", () =>
+    Effect.gen(function* () {
+      const { service, swarm, a } = yield* setup
+      const firstTask = yield* service.createTask({ swarmID: swarm.id, title: "global retiring row", now: 100 })
+      const firstLease = yield* service.claimTask({
+        swarmID: swarm.id,
+        taskID: firstTask.id,
+        memberID: a.id,
+        processOwner: "runtime-owner-a",
+        leaseMs: 10_000,
+        now: 110,
+      })
+      yield* service.requestTaskRetirement({ token: firstLease.token, reason: "operator_release", now: 120 })
+
+      const scopedSwarm = yield* service.create({
+        projectID,
+        workspaceID,
+        directory: "/swarm/runtime",
+        name: "scoped retirement swarm",
+        now: 130,
+      })
+      yield* service.update({
+        id: scopedSwarm.id,
+        expectedRevision: scopedSwarm.revision,
+        status: "active",
+        now: 140,
+      })
+      const scopedMember = yield* service.addMember({
+        swarmID: scopedSwarm.id,
+        name: "scoped-worker",
+        kind: "managed_worker",
+        role: "worker",
+        desiredProfile: managedProfile,
+        sessionID: sessionC,
+        workspacePolicy: { mode: "shared-read" },
+        now: 150,
+      })
+      const scopedTask = yield* service.createTask({
+        swarmID: scopedSwarm.id,
+        title: "scoped retiring row",
+        now: 160,
+      })
+      const scopedLease = yield* service.claimTask({
+        swarmID: scopedSwarm.id,
+        taskID: scopedTask.id,
+        memberID: scopedMember.id,
+        processOwner: "runtime-owner-scoped",
+        leaseMs: 10_000,
+        now: 170,
+      })
+      yield* service.requestTaskRetirement({ token: scopedLease.token, reason: "operator_release", now: 180 })
+
+      expect(yield* service.retiringTargets({ limit: 1, swarmID: scopedSwarm.id })).toMatchObject([
+        { swarmID: scopedSwarm.id, token: scopedLease.token },
+      ])
+      expect(yield* service.retiringTargets({ limit: 1, taskID: scopedTask.id })).toMatchObject([
+        { swarmID: scopedSwarm.id, token: scopedLease.token },
+      ])
     }),
   )
 

@@ -50,6 +50,42 @@ describe("GoalCreationPolicy", () => {
     }
   })
 
+  test("treats the composer @goal mention token as the same directive as the bare word", () => {
+    expect(
+      GoalCreationPolicy.authorize({
+        userMessageID: "msg_goal_mention",
+        userText: "create a @goal and start working on implementing the plan e2e.",
+      }),
+    ).toMatchObject({
+      allowed: true,
+      reason: "explicit-user-request",
+      source: { userMessageID: "msg_goal_mention" },
+    })
+    expect(GoalCreationPolicy.authorize({ userMessageID: "msg_goal_plain", userText: "create a goal" })).toMatchObject({
+      allowed: true,
+      reason: "explicit-user-request",
+    })
+
+    for (const userText of ["Create a @goal for this refactor.", "@goal mode on.", "We should make this a @goal."]) {
+      expect(GoalCreationPolicy.explicitlyRequestsGoal(userText), userText).toBe(true)
+    }
+
+    expect(GoalCreationPolicy.explicitlyRequestsGoalUpdate("Update the @goal and add stress-test corpuses.")).toBe(true)
+    expect(GoalCreationPolicy.explicitlyDeclinesGoal("Do not create a @goal for this.")).toBe(true)
+    expect(GoalCreationPolicy.explicitlyRequestsDraft("Create a @goal draft for this, but don't start it yet.")).toBe(true)
+    expect(GoalCreationPolicy.explicitlyRequestsGoal("@goal")).toBe(false)
+    expect(GoalCreationPolicy.explicitlyRequestsGoal("create someone@goal.example")).toBe(false)
+  })
+
+  test("does not authorize an unrelated human turn", () => {
+    expect(
+      GoalCreationPolicy.authorize({
+        userMessageID: "msg_unrelated",
+        userText: "Refactor the parser and run the focused tests.",
+      }).allowed,
+    ).toBe(false)
+  })
+
   test("does not treat informational or negative Goal discussion as authorization", () => {
     expect(
       GoalCreationPolicy.authorize({ userMessageID: "msg_info", userText: "How do I create a goal in OpenCode?" }).allowed,

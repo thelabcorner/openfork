@@ -96,6 +96,17 @@ function finitePositive(value: number) {
 
 export function makeRuntimeOperations(input: { readonly readDb: Db }) {
   const { readDb } = input
+  // Renewal must be work the lease owner can actually perform. A stale active
+  // binding otherwise schedules "now" forever while renewTaskLease rejects it.
+  // Retiring safety fences remain renewable even after a stop/rebind.
+  const renewableBinding = () => or(
+    eq(SwarmTaskLeaseTable.state, "retiring"),
+    and(
+      eq(SwarmMemberTable.lifecycle, "active"),
+      eq(SwarmMemberTable.session_id, SwarmTaskLeaseTable.owner_session_id),
+      eq(SwarmMemberTable.binding_generation, SwarmTaskLeaseTable.owner_binding_generation),
+    ),
+  )
 
   /**
    * Resolve member-side task mutation authority exclusively from trusted
@@ -188,11 +199,13 @@ export function makeRuntimeOperations(input: { readonly readDb: Db }) {
       .select({ lease: SwarmTaskLeaseTable, swarmID: SwarmTaskTable.swarm_id })
       .from(SwarmTaskLeaseTable)
       .innerJoin(SwarmTaskTable, eq(SwarmTaskTable.id, SwarmTaskLeaseTable.task_id))
+      .innerJoin(SwarmMemberTable, eq(SwarmMemberTable.id, SwarmTaskLeaseTable.owner_member_id))
       .where(
         and(
           eq(SwarmTaskLeaseTable.lease_owner_process, owner),
           gt(SwarmTaskLeaseTable.expires_at, request.now),
           lte(SwarmTaskLeaseTable.expires_at, request.renewBefore),
+          renewableBinding(),
         ),
       )
       .orderBy(asc(SwarmTaskLeaseTable.expires_at), asc(SwarmTaskLeaseTable.task_id))
@@ -288,14 +301,26 @@ export function makeRuntimeOperations(input: { readonly readDb: Db }) {
     return rows.map((row) => targetOf(row.swarmID, row.lease))
   })
 
-  const retiringTargets = Effect.fn("Swarm.retiringTargets")(function* (request?: { readonly limit?: number }) {
+  const retiringTargets = Effect.fn("Swarm.retiringTargets")(function* (request?: {
+    readonly limit?: number
+    readonly afterTaskID?: Swarm.TaskID
+    readonly swarmID?: Swarm.ID
+    readonly taskID?: Swarm.TaskID
+  }) {
     const limit = Math.min(256, Math.max(1, Math.trunc(request?.limit ?? 64)))
     const leaseRows = yield* readDb
       .select({ lease: SwarmTaskLeaseTable, swarmID: SwarmTaskTable.swarm_id })
       .from(SwarmTaskLeaseTable)
       .innerJoin(SwarmTaskTable, eq(SwarmTaskTable.id, SwarmTaskLeaseTable.task_id))
-      .where(eq(SwarmTaskLeaseTable.state, "retiring"))
-      .orderBy(asc(SwarmTaskLeaseTable.retire_requested_at), asc(SwarmTaskLeaseTable.task_id))
+      .where(
+        and(
+          eq(SwarmTaskLeaseTable.state, "retiring"),
+          request?.swarmID === undefined ? undefined : eq(SwarmTaskTable.swarm_id, request.swarmID),
+          request?.taskID === undefined ? undefined : eq(SwarmTaskLeaseTable.task_id, request.taskID),
+          request?.afterTaskID === undefined ? undefined : gt(SwarmTaskLeaseTable.task_id, request.afterTaskID),
+        ),
+      )
+      .orderBy(asc(SwarmTaskLeaseTable.task_id))
       .limit(limit)
       .all()
       .pipe(Effect.orDie)
@@ -460,10 +485,12 @@ export function makeRuntimeOperations(input: { readonly readDb: Db }) {
         ? readDb
             .select({ due: SwarmTaskLeaseTable.expires_at })
             .from(SwarmTaskLeaseTable)
+            .innerJoin(SwarmMemberTable, eq(SwarmMemberTable.id, SwarmTaskLeaseTable.owner_member_id))
             .where(
               and(
                 eq(SwarmTaskLeaseTable.lease_owner_process, owner),
                 gt(SwarmTaskLeaseTable.expires_at, request.now),
+                renewableBinding(),
               ),
             )
             .orderBy(asc(SwarmTaskLeaseTable.expires_at))

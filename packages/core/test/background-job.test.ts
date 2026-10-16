@@ -74,6 +74,25 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
+  it.live("delayed Stop cancels only jobs admitted before its exact observation cutoff", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessionID = "stop_epoch_session"
+      const old = yield* jobs.start({
+        id: "old_job_before_stop", type: "test", metadata: { sessionId: sessionID }, run: Effect.never,
+      })
+      const cutoff = BackgroundJob.captureSessionJobCancellationCutoff()
+      // A newer generation admits this job while Stop is awaiting SQLite.
+      const fresh = yield* jobs.start({
+        id: "new_job_after_stop", type: "test", metadata: { sessionId: sessionID }, run: Effect.never,
+      })
+      yield* BackgroundJob.cancelOwnedBySession(sessionID, Effect.void, cutoff)
+      expect((yield* jobs.get(old.id))?.status).toBe("cancelled")
+      expect((yield* jobs.get(fresh.id))?.status).toBe("running")
+      yield* jobs.cancel(fresh.id)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
   it.live("keeps the session admission fence through local-runner teardown", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
@@ -196,5 +215,77 @@ describe("BackgroundJob", () => {
       // The abandoned in-memory registry is not a durable observation channel.
       expect((yield* jobs.get(job.id))?.status).toBe("running")
     }),
+  )
+
+  it.live("indexes one completion signal across 100 workers without unrelated wakeups", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const gates = yield* Effect.forEach(Array.from({ length: 100 }), () => Deferred.make<void>())
+      const current = yield* Effect.forEach(gates, (gate, index) =>
+        jobs.start({ id: `batch_wait_${index}`, type: "test", run: Deferred.await(gate).pipe(Effect.as(`done_${index}`)) }),
+      )
+      const targets = current.map(({ id, generation }) => ({ id, generation }))
+      const unrelated = yield* jobs.start({ id: "batch_wait_unrelated", type: "test", run: Effect.succeed("unrelated") })
+      expect((yield* jobs.wait({ id: unrelated.id })).info?.status).toBe("completed")
+      expect(yield* jobs.waitAny({ jobs: targets, timeout: 25 })).toEqual({ timedOut: true })
+      const watcher = yield* jobs.waitAny({ jobs: targets, timeout: 5_000 }).pipe(Effect.forkChild)
+      yield* Deferred.succeed(gates[73]!, undefined)
+      expect(yield* Fiber.join(watcher)).toEqual({ timedOut: false })
+      expect((yield* jobs.get(current[73]!.id))?.status).toBe("completed")
+      expect((yield* jobs.get(current[74]!.id))?.status).toBe("running")
+      yield* Effect.forEach(current, (job, index) =>
+        index === 73 ? Effect.void : jobs.cancel(job.id).pipe(Effect.asVoid),
+        { discard: true },
+      )
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("does not miss immediately completed jobs and fences reused job generations", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const old = yield* jobs.start({ id: "batch_wait_recycled", type: "test", run: Effect.succeed("old") })
+      yield* jobs.wait({ id: old.id })
+      expect(yield* jobs.waitAny({ jobs: [{ id: old.id, generation: old.generation }], timeout: 5_000 }))
+        .toEqual({ timedOut: false })
+      const renewed = yield* jobs.start({ id: old.id, type: "test", run: Effect.never })
+      expect(renewed.generation).toBe((old.generation ?? 0) + 1)
+      expect(yield* jobs.waitAny({ jobs: [{ id: renewed.id, generation: old.generation }], timeout: 5_000 }))
+        .toEqual({ timedOut: false })
+      expect(yield* jobs.waitAny({ jobs: [{ id: renewed.id, generation: renewed.generation }], timeout: 15 }))
+        .toEqual({ timedOut: true })
+      yield* jobs.cancel(renewed.id)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("interrupts pending indexed batch waits without interrupting worker execution", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const active = yield* jobs.start({ id: "batch_wait_interrupt", type: "test", run: Effect.never })
+      for (let iteration = 0; iteration < 50; iteration++) {
+        const waiter = yield* jobs.waitAny({ jobs: [{ id: active.id }], timeout: 20_000 }).pipe(Effect.forkChild)
+        yield* Fiber.interrupt(waiter)
+      }
+      expect((yield* jobs.get(active.id))?.status).toBe("running")
+      yield* jobs.cancel(active.id)
+      expect(yield* jobs.waitAny({ jobs: [{ id: active.id }], timeout: 500 })).toEqual({ timedOut: false })
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("reads a consistent batch of job projections with no missing or duplicate entries", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const pending = yield* jobs.start({ id: "batch_projection_running", type: "test", metadata: { owner: "worker" }, run: Effect.never })
+      const finished = yield* jobs.start({ id: "batch_projection_finished", type: "test", run: Effect.succeed("ready") })
+      yield* jobs.wait({ id: finished.id })
+      const page = yield* jobs.getMany([pending.id, "missing_id", finished.id, pending.id])
+      expect(page.size).toBe(2)
+      expect(page.get(pending.id)).toMatchObject({ status: "running", generation: pending.generation })
+      expect(page.get(finished.id)).toMatchObject({ status: "completed", output: "ready" })
+      expect(page.has("missing_id")).toBe(false)
+      // Returned projections never expose the mutable registry metadata object.
+      page.get(pending.id)!.metadata!.owner = "mutated snapshot"
+      expect((yield* jobs.get(pending.id))?.metadata?.owner).toBe("worker")
+      yield* jobs.cancel(pending.id)
+    }).pipe(Effect.provide(jobsLayer)),
   )
 })

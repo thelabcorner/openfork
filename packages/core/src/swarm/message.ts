@@ -26,9 +26,10 @@ export function expandRecipients(
   members: readonly Pick<Swarm.Member, "id" | "lifecycle">[],
   senderMemberID: Swarm.MemberID,
   target: MessageTarget,
+  allowForeignSender = false,
 ): TargetExpansion {
   const byID = new Map(members.map((member) => [member.id, member] as const))
-  if (!byID.has(senderMemberID)) return { ok: false, reason: "sender_missing" }
+  if (!byID.has(senderMemberID) && !allowForeignSender) return { ok: false, reason: "sender_missing" }
 
   if (target.type === "member") {
     if (target.memberID === senderMemberID) return { ok: false, reason: "self_send" }
