@@ -37,6 +37,8 @@ type TreeStoreOptions = {
   cacheScope?: () => string
   normalizeDir: (input: string) => string
   list: (input: string, priority: "interactive" | "background") => Promise<FileNode[]>
+  /** Promote an already-admitted backend request without creating a duplicate. */
+  promote?: (input: string) => void
   onError: (message: string) => void
   cache?: {
     maxScopes?: number
@@ -57,6 +59,21 @@ const MAX_QUEUED_BACKGROUND_REQUESTS = 256
 const MAX_CHILD_CACHE_ENTRIES = 8192
 const WARM_SNAPSHOT_MAX_NODES = 1024
 const WARM_SNAPSHOT_MAX_DIRECTORIES = 96
+
+/** File-list metadata equality: preserve identity when a watcher reports no change. */
+function sameFileNode(previous: FileNode | undefined, node: FileNode) {
+  return Boolean(
+    previous &&
+    previous.name === node.name &&
+    previous.path === node.path &&
+    previous.absolute === node.absolute &&
+    previous.type === node.type &&
+    previous.ignored === node.ignored &&
+    previous.size === node.size &&
+    previous.mtime === node.mtime &&
+    previous.lineCount === node.lineCount,
+  )
+}
 
 /**
  * Outcome of an expandAll run. `truncated` is the signal that used to be
@@ -135,6 +152,51 @@ export function createFileTreeStore(options: TreeStoreOptions) {
   const directoryTouches = new Map<string, number>()
   let touchClock = 0
   const [nodeVersion, bumpNodeVersion] = createSignal(0)
+  // Domain-owned journal of structural changes, so presentation consumers
+  // can update a changed branch rather than reflattening unrelated folders.
+  const [viewVersion, setViewVersion] = createSignal(0)
+  const viewChanges: Array<{
+    revision: number
+    directory?: string
+    removedRoots: readonly string[]
+    convertedDirectories: readonly string[]
+  }> = []
+  const recordViewChange = (
+    directory?: string,
+    removedRoots: readonly string[] = [],
+    convertedDirectories: readonly string[] = [],
+  ) => {
+    const revision = viewVersion() + 1
+    viewChanges.push({ revision, directory, removedRoots, convertedDirectories })
+    if (viewChanges.length > 256) viewChanges.splice(0, viewChanges.length - 256)
+    setViewVersion(revision)
+  }
+  const changesSince = (revision: number) => {
+    const current = viewVersion()
+    if (revision === current) return {
+      revision: current, directories: [] as string[], removedRoots: [] as string[],
+      convertedDirectories: [] as string[],
+    }
+    const first = viewChanges[0]?.revision
+    if (revision < 0 || first === undefined || revision < first - 1) return
+    const changes = viewChanges.filter((change) => change.revision > revision)
+    if (changes.some((change) => change.directory === undefined)) return
+    return {
+      revision: current,
+      directories: changes.map((change) => change.directory!),
+      // Only authoritative completed directory listings report removals.
+      // A scope reset, eviction or collapsed presentation node must never
+      // become evidence that a file ceased to exist on disk.
+      removedRoots: changes.flatMap((change) => change.removedRoots),
+      convertedDirectories: changes.flatMap((change) => change.convertedDirectories),
+    }
+  }
+  // Search walks asynchronously in cooperative slices. Never hand it the
+  // mutable index array: a simultaneous directory refresh can swap-delete
+  // or append nodes midway through a generation, making it skip/duplicate
+  // candidates. Copy only on demand, once per index revision.
+  let searchIndexVersion = -1
+  let searchIndexSnapshot: readonly FileNode[] = []
   // Resume the persisted epoch rather than restarting at 0/1. Directory
   // freshness is (`loaded`, `loadedEpoch === staleEpoch()`), so the restored
   // epoch must be the same one the restored `loadedEpoch`s were written under.
@@ -277,13 +339,16 @@ export function createFileTreeStore(options: TreeStoreOptions) {
       if (!children || children.length === 0) continue
 
       const removed = new Set<string>()
-      const collect = (path: string) => {
-        if (removed.has(path)) return
+      const pending = [...children]
+      // Deep dependency trees can contain thousands of nested directories.
+      // Iterative traversal is stack-safe and guards malformed listing cycles.
+      while (pending.length > 0) {
+        const path = pending.pop()!
+        if (removed.has(path)) continue
         removed.add(path)
-        if (tree.node[path]?.type !== "directory") return
-        for (const child of tree.dir[path]?.children ?? []) collect(child)
+        if (tree.node[path]?.type !== "directory") continue
+        for (const child of tree.dir[path]?.children ?? []) pending.push(child)
       }
-      for (const child of children) collect(child)
       if (removed.size === 0) continue
 
       // The directory's own node stays (it remains visible); its children and
@@ -318,6 +383,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
         }
         for (const path of removed) removeNodeIndex(path)
         bumpNodeVersion((value) => value + 1)
+        recordViewChange()
       })
       propagateSubtreeSize(directory, before)
       overage -= removed.size
@@ -333,61 +399,91 @@ export function createFileTreeStore(options: TreeStoreOptions) {
   let activeListRequests = 0
   let activeBackgroundListRequests = 0
   type ListPriority = "interactive" | "background"
-  type ListJob = { run: () => void; cancel: () => void; priority: ListPriority; generation: number }
-  const queuedListRequests: ListJob[] = []
+  type ListJob = {
+    dir: string
+    run: (priority: ListPriority) => void
+    cancel: () => void
+    priority: ListPriority
+    generation: number
+  }
+  const interactiveQueue: ListJob[] = []
+  const backgroundQueue: ListJob[] = []
+  const queuedByDir = new Map<string, ListJob>()
+  const queuedCount = () => interactiveQueue.length + backgroundQueue.length
+  const forgetQueued = (job: ListJob) => {
+    if (queuedByDir.get(job.dir) === job) queuedByDir.delete(job.dir)
+  }
+  const cancelQueued = () => {
+    for (const queue of [interactiveQueue, backgroundQueue]) {
+      for (const job of queue) {
+        forgetQueued(job)
+        job.cancel()
+      }
+      queue.length = 0
+    }
+  }
   const pumpListRequests = () => {
-    while (activeListRequests < DIRECTORY_LIST_CONCURRENCY && queuedListRequests.length > 0) {
-      const interactive = queuedListRequests.findIndex((job) => job.priority === "interactive")
-      const index = interactive === -1 ? 0 : interactive
-      const job = queuedListRequests.splice(index, 1)[0]!
+    while (activeListRequests < DIRECTORY_LIST_CONCURRENCY && queuedCount() > 0) {
+      // Two FIFO lanes avoid repeatedly scanning the entire (up to 1,024)
+      // backlog for interactive work. Reserve one slot for user gestures.
+      const job = interactiveQueue.shift() ??
+        (activeBackgroundListRequests < BACKGROUND_LIST_CONCURRENCY ? backgroundQueue.shift() : undefined)
+      if (!job) break
+      forgetQueued(job)
       if (job.generation !== generation) {
         job.cancel()
         continue
       }
-      if (job.priority === "background" && activeBackgroundListRequests >= BACKGROUND_LIST_CONCURRENCY) {
-        queuedListRequests.unshift(job)
-        break
-      }
-      const run = job.run
       activeListRequests += 1
       if (job.priority === "background") activeBackgroundListRequests += 1
-      run()
+      job.run(job.priority)
     }
   }
+  const promoteQueued = (dir: string, requestGeneration: number) => {
+    const job = queuedByDir.get(dir)
+    if (!job || job.generation !== requestGeneration || job.priority !== "background") return
+    const index = backgroundQueue.indexOf(job)
+    if (index < 0) return
+    backgroundQueue.splice(index, 1)
+    job.priority = "interactive"
+    interactiveQueue.push(job)
+    pumpListRequests()
+  }
   const scheduleListRequest = (
-    task: () => Promise<FileNode[]>,
-    options: { generation: number; priority: ListPriority },
+    task: (priority: ListPriority) => Promise<FileNode[]>,
+    options: { dir: string; generation: number; priority: ListPriority },
   ) => {
     if (disposed) return Promise.resolve(CANCELLED_LIST)
     return new Promise<FileNode[]>((resolve, reject) => {
       let settled = false
-      const finish = () => {
+      const finish = (priority: ListPriority) => {
         activeListRequests -= 1
-        if (options.priority === "background") activeBackgroundListRequests -= 1
+        if (priority === "background") activeBackgroundListRequests -= 1
         pumpListRequests()
       }
-      const job = {
+      const job: ListJob = {
+        dir: options.dir,
         priority: options.priority,
         generation: options.generation,
-        run: () => {
+        run: (priority) => {
           if (settled) {
-            finish()
+            finish(priority)
             return
           }
           void Promise.resolve()
             .then(() => {
               if (disposed || options.generation !== generation) return CANCELLED_LIST
-              return task()
+              return task(priority)
             })
             .then(
               (value) => {
                 settled = true
-                finish()
+                finish(priority)
                 resolve(value)
               },
               (error) => {
                 settled = true
-                finish()
+                finish(priority)
                 reject(error)
               },
             )
@@ -398,13 +494,14 @@ export function createFileTreeStore(options: TreeStoreOptions) {
           resolve(CANCELLED_LIST)
         },
       }
-      if (options.priority === "background" && queuedListRequests.length >= MAX_QUEUED_BACKGROUND_REQUESTS) {
-        const oldest = queuedListRequests.findIndex((entry) => entry.priority === "background")
-        if (oldest >= 0) queuedListRequests.splice(oldest, 1)[0]!.cancel()
-        else return resolve(CANCELLED_LIST)
+      if (options.priority === "background" && backgroundQueue.length >= MAX_QUEUED_BACKGROUND_REQUESTS) {
+        const oldest = backgroundQueue.shift()!
+        forgetQueued(oldest)
+        oldest.cancel()
       }
-      if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCELLED_LIST)
-      queuedListRequests.push(job)
+      if (queuedCount() >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCELLED_LIST)
+      queuedByDir.set(options.dir, job)
+      ;(options.priority === "interactive" ? interactiveQueue : backgroundQueue).push(job)
       pumpListRequests()
     })
   }
@@ -512,6 +609,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     setStaleEpoch(snap.loadedEpoch ?? (snap.stale ? 1 : 0))
     bumpNodeVersion((value) => value + 1)
     trimLiveTree()
+    recordViewChange()
   }
 
   const touch = (key: string) => {
@@ -554,6 +652,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     setTree("dir", "", { expanded: true })
     setStaleEpoch(0)
     bumpNodeVersion((value) => value + 1)
+    recordViewChange()
   }
 
   const ensureDir = (path: string) => {
@@ -573,7 +672,13 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     if (!opts?.force && current?.loaded && current.loadedEpoch === currentEpoch) return Promise.resolve()
 
     const pending = inflight.get(dir)
-    if (pending?.generation === requestGeneration) return pending.promise
+    if (pending?.generation === requestGeneration) {
+      if (opts?.priority !== "background") {
+        promoteQueued(dir, requestGeneration)
+        options.promote?.(dir)
+      }
+      return pending.promise
+    }
 
     setTree(
       "dir",
@@ -587,7 +692,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     const directory = options.scope()
     const listStarted = performance.now()
 
-    const promise = scheduleListRequest(() => {
+    const promise = scheduleListRequest((priority) => {
       // A scope switch can happen while a request is waiting behind the
       // semaphore.  Avoid starting stale network work in that case; the
       // completion path below also ignores stale results from requests that
@@ -599,8 +704,8 @@ export function createFileTreeStore(options: TreeStoreOptions) {
       // empty listing, so a future edit that removed the redundant guard in
       // the completion path would silently wipe a directory's children.
       if (disposed || options.scope() !== directory || requestGeneration !== generation) return Promise.resolve(CANCELLED_LIST)
-      return options.list(dir, opts?.priority ?? "interactive")
-    }, { generation: requestGeneration, priority: opts?.priority ?? "interactive" })
+      return options.list(dir, priority)
+    }, { dir, generation: requestGeneration, priority: opts?.priority ?? "interactive" })
       .then((nodes) => {
         if (nodes === CANCELLED_LIST) {
           // Dropped without an answer. This is NOT an empty directory: leave
@@ -610,35 +715,82 @@ export function createFileTreeStore(options: TreeStoreOptions) {
         }
         if (disposed || options.scope() !== directory || requestGeneration !== generation) return
         const prevChildren = tree.dir[dir]?.children ?? []
+        const sameOrder =
+          prevChildren.length === nodes.length &&
+          nodes.every((node, index) => node.path === prevChildren[index])
+        // Most watcher-triggered force lists return an identical directory.
+        // Updating thousands of Solid store entries, search indexes and
+        // subtree accounting for that no-op burns renderer time and creates
+        // avoidable reactive invalidations. A successfully validated result
+        // still advances loadedEpoch (important after watcher loss).
+        // An *unlisted* empty directory has undefined children, not [].
+        // It must commit the authoritative [] so expandAll can distinguish a
+        // real empty response from a cancelled/dropped request.
+        if (
+          tree.dir[dir]?.children !== undefined &&
+          sameOrder &&
+          nodes.every((node) => sameFileNode(tree.node[node.path], node))
+        ) {
+          setTree(
+            "dir",
+            dir,
+            produce((draft) => {
+              draft.loaded = true
+              draft.loadedEpoch = currentEpoch
+              draft.loading = false
+            }),
+          )
+          return
+        }
         // Captured before the children are rewritten; propagateSubtreeSize folds
         // the difference into `dir` and its ancestors.
         const sizeBefore = subtreeSize(dir)
         const nextChildren = nodes.map((node) => node.path)
         const nextSet = new Set(nextChildren)
-        let nodeIndexChanged =
-          prevChildren.length !== nextChildren.length ||
-          prevChildren.some((path, index) => path !== nextChildren[index])
+        let nodeIndexChanged = !sameOrder
         if (nodeIndexChanged) {
           childCache.delete(dir)
         }
+        const convertedDirectories = nodes.filter(
+          (node) => node.type !== "directory" && tree.node[node.path]?.type === "directory",
+        ).map((node) => node.path)
         const removedDirectoryPaths = prevChildren.filter(
           (path) => !nextSet.has(path) && tree.node[path]?.type === "directory",
-        )
+        ).concat(convertedDirectories)
         const removedPaths = new Set<string>()
-        const removedDirs = new Set<string>()
-        const collectRemoved = (path: string) => {
-          if (removedPaths.has(path)) return
-          removedPaths.add(path)
-          if (tree.node[path]?.type !== "directory") return
-          removedDirs.add(path)
-          for (const child of tree.dir[path]?.children ?? []) collectRemoved(child)
+        // A directory->file replacement retains the path itself but must drop
+        // all descendants and the old directory state. A same-order listing
+        // is not evidence that the former subtree still exists.
+        const removedDirs = new Set<string>(convertedDirectories)
+        // Iterative pruning survives pathological nested trees and avoids a
+        // deep recursive stack during branch switches or dependency installs.
+        const pendingRemovals = prevChildren.filter((path) => !nextSet.has(path))
+        for (const path of convertedDirectories) {
+          for (const child of tree.dir[path]?.children ?? []) pendingRemovals.push(child)
         }
-        for (const path of prevChildren) if (!nextSet.has(path)) collectRemoved(path)
+        while (pendingRemovals.length > 0) {
+          const path = pendingRemovals.pop()!
+          if (removedPaths.has(path)) continue
+          removedPaths.add(path)
+          if (tree.node[path]?.type !== "directory") continue
+          removedDirs.add(path)
+          for (const child of tree.dir[path]?.children ?? []) pendingRemovals.push(child)
+        }
         const pruneStarted = removedDirectoryPaths.length > 0 ? performance.now() : 0
         if (removedDirectoryPaths.length > 0) {
+          // A wide delete used to test every cached path against every removed
+          // directory: O(removed siblings × cached branches). Parent-prefix
+          // membership yields O(cached branches × tree depth) instead.
+          const removedRoots = new Set(removedDirectoryPaths)
           for (const cachedDir of childCache.keys()) {
-            if (removedDirectoryPaths.some((removed) => cachedDir === removed || cachedDir.startsWith(removed + "/"))) {
-              childCache.delete(cachedDir)
+            let cursor = cachedDir
+            while (cursor) {
+              if (removedRoots.has(cursor)) {
+                childCache.delete(cachedDir)
+                break
+              }
+              const slash = cursor.lastIndexOf("/")
+              cursor = slash < 0 ? "" : cursor.slice(0, slash)
             }
           }
           for (const removed of removedDirs) directoryTouches.delete(removed)
@@ -660,17 +812,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
                 // when nothing changed. Preserve the existing object in that
                 // case so downstream WeakMap projections and row components
                 // retain identity across a watcher refresh.
-                if (
-                  previous &&
-                  previous.name === node.name &&
-                  previous.path === node.path &&
-                  previous.absolute === node.absolute &&
-                  previous.type === node.type &&
-                  previous.ignored === node.ignored &&
-                  previous.size === node.size &&
-                  previous.mtime === node.mtime &&
-                  previous.lineCount === node.lineCount
-                ) {
+                if (sameFileNode(previous, node)) {
                   continue
                 }
                 nodeIndexChanged = true
@@ -693,11 +835,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
               draft.loaded = true
               draft.loadedEpoch = currentEpoch
               draft.loading = false
-              draft.children =
-                prevChildren.length === nextChildren.length &&
-                prevChildren.every((path, index) => path === nextChildren[index])
-                  ? prevChildren
-                  : nextChildren
+              draft.children = sameOrder ? prevChildren : nextChildren
             }),
           )
           for (const child of prevChildren) {
@@ -710,6 +848,12 @@ export function createFileTreeStore(options: TreeStoreOptions) {
           // projections remain stable. Index the retained object as well, or a
           // search consumer would observe a new identity on every refresh.
           for (const node of nodes) upsertNodeIndex(tree.node[node.path] ?? node)
+          // All direct-child node writes happen through this listing commit.
+          // Invalidate the parent's materialized child array even if the
+          // ordered path IDs are unchanged (metadata updates). That makes
+          // cached reads O(1) rather than comparing every node in a 50k-wide
+          // directory during each tree flatten or rerender.
+          if (nodeIndexChanged) childCache.delete(dir)
           // `allNodes()` backs the explorer's O(N) search index. A watcher
           // force-list that returns byte-for-byte identical rows must not bump
           // its revision and rebuild that index for the whole project.
@@ -720,6 +864,9 @@ export function createFileTreeStore(options: TreeStoreOptions) {
           for (const path of removedPaths) subtreeSizes.delete(path)
           propagateSubtreeSize(dir, sizeBefore)
           trimLiveTree()
+          if (nodeIndexChanged || removedPaths.size > 0) {
+            recordViewChange(dir, prevChildren.filter((path) => !nextSet.has(path)), convertedDirectories)
+          }
           if (pruneStarted > 0) perf.span("prune", performance.now() - pruneStarted)
         })
       })
@@ -757,7 +904,9 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     const dir = options.normalizeDir(input)
     touchDirectory(dir)
     ensureDir(dir)
+    const changed = tree.dir[dir]?.expanded !== true
     setTree("dir", dir, "expanded", true)
+    if (changed) recordViewChange(dir)
     if (behavior?.list === false) return
     void listDir(dir, { generation: behavior?.generation, priority: behavior?.priority })
   }
@@ -766,7 +915,9 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     const dir = options.normalizeDir(input)
     touchDirectory(dir)
     ensureDir(dir)
+    const changed = tree.dir[dir]?.expanded !== false
     setTree("dir", dir, "expanded", false)
+    if (changed) recordViewChange(dir)
   }
 
   const dirState = (input: string) => {
@@ -781,21 +932,14 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     const ids = tree.dir[dir]?.children
     if (!ids) return emptyChildren
     const cached = childCache.get(dir)
-    if (cached?.ids === ids && cached.nodes.length === ids.length) {
-      let unchanged = true
-      for (let index = 0; index < ids.length; index++) {
-        if (cached.nodes[index] !== tree.node[ids[index]]) {
-          unchanged = false
-          break
-        }
-      }
-      if (unchanged) {
-        // Keep frequently rendered directories hot without retaining an array
-        // for every directory reached by expand-all forever.
-        childCache.delete(dir)
-        childCache.set(dir, cached)
-        return cached.nodes
-      }
+    if (cached?.ids === ids) {
+      // Mutation sites invalidate this directory's child cache whenever a
+      // direct node changes, including a same-order metadata refresh.
+      // Avoid O(width) per-access identity verification. The IDs array is
+      // authoritative and retains identity for unchanged listings.
+      childCache.delete(dir)
+      childCache.set(dir, cached)
+      return cached.nodes
     }
     const out: FileNode[] = []
     for (const id of ids) {
@@ -812,8 +956,12 @@ export function createFileTreeStore(options: TreeStoreOptions) {
   }
 
   const allNodes = () => {
-    nodeVersion()
-    return nodeIndex
+    const version = nodeVersion()
+    if (searchIndexVersion !== version) {
+      searchIndexSnapshot = nodeIndex.slice()
+      searchIndexVersion = version
+    }
+    return searchIndexSnapshot
   }
 
   const markAllStale = () => {
@@ -833,12 +981,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
   // failing directory just stops that branch.
   const beginGeneration = () => {
     generation += 1
-    for (let index = queuedListRequests.length - 1; index >= 0; index--) {
-      const job = queuedListRequests[index]
-      if (!job || job.generation === generation) continue
-      queuedListRequests.splice(index, 1)
-      job.cancel()
-    }
+    cancelQueued()
     return generation
   }
 
@@ -878,6 +1021,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     }
     // `expanded` counts directories this run claimed; `reached` those it could
     // actually list. Any gap is truncation the caller must be able to see.
+    recordViewChange()
     return {
       truncated: dropped.length > 0,
       droppedDirectories: dropped,
@@ -894,6 +1038,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
         setTree("dir", dir, "expanded", false)
       }
     })
+    recordViewChange()
   }
 
   // Explicit root-only prewarm. The store used to schedule this automatically
@@ -911,7 +1056,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     if (disposed) return
     disposed = true
     generation += 1
-    while (queuedListRequests.length > 0) queuedListRequests.shift()!.cancel()
+    cancelQueued()
   }
 
   // Called by the consumer when the project scope changes. Saves the outgoing
@@ -922,7 +1067,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     const next = cacheScope()
     if (next === currentScope) return
     cache.set(currentScope, snapshot())
-    generation += 1
+    beginGeneration()
     currentScope = next
     inflight.clear()
     childCache.clear()
@@ -934,6 +1079,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
       reset()
     }
     evict()
+    recordViewChange()
   }
 
   // Called when the OWNING FileProvider itself is about to unmount (not just a scope
@@ -965,6 +1111,8 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     // Primarily useful for diagnostics/regression tests. Consumers should use
     // allNodes(), which already tracks this signal reactively.
     nodeRevision: nodeVersion,
+    viewRevision: viewVersion,
+    changesSince,
     hasNode: (input: string) => {
       const key = options.normalizeDir(input)
       return tree.node[key] !== undefined

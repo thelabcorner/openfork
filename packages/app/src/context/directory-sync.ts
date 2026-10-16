@@ -17,6 +17,7 @@ const sessionFields = new Set([
   "question",
   "message",
   "session_message",
+  "message_window",
   "part",
   "part_text_accum_delta",
 ])
@@ -27,7 +28,7 @@ export const createDirSyncContext = (
   serverSDK: ReturnType<typeof createServerSdkContext>,
 ) => {
   const client = serverSDK.createClient({ directory, throwOnError: true })
-  const current = createMemo(() => serverSync.child(directory, { mcp: true }))
+  const current = createMemo(() => serverSync.child(directory))
   const absolute = (path: string) => (current()[0].path.directory + "/" + path).replace("//", "/")
   const data = new Proxy({} as State, {
     get(_, property: keyof State) {
@@ -83,6 +84,9 @@ export const createDirSyncContext = (
         const session = serverSync.session.get(sessionID)
         if (session?.directory === directory) return session
       },
+      structureChange(sessionID: string) {
+        return serverSync.session.structureChange(sessionID)
+      },
       optimistic: {
         add(input: { directory?: string; sessionID: string; message: Message; parts: Part[] }) {
           serverSync.session.optimistic.add(input)
@@ -116,6 +120,10 @@ export const createDirSyncContext = (
         await serverSync.session.sync(sessionID, options)
         index(sessionID)
       },
+      loadFullMessage: serverSync.session.loadFullMessage,
+      inspectMessageParts: serverSync.session.inspectMessageParts,
+      retryTimelineContent: serverSync.session.retryTimelineContent,
+      timelineContentStatus: serverSync.session.timelineContentStatus,
       prefetch(sessionID: string, limit = 20) {
         return serverSync.session.prefetch(sessionID, limit)
       },
@@ -152,6 +160,7 @@ export const createDirSyncContext = (
       },
     },
     mcp: {
+      ensure: () => serverSync.child(directory, { bootstrap: false, mcp: true }),
       toggle: (name: string) => serverSync.mcp.toggle(directory, name),
     },
     absolute,

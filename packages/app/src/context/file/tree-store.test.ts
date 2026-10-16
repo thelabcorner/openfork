@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { createRoot, createSignal } from "solid-js"
 import type { FileNode } from "@opencode-ai/sdk/v2"
 import { createFileTreeStore, type TreeSnapshot } from "./tree-store"
+import { createIncrementalLiveFileTreeV2, flattenLiveFileTreeV2 } from "../../components/file-tree-v2-model"
 
 const fs: Record<string, { name: string; type: "file" | "directory" }[]> = {
   "": [
@@ -163,6 +164,45 @@ describe("file tree store search + expand/collapse helpers", () => {
     expect(store.isLoaded("")).toBe(true)
     store.dispose()
   })
+
+  test("search-index snapshots are stable across asynchronous directory updates", async () => {
+    const { store } = makeStore()
+    await store.listDir("")
+    const snapshot = store.allNodes()
+    expect(store.allNodes()).toBe(snapshot)
+    expect(snapshot.map((node) => node.path)).toEqual(["src", "package.json"])
+
+    // Search consumes this snapshot over multiple event-loop slices while
+    // another listing can append/swap-remove the live index.
+    await store.listDir("src")
+    expect(snapshot.map((node) => node.path)).toEqual(["src", "package.json"])
+    const updated = store.allNodes()
+    expect(updated).not.toBe(snapshot)
+    expect(updated.map((node) => node.path)).toContain("src/index.ts")
+    expect(store.allNodes()).toBe(updated)
+  })
+
+  test("unchanged watcher refresh preserves the child projection and validates freshness", async () => {
+    const { store } = makeStore()
+    await store.listDir("")
+    const children = store.children("")
+    const index = store.allNodes()
+    store.markAllStale()
+    expect(store.isLoaded("")).toBe(false)
+
+    await store.listDir("", { force: true })
+    expect(store.isLoaded("")).toBe(true)
+    expect(store.children("")).toBe(children)
+    expect(store.allNodes()).toBe(index)
+  })
+
+  test("first empty listing commits an authoritative empty child array", async () => {
+    const { store } = makeStore()
+    await store.listDir("empty")
+    expect(store.dirState("empty")?.loaded).toBe(true)
+    expect(store.dirState("empty")?.children).toEqual([])
+    expect(store.isLoaded("empty")).toBe(true)
+  })
   test("limits concurrent directory listings while preserving each caller", async () => {
     let active = 0
     let peak = 0
@@ -195,12 +235,286 @@ describe("file tree store search + expand/collapse helpers", () => {
     expect(store.dirState("dir-11")?.loaded).toBe(true)
   })
 
+  test("interactive directory expansion promotes a queued background refresh without duplicate I/O", async () => {
+    let release!: () => void
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const calls: Array<{ dir: string; priority: string }> = []
+    const promotions: string[] = []
+    const store = createRoot(() => createFileTreeStore({
+      scope: () => "/priority",
+      normalizeDir: (dir) => dir,
+      list: async (dir, priority) => {
+        calls.push({ dir, priority })
+        if (dir.startsWith("blocked")) await blocked
+        return []
+      },
+      promote: (dir) => { promotions.push(dir) },
+      onError: () => {},
+      cache: { store: new Map() },
+    }))
+
+    const active = Array.from({ length: 3 }, (_, i) => store.listDir(`blocked-${i}`, { priority: "background" }))
+    const background = Array.from({ length: 20 }, (_, i) => store.listDir(`queued-${i}`, { priority: "background" }))
+    const target = store.listDir("target", { priority: "background" })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(calls.map((x) => x.dir)).not.toContain("target")
+
+    const interactive = store.listDir("target", { priority: "interactive" })
+    expect(interactive).toBe(target)
+    await interactive
+    expect(calls.filter((x) => x.dir === "target")).toEqual([{ dir: "target", priority: "interactive" }])
+    expect(promotions).toEqual(["target"])
+
+    release()
+    await Promise.all([...active, ...background])
+    store.dispose()
+  })
+
+  test("new interactive listings bypass queued background work at the reserved slot", async () => {
+    let release!: () => void
+    const blocked = new Promise<void>((resolve) => { release = resolve })
+    const calls: string[] = []
+    const store = createRoot(() => createFileTreeStore({
+      scope: () => "/reserve",
+      normalizeDir: (dir) => dir,
+      list: async (dir) => {
+        calls.push(dir)
+        if (dir.startsWith("blocked")) await blocked
+        return []
+      },
+      onError: () => {},
+      cache: { store: new Map() },
+    }))
+    const active = Array.from({ length: 3 }, (_, i) => store.listDir(`blocked-${i}`, { priority: "background" }))
+    const queued = Array.from({ length: 10 }, (_, i) => store.listDir(`pending-${i}`, { priority: "background" }))
+    await Promise.resolve()
+    await store.listDir("interactive", { priority: "interactive" })
+    expect(calls.at(-1)).toBe("interactive")
+    expect(calls.some((dir) => dir.startsWith("pending-"))).toBe(false)
+    release()
+    await Promise.all([...active, ...queued])
+    store.dispose()
+  })
+
+  test("mass root removal drops descendant indexes and stale child caches without corrupting survivors", async () => {
+    let removed = false
+    const makeNode = (path: string, type: "file" | "directory"): FileNode => ({
+      path, name: path.slice(path.lastIndexOf("/") + 1),
+      absolute: `/mass/${path}`, type, ignored: false,
+    })
+    const store = createRoot(() => createFileTreeStore({
+      scope: () => "/mass",
+      normalizeDir: (dir) => dir,
+      list: async (dir) => dir === ""
+        ? removed ? [makeNode("keep", "directory")] : [
+            makeNode("keep", "directory"),
+            ...Array.from({ length: 1_500 }, (_, i) => makeNode(`drop-${i}`, "directory")),
+          ]
+        : [makeNode(`${dir}/leaf.ts`, "file")],
+      onError: () => {},
+      cache: { store: new Map(), maxLiveNodes: 10_000 },
+    }))
+    await store.listDir("")
+    const loaded = Array.from({ length: 100 }, (_, i) => `drop-${i}`)
+    await Promise.all(["keep", ...loaded].map((dir) => store.listDir(dir)))
+    for (const dir of ["keep", ...loaded]) expect(store.children(dir)).toHaveLength(1)
+    expect(store.allNodes().length).toBeGreaterThan(1_500)
+
+    removed = true
+    await store.listDir("", { force: true })
+    expect(store.children("").map((item) => item.path)).toEqual(["keep"])
+    expect(store.children("keep").map((item) => item.path)).toEqual(["keep/leaf.ts"])
+    expect(store.hasNode("drop-0")).toBe(false)
+    expect(store.hasNode("drop-0/leaf.ts")).toBe(false)
+    expect(store.children("drop-0")).toEqual([])
+    expect(store.allNodes().map((node) => node.path).toSorted()).toEqual(["keep", "keep/leaf.ts"])
+    store.dispose()
+  })
+
   test("preserves unchanged node identity across forced watcher refreshes", async () => {
     const { store } = makeStore()
     await store.listDir("")
     const before = store.node("src")
     await store.listDir("", { force: true })
     expect(store.node("src")).toBe(before)
+  })
+
+  test("cached child arrays remain O(1)-reusable until a same-order metadata update", async () => {
+    let mtime = 1
+    const store = createRoot(() => createFileTreeStore({
+      scope: () => "/child-cache",
+      normalizeDir: (path) => path,
+      list: async () => Array.from({ length: 2000 }, (_, index) => ({
+        name: `file-${index}.ts`, path: `file-${index}.ts`,
+        absolute: `/child-cache/file-${index}.ts`, type: "file" as const,
+        ignored: false, mtime: index === 1100 ? mtime : 1,
+      })),
+      onError: () => {},
+      cache: { store: new Map() },
+    }))
+    await store.listDir("")
+    const first = store.children("")
+    expect(store.children("")).toBe(first)
+    const revision = store.nodeRevision()
+    await store.listDir("", { force: true })
+    expect(store.children("")).toBe(first)
+    expect(store.nodeRevision()).toBe(revision)
+
+    mtime = 2
+    await store.listDir("", { force: true })
+    const second = store.children("")
+    expect(second).not.toBe(first)
+    expect(second[1100]?.mtime).toBe(2)
+    expect(store.nodeRevision()).toBeGreaterThan(revision)
+    expect(store.children("")).toBe(second)
+    store.dispose()
+  })
+
+  test("directory to file replacement prunes old descendants but preserves the replacement path", async () => {
+    let isDirectory = true
+    const node = (path: string, type: "file" | "directory"): FileNode => ({
+      path, name: path.split("/").at(-1)!, absolute: `/conversion/${path}`,
+      type, ignored: false,
+    })
+    const store = createRoot(() => createFileTreeStore({
+      scope: () => "/conversion",
+      normalizeDir: (dir) => dir,
+      list: async (dir) => {
+        if (dir === "") return [node("src", isDirectory ? "directory" : "file"), node("other.md", "file")]
+        if (dir === "src") return [node("src/deep", "directory")]
+        if (dir === "src/deep") return [node("src/deep/child.ts", "file")]
+        return []
+      },
+      onError: () => {},
+      cache: { store: new Map() },
+    }))
+    await store.listDir("")
+    await store.listDir("src")
+    await store.listDir("src/deep")
+    expect(store.hasNode("src/deep/child.ts")).toBe(true)
+    expect(store.children("src/deep")).toHaveLength(1)
+    const before = store.viewRevision()
+    isDirectory = false
+    await store.listDir("", { force: true })
+    expect(store.node("src")?.type).toBe("file")
+    expect(store.hasNode("src/deep")).toBe(false)
+    expect(store.hasNode("src/deep/child.ts")).toBe(false)
+    expect(store.children("src")).toEqual([])
+    expect(store.children("src/deep")).toEqual([])
+    expect(store.allNodes().map((item) => item.path).toSorted()).toEqual(["other.md", "src"])
+    expect(store.changesSince(before)?.convertedDirectories).toEqual(["src"])
+    expect(store.changesSince(before)?.removedRoots).toEqual([])
+    store.dispose()
+  })
+
+  test("completed directory listing emits authoritative removed roots, but collapse and no-op do not", async () => {
+    let present = true
+    const node = (path: string, type: "directory" | "file"): FileNode => ({
+      path, name: path.split("/").at(-1)!, absolute: `/removed/${path}`,
+      type, ignored: false,
+    })
+    const store = createRoot(() => createFileTreeStore({
+      scope: () => "/removed",
+      normalizeDir: (path) => path,
+      list: async (dir) => dir === ""
+        ? [node("src", "directory"), node("stable.md", "file")]
+        : present ? [node("src/deleted", "directory"), node("src/keep.ts", "file")] :
+          [node("src/keep.ts", "file")],
+      onError: () => {},
+      cache: { store: new Map() },
+    }))
+    await store.listDir("")
+    await store.listDir("src")
+    await store.listDir("src/deleted")
+    const before = store.viewRevision()
+    present = false
+    await store.listDir("src", { force: true })
+    const changed = store.changesSince(before)
+    expect(changed?.directories).toEqual(["src"])
+    expect(changed?.removedRoots).toEqual(["src/deleted"])
+    const after = store.viewRevision()
+    await store.listDir("src", { force: true })
+    expect(store.changesSince(after)?.removedRoots).toEqual([])
+    store.collapseDir("src")
+    expect(store.changesSince(after)?.removedRoots).toEqual([])
+    store.reset()
+    expect(store.changesSince(after)).toBeUndefined()
+    store.dispose()
+  })
+
+  test("structural change journal reports affected directories, ignores no-ops and invalidates on reset", async () => {
+    const { store } = makeStore()
+    const initial = store.viewRevision()
+    await store.listDir("")
+    expect(store.changesSince(initial)?.directories).toEqual([""])
+    const rootRevision = store.viewRevision()
+    await store.listDir("", { force: true })
+    expect(store.viewRevision()).toBe(rootRevision)
+    expect(store.changesSince(rootRevision)?.directories).toEqual([])
+
+    store.expandDir("src", { list: false })
+    expect(store.changesSince(rootRevision)?.directories).toEqual(["src"])
+    const expandedRevision = store.viewRevision()
+    await store.listDir("src")
+    expect(store.changesSince(expandedRevision)?.directories).toEqual(["src"])
+    const listedRevision = store.viewRevision()
+    store.collapseDir("src")
+    expect(store.changesSince(listedRevision)?.directories).toEqual(["src"])
+    store.reset()
+    expect(store.changesSince(listedRevision)).toBeUndefined()
+  })
+
+  test("owner journal keeps incremental explorer rows identical through watcher, toggle, reset and metadata changes", async () => {
+    let srcRevision = 1
+    let srcLeaves = ["src/a.ts", "src/b.ts"]
+    const node = (path: string, type: "directory" | "file"): FileNode => ({
+      path, name: path.split("/").at(-1)!, absolute: `/view/${path}`,
+      type, ignored: false, mtime: type === "file" ? srcRevision : 1,
+    })
+    const store = createRoot(() => createFileTreeStore({
+      scope: () => "/view",
+      normalizeDir: (dir) => dir,
+      list: async (dir) => dir === ""
+        ? [node("src", "directory"), node("README.md", "file")]
+        : dir === "src" ? srcLeaves.map((leaf) => node(leaf, "file")) : [],
+      onError: () => {},
+      cache: { store: new Map() },
+    }))
+    const children = (dir: string) => store.children(dir)
+    const expanded = (dir: string) => store.dirState(dir)?.expanded ?? false
+    const projection = createIncrementalLiveFileTreeV2(children, expanded)
+    let revision = store.viewRevision()
+    const check = () => {
+      const changes = store.changesSince(revision)
+      if (!changes) projection.rebuild()
+      else for (const directory of changes.directories) projection.update(directory)
+      revision = store.viewRevision()
+      const asPaths = (rows: ReturnType<typeof flattenLiveFileTreeV2>) =>
+        rows.map((row) => [row.node.path, row.level, row.node.mtime])
+      expect(asPaths(projection.rows())).toEqual(asPaths(flattenLiveFileTreeV2(children, expanded)))
+    }
+
+    await store.listDir("")
+    check()
+    store.expandDir("src", { list: false })
+    check()
+    await store.listDir("src")
+    check()
+    srcRevision = 2
+    srcLeaves = ["src/b.ts", "src/c.ts", "src/a.ts"]
+    await store.listDir("src", { force: true })
+    check()
+    store.collapseDir("src")
+    check()
+    srcLeaves = ["src/c.ts"]
+    await store.listDir("src", { force: true })
+    check()
+    store.expandDir("src", { list: false })
+    check()
+    store.reset()
+    check()
+    store.dispose()
   })
 
   test("identical forced refresh does not invalidate allNodes consumers", async () => {

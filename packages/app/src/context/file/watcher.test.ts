@@ -146,4 +146,28 @@ describe("file watcher invalidation", () => {
 
     expect(refresh).toEqual([])
   })
+
+  test("ignores absolute worktree git-directory updates", () => {
+    const invalidated: string[] = []
+    for (const file of [
+      "/repo/.git/worktrees/feature/HEAD",
+      "C:\\repo\\.git\\worktrees\\feature\\HEAD",
+    ]) {
+      invalidateFromWatcher(
+        { type: "file.watcher.updated", properties: { file, event: "change" } },
+        {
+          normalize: (input) => input.replaceAll("\\", "/"),
+          hasFile: () => true,
+          loadFile: () => {
+            throw new Error("should not load Git metadata")
+          },
+          node: () => undefined,
+          isDirLoaded: () => true,
+          refreshDir: () => {},
+          onInvalidate: (path) => invalidated.push(path),
+        },
+      )
+    }
+    expect(invalidated).toEqual([])
+  })
 })

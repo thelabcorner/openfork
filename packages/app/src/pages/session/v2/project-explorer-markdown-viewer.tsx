@@ -37,7 +37,8 @@ function getHighlighter() {
 const parser = createMarkdownParser(async (code, language) => {
   const instance = await getHighlighter()
   const { bundledLanguages } = await import("shiki")
-  const name = language in bundledLanguages ? language : "text"
+  const languageID = language.trim().split(/\s+/, 1)[0]?.toLowerCase()
+  const name = languageID && Object.hasOwn(bundledLanguages, languageID) ? languageID : "text"
   if (!instance.getLoadedLanguages().includes(name))
     await instance.loadLanguage(bundledLanguages[name as BundledLanguage])
   return instance.codeToHtml(code, { lang: name as BundledLanguage, theme: "OpenCode", tabindex: false })

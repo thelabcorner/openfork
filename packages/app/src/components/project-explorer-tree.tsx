@@ -1,24 +1,31 @@
 import { createEffect, createMemo, createSignal, For, lazy, onCleanup, Show, Suspense, untrack, type Accessor } from "solid-js"
 import { createVirtualizer, defaultRangeExtractor } from "@tanstack/solid-virtual"
-import type { FileNode } from "@opencode-ai/sdk/v2"
 import { FileIcon } from "@opencode-ai/ui/file-icon"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { Spinner } from "@opencode-ai/ui/spinner"
 import { useFile } from "@/context/file"
+import { useSDK } from "@/context/sdk"
 import { useLanguage } from "@/context/language"
 import { virtualScrollElement } from "@/components/virtual-scroll-element"
 import { pathToFileUrl, withFileDragImage, type Kind } from "@/components/file-tree"
 import { buildFileDragTransfer } from "@opencode-ai/core/util/file-drag-transfer"
 import {
-  flattenLiveFileTreeV2,
   normalizeFileTreeV2Path,
   type FileTreeV2Node,
   type FileTreeV2Row,
+  type FileTreeV2Model,
 } from "@/components/file-tree-v2-model"
+import { createIndexedLiveFileTreeV2 } from "@/components/project-explorer-indexed-live"
+import { createIndexedSearchFileTreeRows } from "@/components/project-explorer-indexed-search"
+import { createProjectExplorerKeyResolver } from "@/components/project-explorer-virtualizer-keys"
 import type { ProjectExplorerFavorites } from "@/utils/project-explorer-favorites"
 import type { ProjectExplorerNodeActions } from "@/components/project-explorer-tree-context-menu"
-import { createProjectExplorerSearchExpansion } from "@/components/project-explorer-search"
+import { startProjectExplorerSearchTree } from "@/components/project-explorer-search-tree"
+import { startProjectExplorerSearchTreeDelta } from "@/components/project-explorer-search-incremental"
+import { dispatchProjectExplorerBulk } from "@/components/project-explorer-bulk-dispatch"
 import {
+  appendedProjectExplorerSearchPaths,
+  createProjectExplorerSearchAccumulator,
   startProjectExplorerSearch,
   type ProjectExplorerSearchResult,
 } from "@/components/project-explorer-search-runner"
@@ -38,7 +45,6 @@ const ProjectExplorerTreeContextMenu = lazy(() =>
 
 type PendingCreate = { parentDir: string; kind: "file" | "directory" }
 
-const emptySearchSet = new Set<string>()
 
 export type ProjectExplorerTreeHandle = {
   startRename: (path: string) => void
@@ -66,13 +72,15 @@ export function ProjectExplorerTree(props: {
   search?: string
   onOpen: (node: { path: string; type: "file" | "directory" }) => void
   onMention: (path: string) => void
-  onRename: (from: string, to: string) => void
-  onDelete: (path: string) => void
+  onRename: (from: string, to: string) => void | boolean | Promise<void | boolean>
+  onDelete: (path: string) => void | boolean | Promise<void | boolean>
   onCreate: (path: string, kind: "file" | "directory") => void
+  onRevealClearSearch?: () => void
   onSelectionChange?: (paths: string[]) => void
   ref?: (handle: ProjectExplorerTreeHandle) => void
 }) {
   const file = useFile()
+  const sdk = useSDK()
   const language = useLanguage()
 
   const loading = createMemo(() => {
@@ -133,6 +141,16 @@ export function ProjectExplorerTree(props: {
             This directory is empty — create a file to get started.
           </div>
         </Show>
+        <Show when={isSearch() && searchHasMore() && !searchBusy()}>
+          <button
+            type="button"
+            disabled={searchLoadingMore()}
+            class="rounded bg-v2-background-bg-hover px-2 py-1 text-11-regular text-v2-text-text-base hover:bg-v2-background-bg-active disabled:opacity-50"
+            onClick={() => loadMoreSearch?.()}
+          >
+            {language.t("common.loadMore")}
+          </button>
+        </Show>
       </div>
     )
   }
@@ -175,17 +193,23 @@ export function ProjectExplorerTree(props: {
   const selectRange = (target: string, additive: boolean) => {
     if (target.startsWith("__creating__:")) return
     const a = anchor()
-    const list = visibleRows()
-    const idx = visibleIndex()
-    const aIdx = a ? (idx.get(a) ?? -1) : -1
-    const tIdx = idx.get(target) ?? -1
+    const aIdx = a ? visibleIndexOf(a) : -1
+    const tIdx = visibleIndexOf(target)
     if (aIdx === -1 || tIdx === -1) {
       selectSingle(target)
       return
     }
     const lo = Math.min(aIdx, tIdx)
     const hi = Math.max(aIdx, tIdx)
-    const range = list.slice(lo, hi + 1).map((r) => r.node.path)
+    // The indexed projection already supports O(log chunks) positional
+    // reads. A short Shift+Arrow range must not flatten all 50k visible rows
+    // before selecting its two or three members.
+    const view = visibleView()
+    const range: string[] = []
+    for (let index = lo; index <= hi; index++) {
+      const path = view.at(index)?.node.path
+      if (path) range.push(path)
+    }
     if (additive) {
       const next = new Set(selectedSet())
       for (const p of range) if (!p.startsWith("__creating__:")) next.add(p)
@@ -203,22 +227,18 @@ export function ProjectExplorerTree(props: {
     if (all.length > 0) setAnchor(all[0]!)
   }
 
-  // Bulk actions eventually call network-backed parent callbacks. Dispatch a
-  // small synchronous slice, then yield with a timer so a 10k-file selection
-  // cannot monopolize the renderer while still preserving action order.
+  // Bulk actions are backpressured by *settlement*, not merely by a timer:
+  // 10k selected files previously overflowed the panel's bounded mutation
+  // queue and silently lost the remainder after item 512.
   let disposed = false
   onCleanup(() => {
     disposed = true
   })
-  const dispatchInChunks = <A,>(items: readonly A[], dispatch: (item: A) => void) => {
-    let cursor = 0
-    const drain = () => {
-      if (disposed) return
-      const end = Math.min(items.length, cursor + 32)
-      while (cursor < end) dispatch(items[cursor++])
-      if (cursor < items.length) setTimeout(drain, 0)
-    }
-    drain()
+  const dispatchInChunks = <A,>(
+    items: readonly A[],
+    dispatch: (item: A) => void | boolean | Promise<void | boolean>,
+  ) => {
+    void dispatchProjectExplorerBulk(items, dispatch, { cancelled: () => disposed })
   }
 
   // Provide project-explorer-tree equivalent of `select(path)` for backwards-compat
@@ -230,7 +250,10 @@ export function ProjectExplorerTree(props: {
 
   createEffect(() => {
     const state = file.tree.state("")
-    if (state?.loaded || state?.loading) return
+    // A rejected initial listing must not retrigger itself as loading flips
+    // false. Without this guard an unavailable workspace starts an unbounded
+    // request/toast loop; the error state already renders an explicit Retry.
+    if (state?.loaded || state?.loading || state?.error) return
     untrack(() => void file.tree.list(""))
   })
 
@@ -242,45 +265,90 @@ export function ProjectExplorerTree(props: {
     startupTransportDiagnostic("project-explorer.first-root.transport")
   })
 
-  const expanded = (path: string) => file.tree.state(path)?.expanded ?? false
+  const filesystemExpanded = (path: string) => file.tree.state(path)?.expanded ?? false
+  const expanded = (path: string) =>
+    searching() ? !searchCollapsed().has(path) : filesystemExpanded(path)
 
-  const rows = createMemo(() => {
-    const base = flattenLiveFileTreeV2((path) => file.tree.children(path), expanded)
-    const pending = creating()
-    if (!pending) return base
-    const insertAt = pending.parentDir === "" ? 0 : base.findIndex((row) => row.node.path === pending.parentDir) + 1
-    const level =
-      pending.parentDir === "" ? 0 : (base.find((row) => row.node.path === pending.parentDir)?.level ?? 0) + 1
-    const synthetic = {
-      node: {
-        name: "",
-        path: `__creating__:${pending.parentDir}`,
-        absolute: "",
-        type: pending.kind,
-        ignored: false,
-        originalPath: "",
-      } as FileTreeV2Node,
-      level,
+  let liveProjection: ReturnType<typeof createIndexedLiveFileTreeV2> | undefined
+  let projectedRevision = -1
+  let liveScope = ""
+  let liveInstance = 0
+  const liveView = createMemo(() => {
+    const revision = file.tree.viewRevision()
+    const scope = sdk().directory
+    if (!liveProjection || liveScope !== scope) {
+      liveScope = scope
+      liveInstance++
+      liveProjection = untrack(() => createIndexedLiveFileTreeV2(
+        (path) => file.tree.children(path), filesystemExpanded, (path) => file.tree.node(path),
+      ))
+      projectedRevision = revision
+    } else if (revision !== projectedRevision) {
+      const changes = file.tree.changesSince(projectedRevision)
+      untrack(() => {
+        if (!changes) liveProjection!.rebuild()
+        else {
+          const affected = new Set(changes.directories)
+          // Changes are replayed against the *final* authoritative store.
+          // When both parent and child changed in the same reactive batch,
+          // refreshing the parent subsumes its descendants. Repeated watcher
+          // events for the same directory likewise need only one projection.
+          if (affected.has("")) {
+            // Root order and all visible child-subtree positions can change.
+            // Rebuilding once is preferable to repeated O(log N) repositioning
+            // for tens of thousands of root siblings.
+            liveProjection!.rebuild()
+          }
+          else for (const directory of affected) {
+            let parent = directory
+            let subsumed = false
+            while (parent.includes("/")) {
+              parent = parent.slice(0, parent.lastIndexOf("/"))
+              if (affected.has(parent)) { subsumed = true; break }
+            }
+            if (!subsumed) liveProjection!.update(directory)
+          }
+        }
+      })
+
+      projectedRevision = revision
     }
-    return [...base.slice(0, insertAt), synthetic, ...base.slice(insertAt)]
+    // This wrapper changes identity only when the domain revision/scope does.
+    // Consumers can access count/key/viewport rows without calling rows().
+    return { projection: liveProjection!, revision, scope, instance: liveInstance }
   })
 
   const searching = createMemo(() => Boolean(props.search?.trim()))
   const searchQuery = createMemo(() => props.search?.trim().toLowerCase() ?? "")
   const [searchResult, setSearchResult] = createSignal<ProjectExplorerSearchResult>()
   const [searchBusy, setSearchBusy] = createSignal(false)
+  const [searchHasMore, setSearchHasMore] = createSignal(false)
+  const [searchLoadingMore, setSearchLoadingMore] = createSignal(false)
+  // Search owns a lightweight path projection. Never expand filesystem
+  // directories merely to render results the workspace index already knows.
+  const [searchCollapsed, setSearchCollapsed] = createSignal<Set<string>>(new Set())
   let searchGeneration = 0
   let cancelSearch: (() => void) | undefined
+  let loadMoreSearch: (() => void) | undefined
+  let refreshLocalSearch: (() => void) | undefined
 
   createEffect(() => {
     const query = searchQuery()
-    // allNodes() is intentionally read ONLY for an active query. Its nodeVersion
-    // dependency restarts this generation when a watcher changes the loaded
-    // corpus, but idle explorer metadata churn remains O(1).
-    const nodes = query ? file.tree.allNodes() : undefined
+    // A workspace switch must invalidate the old search even if the user
+    // leaves the query text unchanged.
+    sdk().directory
+    setSearchCollapsed(new Set<string>())
+    // Snapshot the currently loaded corpus once per query generation. Search-
+    // owned expansions below load more nodes; tracking nodeVersion here would
+    // otherwise restart/abort the same search for every ancestor listing.
+    const nodes = query ? untrack(() => file.tree.allNodes()) : undefined
     const generation = ++searchGeneration
     cancelSearch?.()
+    refreshLocalSearch = undefined
     cancelSearch = undefined
+    loadMoreSearch = undefined
+    setSearchHasMore(false)
+    setSearchLoadingMore(false)
     if (!query || !nodes) {
       setSearchBusy(false)
       setSearchResult(undefined)
@@ -289,19 +357,173 @@ export function ProjectExplorerTree(props: {
 
     setSearchBusy(true)
     setSearchResult(undefined)
-    // Let the input event/paint settle before beginning even the first slice.
-    cancelSearch = startProjectExplorerSearch({
+    const abort = new AbortController()
+    // Keep an immutable published snapshot for the cooperative projector.
+    // Only replay *new* page paths; replaying every historical server page on
+    // each Load More made the cumulative ranking/ancestry merge quadratic.
+    const accumulator = createProjectExplorerSearchAccumulator(query)
+    const pendingRemote: string[] = []
+    const pendingDirectories: string[] = []
+    let localDone = false
+    let remoteDone = false
+    const publish = () => {
+      if (generation !== searchGeneration) return
+      if (pendingRemote.length > 0 || pendingDirectories.length > 0) {
+        accumulator.page(pendingRemote, pendingDirectories)
+        pendingRemote.length = 0
+        pendingDirectories.length = 0
+      }
+      setSearchResult(accumulator.snapshot())
+      if (localDone && remoteDone) setSearchBusy(false)
+    }
+
+    // Let the input event/paint settle before beginning even the first local
+    // slice. This preserves every loaded-tree substring match immediately.
+    let cancelLocalRebase: (() => void) | undefined
+    let stopLocal = startProjectExplorerSearch({
       query,
       nodes,
       root: () => file.tree.children(""),
       children: (path) => file.tree.children(path),
+      projectRows: false,
       cancelled: () => generation !== searchGeneration,
       complete: (result) => {
         if (generation !== searchGeneration) return
-        setSearchResult(result)
-        setSearchBusy(false)
+        cancelLocalRebase?.()
+        // Local search itself is cooperative, but ingesting its 50k matches
+        // synchronously still caused a long input-blocking commit. Reuse the
+        // same time-sliced accumulator for initial and watcher scans.
+        cancelLocalRebase = accumulator.refreshLocalCooperatively(result, {
+          cancelled: () => generation !== searchGeneration,
+          complete: () => {
+            if (generation !== searchGeneration) return
+            localDone = true
+            publish()
+          },
+        })
       },
     })
+
+    // The loaded-file index may change while the same search query remains
+    // active. Debounce watcher bursts and recompute only the local contribution
+    // to the result set, leaving the remote server page cursor untouched.
+    let scannedRevision = untrack(() => file.tree.nodeRevision())
+    let scannedViewRevision = untrack(() => file.tree.viewRevision())
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined
+    refreshLocalSearch = () => {
+      const revision = file.tree.nodeRevision()
+      if (revision === scannedRevision) return
+      scannedRevision = revision
+      const changes = file.tree.changesSince(scannedViewRevision)
+      scannedViewRevision = file.tree.viewRevision()
+      if (changes?.removedRoots.length) accumulator.invalidateRemoteRoots(changes.removedRoots)
+      if (changes?.convertedDirectories.length) {
+        accumulator.invalidateRemoteDescendants(changes.convertedDirectories)
+      }
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer)
+      refreshTimer = setTimeout(() => {
+        refreshTimer = undefined
+        if (generation !== searchGeneration) return
+        stopLocal()
+        cancelLocalRebase?.()
+        stopLocal = startProjectExplorerSearch({
+          query,
+          nodes: file.tree.allNodes(),
+          root: () => file.tree.children(""),
+          children: (path) => file.tree.children(path),
+          projectRows: false,
+          cancelled: () => generation !== searchGeneration,
+          complete: (result) => {
+            if (generation !== searchGeneration) return
+            cancelLocalRebase?.()
+            cancelLocalRebase = accumulator.refreshLocalCooperatively(result, {
+              cancelled: () => generation !== searchGeneration,
+              complete: () => {
+                if (generation !== searchGeneration) return
+                localDone = true
+                publish()
+              },
+            })
+          },
+        })
+      }, 140)
+    }
+
+    // Add full-workspace candidates from the server without broadening Explorer
+    // semantics: /find/search may be fuzzy, so retain only paths satisfying the
+    // existing case-insensitive substring rule. The local result remains the
+    // fallback and source of truth for every already-loaded node.
+    let nextOffset = 0
+    let fetching = false
+    const fetchPage = (initial: boolean) => {
+      if (fetching || abort.signal.aborted || generation !== searchGeneration) return
+      fetching = true
+      if (!initial) setSearchLoadingMore(true)
+      void file.searchMentions(query, {
+        limit: 1000,
+        offset: nextOffset,
+        symbols: false,
+        signal: abort.signal,
+      }).then(
+        (page) => {
+          if (generation !== searchGeneration) return
+          // The endpoint is a ranked fuzzy search. Pagination must advance by
+          // UNFILTERED results or substring filtering can re-request pages
+          // indefinitely and silently omit valid later matches.
+          nextOffset += page.results.length
+          for (const item of page.results) {
+            if (item.kind !== "file") continue
+            const path = normalizeFileTreeV2Path(item.path)
+            if (!path.toLowerCase().includes(query)) continue
+            // Preserve original rootedness until the accumulator validates
+            // the raw path. The generic normalizer strips leading slashes.
+            pendingRemote.push(item.path)
+            if (item.type === "directory") pendingDirectories.push(item.path)
+          }
+          setSearchHasMore(page.hasMore && page.results.length > 0)
+          publish()
+        },
+        () => {
+          if (generation !== searchGeneration) return
+          if (initial) {
+            setSearchHasMore(false)
+            publish()
+          }
+          // A subsequent page failure preserves the previous results and
+          // the Load More affordance so the user may retry.
+        },
+      ).finally(() => {
+        if (generation !== searchGeneration) return
+        fetching = false
+        if (initial) {
+          remoteDone = true
+          publish()
+        } else setSearchLoadingMore(false)
+      })
+    }
+    if (query.length < 2) {
+      remoteDone = true
+    } else {
+      loadMoreSearch = () => fetchPage(false)
+      fetchPage(true)
+    }
+
+    cancelSearch = () => {
+      stopLocal()
+      cancelLocalRebase?.()
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer)
+      refreshLocalSearch = undefined
+      abort.abort()
+    }
+  })
+
+  createEffect(() => {
+    // Keep the watcher subscription out of the query's effect: tracking this
+    // revision there would cancel the remote generation after every mutation.
+    if (!searchQuery()) return
+    sdk().directory
+    file.tree.nodeRevision()
+    untrack(() => refreshLocalSearch?.())
   })
 
   onCleanup(() => {
@@ -309,60 +531,169 @@ export function ProjectExplorerTree(props: {
     cancelSearch?.()
   })
 
-  const searchExpansion = createProjectExplorerSearchExpansion({
-    isExpanded: (path) => file.tree.state(path)?.expanded ?? false,
-    expand: (path, options) => file.tree.expand(path, options),
-    collapse: (path) => file.tree.collapse(path),
-    beginGeneration: file.tree.beginGeneration,
-  })
-
-  const searchMatches = createMemo(() => {
-    const query = searchQuery()
-    if (!query) return undefined
-    const result = searchResult()
-    return result?.query === query ? result.matches : emptySearchSet
-  })
-
-  const searchAncestors = createMemo(() => {
-    const query = searchQuery()
-    if (!query) return undefined
-    const result = searchResult()
-    return result?.query === query ? result.ancestors : emptySearchSet
-  })
-
+  const [searchModel, setSearchModel] = createSignal<FileTreeV2Model>()
+  const [searchProjectionBusy, setSearchProjectionBusy] = createSignal(false)
+  let projectedQuery = ""
+  let projectedRoot = ""
+  let committedSearch: ProjectExplorerSearchResult | undefined
+  let committedModel: FileTreeV2Model | undefined
   createEffect(() => {
-    const ancestors = searchAncestors()
     const query = searchQuery()
-    untrack(() => searchExpansion.sync(ancestors, query))
-  })
-
-  onCleanup(searchExpansion.dispose)
-
-  const visibleRows = createMemo(() => {
-    const query = searchQuery()
-    if (!query) return rows()
     const result = searchResult()
-    return result?.query === query ? result.rows : []
-  })
-
-  const empty = createMemo(() => visibleRows().length === 0)
-
-  const visibleLookup = createMemo(() => {
-    const index = new Map<string, number>()
-    const row = new Map<string, FileTreeV2Row>()
-    let i = 0
-    for (const item of visibleRows()) {
-      index.set(item.node.path, i++)
-      row.set(item.node.path, item)
+    const root = sdk().directory
+    if (query !== projectedQuery || root !== projectedRoot) {
+      setSearchModel(undefined)
+      committedSearch = undefined
+      committedModel = undefined
+      projectedQuery = query
+      projectedRoot = root
     }
-    return { index, row }
+    if (!query || result?.query !== query) {
+      setSearchProjectionBusy(false)
+      return
+    }
+    setSearchProjectionBusy(true)
+    const complete = (model: FileTreeV2Model) => {
+      committedSearch = result
+      committedModel = model
+      setSearchModel(model)
+      setSearchProjectionBusy(false)
+    }
+    // Only the newly appended paths are projected on ordinary search pages.
+    // Existing sorted buckets and immutable model snapshots are preserved.
+    // A scope switch, invalid snapshot, very large local search burst, or
+    // bounded persistent-index rebase uses the full cooperative reference.
+    const addedMatches = committedSearch &&
+      appendedProjectExplorerSearchPaths(committedSearch.matches, result.matches)
+    const addedAncestors = committedSearch &&
+      appendedProjectExplorerSearchPaths(committedSearch.ancestors, result.ancestors)
+    const stop = (committedModel && addedMatches && addedAncestors
+      ? startProjectExplorerSearchTreeDelta({
+          previous: committedModel,
+          addedMatches,
+          addedAncestors,
+          root,
+          lookup: (path) => file.tree.node(path),
+          complete,
+        })
+      : undefined) ?? startProjectExplorerSearchTree({
+        matches: result.matches,
+        ancestors: result.ancestors,
+        root,
+        lookup: (path) => file.tree.node(path),
+        complete,
+      })
+    onCleanup(stop)
   })
-  const visibleIndex = () => visibleLookup().index
-  const rowByKey = () => visibleLookup().row
 
+  let searchRowProjection: {
+    model: FileTreeV2Model
+    view: ReturnType<typeof createIndexedSearchFileTreeRows>
+    instance: number
+  } | undefined
+  type VisibleProjection = {
+    readonly length: number
+    readonly keySignature: string
+    at: (index: number) => FileTreeV2Row | undefined
+    indexOfPath: (path: string) => number
+    rowForPath: (path: string) => FileTreeV2Row | undefined
+    rows: () => FileTreeV2Row[]
+  }
+  const emptyRows: FileTreeV2Row[] = []
+  const emptyProjection: VisibleProjection = {
+    keySignature: "empty",
+    length: 0, at: () => undefined, indexOfPath: () => -1,
+    rowForPath: () => undefined, rows: () => emptyRows,
+  }
+  let searchKeyEpoch = 0
+  const visibleView = createMemo<VisibleProjection>(() => {
+    const query = searchQuery()
+    let base: VisibleProjection
+    if (!query) {
+      const { projection, instance } = liveView()
+      base = {
+        keySignature: `live:${instance}:${projection.keysVersion}`,
+        length: projection.length,
+        at: projection.at,
+        indexOfPath: projection.indexOfPath,
+        rowForPath: projection.rowForPath,
+        rows: projection.rows,
+      }
+    } else {
+      const model = searchModel()
+      if (!model) return emptyProjection
+      const collapsed = searchCollapsed()
+      if (!searchRowProjection || searchRowProjection.model !== model) {
+        searchRowProjection = { model, view: createIndexedSearchFileTreeRows(model, collapsed), instance: ++searchKeyEpoch }
+      } else searchRowProjection.view.update(collapsed)
+      const projection = searchRowProjection.view
+      base = {
+        keySignature: `search:${searchRowProjection.instance}:${projection.keysVersion}`,
+        length: projection.length,
+        at: projection.at,
+        indexOfPath: projection.indexOfPath,
+        rowForPath: projection.rowForPath,
+        rows: projection.rows,
+      }
+    }
+    const pending = creating()
+    if (!pending) return base
+    const parent = base.indexOfPath(pending.parentDir)
+    const index = pending.parentDir ? Math.max(0, parent + 1) : 0
+    const level = pending.parentDir ? (base.at(parent)?.level ?? 0) + 1 : 0
+    const synthetic: FileTreeV2Row = {
+      node: { name: "", path: `__creating__:${pending.parentDir}`, absolute: "", type: pending.kind, ignored: false, originalPath: "" },
+      level,
+    }
+    return {
+      keySignature: `${base.keySignature}:create:${pending.parentDir}:${pending.kind}`,
+      length: base.length + 1,
+      at: (position: number) =>
+        position === index ? synthetic : base.at(position > index ? position - 1 : position),
+      indexOfPath: (path: string) => {
+        if (path === synthetic.node.path) return index
+        const found = base.indexOfPath(path)
+        return found < 0 ? -1 : found >= index ? found + 1 : found
+      },
+      rowForPath: (path: string) => path === synthetic.node.path ? synthetic : base.rowForPath(path),
+      rows: () => {
+        const list = base.rows()
+        return list.slice(0, index).concat(synthetic, list.slice(index))
+      },
+    }
+  })
+  // Deliberately not a Solid memo: an array is materialized only for global
+  // operations such as Select All / keyboard ranges, never to render the
+  // virtualized viewport or process an ordinary watcher update.
+  const visibleRows = () => visibleView().rows()
+  const visibleRowAt = (index: number) => visibleView().at(index)
+  const visibleCount = () => visibleView().length
+
+  const empty = createMemo(() => visibleCount() === 0)
+
+  // The virtualizer normally needs the position of ONE focused path, not a
+  // complete 50k-entry path→index map. A tracked memo computes that position
+  // once per focus/visible-tree revision, never on every scroll notification.
+  // Shift selection makes two bounded scans, avoiding the O(N) map allocation
+  // that each watcher-triggered projection formerly caused.
+  const visibleIndexOf = (path: string) => visibleView().indexOfPath(path)
+  const pinnedIndex = createMemo(() => {
+    const path = focused()
+    return path ? visibleIndexOf(path) : -1
+  })
+  // Both the live and search projections now have their own path index.
+  // Building a separate 50k-entry Map during a bulk rename/drop would be
+  // redundant allocation; the existing index remains authoritative.
+  const rowForPath = (path: string, _bulk = false) => visibleView().rowForPath(path)
+
+  // A metadata-only watcher commit changes visible row wrappers, but NOT the
+  // ordered virtualizer keys. Avoid 50k full-key remeasurement in TanStack.
+  // The resolver reads the latest view when invoked, while its identity only
+  // changes when a structural edit/order/selection-creation changes keys.
+  const itemKeyResolver = createProjectExplorerKeyResolver(visibleView)
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
     get count() {
-      return visibleRows().length
+      return visibleCount()
     },
     getScrollElement: () => virtualScrollElement(root()),
     initialRect: { width: 0, height: 600 },
@@ -373,13 +704,11 @@ export function ProjectExplorerTree(props: {
     gap: 0,
     overscan: 12,
     get getItemKey() {
-      const current = visibleRows()
-      return (index: number) => current[index]?.node.path ?? index
+      return itemKeyResolver()
     },
     rangeExtractor: (range) => {
       const indexes = defaultRangeExtractor(range)
-      const path = focused()
-      const index = path ? (visibleIndex().get(path) ?? -1) : -1
+      const index = pinnedIndex()
       if (index < 0 || indexes.includes(index)) return indexes
       return [...indexes, index].sort((a, b) => a - b)
     },
@@ -414,19 +743,25 @@ export function ProjectExplorerTree(props: {
     onCleanup(() => observer.disconnect())
   })
 
-  // Iterate the virtual items themselves rather than a list of their `key`s.
-  // `getItemKey` returns `node.path`, and a tree can legitimately surface the
-  // same normalized path more than once in `visibleRows()` (an expanded
-  // directory re-listing a child that is already present upstream). `<For>` is
-  // keyed by value, so duplicate string keys made it render one row several
-  // times and silently drop the others — the rendered rows collapsed onto a few
-  // shared offsets, leaving 22px-multiple voids where the dropped rows should
-  // have been. Expanding `docs` in this repo produced 71 elements at 46 distinct
-  // positions. `index` is unique by construction, so it cannot collide.
+  // Keys are unique normalized paths (flattenLiveFileTreeV2 enforces this,
+  // including across duplicate watcher listings). Iterate *keys*, not the
+  // VirtualItem objects that tanstack recreates during scrolling. Solid's For
+  // would otherwise remount unchanged row DOM whenever item measurements
+  // change, losing inline editor/focus state and wasting render work.
   const virtualItems = createMemo(() => virtualizer.getVirtualItems())
+  const virtualItemKeys = createMemo(() => virtualItems().map((item) => item.key))
+  const virtualItemByKey = createMemo(() => new Map(virtualItems().map((item) => [item.key, item] as const)))
 
   const toggleDir = (node: FileTreeV2Node) => {
-    searchExpansion.userToggled(node.path)
+    if (searching()) {
+      setSearchCollapsed((previous) => {
+        const next = new Set(previous)
+        if (next.has(node.path)) next.delete(node.path)
+        else next.add(node.path)
+        return next
+      })
+      return
+    }
     if (expanded(node.path)) {
       file.tree.collapse(node.originalPath)
       return
@@ -457,6 +792,25 @@ export function ProjectExplorerTree(props: {
     if (!trimmed) return
     const path = pending.parentDir ? `${pending.parentDir}/${trimmed}` : trimmed
     props.onCreate(path, pending.kind)
+  }
+  const beginCreate = (parentDir: string, kind: PendingCreate["kind"]) => {
+    if (searching()) {
+      // Search is a read-only path projection. Opening an inline editor must
+      // not schedule a separate filesystem listing of every search ancestor.
+      // Open its collapsed ancestors locally, even after Collapse All.
+      const normalized = normalizeFileTreeV2Path(parentDir)
+      setSearchCollapsed((previous) => {
+        const next = new Set(previous)
+        let path = normalized
+        while (path) {
+          next.delete(path)
+          const cut = path.lastIndexOf("/")
+          path = cut === -1 ? "" : path.slice(0, cut)
+        }
+        return next
+      })
+    } else file.tree.expand(parentDir || "")
+    setCreating({ parentDir, kind })
   }
 
   // ── click / keyboard selection helpers (IDE semantics) ──
@@ -579,7 +933,7 @@ export function ProjectExplorerTree(props: {
       if (dest === src) continue
       // originalPath may be needed for correct server path, but tree stores
       // normalized; map back via rowByKey when possible
-      const srcNode = rowByKey().get(src)?.node ?? ({ originalPath: src } as FileTreeV2Node)
+      const srcNode = rowForPath(src, sources.length >= 16)?.node ?? ({ originalPath: src } as FileTreeV2Node)
       const from = (srcNode as FileTreeV2Node).originalPath || src
       moves.push({ from, to: dest })
     }
@@ -587,14 +941,15 @@ export function ProjectExplorerTree(props: {
   }
 
   const moveSelection = (delta: number, extend: boolean) => {
-    const list = visibleRows()
-    if (list.length === 0) return
+    const count = visibleCount()
+    if (count === 0) return
     // `focused` is the keyboard cursor; if nothing focused, anchor or first item.
     const cursor =
-      focused() ?? anchor() ?? (selectedSet().size === 1 ? [...selectedSet()][0] : undefined) ?? list[0]!.node.path
-    const curIdx = visibleIndex().get(cursor) ?? 0
-    const nextIdx = Math.min(list.length - 1, Math.max(0, curIdx + delta))
-    const path = list[nextIdx]!.node.path
+      focused() ?? anchor() ?? (selectedSet().size === 1 ? [...selectedSet()][0] : undefined) ?? visibleRowAt(0)!.node.path
+    const located = visibleIndexOf(cursor)
+    const curIdx = located < 0 ? 0 : located
+    const nextIdx = Math.min(count - 1, Math.max(0, curIdx + delta))
+    const path = visibleRowAt(nextIdx)!.node.path
     if (extend) {
       // Shift+Arrow extends from anchor, leaving existing selection additive (like VS Code)
       if (!anchor()) setAnchor(cursor)
@@ -612,7 +967,7 @@ export function ProjectExplorerTree(props: {
     if (!path) return
     const scroller = virtualScrollElement(root())
     if (!scroller) return
-    const index = visibleIndex().get(path) ?? -1
+    const index = visibleIndexOf(path)
     if (index < 0) return
     setRevealTarget(undefined)
     const item = virtualizer.getVirtualItems().find((entry) => entry.key === path)
@@ -626,10 +981,12 @@ export function ProjectExplorerTree(props: {
   })
 
   const reveal = (path: string) => {
+    // Reveal is an explicit navigation gesture, not a query result. Remove
+    // the search filter before expanding the real filesystem ancestry.
+    if (searching()) props.onRevealClearSearch?.()
     const normalized = normalizeFileTreeV2Path(path)
     for (let parent = normalized.lastIndexOf("/"); parent !== -1; parent = normalized.lastIndexOf("/", parent - 1)) {
       const dir = normalized.slice(0, parent)
-      searchExpansion.userToggled(dir)
       if (!file.tree.state(dir)?.expanded) file.tree.expand(dir)
     }
     selectSingle(normalized)
@@ -643,41 +1000,42 @@ export function ProjectExplorerTree(props: {
     untrack(() => props.onSelectionChange?.(paths))
   })
 
-  // Prune stale selections only when files actually vanish from the *filesystem*
-  // (not when a collapsed folder hides them). Check the maintained tree index
-  // for each selected path instead of rebuilding a Set of every loaded node on
-  // every watcher refresh; a 50k-node tree now costs O(selected) here.
+  // The loaded directory tree is NOT an existence oracle: search can select
+  // files discovered by the server index that have never been listed locally.
+  // A query change or closing search must not silently erase that selection.
+  // Only an explicit workspace switch can confidently invalidate these paths.
+  let selectionScope = sdk().directory
   createEffect(() => {
-    const current = selectedSet()
-    let changed = false
-    const pruned = new Set<string>()
-    for (const p of current) {
-      if (file.tree.hasNode(p) || p.startsWith("__creating__:")) pruned.add(p)
-      else changed = true
-    }
-    if (changed) setSelectedSet(pruned)
-    const a = anchor()
-    if (a && !file.tree.hasNode(a)) setAnchor([...pruned][0])
+    const scope = sdk().directory
+    if (scope === selectionScope) return
+    selectionScope = scope
+    clearSelection()
+    setFocused(undefined)
+    setCreating(undefined)
+    setRenaming(undefined)
+    setDeleting(undefined)
   })
 
   props.ref?.({
     startRename: (path) => setRenaming(path),
-    startCreate: (parentDir, kind) => {
-      searchExpansion.userToggled(normalizeFileTreeV2Path(parentDir))
-      file.tree.expand(parentDir || "")
-      setCreating({ parentDir, kind })
-    },
+    startCreate: beginCreate,
     startDelete: (path) => {
       // Bulk: if the requested path is part of a multi-selection, confirm all.
       if (isSelected(path) && selectedSet().size > 1) return setDeleting("__bulk__")
       setDeleting(path)
     },
     expandAll: () => {
-      searchExpansion.releaseAll(searchQuery())
+      if (searching()) {
+        setSearchCollapsed(new Set<string>())
+        return
+      }
       void file.tree.expandAll()
     },
     collapseAll: () => {
-      searchExpansion.releaseAll(searchQuery())
+      if (searching()) {
+        setSearchCollapsed(new Set(Array.from(searchModel()?.children.keys() ?? []).filter(Boolean)))
+        return
+      }
       file.tree.collapseAll()
     },
     reveal,
@@ -729,7 +1087,7 @@ export function ProjectExplorerTree(props: {
       }
     }
     const cursor = focused() ?? anchor() ?? (selectedSet().size === 1 ? [...selectedSet()][0]! : undefined)
-    const current = cursor ? rowByKey().get(cursor) : undefined
+    const current = cursor ? rowForPath(cursor) : undefined
     if (!current) return
     if (event.key === "ArrowRight" && current.node.type === "directory" && !expanded(current.node.path)) {
       event.preventDefault()
@@ -747,7 +1105,7 @@ export function ProjectExplorerTree(props: {
       if (selectedSet().size > 1) {
         const files: Array<{ path: string; type: "file" }> = []
         for (const p of selectedSet()) {
-          const n = rowByKey().get(p)?.node
+          const n = rowForPath(p)?.node
           if (n?.type === "file") files.push({ path: n.originalPath, type: "file" })
         }
         dispatchInChunks(files, (file) => props.onOpen(file))
@@ -804,7 +1162,7 @@ export function ProjectExplorerTree(props: {
           const base = src.includes("/") ? src.slice(src.lastIndexOf("/") + 1) : src
           if (src === base) continue // already at root
           if (base.includes("/")) continue
-          const srcNode = rowByKey().get(src)?.node ?? ({ originalPath: src } as FileTreeV2Node)
+          const srcNode = rowForPath(src, sources.length >= 16)?.node ?? ({ originalPath: src } as FileTreeV2Node)
           const from = (srcNode as FileTreeV2Node).originalPath || src
           // Skip if already at root
           if (from === base) continue
@@ -814,7 +1172,13 @@ export function ProjectExplorerTree(props: {
       }}
       style={{
         position: "relative",
-        height: `${Math.max(virtualizer.getTotalSize(), searching() ? 36 : loading() && empty() && !searching() ? 220 : empty() && !searching() ? 140 : 0)}px`,
+        // A search with no visible matches still needs enough height for its
+        // empty state and Load More control. The old 36px minimum clipped
+        // those controls into an effectively unclickable area.
+        height: `${Math.max(
+          virtualizer.getTotalSize(),
+          searching() ? (searchBusy() || searchProjectionBusy() ? 36 : empty() ? 140 : 0) : loading() && empty() ? 220 : empty() ? 140 : 0,
+        )}px`,
       }}
     >
       <Show
@@ -845,11 +1209,11 @@ export function ProjectExplorerTree(props: {
           }
         >
            <Show
-             when={visibleRows().length > 0}
+             when={visibleCount() > 0}
              fallback={
                <div data-slot="project-explorer-empty" class="absolute inset-0">
                  <Show
-                   when={!searchBusy()}
+                    when={!searchBusy() && !searchProjectionBusy()}
                    fallback={
                      <div class="flex h-9 items-center justify-center gap-2 text-11-regular text-v2-text-text-faint">
                        <Spinner class="size-3" />
@@ -862,25 +1226,26 @@ export function ProjectExplorerTree(props: {
                </div>
              }
           >
-            <For each={virtualItems()}>
-              {(item) => (
+            <For each={virtualItemKeys()}>
+              {(key) => (
                 <div
                   style={{
                     position: "absolute",
                     top: "0",
                     "inset-inline-start": "0",
                     width: "100%",
-                    height: `${item.size}px`,
-                    transform: `translateY(${item.start}px)`,
+                    height: `${virtualItemByKey().get(key)?.size ?? 22}px`,
+                    transform: `translateY(${virtualItemByKey().get(key)?.start ?? 0}px)`,
                     overflow: "hidden",
                   }}
                 >
-                  <Show when={visibleRows()[item.index]}>
+                  <Show when={visibleRowAt(virtualItemByKey().get(key)?.index ?? -1)}>
                     {(row) => {
                       const isBulkDelete = () => deleting() === "__bulk__" && isSelected(row().node.path)
                       const rowElement = (
                         <ProjectExplorerRow
                           row={row}
+                          searchMode={searching()}
                           selected={isSelected(row().node.path)}
                           focused={focused() === row().node.path}
                           expanded={expanded(row().node.path)}
@@ -930,8 +1295,8 @@ export function ProjectExplorerTree(props: {
                               const paths = [...selectedSet()]
                               setDeleting(undefined)
                               const deletions = paths.map((p) => {
-                                // `onDelete` expects originalPath; map back via rowByKey
-                                const n = rowByKey().get(p)?.node ?? ({ originalPath: p } as FileTreeV2Node)
+                                 // `onDelete` expects originalPath; retain native spellings
+                                 const n = rowForPath(p)?.node ?? ({ originalPath: p } as FileTreeV2Node)
                                 return (n as FileTreeV2Node).originalPath || p
                               })
                               dispatchInChunks(deletions, (path) => props.onDelete(path))
@@ -965,8 +1330,8 @@ export function ProjectExplorerTree(props: {
                           if (isSelected(node.path) && selectedSet().size > 1) {
                             const mentions: string[] = []
                             for (const p of selectedSet()) {
-                              const n = rowByKey().get(p)?.node
-                              if (n) mentions.push(n.originalPath)
+                               const n = rowForPath(p)?.node
+                               if (n) mentions.push(n.originalPath)
                             }
                             dispatchInChunks(mentions, (path) => props.onMention(path))
                           } else props.onMention(node.originalPath)
@@ -977,14 +1342,8 @@ export function ProjectExplorerTree(props: {
                           if (isSelected(node.path) && selectedSet().size > 1) setDeleting("__bulk__")
                           else setDeleting(node.path)
                         },
-                        onNewFile: () => {
-                          if (node.type === "directory") file.tree.expand(node.originalPath)
-                          setCreating({ parentDir: parentDirFor, kind: "file" })
-                        },
-                        onNewFolder: () => {
-                          if (node.type === "directory") file.tree.expand(node.originalPath)
-                          setCreating({ parentDir: parentDirFor, kind: "directory" })
-                        },
+                        onNewFile: () => beginCreate(parentDirFor, "file"),
+                        onNewFolder: () => beginCreate(parentDirFor, "directory"),
                       }
                       return (
                         <div class="block w-full min-w-0" onContextMenu={(event) => handleRowContextMenu(event, node, actions)}>
@@ -1009,10 +1368,37 @@ export function ProjectExplorerTree(props: {
                 </Suspense>
               )}
             </Show>
-            <Show when={loading() && visibleRows().length > 0 && !searching()}>
+            <Show when={loading() && visibleCount() > 0 && !searching()}>
               <div class="pointer-events-none sticky bottom-0 flex items-center gap-2 border-t border-v2-border-border-base bg-v2-background-bg-base/80 px-3 py-1.5 text-11-regular text-v2-text-text-faint backdrop-blur">
                 <Spinner class="size-3 shrink-0" />
-                <span>Loading {visibleRows().length.toLocaleString()} files…</span>
+                <span>Loading {visibleCount().toLocaleString()} files…</span>
+              </div>
+            </Show>
+            <Show when={searching() && searchHasMore() && !empty()}>
+              <div class="sticky bottom-0 flex items-center justify-center border-t border-v2-border-border-muted bg-v2-background-bg-base py-1.5">
+                <button
+                  type="button"
+                  disabled={searchLoadingMore() || searchProjectionBusy()}
+                  class="rounded bg-v2-background-bg-hover px-2 py-1 text-11-regular text-v2-text-text-base hover:bg-v2-background-bg-active disabled:opacity-50"
+                  onClick={() => loadMoreSearch?.()}
+                >
+                  {language.t("common.loadMore")}
+                </button>
+              </div>
+            </Show>
+            {/* A warm snapshot can leave rows visible when revalidation fails.
+                Keep those rows usable but expose a retry instead of trapping
+                the user behind the automatic-retry error guard. */}
+            <Show when={rootError() && !empty() && !searching()}>
+              <div class="sticky bottom-0 flex items-center gap-2 border-t border-v2-border-border-base bg-v2-background-bg-base px-3 py-1.5 text-11-regular text-v2-text-text-muted">
+                <span class="min-w-0 flex-1 truncate">{language.t("toast.file.listFailed.title")}</span>
+                <button
+                  type="button"
+                  class="shrink-0 rounded bg-v2-background-bg-hover px-2 py-1 text-v2-text-text-base hover:bg-v2-background-bg-active"
+                  onClick={() => void file.tree.list("", { force: true })}
+                >
+                  {language.t("common.retry")}
+                </button>
               </div>
             </Show>
           </Show>
@@ -1022,25 +1408,9 @@ export function ProjectExplorerTree(props: {
   )
 }
 
-function toLive(node: FileNode): FileTreeV2Node {
-  const cached = liveNodeCache.get(node)
-  if (cached) return cached
-  const live = {
-    ...node,
-    path: normalizeFileTreeV2Path(node.path),
-    originalPath: node.path,
-  }
-  liveNodeCache.set(node, live)
-  return live
-}
-
-// FileTreeV2Node is a derived view of a FileNode. File watcher refreshes often
-// return fresh directory arrays containing the same store node identities; a
-// WeakMap keeps those refreshes from allocating one spread object per row.
-const liveNodeCache = new WeakMap<FileNode, FileTreeV2Node>()
-
 function ProjectExplorerRow(props: {
   row: Accessor<{ node: FileTreeV2Node; level: number }>
+  searchMode?: boolean
   selected: boolean
   focused: boolean
   expanded: boolean
@@ -1073,10 +1443,19 @@ function ProjectExplorerRow(props: {
   onCancelCreate: () => void
   language: ReturnType<typeof useLanguage>
 }) {
-  const node = () => props.row().node
+  const file = useFile()
+  const node = createMemo(() => {
+    const snapshot = props.row().node
+    if (!props.searchMode || snapshot.path.startsWith("__creating__:")) return snapshot
+    // The workspace-wide search projection intentionally freezes metadata
+    // while it builds in cooperative slices. Subscribe only the ~viewport
+    // rows to live node metadata, never every one of the 50k search hits.
+    const latest = file.tree.node(snapshot.originalPath)
+    if (!latest || latest.type !== snapshot.type) return snapshot
+    return { ...snapshot, ...latest, path: snapshot.path, originalPath: snapshot.originalPath }
+  })
   const level = () => props.row().level
   const isSynthetic = () => node().path.startsWith("__creating__:")
-  const file = useFile()
   let inputRef: HTMLInputElement | undefined
   let settled = false
 
@@ -1109,8 +1488,10 @@ function ProjectExplorerRow(props: {
     const dir = node().originalPath || node().path
     const state = file.tree.state(dir)
     if (!state?.loaded) return undefined
-    const count = file.tree.children(dir).length
-    return count
+    // A listing owns its ordered child IDs; their count is already available
+    // in O(1). Calling children() here revalidates the whole child-node array
+    // on each visible directory badge, potentially O(width) per row.
+    return state.children?.length
   })
 
   const rawSize = () => (node() as unknown as { size?: number | string }).size
