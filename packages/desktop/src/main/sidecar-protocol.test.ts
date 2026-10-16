@@ -17,6 +17,7 @@ const state = (): SidecarOxpState => ({
     read: true,
     write: false,
     process: false,
+    code: false,
     git: false,
     integrations: false,
     browser: false,
@@ -77,6 +78,7 @@ describe("desktop sidecar protocol", () => {
       request: { action: "set-grant", patch: { read: true, sessionSupervision: "approved-roots" } },
     })
     expect(parseSidecarGrantPatch({ read: true, arbitrary: true })).toBeUndefined()
+    expect(parseSidecarGrantPatch({ code: true })).toEqual({ code: true })
     expect(
       parseSidecarCommand({
         type: "oxp-request",
@@ -270,6 +272,10 @@ describe("desktop sidecar protocol", () => {
         },
       }),
     ).toBe(true)
+
+    const { code: _legacyCode, ...legacyGrant } = value.grant
+    expect(isSidecarOxpState({ ...value, grant: legacyGrant })).toBe(true)
+    expect(isSidecarMessage({ type: "oxp-state", state: { ...value, grant: legacyGrant } })).toBe(true)
 
     expect(isSidecarMessage({ type: "oxp-state", state: { ...value, grant: { read: true } } })).toBe(false)
     expect(isSidecarOxpState({ ...value, workerPolicy: { models: [], agents: [] } })).toBe(true)

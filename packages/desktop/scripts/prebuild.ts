@@ -3,6 +3,7 @@ import { $ } from "bun"
 
 import { buildLocalCliToResources, resolveChannel } from "./utils"
 import { fetchTunnelClient } from "./fetch-tunnel-client"
+import { fetchCloudflared } from "./fetch-cloudflared"
 import { preflightWorktreeStore, stageWorktreeStore } from "./fetch-worktree-store"
 
 const channel = resolveChannel()
@@ -18,6 +19,7 @@ await $`bun ./scripts/copy-metainfo.ts ${channel}`
 
 await $`cd ../opencode && bun script/build-node.ts`
 await fetchTunnelClient()
+await fetchCloudflared()
 // The managed worktree-store sidecar is staged only from a checked-in pin.
 // Unpinned dev builds continue without it; beta/prod fail closed so a
 // production build can never ship an unverified sidecar.

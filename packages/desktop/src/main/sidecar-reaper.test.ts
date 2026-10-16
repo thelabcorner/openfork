@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { validatePreviousSidecar } from "./sidecar-reaper"
+import { execFileSync } from "node:child_process"
+import { previousSidecarPidMayExist, validatePreviousSidecar, windowsSidecarInspectionScript } from "./sidecar-reaper"
 import { parseHandshake } from "../../../mobile/dev/handshake"
 import type { DevHandshake } from "../../../mobile/dev/handshake"
 
@@ -13,7 +14,7 @@ const handshake: DevHandshake = {
   sidecarStartedAt: "2026-09-28T10:00:01.000Z",
 }
 const electronPath = "C:\\Program Files\\OpenFork\\OpenFork.exe"
-const process = {
+const sidecarProcess = {
   pid: 200,
   parentPID: 100,
   createdAt: "2026-09-28T10:00:01.100Z",
@@ -30,25 +31,51 @@ describe("previous sidecar ownership checks", () => {
     expect(parseHandshake(JSON.stringify(foreign))?.inspectorURL).toBeUndefined()
   })
   test("accepts only the handshake's matching utility process generation and app executable", () => {
-    expect(validatePreviousSidecar(handshake, process, electronPath).ok).toBe(true)
+    expect(validatePreviousSidecar(handshake, sidecarProcess, electronPath).ok).toBe(true)
   })
   test("can identify a hung predecessor without requiring its event loop to answer HTTP", () => {
     // The reaper's ownership proof comes from the durable handshake plus OS
     // process incarnation, so an event-loop hang does not make the proof depend
     // on an HTTP response from the process being reaped.
-    expect(validatePreviousSidecar(handshake, process, electronPath)).toMatchObject({
+    expect(validatePreviousSidecar(handshake, sidecarProcess, electronPath)).toMatchObject({
       ok: true,
       instanceID: "instance-old",
       pid: 200,
     })
   })
   test("rejects stale handshakes without sidecar identity", () => {
-    expect(validatePreviousSidecar({ ...handshake, sidecarPID: undefined }, process, electronPath)).toMatchObject({ ok: false })
+    expect(validatePreviousSidecar({ ...handshake, sidecarPID: undefined }, sidecarProcess, electronPath)).toMatchObject({ ok: false })
   })
   test("rejects foreign processes even if their PID is in the handshake", () => {
-    expect(validatePreviousSidecar(handshake, { ...process, commandLine: "opencode serve" }, electronPath)).toMatchObject({ reason: "foreign-process" })
+    expect(validatePreviousSidecar(handshake, { ...sidecarProcess, commandLine: "opencode serve" }, electronPath)).toMatchObject({ reason: "foreign-process" })
   })
   test("rejects PID reuse with a different process start time", () => {
-    expect(validatePreviousSidecar(handshake, { ...process, createdAt: "2026-09-28T11:00:01.100Z" }, electronPath)).toMatchObject({ reason: "pid-reused-or-start-mismatch" })
+    expect(validatePreviousSidecar(handshake, { ...sidecarProcess, createdAt: "2026-09-28T11:00:01.100Z" }, electronPath)).toMatchObject({ reason: "pid-reused-or-start-mismatch" })
   })
+  test("rejects invalid process IDs before interpolating PowerShell", () => {
+    expect(windowsSidecarInspectionScript(0)).toBeUndefined()
+    expect(windowsSidecarInspectionScript(-1)).toBeUndefined()
+    expect(windowsSidecarInspectionScript(Number.NaN)).toBeUndefined()
+    expect(windowsSidecarInspectionScript(Number.MAX_SAFE_INTEGER + 1)).toBeUndefined()
+  })
+  test("proves a stale PID absent without slow CIM, but never trusts permission denial", () => {
+    expect(previousSidecarPidMayExist(200, () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }) })).toBe(false)
+    expect(previousSidecarPidMayExist(200, () => { throw Object.assign(new Error("denied"), { code: "EPERM" }) })).toBe(true)
+    expect(previousSidecarPidMayExist(200, () => { throw new Error("unexpected") })).toBe(true)
+    expect(previousSidecarPidMayExist(0)).toBe(false)
+    expect(previousSidecarPidMayExist(process.pid)).toBe(true)
+  })
+  test("inspects a real Windows CIM DateTime without attempting termination", () => {
+    if (process.platform !== "win32") return
+    const script = windowsSidecarInspectionScript(process.pid)
+    expect(script).toBeDefined()
+    const stdout = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script!], {
+      timeout: 25_000,
+      encoding: "utf8",
+    })
+    const result = JSON.parse(stdout) as { ProcessId: number; CreationDate: string; ExecutablePath: string }
+    expect(result.ProcessId).toBe(process.pid)
+    expect(Number.isFinite(Date.parse(result.CreationDate))).toBe(true)
+    expect(result.ExecutablePath.length).toBeGreaterThan(0)
+  }, 30_000)
 })

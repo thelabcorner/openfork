@@ -10,6 +10,7 @@ import { getStore } from "./store"
 import { DEFAULT_SERVER_URL_KEY } from "./store-keys"
 import { waitForServerHealth } from "./server-health"
 import { resolveWorktreeStoreSidecarEnv } from "./worktree-store-env"
+import { dispatchOxpState } from "./oxp-state-dispatch"
 import {
   isSidecarMessage,
   type OxpSidecarRequest,
@@ -21,7 +22,7 @@ export type SidecarListener = { stop: () => Promise<void> }
 export type OxpSidecarClient = {
   request: (request: OxpSidecarRequest) => Promise<SidecarOxpState>
   listWorkerAgents: (rootID: string) => Promise<SidecarOxpAgentCatalog>
-  subscribe: (listener: (state: SidecarOxpState) => void) => () => void
+  subscribe: (listener: (state: SidecarOxpState) => boolean | void) => () => void
   onClosed: (listener: (code: number) => void) => () => void
 }
 const SIDECAR_SERVICE_NAME = "opencode server"
@@ -217,13 +218,13 @@ function createOxpSidecarClient(
     { resolve: (catalog: SidecarOxpAgentCatalog) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
   >()
 
-  const listeners = new Set<(state: SidecarOxpState) => void>()
+  const listeners = new Set<(state: SidecarOxpState) => boolean | void>()
   const closeListeners = new Set<(code: number) => void>()
   const onMessage = (value: unknown) => {
     if (!isSidecarMessage(value)) return
     if (value.type === "oxp-state" || value.type === "oxp-runtime-trial") {
-      for (const listener of listeners) listener(value.state)
-      if (value.type === "oxp-runtime-trial") {
+      const accepted = dispatchOxpState(value.state, listeners)
+      if (value.type === "oxp-runtime-trial" && accepted) {
         // Acknowledge only after Electron main has consumed the exact candidate
         // state. If this private IPC send fails, the coordinator's deadline
         // remains authoritative and automatically rolls the candidate back.
@@ -319,7 +320,7 @@ function createOxpSidecarClient(
       })
     },
 
-    subscribe(listener) {
+    subscribe(listener: (state: SidecarOxpState) => boolean | void) {
       listeners.add(listener)
       return () => listeners.delete(listener)
     },

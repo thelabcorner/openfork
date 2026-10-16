@@ -15,6 +15,9 @@ async function run() {
     frame: false,
     webPreferences: { sandbox: true, contextIsolation: true },
   })
+  window.webContents.on("console-message", (_event, _level, message) => {
+    if (message.includes("MARKDOWN_GATE_PROGRESS")) console.log(message)
+  })
   window.webContents.setBackgroundThrottling(false)
   window.showInactive()
   await window.loadURL(url)

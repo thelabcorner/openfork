@@ -42,9 +42,9 @@ import {
   toElementState,
 } from "./scripts-resolve"
 import {
-  installReactHookScript,
   profilerStartScript,
   profilerStopScript,
+  reactDevtoolsStatusScript,
   reactPresentScript,
 } from "./scripts-profiler"
 import {
@@ -1156,14 +1156,21 @@ export class BrowserOperations {
     const tab = this.resolveTab(tabId)
     const component = input?.component
     return this.withControl(tab, "profiler_start", async (send) => {
-      // Ensure the minimal DevTools hook exists so future commits are captured
-      await this.evaluate(send, installReactHookScript(), true).catch(() => undefined)
       const present = (await this.evaluate(send, reactPresentScript(), true)) as boolean
       if (present === false) throw new BrowserNotAReactAppError()
+      const devtools = (await this.evaluate(send, reactDevtoolsStatusScript(), true)) as { connected?: boolean }
+      if (!devtools?.connected) {
+        throw new BrowserOperationFailedError(
+          "No React DevTools renderer is connected to this page. Install or enable React DevTools, then reload the page before profiling.",
+        )
+      }
       const started = (await this.evaluate(send, profilerStartScript(component), true)) as
-        | { noReact?: boolean; already?: boolean; started?: boolean }
+        | { noReact?: boolean; noDevtools?: boolean; already?: boolean; started?: boolean }
         | null
       if (started?.noReact) throw new BrowserNotAReactAppError()
+      if (started?.noDevtools) {
+        throw new BrowserOperationFailedError("React DevTools disconnected before profiling could start. Reload the page and retry.")
+      }
       return { started: { snapshotVersion: this.deps.registry.get(tab.runtimeTabId)?.snapshotVersion ?? 0 } }
     })
   }

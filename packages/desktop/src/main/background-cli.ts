@@ -5,6 +5,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 import { app } from "electron"
+import { waitForBackgroundService } from "./background-cli-health"
 import { LEGACY_USER_DATA_NAMES, USER_DATA_NAMES } from "./user-data"
 const execFileAsync = promisify(execFile)
 const root = dirname(fileURLToPath(import.meta.url))
@@ -33,14 +34,21 @@ export async function startBackgroundCli(logger: Logger) {
   // Without this, discovery reuses a stale daemon started by the baseline CLI or
   // an installed build, so /quota/providers never sees the local claude adapter etc.
   if (!app.isPackaged) {
-    const devStates = desktopStateNames.map((name) => join(app.getPath("appData"), name))
-    for (const sh of [...new Set(devStates)]) {
+    // Stopping a service in a state directory that has never existed still
+    // starts the CLI runtime just to learn that there is nothing to stop. On a
+    // cold dev launch the six compatibility/current names used to pay that
+    // process-start cost serially. Existing state homes are independent, so
+    // inspect only those and stop their stale daemons concurrently.
+    const devStates = [...new Set(desktopStateNames.map((name) => join(app.getPath("appData"), name)))].filter(
+      existsSync,
+    )
+    await Promise.all(devStates.map(async (sh) => {
       try {
         await run(binary, ["service", "stop"], logger, { stateHome: sh })
       } catch {
         // no service or stop failed — fine, we want it dead anyway
       }
-    }
+    }))
   }
   const candidates = [...new Set(desktopStateNames.map((name) => join(app.getPath("appData"), name)))].filter(
     existsSync,
@@ -62,6 +70,10 @@ export async function startBackgroundCli(logger: Logger) {
     redact: true,
     stateHome: daemonStateHome,
   })
+  // `service start` can return a URL for a daemon that is still starting or no
+  // longer answers requests. Do not publish it to the renderer as ready until
+  // the process-wide health route responds with the credentials just read.
+  await waitForBackgroundService({ url, username: "opencode", password })
   logger.log("v2 CLI background service ready", {
     existing: Boolean(found),
     username: "opencode",

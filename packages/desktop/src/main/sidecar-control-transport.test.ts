@@ -29,6 +29,16 @@ describe("sidecar control transport", () => {
     expect(admitted).toBe(true)
     const signal = await dispatch({ ...input, url: "http://127.0.0.1:4096/session/ses_1/abort" }, new AbortController().signal)
     expect(signal.body).toBe("true")
+    const policy = await dispatch(
+      {
+        ...input,
+        url: "http://127.0.0.1:4096/permission/auto-accept?directory=%2Frepo",
+        method: "PUT",
+        body: JSON.stringify({ autoAccept: { ses_1: false }, mode: "patch" }),
+      },
+      new AbortController().signal,
+    )
+    expect(policy.body).toBe("true")
     const created = await dispatch({ ...input, url: "http://127.0.0.1:4096/session" }, new AbortController().signal)
     expect(created.body).toBe("true")
     admission.resolve(new Response(null, { status: 204 }))
@@ -42,6 +52,23 @@ describe("sidecar control transport", () => {
     expect(() => validateSidecarControlFetch({ ...input, url: "http://127.0.0.1:4097/global/event/interest" }, "http://127.0.0.1:4096")).toThrow()
     expect(() => validateSidecarControlFetch({ ...input, url: "http://127.0.0.1:4096/provider" }, "http://127.0.0.1:4096")).toThrow()
     expect(() => validateSidecarControlFetch(input, "http://example.test:4096")).toThrow()
+  })
+
+  test("rejects cached renderer requests after the owning sidecar exits", async () => {
+    let activeURL: string | null = "http://127.0.0.1:4096"
+    let forwarded = 0
+    const dispatch = createSidecarControlTransport({
+      sidecarURL: () => activeURL,
+      fetch: async () => {
+        forwarded++
+        return new Response("ok")
+      },
+    })
+
+    await dispatch(input, new AbortController().signal)
+    activeURL = null
+    await expect(dispatch(input, new AbortController().signal)).rejects.toThrow("The active sidecar is not ready")
+    expect(forwarded).toBe(1)
   })
 
   test("forwards only approved auth/location headers and omits cookie credentials", async () => {

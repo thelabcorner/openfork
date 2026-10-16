@@ -4,6 +4,24 @@ import { createDesktopFetch } from "./control-fetch"
 const ready = { url: "http://127.0.0.1:4096", username: "openfork", password: "secret" }
 
 describe("desktop control fetch adapter", () => {
+  test("resolves explicit session metadata while renderer traffic is blocked", async () => {
+    const blocked = Promise.withResolvers<Response>()
+    const fetcher = createDesktopFetch({
+      fetch: () => blocked.promise,
+      awaitInitialization: async () => ready,
+      dispatch: async (_id, input) => {
+        expect(input.method).toBe("GET")
+        expect(input.url).toBe(ready.url + "/global/session/ses_1")
+        expect(input.body).toBeUndefined()
+        return { status: 200, statusText: "OK", headers: {}, body: '{"id":"ses_1"}' }
+      },
+      cancel: () => {},
+    })
+    const background = fetcher(ready.url + "/provider")
+    expect(await (await fetcher(ready.url + "/global/session/ses_1")).json()).toEqual({ id: "ses_1" })
+    blocked.resolve(new Response("catalog"))
+    await background
+  })
   test("control dispatch completes independently while ordinary renderer traffic is blocked", async () => {
     let releaseBackground!: (response: Response) => void
     let backgroundStarted = false
@@ -55,6 +73,39 @@ describe("desktop control fetch adapter", () => {
     expect(calls).toEqual([
       "https://server.example/session/ses_1/prompt_async",
       "http://127.0.0.1:4096/session/ses_1/message",
+    ])
+  })
+
+  test("routes permission auto-accept preflight through the isolated control transport", async () => {
+    const ordinary: string[] = []
+    const control: Array<{ method: string; url: string; body?: string }> = []
+    const fetcher = createDesktopFetch({
+      fetch: async (input) => {
+        ordinary.push(input instanceof Request ? input.url : input.toString())
+        return new Response("ordinary")
+      },
+      awaitInitialization: async () => ready,
+      dispatch: async (_requestID, input) => {
+        control.push({ method: input.method, url: input.url, body: input.body })
+        return { status: 200, statusText: "OK", headers: { "content-type": "application/json" }, body: "true" }
+      },
+      cancel: () => {},
+    })
+
+    const response = await fetcher("http://127.0.0.1:4096/permission/auto-accept?directory=C%3A%5Cwork", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ autoAccept: { ses_1: false }, mode: "patch" }),
+    })
+
+    expect(await response.json()).toBe(true)
+    expect(ordinary).toEqual([])
+    expect(control).toEqual([
+      {
+        method: "PUT",
+        url: "http://127.0.0.1:4096/permission/auto-accept?directory=C%3A%5Cwork",
+        body: JSON.stringify({ autoAccept: { ses_1: false }, mode: "patch" }),
+      },
     ])
   })
 

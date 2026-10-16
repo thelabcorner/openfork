@@ -226,6 +226,6 @@ export const OPERATION_TO_CDP: Record<string, string[]> = {
   recording_start: ["Page.startScreencast (JPEG q80 12fps) — NOT YET: stub BrowserUnsupportedOperation"],
   recording_stop: ["Page.stopScreencast — NOT YET: stub"],
   react_inspect: ["Runtime.evaluate __reactFiber$ probe (same fiber-key trick as annotation-overlay)"],
-  profiler_start: ["Runtime.evaluate installReactHookScript"],
+  profiler_start: ["Runtime.evaluate against a live React DevTools hook/renderer; no fallback hook is installed after page load"],
   profiler_stop: ["Runtime.evaluate profilerStopScript"],
 }

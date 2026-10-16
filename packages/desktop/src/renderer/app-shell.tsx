@@ -84,10 +84,29 @@ export default function DesktopAppShell(props: {
     const language = useLanguage()
     props.setMenuTrigger((id) => command.trigger(id))
     let sidecarWasUnresponsive = false
+    let sidecarWasStopped = false
     let unsubscribeSidecarLiveness: (() => void) | undefined
     let disposed = false
     void window.api
       .onSidecarLivenessChanged((event) => {
+        if (event.state === "stopped") {
+          if (sidecarWasStopped) return
+          sidecarWasStopped = true
+          sidecarWasUnresponsive = false
+          showToast({
+            variant: "error",
+            title: language.t("desktop.sidecar.stopped.title"),
+            description: language.t("desktop.sidecar.stopped.description"),
+            persistent: true,
+            actions: [
+              {
+                label: language.t("desktop.recovery.action.relaunch"),
+                onClick: () => window.api.relaunch(),
+              },
+            ],
+          })
+          return
+        }
         if (event.state === "suspected-hang") {
           sidecarWasUnresponsive = true
           showToast({

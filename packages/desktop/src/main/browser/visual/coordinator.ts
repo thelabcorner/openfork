@@ -136,6 +136,10 @@ export class VisualCapabilityError extends Error {
  */
 export class VisualObservationCoordinator {
   private readonly capabilities = new Map<string, CapabilityRecord>()
+  /** A capability is not fully settled until its asynchronous temp-file
+   * teardown finishes; expose that in activeCount/stop rather than racing UI
+   * refresh and the next capture against a half-deleted artifact. */
+  private readonly disposals = new Map<string, Promise<void>>()
   private readonly requestCapabilities = new Map<string, string>()
   private readonly stores = new Map<string, Promise<OpenCodeSnapEyeStore>>()
   private readonly now: () => number
@@ -358,14 +362,17 @@ export class VisualObservationCoordinator {
     const enriched = { ...result, opencode: record.environment } as SnapEyeResult
     await record.store.commitResult(runId, enriched)
     record.terminal = true
-    await this.dispose(record, false)
+    await this.dispose(record)
     return enriched
   }
 
   async abort(capability: string): Promise<void> {
+    const disposing = this.disposals.get(capability)
+    if (disposing) return disposing
     const record = this.capabilities.get(capability)
     if (!record) return
-    await this.dispose(record, true)
+    record.terminal = true
+    await this.dispose(record)
   }
 
   async abortRequest(requestId: string): Promise<void> {
@@ -374,12 +381,15 @@ export class VisualObservationCoordinator {
   }
 
   async stop(): Promise<void> {
-    await Promise.all([...this.capabilities.keys()].map((token) => this.abort(token)))
+    await Promise.all([
+      ...[...this.capabilities.keys()].map((token) => this.abort(token)),
+      ...this.disposals.values(),
+    ])
     this.stores.clear()
   }
 
   get activeCount(): number {
-    return this.capabilities.size
+    return this.capabilities.size + this.disposals.size
   }
 
   async history(
@@ -388,6 +398,50 @@ export class VisualObservationCoordinator {
   ): Promise<VisualHistorySnapshot> {
     const directory = this.requireProjectContext(context)
     return (await this.storeFor(directory)).listHistory(options)
+  }
+
+  /**
+   * The first-party desktop renderer is authorized by the main-process IPC
+   * sender check, not by an agent broker principal. Keep this as a separate,
+   * deliberately narrow entry point instead of manufacturing a Session
+   * principal (or relaxing requireProjectContext for untrusted broker calls).
+   * Only the main-process renderer API may invoke it.
+   */
+  async historyForTrustedRenderer(
+    directory: string,
+    options: { maxRuns?: number; maxBaselines?: number } = {},
+  ): Promise<VisualHistorySnapshot> {
+    return (await this.storeFor(this.requireRendererDirectory(directory))).listHistory(options)
+  }
+
+  async artifactForTrustedRenderer(
+    directory: string,
+    input: Parameters<OpenCodeSnapEyeStore["describeArtifact"]>[0],
+  ): Promise<VisualArtifactDescriptor | null> {
+    return (await this.storeFor(this.requireRendererDirectory(directory))).describeArtifact(input)
+  }
+
+  async artifactPreviewForTrustedRenderer(
+    directory: string,
+    input: Parameters<OpenCodeSnapEyeStore["readArtifact"]>[0],
+    maxBytes = 16 * 1024 * 1024,
+  ): Promise<VisualArtifactPayload | null> {
+    return (await this.storeFor(this.requireRendererDirectory(directory))).readArtifact(input, maxBytes)
+  }
+
+  async approveRunForTrustedRenderer(
+    directory: string,
+    runId: string,
+    expected: VisualApprovalExpectation,
+  ): Promise<VisualApprovalResult> {
+    return (await this.storeFor(this.requireRendererDirectory(directory))).approveRunCurrent(runId, expected)
+  }
+
+  private requireRendererDirectory(directory: string): string {
+    if (typeof directory !== "string" || !directory.trim()) {
+      throw new VisualCapabilityError("VISUAL_CONTEXT_REQUIRED", "Visual verification requires an open project")
+    }
+    return directory
   }
 
   async artifact(
@@ -499,7 +553,10 @@ export class VisualObservationCoordinator {
     }
   }
 
-  private async dispose(record: CapabilityRecord, abortTransfers: boolean): Promise<void> {
+  private async dispose(record: CapabilityRecord): Promise<void> {
+    const existing = this.disposals.get(record.token)
+    if (existing) return existing
+    record.terminal = true
     this.capabilities.delete(record.token)
     if (this.requestCapabilities.get(record.requestId) === record.token) this.requestCapabilities.delete(record.requestId)
     if (record.abortListener && record.context.signal) record.context.signal.removeEventListener("abort", record.abortListener)
@@ -507,9 +564,16 @@ export class VisualObservationCoordinator {
     const writes = [...record.writes.values()]
     record.reads.clear()
     record.writes.clear()
-    await Promise.all(reads.map((transfer) => transfer.handle.close().catch(() => undefined)))
-    if (abortTransfers) await Promise.all(writes.map((transfer) => transfer.handle.abort().catch(() => undefined)))
-    else if (writes.length > 0) await Promise.all(writes.map((transfer) => transfer.handle.abort().catch(() => undefined)))
+    const pending = Promise.all([
+      ...reads.map((transfer) => transfer.handle.close().catch(() => undefined)),
+      ...writes.map((transfer) => transfer.handle.abort().catch(() => undefined)),
+    ]).then(() => undefined)
+    this.disposals.set(record.token, pending)
+    try {
+      await pending
+    } finally {
+      this.disposals.delete(record.token)
+    }
   }
 
   private storeFor(directory: string): Promise<OpenCodeSnapEyeStore> {

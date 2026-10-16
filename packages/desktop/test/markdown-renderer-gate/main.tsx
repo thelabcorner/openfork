@@ -1,9 +1,11 @@
 import { createSignal } from "solid-js"
 import { render } from "solid-js/web"
+import "../../../session-ui/src/components/markdown.css"
 import { createServerSession } from "../../../app/src/context/server-session"
 import { Markdown } from "../../../session-ui/src/components/markdown"
 import { markdownDomCommitSnapshot } from "../../../session-ui/src/components/markdown-dom-commit"
 import { markdownFrameWorkSnapshot } from "../../../session-ui/src/components/markdown-frame-work"
+import { largeMarkdownRenderSnapshot } from "../../../session-ui/src/components/markdown-large-render"
 import type { MarkdownTraceEvent } from "../../../session-ui/src/components/markdown-trace"
 import { highlightStreamingCode, parseMarkdown } from "../../../session-ui/src/components/markdown-worker"
 
@@ -38,7 +40,7 @@ ${Array.from({ length: 500 }, (_, index) => `    "entry-${index}",`).join("\n")}
   ]
 }
 \`\`\``
-const INLINE_CODE_DENSE_BLOCK = Array.from({ length: 800 }, (_, index) => `inline `token-${index}``).join(" ")
+const INLINE_CODE_DENSE_BLOCK = Array.from({ length: 800 }, (_, index) => "inline `token-" + index + "`").join(" ")
 const makeHistory = (session: number) => {
   const blocks: string[] = [`### Session ${session} completed history`]
   for (let index = 1; index <= 24; index++) {
@@ -188,7 +190,9 @@ window.__markdownGate = {
         "tail",
       ),
     ])
-    for (const concurrency of [1, 3, 6]) {
+    const concurrencyScenarios = new URLSearchParams(window.location.search).has("oversized-only") ? [] : [1, 3, 6]
+    for (const concurrency of concurrencyScenarios) {
+      console.log(`MARKDOWN_GATE_PROGRESS scenario=${concurrency} stage=start`)
       maxFrameGapMs = 0
       root.replaceChildren()
       window.__markdownTraceEvents = []
@@ -241,7 +245,7 @@ window.__markdownGate = {
         const commits = markdownDomCommitSnapshot()
         if (
           initialWorkerDone >= expectedInitialWorkerDone &&
-          initialTailDone >= concurrency * 2 &&
+          initialTailDone >= concurrency &&
           initialDOMComplete &&
           sanitizer.queuedJobs === 0 &&
           sanitizer.reservedJobs === 0 &&
@@ -254,6 +258,7 @@ window.__markdownGate = {
       const initialWorkerDone = (window.__markdownTraceEvents ?? []).filter(
         (event) => event.phase === "worker" && event.status === "ok",
       ).length
+      console.log(`MARKDOWN_GATE_PROGRESS scenario=${concurrency} stage=initial-drained frames=${initialFrames} workers=${initialWorkerDone}/${expectedInitialWorkerDone}`)
       const initialTailDone = (window.__markdownTraceEvents ?? []).filter(
         (event) => event.phase === "worker" && event.priority === "tail" && event.status === "ok",
       ).length
@@ -266,9 +271,27 @@ window.__markdownGate = {
       const initialBlockNodes = entries.map((entry) =>
         Array.from(entry.element.querySelectorAll("[data-markdown-block]")),
       )
-      const denseCodeCooperativeMounts = (window.__markdownTraceEvents ?? []).filter(
-        (event) => event.phase === "block" && event.action === "cooperative-code-mount" && event.mode === "code",
+      const completenessStages = { initial: entries[0]!.element.querySelectorAll("code").length, stale: 0, repaired: 0 }
+      const denseCodeTrace = (window.__markdownTraceEvents ?? []).filter(
+        (event) => event.phase === "block" && event.mode === "code",
+      ).map((event) => event.phase === "block" ? { action: event.action, chars: event.chars, tokenCount: event.tokenCount } : undefined)
+      const denseCodeCooperativeMounts = denseCodeTrace.filter(
+        (event) =>
+          (event?.action === "cooperative-code-mount" || event?.action === "cooperative-code-append") &&
+          (event.chars ?? 0) > 8000 &&
+          (event.tokenCount ?? 0) > 128,
       ).length
+      const denseCodeBySession = entries.map((entry) => {
+        const node = Array.from(entry.element.querySelectorAll<HTMLElement>('[data-component="markdown-code"]'))
+          .find((element) => textContent(element).includes('"entry-499"'))
+        return {
+          present: !!node,
+          pending: node?.dataset.markdownPending === "true",
+          textLength: node ? textContent(node).length : 0,
+          tokenSpanCount: node?.querySelectorAll("code > span").length ?? 0,
+          lastEntryPresent: !!node && textContent(node).includes('"entry-499"'),
+        }
+      })
       window.__markdownTraceEvents = []
       // Start a parse just below the admitted byte ceiling on the background-
       // only worker lane before emitting a visible tail. A second worker lane
@@ -350,6 +373,7 @@ window.__markdownGate = {
       const renderedMarkerCount = entries.filter((entry, session) =>
         textContent(entry.element).includes(`visible-tail-marker-${concurrency}-${session}`),
       ).length
+      console.log(`MARKDOWN_GATE_PROGRESS scenario=${concurrency} stage=tail-drained domFrames=${domFrames} workerFrames=${workerFrames} markers=${renderedMarkerCount}/${concurrency}`)
       const priorityEntry = entries.at(-1)!
       priorityEntry.element.style.marginTop = "1200px"
       await frame()
@@ -365,9 +389,8 @@ window.__markdownGate = {
         if (textContent(priorityEntry.element).includes("background-priority-marker") && completed.length >= 2) break
         await frame()
       }
-      const backgroundPriorityObserved = (window.__markdownTraceEvents ?? []).some(
-        (event) => event.phase === "worker" && event.priority === "background" && event.status === "ok",
-      )
+      const offscreenWorkerJobs = (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "worker").length
+      const offscreenMarkerRendered = textContent(priorityEntry.element).includes("background-priority-marker")
       priorityEntry.element.style.marginTop = "0"
       await frame()
       await frame()
@@ -395,6 +418,7 @@ window.__markdownGate = {
         await frame()
       }
       const staleSuperseded = !textContent(entries[0]!.element).includes(staleMarker)
+      completenessStages.stale = entries[0]!.element.querySelectorAll("code").length
       const repair = fixture.holdRepair()
       const beforeGap = fixture.currentText.get(staleUpdateID)!
       fixture.currentText.set(staleUpdateID, `${beforeGap}\n\nrepaired-from-server`)
@@ -418,6 +442,7 @@ window.__markdownGate = {
       await frame()
       const gapRepaired = !fixture.store.needsRepair(staleUpdateID)
       const repairedText = textContent(entries[0]!.element).includes("repaired-from-server")
+      completenessStages.repaired = entries[0]!.element.querySelectorAll("code").length
       fixture.releaseAll()
       const interestReleased = fixture.interestHistory.at(-1)?.length === 0
       results.push({
@@ -430,7 +455,8 @@ window.__markdownGate = {
         gapRepaired,
         repairedText,
         staleSuperseded,
-        backgroundPriorityObserved,
+        offscreenWorkerJobs,
+        offscreenMarkerRendered,
         reenteredTailPriority,
         initialWorkerDone,
         expectedInitialWorkerDone,
@@ -458,7 +484,10 @@ window.__markdownGate = {
         maxTailQueueWaitMs: Number(Math.max(0, ...tailEvents.map((event) => event.phase === "worker" ? event.dispatchWaitMs ?? 0 : 0)).toFixed(2)),
         historyBlocks: entries[0]!.element.querySelectorAll("[data-markdown-block]").length,
         richInlineCodeNodes: entries[0]!.element.querySelectorAll("code").length,
+        completenessStages,
         denseCodeCooperativeMounts,
+        denseCodeTrace,
+        denseCodeBySession,
         maximumFrameGapMs: Number(maxFrameGapMs.toFixed(2)),
         historyNodeIdentityPreserved,
         effectBlockCount: latestEffect?.phase === "effect" ? latestEffect.blockCount : 0,
@@ -468,9 +497,9 @@ window.__markdownGate = {
         ).length,
         blockSkipsOnTail: blockEvents.length - blockWrites.length,
         parseEventsOnTail: workerEvents.filter((event) => event.phase === "worker" && event.kind === "parse").length,
-        highlightEventsOnTail: workerEvents.filter((event) => event.phase === "worker" && event.kind === "highlight").length,
+        highlightEventsOnTail: tailEvents.filter((event) => event.phase === "worker" && event.kind === "highlight").length,
         tailHighlightLanes: workerEvents
-          .filter((event) => event.phase === "worker" && event.kind === "highlight")
+          .filter((event) => event.phase === "worker" && event.kind === "highlight" && event.priority === "tail")
           .map((event) => event.phase === "worker" ? event.lane ?? -1 : -1),
         codeUpdateTokenSum: codeEvents.reduce(
           (sum, event) => sum + (event.phase === "block" ? event.tokenCount ?? 0 : 0),
@@ -480,11 +509,109 @@ window.__markdownGate = {
         visibleMarkdownRoots: activeAfterCommit,
         frameWork: markdownFrameWorkSnapshot(),
       })
+      console.log(`MARKDOWN_GATE_PROGRESS scenario=${concurrency} stage=complete maxFrameGapMs=${Number(maxFrameGapMs.toFixed(2))} denseCodeMounts=${denseCodeCooperativeMounts}`)
       disposers.forEach((dispose) => dispose())
       await frame()
       await frame()
       results[results.length - 1]!.teardownMarkdownRoots = root.querySelectorAll("[data-component='markdown']").length
     }
+    root.replaceChildren()
+    const firstPaintElement = document.createElement("section")
+    root.append(firstPaintElement)
+    const [firstPaintText, setFirstPaintText] = createSignal("# First paint\n\n**formatted from the start**\n\n- first item")
+    let rawSyntaxSeen = false
+    let mutations = 0
+    const firstPaintObserver = new MutationObserver(() => {
+      mutations++
+      const text = textContent(firstPaintElement)
+      rawSyntaxSeen ||= text.includes("# First paint") || text.includes("**formatted") || text.includes("- first item")
+    })
+    firstPaintObserver.observe(firstPaintElement, { subtree: true, childList: true, characterData: true })
+    const disposeFirstPaint = render(() => <Markdown text={firstPaintText()} streaming />, firstPaintElement)
+    for (let index = 0; index < 600 && !firstPaintElement.querySelector("strong"); index++) await frame()
+    const heading = firstPaintElement.querySelector("h1")
+    for (let index = 0; index < 12; index++) {
+      setFirstPaintText((text) => text + `\n- item ${index}`)
+      await frame()
+    }
+    for (let index = 0; index < 600 && !textContent(firstPaintElement).includes("item 11"); index++) await frame()
+    firstPaintObserver.disconnect()
+    results.push({
+      scenario: "rich-first-paint", rawSyntaxSeen, mutations,
+      headingPreserved: heading === firstPaintElement.querySelector("h1"),
+      markerVisible: !!heading && !!firstPaintElement.querySelector("strong") && !!firstPaintElement.querySelector("ul") && textContent(firstPaintElement).includes("item 11"),
+    })
+    disposeFirstPaint()
+    root.replaceChildren()
+    const batchElement = document.createElement("section")
+    root.append(batchElement)
+    const batchParagraphs = Array.from({ length: 160 }, (_, index) => `Paragraph ${index} has **formatted content** and a batch-marker-${index}.`)
+    const batchSource = ["# Batch first paint", ...batchParagraphs].join("\n\n")
+    window.__markdownTraceEvents = []
+    const batchStart = performance.now()
+    let batchFirstPaintMs: number | undefined
+    let batchParsesAtFirstPaint: number | undefined
+    let batchHeading: Element | null = null
+    let batchRawSyntaxSeen = false
+    const batchObserver = new MutationObserver(() => {
+      batchRawSyntaxSeen ||= textContent(batchElement).includes("**formatted content**") || textContent(batchElement).includes("# Batch first paint")
+      if (batchHeading || !batchElement.querySelector("h1")) return
+      batchHeading = batchElement.querySelector("h1")
+      batchFirstPaintMs = performance.now() - batchStart
+      batchParsesAtFirstPaint = (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "worker" && event.kind === "parse" && event.status === "ok").length
+    })
+    batchObserver.observe(batchElement, { subtree: true, childList: true, characterData: true })
+    const disposeBatch = render(() => <Markdown text={batchSource} />, batchElement)
+    for (let index = 0; index < 1800 && !textContent(batchElement).includes("batch-marker-159"); index++) await frame()
+    await frame()
+    batchObserver.disconnect()
+    results.push({
+      scenario: "batched-rich-first-paint", firstPaintMs: batchFirstPaintMs,
+      totalRenderMs: performance.now() - batchStart, parsesAtFirstPaint: batchParsesAtFirstPaint,
+      expectedParses: batchParagraphs.length + 1, rawSyntaxSeen: batchRawSyntaxSeen,
+      headingPreserved: batchHeading === batchElement.querySelector("h1"),
+      bodyExact: batchElement.querySelectorAll("p").length === batchParagraphs.length && batchElement.querySelectorAll("strong").length === batchParagraphs.length && textContent(batchElement).includes("batch-marker-159"),
+    })
+    disposeBatch()
+    root.replaceChildren()
+    const richLargeElement = document.createElement("section")
+    root.append(richLargeElement)
+    const richLargeBody = "bounded rich content 😀 ".repeat(30_000) + "tail"
+    const richLargeSource = `# Rich oversized heading\n\n**${richLargeBody}**\n\n- rich-large-end-marker`
+    const disposeRichLarge = render(() => <Markdown text={richLargeSource} />, richLargeElement)
+    let firstStrong: Element | null = null
+    let reenteredRichBody = false
+    maxFrameGapMs = 0
+    for (let index = 0; index < 1800; index++) {
+      await frame()
+      firstStrong ??= richLargeElement.querySelector("strong")
+      if (!reenteredRichBody && firstStrong && richLargeElement.querySelector("[data-markdown-pending]")) {
+        richLargeElement.style.opacity = "0"
+        await frame()
+        await frame()
+        await frame()
+        richLargeElement.style.opacity = "1"
+        firstStrong = null
+        reenteredRichBody = true
+        await frame()
+        await frame()
+      }
+      if (richLargeElement.querySelector("strong")?.textContent === richLargeBody && textContent(richLargeElement).includes("rich-large-end-marker") && !richLargeElement.querySelector("[data-markdown-pending]")) break
+    }
+    results.push({
+      scenario: "oversized-rich-markdown", inputBytes: richLargeSource.length * 2,
+      markerVisible: !!richLargeElement.querySelector("h1") && !!richLargeElement.querySelector("ul") && textContent(richLargeElement).includes("rich-large-end-marker"),
+      bodyExact: richLargeElement.querySelector("strong")?.textContent === richLargeBody,
+      strongCount: richLargeElement.querySelectorAll("strong").length,
+      reenteredRichBody,
+      continuationIdentityPreserved: firstStrong === richLargeElement.querySelector("strong"),
+      pendingCount: richLargeElement.querySelectorAll("[data-markdown-pending]").length,
+      maximumFrameGapMs: Number(maxFrameGapMs.toFixed(2)),
+    })
+    disposeRichLarge()
+    await frame()
+    await frame()
+    results[results.length - 1]!.largeWorkAfterTeardown = largeMarkdownRenderSnapshot()
     root.replaceChildren()
     const fallbackElement = document.createElement("section")
     fallbackElement.style.opacity = "0"
@@ -496,6 +623,11 @@ window.__markdownGate = {
     await frame()
     await frame()
     const coldHiddenWorkerJobs = (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "worker").length
+    const coldHiddenWorkerEvents = (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "worker").map((event) =>
+      event.phase === "worker"
+        ? { kind: event.kind, status: event.status, priority: event.priority, chars: event.chars }
+        : undefined,
+    )
     const coldHiddenHasContentBlock = !!fallbackElement.querySelector("[data-markdown-block]")
     const coldHiddenPlaceholderHeight = fallbackElement.querySelector<HTMLElement>("[data-markdown-placeholder]")?.getBoundingClientRect().height ?? 0
     maxFrameGapMs = 0
@@ -503,16 +635,31 @@ window.__markdownGate = {
     let fallbackFrames = 0
     while (
       fallbackFrames < 1800 &&
-      (textContent(fallbackElement).length !== oversizedText.length || markdownDomCommitSnapshot().queuedJobs > 0)
+      (!fallbackElement.querySelector<HTMLElement>("[data-markdown-block]") ||
+        fallbackElement.querySelector<HTMLElement>("[data-markdown-block]")?.dataset.markdownPending === "true" ||
+        markdownDomCommitSnapshot().queuedJobs > 0)
     ) {
       await frame()
       fallbackFrames++
     }
+    const fallbackMaximumFrameGapMs = Number(maxFrameGapMs.toFixed(2))
+    const fallbackRenderedText = textContent(fallbackElement)
     const fallbackVisible =
-      textContent(fallbackElement).length === oversizedText.length &&
-      textContent(fallbackElement).includes("oversized-plaintext-marker") &&
+      fallbackRenderedText.length === oversizedText.length &&
+      fallbackRenderedText.includes("oversized-plaintext-marker") &&
       markdownDomCommitSnapshot().queuedJobs === 0
-    const fallbackTextLength = textContent(fallbackElement).length
+    const fallbackTextLength = fallbackRenderedText.length
+    const fallbackDiagnostics = {
+      ready: fallbackElement.querySelector<HTMLElement>("[data-component='markdown']")?.dataset.markdownReady === "true",
+      blockCount: fallbackElement.querySelectorAll("[data-markdown-block]").length,
+      pendingCount: fallbackElement.querySelectorAll("[data-markdown-pending]").length,
+      workerEvents: (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "worker").map((event) =>
+        event.phase === "worker" ? { kind: event.kind, status: event.status, priority: event.priority, chars: event.chars } : undefined,
+      ),
+      effects: (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "effect").map((event) =>
+        event.phase === "effect" ? { textChars: event.textChars, blockCount: event.blockCount } : undefined,
+      ),
+    }
     disposeFallback()
     await frame()
     results.push({
@@ -521,10 +668,12 @@ window.__markdownGate = {
       overPerJobLimit: oversizedText.length * 2 > 8 * 1024 * 1024,
       markerVisible: fallbackVisible,
       outputTextLength: fallbackTextLength,
+      diagnostics: fallbackDiagnostics,
       coldHiddenWorkerJobs,
+      coldHiddenWorkerEvents,
       coldHiddenHasContentBlock,
       coldHiddenPlaceholderHeight,
-      maximumFrameGapMs: Number(maxFrameGapMs.toFixed(2)),
+      maximumFrameGapMs: fallbackMaximumFrameGapMs,
       domCommit: markdownDomCommitSnapshot(),
       frameWork: markdownFrameWorkSnapshot(),
       teardownMarkdownRoots: root.querySelectorAll("[data-component='markdown']").length,
@@ -551,12 +700,24 @@ window.__markdownGate = {
     await frame()
     const coldCodeWorkerJobs = (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "worker").length
     const coldCodeHasBlock = !!oversizedCodeElement.querySelector("[data-markdown-block]")
+    const oversizedCodeLongTasks: Array<{ startTime: number; duration: number }> = []
+    const longTaskObserver =
+      typeof PerformanceObserver === "function" && PerformanceObserver.supportedEntryTypes.includes("longtask")
+        ? new PerformanceObserver((list) => {
+            for (const entry of list.getEntries())
+              oversizedCodeLongTasks.push({ startTime: Number(entry.startTime.toFixed(1)), duration: Number(entry.duration.toFixed(1)) })
+          })
+        : undefined
+    longTaskObserver?.observe({ type: "longtask", buffered: false })
     maxFrameGapMs = 0
     oversizedCodeElement.style.opacity = "1"
     let codeFrames = 0
     while (
       codeFrames < 1800 &&
-      (textContent(oversizedCodeElement).length !== oversizedCodeBody.length || markdownDomCommitSnapshot().queuedJobs > 0 || !clipboardText)
+      (!oversizedCodeElement.querySelector<HTMLElement>("[data-markdown-block]") ||
+        oversizedCodeElement.querySelector<HTMLElement>("[data-markdown-block]")?.dataset.markdownPending === "true" ||
+        markdownDomCommitSnapshot().queuedJobs > 0 ||
+        !clipboardText)
     ) {
       const copy = oversizedCodeElement.querySelector<HTMLElement>('[data-slot="markdown-copy-button"]')
       const pending = !!copy?.closest("[data-markdown-pending]")
@@ -567,12 +728,33 @@ window.__markdownGate = {
       await frame()
       codeFrames++
     }
+    const oversizedCodeMaximumFrameGapMs = Number(maxFrameGapMs.toFixed(2))
+    longTaskObserver?.disconnect()
+    const oversizedCodeViewport = oversizedCodeElement.querySelector<HTMLElement>("[data-markdown-oversized-code]")
+    const oversizedCodeRenderedText = oversizedCodeViewport?.querySelector("[data-markdown-oversized-code-content]")?.textContent ?? ""
+    const oversizedCodeTextLength = Number(oversizedCodeViewport?.dataset.sourceLength ?? 0)
     const oversizedCodeVisible =
-      textContent(oversizedCodeElement).length === oversizedCodeBody.length &&
-      textContent(oversizedCodeElement).includes("oversized-code-marker") &&
+      oversizedCodeRenderedText.includes("oversized-code-marker") &&
       markdownDomCommitSnapshot().queuedJobs === 0
-    const oversizedCodeTextLength = textContent(oversizedCodeElement).length
+    const oversizedCodeDiagnostics = {
+      ready: oversizedCodeElement.querySelector<HTMLElement>("[data-component='markdown']")?.dataset.markdownReady === "true",
+      blockCount: oversizedCodeElement.querySelectorAll("[data-markdown-block]").length,
+      pendingCount: oversizedCodeElement.querySelectorAll("[data-markdown-pending]").length,
+      virtualizedSourceControl: !!oversizedCodeViewport,
+      visibleLineCount: oversizedCodeViewport?.querySelector("[data-markdown-oversized-code-content]")?.textContent?.split("\n").length ?? 0,
+      workerEvents: (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "worker").map((event) =>
+        event.phase === "worker" ? { kind: event.kind, status: event.status, priority: event.priority, chars: event.chars } : undefined,
+      ),
+      largeBlockEvents: (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "block" && event.chars > 1_000_000).map((event) =>
+        event.phase === "block" ? { action: event.action, mode: event.mode, chars: event.chars } : undefined,
+      ),
+      longTasks: oversizedCodeLongTasks,
+      effects: (window.__markdownTraceEvents ?? []).filter((event) => event.phase === "effect").map((event) =>
+        event.phase === "effect" ? { textChars: event.textChars, blockCount: event.blockCount } : undefined,
+      ),
+    }
     const codeShell = !!oversizedCodeElement.querySelector('[data-component="markdown-code"]')
+    const oversizedCodeScrollable = !!oversizedCodeViewport && oversizedCodeViewport.scrollHeight > oversizedCodeViewport.clientHeight
     const copyControl = !!oversizedCodeElement.querySelector('[data-slot="markdown-copy-button"]')
     disposeOversizedCode()
     await frame()
@@ -582,7 +764,9 @@ window.__markdownGate = {
       overPerJobLimit: oversizedCodeSource.length * 2 > 8 * 1024 * 1024,
       expectedTextLength: oversizedCodeBody.length,
       outputTextLength: oversizedCodeTextLength,
+      diagnostics: oversizedCodeDiagnostics,
       codeShell,
+      oversizedCodeScrollable,
       copyControl,
       copyWasPending: copyDuringPending && clipboardText === oversizedCodeBody,
       clipboardTextLength: clipboardText.length,
@@ -590,7 +774,7 @@ window.__markdownGate = {
       markerVisible: oversizedCodeVisible,
       coldHiddenWorkerJobs: coldCodeWorkerJobs,
       coldHiddenHasContentBlock: coldCodeHasBlock,
-      maximumFrameGapMs: Number(maxFrameGapMs.toFixed(2)),
+      maximumFrameGapMs: oversizedCodeMaximumFrameGapMs,
       domCommit: markdownDomCommitSnapshot(),
       frameWork: markdownFrameWorkSnapshot(),
       teardownMarkdownRoots: root.querySelectorAll("[data-component='markdown']").length,

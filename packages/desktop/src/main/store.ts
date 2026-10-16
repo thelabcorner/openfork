@@ -9,6 +9,8 @@ import { deleteStoreFileIfEmpty } from "./store-cleanup"
 type CachedStore = {
   get: (key: string) => unknown
   set: (key: string, value: unknown) => void
+  setDeferred: (key: string, value: unknown) => void
+  flush: () => void
   delete: (key: string) => void
   clear: () => void
   has: (key: string) => boolean
@@ -44,6 +46,10 @@ export function getStore(name = SETTINGS_STORE): CachedStore {
       data[key] = value
       persist()
     },
+    setDeferred: (key, value) => {
+      data[key] = value
+    },
+    flush: persist,
     delete: (key) => {
       delete data[key]
       persist()

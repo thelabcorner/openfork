@@ -28,6 +28,7 @@ electron.vite.config.*.mjs
 resources/opencode-cli*
 resources/openfork-cli*
 resources/tunnel
+resources/cloudflared
 resources/worktree-store
 resources/icons
 resources/*.metainfo.xml

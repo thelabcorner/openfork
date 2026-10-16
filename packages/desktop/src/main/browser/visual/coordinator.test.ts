@@ -19,6 +19,7 @@ const project = async () => {
 
 const context = (directory: string, overrides: Partial<BrowserDispatchContext> = {}): BrowserDispatchContext => ({
   requestId: "req-1",
+  principal: { kind: "session", sessionId: "sess-1" },
   sessionId: "sess-1",
   windowId: "win-1",
   workspaceId: "workspace-1",
@@ -327,4 +328,11 @@ test("project-scoped history and artifact inspection use trusted directory conte
   const artifact = await coordinator.artifact(inspect, { source: "baseline", name: "panel" })
   expect(artifact).toMatchObject({ kind: "baseline", path: ".snapeye/baselines/panel.png", mime: "image/png", byteLength: 3 })
   await expect(coordinator.history(context(root, { requestId: "missing-dir", directory: undefined }))).rejects.toMatchObject({ code: "VISUAL_CONTEXT_REQUIRED" })
+  // An agent's history call still requires a real broker principal. The
+  // separate trusted-renderer entry point cannot accidentally grant one.
+  await expect(coordinator.history(context(root, { principal: undefined }))).rejects.toMatchObject({ code: "VISUAL_CONTEXT_REQUIRED" })
+  const uiHistory = await coordinator.historyForTrustedRenderer(root, { maxRuns: 5, maxBaselines: 5 })
+  expect(uiHistory.runs[0]?.runId).toBe("run-history")
+  expect((await coordinator.artifactForTrustedRenderer(root, { source: "baseline", name: "panel" }))?.byteLength).toBe(3)
+  await expect(coordinator.historyForTrustedRenderer("")).rejects.toMatchObject({ code: "VISUAL_CONTEXT_REQUIRED" })
 })
