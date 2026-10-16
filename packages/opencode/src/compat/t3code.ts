@@ -21,8 +21,11 @@ type Environment = Readonly<Record<string, string | undefined>>
 
 export function isT3CodeCompatibilityProfile(
   environment: Environment = process.env,
+  executablePath: string = process.execPath,
 ): boolean {
-  return environment[OPENFORK_COMPAT_PROFILE_ENV] === T3_CODE_COMPAT_PROFILE
+  const selected = environment[OPENFORK_COMPAT_PROFILE_ENV]
+  if (selected !== undefined) return selected === T3_CODE_COMPAT_PROFILE
+  return /(?:^|[\\/])openfork-t3code(?:\.exe)?$/i.test(executablePath)
 }
 
 /**

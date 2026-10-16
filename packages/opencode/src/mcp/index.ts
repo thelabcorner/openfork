@@ -22,6 +22,7 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { withTimeout } from "@/util/timeout"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { McpOAuthPendingProvider, McpOAuthProvider, OAUTH_CALLBACK_PATH } from "./oauth-provider"
+import { PendingOAuthTransportStore } from "./pending-oauth-transport-store"
 import { McpOAuthCallback } from "./oauth-callback"
 import { McpAuth } from "./auth"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -108,7 +109,6 @@ export type Status = Schema.Schema.Type<typeof Status>
 
 // Store transports for OAuth servers to allow finishing auth
 type TransportWithAuth = StreamableHTTPClientTransport | SSEClientTransport
-const pendingOAuthTransports = new Map<string, { transport: TransportWithAuth; provider?: McpOAuthPendingProvider }>()
 
 // Prompt cache types
 type PromptInfo = Awaited<ReturnType<MCPClient["listPrompts"]>>["prompts"][number]
@@ -239,6 +239,14 @@ const layer = Layer.effect(
     const auth = yield* McpAuth.Service
     const events = yield* EventV2Bridge.Service
     const browser = yield* McpBrowser.Service
+    // Pending OAuth transports belong to this instance's MCP service lifetime.
+    // A module-global map crosses workspace/runtime ownership boundaries and
+    // can retain live sockets after an instance is disposed.
+    const pendingOAuthTransports = new PendingOAuthTransportStore<TransportWithAuth, McpOAuthPendingProvider>()
+
+    const closePendingOAuth = (name: string) => {
+      return Effect.promise(() => pendingOAuthTransports.close(name))
+    }
 
     type Transport = StdioClientTransport | StreamableHTTPClientTransport | SSEClientTransport
 
@@ -340,16 +348,23 @@ const layer = Layer.effect(
                   })
                   .pipe(Effect.ignore, Effect.as(undefined))
               } else {
-                pendingOAuthTransports.set(key, { transport })
-                lastStatus = { status: "needs_auth" as const }
-                return events
-                  .publish(TuiEvent.ToastShow, {
-                    title: "MCP Authentication Required",
-                    message: `Server "${key}" requires authentication. Run: opencode mcp auth ${key}`,
-                    variant: "warning",
-                    duration: 8000,
-                  })
-                  .pipe(Effect.ignore, Effect.as(undefined))
+                return Effect.promise(() => pendingOAuthTransports.replace(key, { transport })).pipe(
+                  Effect.andThen(
+                    Effect.sync(() => {
+                      lastStatus = { status: "needs_auth" as const }
+                    }),
+                  ),
+                  Effect.andThen(
+                    events
+                      .publish(TuiEvent.ToastShow, {
+                        title: "MCP Authentication Required",
+                        message: `Server "${key}" requires authentication. Run: openfork mcp auth ${key}`,
+                        variant: "warning",
+                        duration: 8000,
+                      })
+                      .pipe(Effect.ignore),
+                  ),
+                )
               }
             }
 
@@ -582,7 +597,7 @@ const layer = Layer.effect(
                 }),
               { concurrency: 8 },
             )
-            pendingOAuthTransports.clear()
+            yield* Effect.promise(() => pendingOAuthTransports.closeAll())
           }),
         )
 
@@ -965,8 +980,11 @@ const layer = Layer.effect(
       }).pipe(
         Effect.catch((error) => {
           if (error instanceof UnauthorizedError && capturedUrl) {
-            pendingOAuthTransports.set(mcpName, { transport, provider: authProvider })
-            return Effect.succeed({ authorizationUrl: capturedUrl.toString(), oauthState } satisfies AuthResult)
+            return Effect.promise(() =>
+              pendingOAuthTransports.replace(mcpName, { transport, provider: authProvider }),
+            ).pipe(
+              Effect.as({ authorizationUrl: capturedUrl.toString(), oauthState } satisfies AuthResult),
+            )
           }
           return Effect.die(error)
         }),
@@ -1034,11 +1052,23 @@ const layer = Layer.effect(
         }),
       )
 
-      if (error) return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
+      if (error) {
+        yield* closePendingOAuth(mcpName)
+        return { status: "failed", error: `OAuth completion failed: ${error}` } satisfies Status
+      }
 
-      yield* Effect.promise(() => pending.provider?.commit() ?? Promise.resolve())
+      const commitError = yield* Effect.tryPromise({
+        try: () => pending.provider?.commit() ?? Promise.resolve(),
+        catch: (error) => error,
+      }).pipe(
+        Effect.match({
+          onFailure: (error) => (error instanceof Error ? error.message : String(error)),
+          onSuccess: () => undefined,
+        }),
+      )
+      yield* closePendingOAuth(mcpName)
+      if (commitError) return { status: "failed", error: `OAuth completion failed: ${commitError}` } satisfies Status
       yield* auth.clearCodeVerifier(mcpName)
-      pendingOAuthTransports.delete(mcpName)
 
       const mcpConfig = yield* requireMcpConfig(mcpName)
 
@@ -1046,9 +1076,9 @@ const layer = Layer.effect(
     })
 
     const removeAuth = Effect.fn("MCP.removeAuth")(function* (mcpName: string) {
-      yield* auth.remove(mcpName)
       McpOAuthCallback.cancelPending(mcpName)
-      pendingOAuthTransports.delete(mcpName)
+      yield* closePendingOAuth(mcpName)
+      yield* auth.remove(mcpName)
     })
 
     const supportsOAuth = Effect.fn("MCP.supportsOAuth")(function* (mcpName: string) {

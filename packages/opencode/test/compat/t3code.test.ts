@@ -83,6 +83,14 @@ describe("T3 Code compatibility profile", () => {
     expect(localServerListeningProduct(environment)).toBe("OpenFork")
   })
 
+  test("native executable alias activates only the explicit T3 compatibility identity", () => {
+    expect(isT3CodeCompatibilityProfile({}, "W:\\Apps\\OpenFork\\openfork-t3code.exe")).toBe(true)
+    expect(isT3CodeCompatibilityProfile({}, "/apps/openfork-t3code")).toBe(true)
+    expect(isT3CodeCompatibilityProfile({}, "W:\\Apps\\OpenFork\\openfork.exe")).toBe(false)
+    expect(isT3CodeCompatibilityProfile({}, "W:\\Apps\\OpenFork\\openfork-t3code.exe.bak")).toBe(false)
+    expect(isT3CodeCompatibilityProfile({ [OPENFORK_COMPAT_PROFILE_ENV]: "other" }, "W:\\openfork-t3code.exe")).toBe(false)
+  })
+
   test("keeps canonical and historical OpenFork entrypoints isolated from the T3 facade", () => {
     expect(compatibilityProfileFromEntrypoint("openfork")).toBe("")
     expect(compatibilityProfileFromEntrypoint("openfork-t3code")).toBe(T3_CODE_COMPAT_PROFILE)

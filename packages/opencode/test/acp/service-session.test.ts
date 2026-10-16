@@ -247,6 +247,12 @@ describe("ACP service sessions", () => {
       }>
       prompt?: (input: unknown) => Promise<{ data: { info: ReturnType<typeof assistantInfo> } }>
       sessionUpdate?: (update: SessionNotification) => Promise<void>
+      sessions?: Array<{
+        id: string
+        directory: string
+        title: string
+        time: { created: number; updated: number }
+      }>
     },
   ) => {
     const updates: SessionNotification[] = []
@@ -258,7 +264,7 @@ describe("ACP service sessions", () => {
     const summarizes: unknown[] = []
     const usageUpdates: string[] = []
     const events = createEventStream()
-    const sessions = Array.from({ length: 102 }, (_, index) => ({
+    const sessions = options?.sessions ?? Array.from({ length: 102 }, (_, index) => ({
       id: `ses_${index + 1}`,
       directory: index % 2 === 0 ? "/workspace" : "/other",
       title: `Session ${index + 1}`,
@@ -660,9 +666,25 @@ describe("ACP service sessions", () => {
 
     expect(first.sessions).toHaveLength(51)
     expect(first.sessions[0]?.sessionId).toBe("ses_101")
+    expect((first.sessions[0]?._meta as any)?.openforkTemporal).toMatchObject({
+      updatedAtBasis: "session_record",
+      recordUpdatedAt: 101,
+      recordUpdatedAtIso: new Date(101).toISOString(),
+      observedAt: expect.any(Number),
+      observedAtIso: expect.any(String),
+    })
     expect(first.sessions.at(-1)?.sessionId).toBe("ses_1")
     expect(first.nextCursor).toBeUndefined()
-    expect(second.sessions).toEqual(first.sessions)
+    expect(second.sessions.map(({ _meta: _meta, ...item }) => item)).toEqual(
+      first.sessions.map(({ _meta: _meta, ...item }) => item),
+    )
+    expect((second.sessions[0]?._meta as any)?.openforkTemporal).toMatchObject({
+      updatedAtBasis: "session_record",
+      recordUpdatedAt: 101,
+      recordUpdatedAtIso: new Date(101).toISOString(),
+      observedAt: expect.any(Number),
+      observedAtIso: expect.any(String),
+    })
   })
 
   it("includes live ACP sessions before they appear in server-backed session list", async () => {
@@ -672,6 +694,11 @@ describe("ACP service sessions", () => {
 
     expect(listed.sessions[0]?.sessionId).toBe(created.sessionId)
     expect(listed.sessions[0]?.cwd).toBe("/workspace")
+    expect((listed.sessions[0]?._meta as any)?.openforkTemporal).toMatchObject({
+      updatedAtBasis: "live_session_created_fallback",
+      observedAt: expect.any(Number),
+      observedAtIso: expect.any(String),
+    })
   })
 
   it("lists all sessions with next cursor when the first page is full", async () => {
@@ -682,8 +709,27 @@ describe("ACP service sessions", () => {
     expect(first.sessions).toHaveLength(100)
     expect(first.sessions[0]?.sessionId).toBe("ses_102")
     expect(first.sessions.at(-1)?.sessionId).toBe("ses_3")
-    expect(first.nextCursor).toBe("3")
+    expect(first.nextCursor).toBe("v1:3:ses_3")
     expect(second.sessions.map((session) => session.sessionId)).toEqual(["ses_2", "ses_1"])
+  })
+
+
+  it("does not skip sessions that share the page-boundary timestamp", async () => {
+    const tied = Array.from({ length: 102 }, (_, index) => ({
+      id: `ses_tie_${String(index + 1).padStart(3, "0")}`,
+      directory: "/workspace",
+      title: `Tied Session ${index + 1}`,
+      time: { created: 42, updated: 42 },
+    }))
+    const { service } = makeService([], { sessions: tied })
+
+    const first = await Effect.runPromise(service.listSessions({}))
+    const second = await Effect.runPromise(service.listSessions({ cursor: first.nextCursor }))
+
+    expect(first.sessions).toHaveLength(100)
+    expect(first.nextCursor).toBe("v1:42:ses_tie_003")
+    expect(second.sessions.map((session) => session.sessionId)).toEqual(["ses_tie_002", "ses_tie_001"])
+    expect(new Set([...first.sessions, ...second.sessions].map((session) => session.sessionId)).size).toBe(102)
   })
 
   it("resumes a session and stores restored state without replaying transcript chunks", async () => {

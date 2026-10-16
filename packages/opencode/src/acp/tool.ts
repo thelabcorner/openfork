@@ -1,5 +1,6 @@
 import { isAbsolute, resolve } from "path"
 import type { ToolCall, ToolCallContent, ToolCallLocation, ToolCallUpdate, ToolKind } from "@agentclientprotocol/sdk"
+import { sniffAttachmentMime } from "@/util/media"
 
 export type ToolInput = Record<string, unknown>
 
@@ -121,6 +122,23 @@ export function completedToolContent(toolName: string, state: CompletedToolState
   }
 
   content.push(...imageContents(state.attachments ?? []))
+  // ACP content blocks support audio, but this must be opt-in by genuine
+  // content provenance: only native Read exposes audio media in tool updates.
+  // Never route raw base64 as text or attempt to preview video as audio.
+  if (toolName.toLowerCase() === "read") {
+    const attachments = state.attachments ?? []
+    const audio = audioContents(attachments)
+    content.push(...audio)
+    const audioTotal = attachments.filter((attachment) => attachment.mime?.startsWith("audio/")).length
+    const videoTotal = attachments.filter((attachment) => attachment.mime?.startsWith("video/")).length
+    if (videoTotal || audioTotal > audio.length) {
+      const notes = [
+        videoTotal ? `${videoTotal} video attachment(s) were not decoded into ACP tool content; use a separately authorized frame-extraction workflow.` : undefined,
+        audioTotal > audio.length ? `${audioTotal - audio.length} audio attachment(s) omitted (invalid format or ACP inline size budget).` : undefined,
+      ].filter((line): line is string => !!line)
+      content.push({ type: "content", content: { type: "text", text: notes.join(" ") } })
+    }
+  }
   return content
 }
 
@@ -249,6 +267,30 @@ export function imageContents(attachments: ReadonlyArray<ToolAttachment>): ToolC
       },
     }
   })
+}
+
+/** Source-validated, bounded ACP audio tool content, without copying full binary buffers. */
+export function audioContents(attachments: ReadonlyArray<ToolAttachment>): ToolCallContent[] {
+  const content: ToolCallContent[] = []
+  const budget = 2 * 1024 * 1024
+  let used = 0
+  for (const attachment of attachments) {
+    if (content.length >= 2) break
+    const mime = typeof attachment.mime === "string" ? attachment.mime : undefined
+    const url = typeof attachment.url === "string" ? attachment.url : undefined
+    if (!mime || !url || !/^audio\/(wav|x-wav|mpeg|mp3|mp4|flac|ogg|aac|aiff)$/.test(mime)) continue
+    const prefix = `data:${mime};base64,`
+    if (!url.startsWith(prefix)) continue
+    const data = url.slice(prefix.length)
+    if (!data.length || data.length % 4 !== 0 || used + data.length > budget) continue
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) continue
+    const expected = mime === "audio/x-wav" ? "audio/wav" : mime === "audio/mp3" ? "audio/mpeg" : mime
+    const sniffed = sniffAttachmentMime(Buffer.from(data.slice(0, 256), "base64"), "application/octet-stream")
+    if (sniffed !== expected) continue
+    used += data.length
+    content.push({ type: "content", content: { type: "audio", mimeType: mime, data } })
+  }
+  return content
 }
 
 export function extractImageAttachments(attachments: ReadonlyArray<ToolAttachment>): ImageAttachment[] {

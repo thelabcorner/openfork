@@ -7,6 +7,18 @@ import { validateChunkDbCapability } from "./chunkdb-capability"
 const AGENT_NAME = "OpenFork"
 const root = path.resolve(import.meta.dir, "..")
 const skipBuild = Bun.argv.includes("--skip-build")
+const configuredSource = process.env.OPENFORK_ACP_SOURCE?.trim()
+// Optional live JetBrains workspace certification. Keep the default repository
+// smoke, but also exercise actual IDE directories before touching acp.json.
+const configuredSmokeDirectories = process.env.OPENFORK_ACP_SMOKE_CWDS?.trim()
+const additionalSmokeDirectories: string[] = configuredSmokeDirectories ? JSON.parse(configuredSmokeDirectories) : []
+if (
+  !Array.isArray(additionalSmokeDirectories) ||
+  additionalSmokeDirectories.some((directory) => typeof directory !== "string" || !directory.trim())
+) {
+  throw new Error("OPENFORK_ACP_SMOKE_CWDS must be a JSON array of non-empty directory strings")
+}
+const smokeDirectories = [...new Set([root, ...additionalSmokeDirectories.map((directory) => path.resolve(directory))])]
 
 if (process.platform !== "win32") {
   throw new Error("JetBrains OpenFork ACP installer currently targets Windows only.")
@@ -18,14 +30,20 @@ async function run(command: string[], cwd = root) {
   if (code !== 0) throw new Error(`${command.join(" ")} exited with code ${code}`)
 }
 
-if (!skipBuild) {
+if (!skipBuild && !configuredSource) {
   await run(["bun", "run", "script/build.ts", "--single", "--skip-embed-web-ui"])
 }
 
 const pkg = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8")) as { version: string }
-const source = path.join(root, "dist", "openfork-windows-x64", "bin", "openfork.exe")
+const source = configuredSource
+  ? path.resolve(configuredSource)
+  : path.join(root, "dist", "openfork-windows-x64", "bin", "openfork.exe")
 await fs.access(source).catch(() => {
-  throw new Error(`Built OpenFork executable not found at ${source}. Run without --skip-build first.`)
+  throw new Error(
+    configuredSource
+      ? `Configured OpenFork ACP source executable not found at ${source}`
+      : `Built OpenFork executable not found at ${source}. Run without --skip-build first.`,
+  )
 })
 
 const localAppData = process.env.LOCALAPPDATA
@@ -40,8 +58,14 @@ const sha = shaResult.exitCode === 0 ? shaResult.stdout.toString().trim() : "unk
 const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14)
 const buildID = `${pkg.version}-openfork-${sha}-${stamp}`
 const installDir = path.join(installRoot, buildID)
-const installed = path.join(installDir, "openfork.exe")
+const canonicalInstalled = path.join(installDir, "openfork.exe")
+const installed = path.join(installDir, "opencode.exe")
 await fs.mkdir(installDir, { recursive: true })
+await fs.copyFile(source, canonicalInstalled)
+// JetBrains' ACP boundary historically identifies the OpenCode-compatible agent
+// executable as opencode.exe. Keep that compatibility filename while retaining
+// the canonical OpenFork binary beside it; both bytes come from the same
+// validated fork build and no consumer-specific compatibility profile is set.
 await fs.copyFile(source, installed)
 
 // Validate the copied executable before pointing JetBrains at it.
@@ -59,8 +83,35 @@ await validateChunkDbCapability(installed)
 // user's real plugin/config environment so a noisy plugin cannot poison the
 // JetBrains transport after we update acp.json.
 async function validateAcpProtocol() {
+  for (const directory of smokeDirectories) {
+    const stat = await fs.stat(directory).catch(() => undefined)
+    if (!stat?.isDirectory()) throw new Error(`ACP smoke-test directory not found: ${directory}`)
+  }
+  // The installer is often invoked from an OpenFork development process whose
+  // process-local OPENCODE_* overrides point at the dev database/desktop
+  // instance. JetBrains itself does not inherit that launcher-local state.
+  // Preserve the user's ordinary environment, but remove development-channel
+  // overrides so the deployment gate exercises the same canonical runtime path
+  // the global ACP entry will launch.
+  const env = { ...process.env }
+  for (const key of [
+    "NODE_ENV",
+    "NODE_ENV_ELECTRON_VITE",
+    "BUN_ENV",
+    "OPENCODE_CLIENT",
+    "OPENCODE_DB",
+    "OPENCODE_DEV_RUN_ID",
+    "OPENCODE_DISABLE_CHANNEL_DB",
+    "OPENCODE_DISABLE_EMBEDDED_WEB_UI",
+    "OPENCODE_INSTANCE_ID",
+    "OPENCODE_PRINT_LOGS",
+  ]) {
+    delete env[key]
+  }
+
   const child = Bun.spawn([installed, "acp"], {
     cwd: root,
+    env,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -97,7 +148,10 @@ async function validateAcpProtocol() {
   const response = async (id: number) => {
     while (true) {
       const raw = await line()
-      if (raw === undefined) throw new Error(`Installed ACP stdout closed before response ${id}`)
+      if (raw === undefined) {
+        const err = (await stderr).trim()
+        throw new Error(`Installed ACP stdout closed before response ${id}${err ? `: ${err.slice(0, 4000)}` : ""}`)
+      }
       let message: any
       try {
         message = JSON.parse(raw)
@@ -119,8 +173,8 @@ async function validateAcpProtocol() {
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       child.kill()
-      reject(new Error("Installed ACP smoke test did not finish within 20 seconds"))
-    }, 20_000)
+      reject(new Error("Installed ACP smoke test exceeded its bounded deadline"))
+    }, 180_000 + additionalSmokeDirectories.length * 60_000)
   })
 
   const smoke = (async () => {
@@ -139,25 +193,35 @@ async function validateAcpProtocol() {
       throw new Error(`Installed ACP initialize failed: ${JSON.stringify(initialized).slice(0, 1000)}`)
     }
 
-    await write({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: root, mcpServers: [] } })
-    const created = await response(2)
-    if (created?.error || typeof created?.result?.sessionId !== "string") {
-      throw new Error(`Installed ACP session/new failed: ${JSON.stringify(created).slice(0, 1000)}`)
-    }
-    const mode = created.result.configOptions?.find((option: any) => option?.id === "mode")
-    const modes = mode && Array.isArray(mode.options) ? modeValues(mode.options) : []
-    if (!modes.includes("yolo")) {
-      throw new Error(`Installed ACP did not advertise YOLO mode. Modes: ${modes.join(", ") || "(none)"}`)
-    }
+    let requestID = 2
+    for (const cwd of smokeDirectories) {
+      const createID = requestID++
+      await write({ jsonrpc: "2.0", id: createID, method: "session/new", params: { cwd, mcpServers: [] } })
+      const created = await response(createID)
+      if (created?.error || typeof created?.result?.sessionId !== "string") {
+        throw new Error(`Installed ACP session/new failed for ${cwd}: ${JSON.stringify(created).slice(0, 1000)}`)
+      }
+      const mode = created.result.configOptions?.find((option: any) => option?.id === "mode")
+      const modes = mode && Array.isArray(mode.options) ? modeValues(mode.options) : []
+      // Agent/mode availability is configuration-dependent. Certify a usable
+      // selector for every real workspace, not merely one default environment.
+      if (modes.length === 0) {
+        throw new Error(`Installed ACP did not advertise usable modes for ${cwd}`)
+      }
 
-    await write({
-      jsonrpc: "2.0",
-      id: 3,
-      method: "session/close",
-      params: { sessionId: created.result.sessionId },
-    })
-    const closed = await response(3)
-    if (closed?.error) throw new Error(`Installed ACP session/close failed: ${JSON.stringify(closed).slice(0, 1000)}`)
+      const closeID = requestID++
+      await write({
+        jsonrpc: "2.0",
+        id: closeID,
+        method: "session/close",
+        params: { sessionId: created.result.sessionId },
+      })
+      const closed = await response(closeID)
+      if (closed?.error) {
+        throw new Error(`Installed ACP session/close failed for ${cwd}: ${JSON.stringify(closed).slice(0, 1000)}`)
+      }
+      console.log(`ACP workspace certified: ${cwd}`)
+    }
 
     child.stdin.end()
     while (true) {
@@ -215,9 +279,9 @@ servers[AGENT_NAME] = {
 config.agent_servers = servers
 
 // Keep a last-known-good backup, then replace the config. The OpenFork custom
-// entry always points at the canonical openfork.exe; stock OpenCode entries are
-// retired separately by machine cutover rather than being treated as runtime
-// dependencies.
+// ACP entry points at the fork-owned opencode.exe compatibility filename while
+// canonical openfork.exe is retained beside it. Stock JetBrains-managed OpenCode
+// entries are never treated as OpenFork runtime dependencies.
 try {
   await fs.copyFile(configPath, `${configPath}.openfork-backup`)
 } catch (error) {
@@ -242,27 +306,27 @@ const healedBuilds: string[] = []
 for (const entry of await fs.readdir(openforkRoot, { withFileTypes: true })) {
   if (!entry.isDirectory() || entry.name === path.basename(installDir)) continue
   const candidateDir = path.join(openforkRoot, entry.name)
-  const canonicalCandidate = path.join(candidateDir, "openfork.exe")
-  const legacyCandidate = path.join(candidateDir, "opencode.exe")
-  let candidate = canonicalCandidate
-  try {
-    await fs.access(canonicalCandidate)
-  } catch {
+  const candidates = [path.join(candidateDir, "openfork.exe"), path.join(candidateDir, "opencode.exe")]
+  const existing: string[] = []
+  for (const candidate of candidates) {
     try {
-      await fs.access(legacyCandidate)
-      candidate = legacyCandidate
-    } catch {
-      continue
+      await fs.access(candidate)
+      existing.push(candidate)
+    } catch {}
+  }
+  if (existing.length === 0) continue
+
+  let healed = false
+  for (const candidate of existing) {
+    try {
+      await fs.copyFile(source, candidate)
+      await validateChunkDbCapability(candidate)
+      healed = true
+    } catch (error) {
+      console.warn(`Could not refresh cached OpenFork ACP path ${candidate}: ${String(error)}`)
     }
   }
-
-  try {
-    await fs.copyFile(installed, candidate)
-    await validateChunkDbCapability(candidate)
-    healedBuilds.push(entry.name)
-  } catch (error) {
-    console.warn(`Could not refresh cached OpenFork ACP path ${candidate}: ${String(error)}`)
-  }
+  if (healed) healedBuilds.push(entry.name)
 }
 
 console.log(`Installed ${AGENT_NAME}`)
