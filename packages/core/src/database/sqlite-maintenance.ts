@@ -29,7 +29,11 @@ export function makeSqliteMaintenanceQuietGate(
   const wait = Effect.fnUntraced(function* () {
     for (;;) {
       const version = yield* dataVersion(db)
-      const now = Date.now()
+      // SQLite maintenance measures elapsed quiet time, not civil time.
+      // Windows time synchronization/clock adjustments can move Date.now()
+      // backward by minutes or forward past the quiet gate, causing either a
+      // stranded background Flock owner or false admission during active use.
+      const now = performance.now()
       if (observedVersion === undefined || version !== observedVersion) {
         observedVersion = version
         quietSince = now

@@ -5,7 +5,6 @@ import type { DatabaseShape } from "./database"
 import { CHUNKDB_COOLING_MS, CHUNKDB_HOT_TAIL_EVENTS } from "./chunkdb"
 import { CHECKPOINT_TYPE, recordCompactedSequences } from "./chunk-compaction"
 import { isV5Frame, parseV5Header } from "./json-codec"
-import { retrySqliteBusy } from "./sqlite-busy"
 import type { SqliteMaintenanceQuietGate } from "./sqlite-maintenance"
 import {
   decodeSemanticStorage,
@@ -64,7 +63,6 @@ const TRANSFORMED_IDENTITY_CACHE_ENTRIES = 8_192
 // data_version quiet gate + busy_timeout=0, not by this row count alone.
 const WRITE_SLICE_ROWS = 256
 const WRITE_SLICE_PAUSE_MS = 2
-const WRITE_SLICE_BUSY_RETRY_MS = 35
 const LEGACY_CHECKPOINT_MIGRATE_ROWS = 2_048
 
 // Migration-only cache. Historical dedup refs are immutable while semantic
@@ -312,17 +310,21 @@ const prepareWriteStage = Effect.fn("ChunkDB.semanticPrune.prepareWriteStage")(f
 const migrateLegacyCheckpoints = Effect.fn("ChunkDB.semanticPrune.migrateLegacyCheckpoints")(function* (
   db: DatabaseShape,
 ) {
-  yield* db.run(`CREATE INDEX IF NOT EXISTS ocdb_checkpoint_migrate_idx
-    ON event (aggregate_id, seq) WHERE type = 'event.compacted.1'`).pipe(Effect.orDie)
+  // This is a rare compatibility migration, not a hot-path query. Building
+  // and dropping a transient partial index over the entire event table costs
+  // tens of seconds on production-sized histories (observed: 37.36 seconds),
+  // and would repeat every maintenance pass after the last marker was drained.
+  // The permanent covering index scans compact (aggregate,type,seq) entries
+  // without touching JSON payloads or performing schema-changing DDL. Do not
+  // create an index solely to prove that a legacy marker is absent.
   const rows = yield* db.all<{ id: string; aggregateID: string; seq: number }>(sql`
     SELECT id, aggregate_id AS aggregateID, seq
-    FROM event INDEXED BY ocdb_checkpoint_migrate_idx
+    FROM event INDEXED BY event_aggregate_type_seq_idx
     WHERE type = 'event.compacted.1'
     ORDER BY aggregate_id, seq
     LIMIT ${LEGACY_CHECKPOINT_MIGRATE_ROWS}
   `).pipe(Effect.orDie)
   if (rows.length === 0) {
-    yield* db.run(`DROP INDEX IF EXISTS ocdb_checkpoint_migrate_idx`).pipe(Effect.orDie)
     return { migrated: 0, hasMore: false }
   }
 
@@ -971,9 +973,8 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
     yield* prepareWriteStage(db)
     for (let start = 0; start < safe.length; start += writeSliceRows) {
       const slice = safe.slice(start, start + writeSliceRows)
-      const outcome = yield* retrySqliteBusy(
-        () =>
-          db.transaction((tx) =>
+      if (options?.quietGate) yield* options.quietGate.wait()
+      const outcome = yield* db.transaction((tx) =>
             Effect.gen(function* () {
           yield* tx.run(`DELETE FROM ocdb_semantic_write_v4`)
           yield* tx.run(`DELETE FROM ocdb_semantic_valid_v4`)
@@ -1191,10 +1192,7 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
             bitmapGrowth: compaction.grewBytes,
           }
             }),
-          ),
-        WRITE_SLICE_BUSY_RETRY_MS,
-        options?.quietGate?.wait,
-      )
+          )
       compatibilityRejected += slice.length - outcome.validCount
       compacted += outcome.validCount
       bitmapBytesStored += outcome.bitmapGrowth

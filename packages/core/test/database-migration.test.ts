@@ -529,7 +529,8 @@ describe("DatabaseMigration", () => {
         yield* db.run(sql`
           INSERT INTO migration (id, time_completed, checksum) VALUES
             ('20260919235500_oxp_parent_activity', 1, '357ae708c1e188cd672b39bbac599ab1a6c2d6851bd8774015518cdf080c479c'),
-            ('20260920034100_schema_convergence', 1, 'b2ef21144060c67f7a5d9f33c97c83e5fa186357464f354b230b9ee8aacda23c')
+            ('20260920034100_schema_convergence', 1, 'b2ef21144060c67f7a5d9f33c97c83e5fa186357464f354b230b9ee8aacda23c'),
+            ('20261007192518_session_tool_recall_projection', 1, 'b442d660a2909ee4badde34d64b896bab0c76643c3a44d28908e01f2d8b1c518')
         `)
 
         const canonical: DatabaseMigration.Migration[] = [
@@ -541,6 +542,11 @@ describe("DatabaseMigration", () => {
           {
             id: "20260920034100_schema_convergence",
             checksum: "b757a6bd6c240aea8dba0bb88abffeefd13fe6690759c4166ebe5d2b1735ab56",
+            up: () => Effect.die("completed migration must not replay"),
+          },
+          {
+            id: "20261007192518_session_tool_recall_projection",
+            checksum: "c67021d3eaf77afa7ea120985fa42705f84a4257f42ced65c58e4fa1dd7821fe",
             up: () => Effect.die("completed migration must not replay"),
           },
         ]
@@ -555,7 +561,43 @@ describe("DatabaseMigration", () => {
             id: "20260920034100_schema_convergence",
             checksum: "b757a6bd6c240aea8dba0bb88abffeefd13fe6690759c4166ebe5d2b1735ab56",
           },
+          {
+            id: "20261007192518_session_tool_recall_projection",
+            checksum: "c67021d3eaf77afa7ea120985fa42705f84a4257f42ced65c58e4fa1dd7821fe",
+          },
         ])
+
+        yield* db.run(sql`
+          UPDATE migration
+          SET checksum = '2e62c3bea8013b7da27e049261260deb7f26cfde395ac4973909eeabff9aa38b'
+          WHERE id = '20261007192518_session_tool_recall_projection'
+        `)
+        yield* DatabaseMigration.applyOnly(db, [canonical[2]!])
+        expect(
+          yield* db.get(
+            sql`SELECT checksum FROM migration WHERE id = '20261007192518_session_tool_recall_projection'`,
+          ),
+        ).toEqual({
+          checksum: "c67021d3eaf77afa7ea120985fa42705f84a4257f42ced65c58e4fa1dd7821fe",
+        })
+
+        // The pre-release scope-index migration previously attempted to create
+        // an already-existing directory index. Existing journaled installs
+        // retain an exact, narrow checksum convergence path after the fix.
+        yield* db.run(sql`
+          INSERT INTO migration (id, time_completed, checksum)
+          VALUES ('20261007195036_session_tool_recall_scope_indexes', 1,
+            'b2a8ffed579b16e92f2cb570f22436ad1653c63c6f08225c65d67116711307a7')
+        `)
+        const scopeMigration: DatabaseMigration.Migration = {
+          id: "20261007195036_session_tool_recall_scope_indexes",
+          checksum: "15f2dda95905e8f2769a993c0143198ca8984c064e182f1a451c4552117a2340",
+          up: () => Effect.die("completed migration must not replay"),
+        }
+        yield* DatabaseMigration.applyOnly(db, [scopeMigration])
+        expect(yield* db.get(
+          sql`SELECT checksum FROM migration WHERE id = '20261007195036_session_tool_recall_scope_indexes'`,
+        )).toEqual({ checksum: scopeMigration.checksum })
 
         yield* db.run(sql`
           UPDATE migration

@@ -8,7 +8,7 @@ import { withBackfillDb, type DatabaseShape } from "./database"
 import { compressSmallText, compressText, SMALL_TEXT_THRESHOLD, THRESHOLD } from "./json-codec"
 import { compressTextAsync } from "./compress-pool"
 import { runSemanticPrunePass, type SemanticPruneOutcome } from "./chunk-prune"
-import { isSqliteBusy, retrySqliteBusy } from "./sqlite-busy"
+import { isSqliteBusy } from "./sqlite-busy"
 import {
   makeSqliteMaintenanceQuietGate,
   type SqliteMaintenanceQuietGate,
@@ -122,6 +122,8 @@ const CHUNKDB_WRITE_SLICE_ROWS = 8
 const CHUNKDB_WRITE_SLICE_BYTES = 512 * 1024
 const CHUNKDB_WRITE_SLICE_PAUSE_MS = 15
 const CHUNKDB_BUSY_RETRY_MS = 35
+const CHUNKDB_BUSY_PASS_BACKOFF_BASE_MS = 250
+const CHUNKDB_BUSY_PASS_BACKOFF_CAP_MS = 5_000
 const BACKLOG_SAMPLE_ROWS = 2_048
 // Once a historical backfill drains, a giant freelist can remain inside the
 // SQLite file even though the logical payload has already shrunk dramatically.
@@ -318,11 +320,53 @@ function reclaimSpace(
  * is already a frame / `$cdbRef` and is never re-selected as a text candidate.
  * Keeps the journal from growing 1:1 with every sealed event over the DB's life.
  */
-function pruneSealJournal(db: DatabaseShape, quietGate?: SqliteMaintenanceQuietGate): Effect.Effect<void> {
+const SEAL_JOURNAL_PRUNE_CURSOR = "seal_journal_prune_rowid_v1"
+export const SEAL_JOURNAL_PRUNE_PAGE_SIZE = 256
+
+export function pruneSealJournal(
+  db: DatabaseShape,
+  quietGate?: SqliteMaintenanceQuietGate,
+): Effect.Effect<void, EffectDrizzleQueryError | SqlError> {
   return Effect.gen(function* () {
     const cutoff = Date.now() - CHUNKDB_SEAL_JOURNAL_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    // Never issue an unbounded DELETE against years of audit rows on a
+    // multi-gigabyte active WAL database. Reuse the table's implicit rowid
+    // B-tree, without building a new time_sealed index during startup.
+    // Persist the cursor because each maintenance pass opens a new worker
+    // connection; an in-memory cursor would repeat the first page forever.
+    const stored = yield* db.get<{ value: string | null }>(
+      sql`SELECT value FROM ocdb_meta WHERE key = ${SEAL_JOURNAL_PRUNE_CURSOR}`,
+    )
+    const position = Number(stored?.value ?? 0)
+    const cursor = Number.isSafeInteger(position) && position >= 0 ? position : 0
+    const rows = yield* db.all<{ rowid: number; time_sealed: number }>(sql`
+      SELECT rowid, time_sealed FROM ocdb_seal
+      WHERE rowid > ${cursor}
+      ORDER BY rowid
+      LIMIT ${SEAL_JOURNAL_PRUNE_PAGE_SIZE}
+    `)
+    if (rows.length === 0 && cursor === 0) return
+    const next = rows.at(-1)?.rowid ?? 0
+    const expired = rows.filter((row) => row.time_sealed < cutoff)
     if (quietGate) yield* quietGate.wait()
-    yield* db.run(sql`DELETE FROM ocdb_seal WHERE time_sealed < ${cutoff}`).pipe(Effect.orDie)
+    yield* db.transaction((tx) =>
+      Effect.gen(function* () {
+        if (expired.length > 0) {
+          yield* tx.run(sql`
+            DELETE FROM ocdb_seal
+            WHERE rowid IN (${sql.join(expired.map((row) => sql`${row.rowid}`), sql`, `)})
+              AND time_sealed < ${cutoff}
+          `)
+        }
+        yield* tx.run(sql`
+          INSERT INTO ocdb_meta (key, value)
+          VALUES (${SEAL_JOURNAL_PRUNE_CURSOR}, ${String(next)})
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value
+          WHERE ocdb_meta.value IS ${stored?.value ?? null}
+        `)
+      }),
+      { behavior: "immediate" },
+    )
   })
 }
 
@@ -384,9 +428,8 @@ export function runPass(
           // transaction. Revalidate under an IMMEDIATE transaction before
           // recording any derived state: a factory reset (or any concurrent
           // delete/update) may have invalidated this candidate meanwhile.
-          yield* retrySqliteBusy(
-            () =>
-              db.transaction(
+          if (options?.quietGate) yield* options.quietGate.wait()
+          yield* db.transaction(
                 (tx) =>
                   Effect.gen(function* () {
                 const current = yield* tx.get<{ one: number }>(sql`
@@ -405,15 +448,11 @@ export function runPass(
                 `)
                   }),
                 { behavior: "immediate" },
-              ),
-            CHUNKDB_BUSY_RETRY_MS,
-            options?.quietGate?.wait,
-          )
+              )
           continue
         }
-        const committed = yield* retrySqliteBusy(
-          () =>
-            db.transaction(
+        if (options?.quietGate) yield* options.quietGate.wait()
+        const committed = yield* db.transaction(
               (tx) =>
                 Effect.gen(function* () {
               const current = yield* tx.get<{ one: number }>(sql`
@@ -434,10 +473,7 @@ export function runPass(
               return true
                 }),
               { behavior: "immediate" },
-            ),
-          CHUNKDB_BUSY_RETRY_MS,
-          options?.quietGate?.wait,
-        )
+            )
         if (!committed) continue
         promoted += 1
         bytes += rawLen
@@ -788,9 +824,14 @@ export function runPassV2(
       if (slice.length > 0) slices.push(slice)
 
       for (const writeSlice of slices) {
-        for (;;) {
-          if (options?.quietGate) yield* options.quietGate.wait()
-          const outcome = yield* db
+        // A complete transaction may have performed writes and may even have
+        // committed before its acknowledgment fails with SQLITE_BUSY. Never
+        // replay its callback here. The outer maintenance owner already
+        // handles BUSY by deferring a new pass from authoritative candidates.
+        // This also prevents an infinite writer-admission loop during a busy
+        // foreground swarm.
+        if (options?.quietGate) yield* options.quietGate.wait()
+        const stats = yield* db
             .transaction(
               (tx) =>
                 Effect.gen(function* () {
@@ -895,23 +936,10 @@ export function runPassV2(
                 }),
               { behavior: "immediate" },
             )
-            .pipe(
-              Effect.map((stats) => ({ kind: "ok" as const, stats })),
-              Effect.catch((error) => Effect.succeed({ kind: "error" as const, error })),
-            )
-
-          if (outcome.kind === "ok") {
-            promoted += outcome.stats.promoted
-            repeated += outcome.stats.repeated
-            bytes += outcome.stats.bytes
-            processed += outcome.stats.processed
-            break
-          }
-          if (!isSqliteBusy(outcome.error)) return yield* Effect.fail(outcome.error)
-          // Foreground owns the SQLite writer slot. Do not queue behind it for
-          // seconds; yield and retry this exact atomic slice later.
-          yield* Effect.sleep(Duration.millis(CHUNKDB_BUSY_RETRY_MS))
-        }
+        promoted += stats.promoted
+        repeated += stats.repeated
+        bytes += stats.bytes
+        processed += stats.processed
 
         yield* Effect.yieldNow
         if (!options?.quietGate) yield* Effect.sleep(Duration.millis(CHUNKDB_WRITE_SLICE_PAUSE_MS))
@@ -953,6 +981,7 @@ export function runPassV2(
 type SealerPassOutcome =
   | { kind: "ok"; promoted: number; repeated: number; processed: number; bytes: number }
   | { kind: "failed"; promoted: number; repeated: number; processed: number; bytes: number }
+  | { kind: "busy"; promoted: number; repeated: number; processed: number; bytes: number }
 
 export interface SealerBacklog {
   /** Sampled large TEXT rows still awaiting a seal decision. */
@@ -1058,6 +1087,9 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
                 // file necessarily share its parent directory.
                 dir: path.join(path.dirname(filename), RUNTIME_LOCK_DIRNAME),
                 staleMs: CHUNKDB_SEALER_LOCK_STALE_MS,
+                // A long-running sealer must not be stolen from a live host
+                // whose event-loop heartbeat was delayed by system load.
+                protectLiveProcess: true,
                 timeoutMs: CHUNKDB_SEALER_LOCK_TIMEOUT_MS,
                 baseDelayMs: 75,
                 maxDelayMs: 200,
@@ -1095,10 +1127,11 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               pid: process.pid,
             })
           }
-          let previousHitCap: boolean = false
-          let reclaimDraining = false
-          let backoffMs = BACKOFF_BASE_MS
-          let semanticNoProgressStreak = 0
+           let previousHitCap: boolean = false
+           let reclaimDraining = false
+           let backoffMs = BACKOFF_BASE_MS
+           let busyBackoffMs = CHUNKDB_BUSY_PASS_BACKOFF_BASE_MS
+           let semanticNoProgressStreak = 0
           for (;;) {
             const draining: boolean = previousHitCap && backfillAllowed
             const cap: number = draining ? CHUNKDB_BACKFILL_MAX_ROWS_PER_PASS : MAX_ROWS_PER_PASS
@@ -1131,12 +1164,13 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               )
               if (semanticOutcome.kind === "busy") {
                 // Every semantic write unit is atomic + idempotent. If a
-                // foreground writer owns SQLite, abandon the current maintenance
-                // pass immediately and retry later rather than queueing behind it
-                // or killing the infinite sealer loop.
-                yield* Effect.sleep(Duration.millis(CHUNKDB_BUSY_RETRY_MS))
-                previousHitCap = false
-                continue
+                 // foreground writer owns SQLite, abandon the current maintenance
+                 // pass immediately and retry later rather than queueing behind it
+                 // or killing the infinite sealer loop.
+                 yield* Effect.sleep(Duration.millis(busyBackoffMs))
+                 busyBackoffMs = Math.min(busyBackoffMs * 2, CHUNKDB_BUSY_PASS_BACKOFF_CAP_MS)
+                 previousHitCap = false
+                 continue
               }
               if (semanticOutcome.kind === "failed") {
                 yield* Effect.sleep(Duration.millis(backoffMs))
@@ -1144,8 +1178,8 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
                 previousHitCap = false
                 continue
               }
-              const pruned = semanticOutcome.value
-              backoffMs = BACKOFF_BASE_MS
+               const pruned = semanticOutcome.value
+               backoffMs = BACKOFF_BASE_MS
               if (pruned.inspected > 0 || !pruned.indexComplete || !pruned.dependencyComplete) {
                 yield* Effect.logInfo("ChunkDB semantic prune pass complete", { filename, ...pruned })
               }
@@ -1177,12 +1211,24 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               maxRowsPerPass: cap,
               quietGate,
             }).pipe(
-              Effect.catch((error) =>
-                Effect.logError("ChunkDB sealer pass failed; backing off", { filename, error }).pipe(
-                  Effect.as({ kind: "failed" as const, promoted: 0, repeated: 0, processed: 0, bytes: 0 }),
-                ),
-              ),
+              Effect.catch((error): Effect.Effect<SealerPassOutcome> => {
+                if (isSqliteBusy(error)) {
+                  return Effect.succeed({ kind: "busy", promoted: 0, repeated: 0, processed: 0, bytes: 0 })
+                }
+                return Effect.logError("ChunkDB sealer pass failed; backing off", { filename, error }).pipe(
+                  Effect.as({ kind: "failed", promoted: 0, repeated: 0, processed: 0, bytes: 0 }),
+                )
+              }),
             )
+            if (outcome.kind === "busy") {
+              // A saturated foreground writer is a scheduling signal, not a
+              // corrupt maintenance pass. Yield this pass and retry from fresh
+              // candidates instead of imposing the general 10-minute error backoff.
+              yield* Effect.sleep(Duration.millis(busyBackoffMs))
+              busyBackoffMs = Math.min(busyBackoffMs * 2, CHUNKDB_BUSY_PASS_BACKOFF_CAP_MS)
+              previousHitCap = false
+              continue
+            }
             if (outcome.kind === "failed") {
               yield* Effect.sleep(Duration.millis(backoffMs))
               backoffMs = Math.min(backoffMs * 2, BACKOFF_CAP_MS)
@@ -1190,6 +1236,7 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               continue
             }
             backoffMs = BACKOFF_BASE_MS
+            busyBackoffMs = CHUNKDB_BUSY_PASS_BACKOFF_BASE_MS
             previousHitCap = outcome.processed >= cap
             if (outcome.processed > 0) {
               yield* Effect.logInfo("ChunkDB sealer pass complete", {

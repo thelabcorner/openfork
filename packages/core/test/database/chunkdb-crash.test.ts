@@ -240,7 +240,47 @@ describe("ChunkDB crash recovery", () => {
     expect(shouldDrainFreelist(1_000, 1_000_000)).toBe(false)
   })
 
-  test("FOREGROUND PRIORITY: backfill yields on SQLITE_BUSY and resumes after the writer lock is released", async () => {
+  test("AFTER-BEGIN BUSY: epoch-2 sealer never replays a callback that already executed writes", async () => {
+    const { dir, path } = tmpDb()
+    try {
+      await runWith(path, (db) => Effect.gen(function* () {
+        yield* seed(db, makeEvents())
+        let transactions = 0
+        const intercept = new Proxy(db, {
+          get(target, key, receiver) {
+            if (key !== "transaction") return Reflect.get(target, key, receiver)
+            return (work: any, options: any) => {
+              transactions++
+              return target.transaction((tx) =>
+                work(tx).pipe(Effect.flatMap((result: unknown) =>
+                  transactions === 1
+                    ? Effect.fail(Object.assign(new Error("SQLITE_BUSY: simulated after writes"), { code: "SQLITE_BUSY" }))
+                    : Effect.succeed(result),
+                )),
+              options)
+            }
+          },
+        }) as DatabaseShape
+        const first = yield* Effect.exit(runPassV2(intercept, { batchSize: 12, maxRowsPerPass: 12 }))
+        expect(first._tag).toBe("Failure")
+        expect(transactions).toBe(1)
+        const before = yield* db.get<{ n: number }>(
+          sql`SELECT count(*) AS n FROM event_value`,
+        )
+        expect(before?.n).toBe(0)
+        const committed = yield* runPassV2(db, { batchSize: 12, maxRowsPerPass: 12 })
+        expect(committed.processed).toBe(12)
+        const after = yield* db.get<{ n: number }>(
+          sql`SELECT count(*) AS n FROM event WHERE data LIKE '{"$cdbRef"%'`,
+        )
+        expect(after?.n).toBe(12)
+      }))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("FOREGROUND PRIORITY: busy backfill fails closed; a later explicit pass resumes after release", async () => {
     const { dir, path } = tmpDb()
     let locker: BunDatabase | undefined
     try {
@@ -271,20 +311,24 @@ describe("ChunkDB crash recovery", () => {
 
       const started = Date.now()
       const sealing = Effect.runPromise(
-        withBackfillDb(path, (db) => runPassV2(db, { batchSize: 16, maxRowsPerPass: 16 })),
+        Effect.exit(withBackfillDb(path, (db) => runPassV2(db, { batchSize: 16, maxRowsPerPass: 16 }))),
       )
 
-      // Keep the foreground writer slot long enough for the background connection
-      // to encounter its 100 ms busy_timeout at least once. Repeats compress only
-      // one canonical payload, so planning reaches SQLite quickly.
-      await Bun.sleep(400)
+      // Maintenance must NOT repeatedly replay the same multi-statement
+      // transaction while the foreground writer remains held. The supervisor
+      // owns admission backoff and retries later from durable candidates.
+      await Bun.sleep(650)
+      const deferred = await sealing
+      expect(deferred._tag).toBe("Failure")
+      expect(Date.now() - started).toBeLessThan(3_000)
       locker.run("ROLLBACK")
       locker.close()
       locker = undefined
 
-      const result = await sealing
+      const result = await Effect.runPromise(
+        withBackfillDb(path, (db) => runPassV2(db, { batchSize: 16, maxRowsPerPass: 16 })),
+      )
       expect(result.processed).toBe(16)
-      expect(Date.now() - started).toBeLessThan(3_000)
 
       await runWith(path, (db) =>
         Effect.gen(function* () {
