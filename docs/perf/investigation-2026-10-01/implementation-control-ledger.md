@@ -57,7 +57,7 @@ bun test test/session-execution-owner.test.ts
 16 passed, including stale-generation interrupt fencing
 ```
 
-The route-level test exercises one local handle and proves zero Instance loads; the RunState test exercises 1, 3, and 6 concurrently active handles. This does not yet prove desktop transport latency or cancellation of orphaned instance-scoped BackgroundJob work when no local Runner handle exists. Such work is not guessed at or canceled by bootstrapping an Instance on this control route; a separate authoritative process-level job owner would be needed if orphan-only jobs are a supported abort state. Cross-process owners receive the durable interrupt, while local cancellation is only claimed for a matching process handle.
+The route-level test exercises one local handle and proves zero Instance loads; the RunState test exercises 1, 3, and 6 concurrently active handles. The later regression `aborts an orphaned session-owned BackgroundJob without loading an Instance` now covers the orphan-only case: the root control route finds the session-owned job through its process-level owner, cancels it, returns success, and never bootstraps `InstanceContextMiddleware`. This is separate from transport latency; the Electron IPC gate now verifies interest, create, and a trusted abort complete while six admissions remain held.
 
 ## V1 session creation admission
 

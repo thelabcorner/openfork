@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "sourceEvidence": "packages/desktop/test/.fg-df475157-BfsaqJ/evidence.json",
+  "sourceFingerprint": "2571073099a0fb5fb02d794a7c97c0eeedea5b975adb19a9218769e72571a92b",
+  "sourceFingerprintAfterRun": "2571073099a0fb5fb02d794a7c97c0eeedea5b975adb19a9218769e72571a92b",
+  "assertions": 35,
+  "validationScope": "Source-built private Electron app and native Node sidecar with 1200 SQLite PartTable rows, cold project, held analytical scan lane",
+  "largeHistory": {
+    "seed": {
+      "messageID": "msg_gate_large_history_ses_ef51dddc7ffe11qy31wyReWc2O",
+      "parts": 1200,
+      "elapsedMs": 66.77950000000055
+    },
+    "detailReadyMs": 3398.600000023842,
+    "history": [
+      {
+        "path": "/session/ses_ef51dddc7ffe11qy31wyReWc2O/message",
+        "status": 200,
+        "messageCount": 1,
+        "partCount": 64,
+        "bytes": 13524,
+        "windowed": "[{\"messageID\":\"msg_gate_large_history_ses_ef51dddc7ffe11qy31wyReWc2O\",\"omittedParts\":1136}]"
+      }
+    ],
+    "historyPaths": [
+      "/session/ses_ef51dddc7ffe11qy31wyReWc2O/message",
+      "/session/ses_ef51dddc7ffe11qy31wyReWc2O/timeline-parts",
+      "/session/ses_ef51dddc7ffe11qy31wyReWc2O/timeline-parts",
+      "/session/ses_ef51dddc7ffe11qy31wyReWc2O/timeline-parts"
+    ],
+    "keyedFetch": false,
+    "partReads": 0,
+    "partDetailReads": 0,
+    "timelinePartReads": [
+      "/session/ses_ef51dddc7ffe11qy31wyReWc2O/timeline-parts",
+      "/session/ses_ef51dddc7ffe11qy31wyReWc2O/timeline-parts",
+      "/session/ses_ef51dddc7ffe11qy31wyReWc2O/timeline-parts"
+    ],
+    "timelineRecoveryElapsedMs": 27.200000047683716,
+    "recoveredPartCount": 1200,
+    "timelinePartContentComplete": true,
+    "omittedRowVisible": false,
+    "composerUsableAfterDetail": true,
+    "omittedParts": 1136,
+    "composerMounted": true,
+    "rendererErrors": [],
+    "consoleErrors": []
+  },
+  "ownerEvents": [],
+  "rendererErrors": [],
+  "consoleErrors": [],
+  "maxLongAnimationFrameMs": 161
+}

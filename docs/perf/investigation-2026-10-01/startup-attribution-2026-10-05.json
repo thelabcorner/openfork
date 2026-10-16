@@ -1,0 +1,201 @@
+{
+  "schemaVersion": 1,
+  "sourceEvidence": "packages/desktop/test/.fg-0befadf6-inACTM/evidence.json",
+  "sourceFingerprint": "34ddc3d4aeeb61bda53806d84e60254a42f44fa5f928c8efd9b0d14166d63979",
+  "sourceFingerprintAfterRun": "34ddc3d4aeeb61bda53806d84e60254a42f44fa5f928c8efd9b0d14166d63979",
+  "validationScope": "Private source-built Electron application; instrumented startup module timings and V8 CPU samples",
+  "sampleCount": 6079,
+  "samplingIntervalUs": 2000,
+  "profileAvailable": true,
+  "topModuleEvaluation": [
+    {
+      "id": "test/full-app-startup-gate/main.tsx",
+      "startedAt": 5258.5,
+      "durationMs": 52.299999952316284
+    },
+    {
+      "id": "dependency/@internationalized/number/dist/private/NumberFormatter.mjs",
+      "startedAt": 5222.199999928474,
+      "durationMs": 6.100000023841858
+    },
+    {
+      "id": "vite-cache/deps/chunk-K7LISDII.js",
+      "startedAt": 6980.299999952316,
+      "durationMs": 1.600000023841858
+    },
+    {
+      "id": "dependency/vite/dist/client/client.mjs",
+      "startedAt": 447.6999999284744,
+      "durationMs": 1.5
+    },
+    {
+      "id": "dependency/@kobalte/core/dist/chunk/LR7LBJN3.jsx",
+      "startedAt": 5228.299999952316,
+      "durationMs": 1.100000023841858
+    },
+    {
+      "id": "vite-cache/deps/luxon.js",
+      "startedAt": 8900,
+      "durationMs": 1.100000023841858
+    },
+    {
+      "id": "dependency/solid-sonner/dist/dev.jsx",
+      "startedAt": 8478.199999928474,
+      "durationMs": 1.100000023841858
+    },
+    {
+      "id": "ui/v2/components/project-avatar-v2.tsx",
+      "startedAt": 6983.399999976158,
+      "durationMs": 0.8999999761581421
+    },
+    {
+      "id": "app/i18n/en.ts",
+      "startedAt": 5257.199999928474,
+      "durationMs": 0.7000000476837158
+    },
+    {
+      "id": "vite-cache/deps/chunk-2J7K7JUI.js",
+      "startedAt": 6982,
+      "durationMs": 0.6999999284744263
+    }
+  ],
+  "topSelfMs": [
+    {
+      "frame": ":0:(idle)",
+      "selfMs": 12230.973
+    },
+    {
+      "frame": ":0:(program)",
+      "selfMs": 1230.357
+    },
+    {
+      "frame": "oc://renderer/@fs/C:/Users/slooshied/WebstormProjects/opencode/packages/ui/src/components/scroll-view.tsx:123:updateThumb",
+      "selfMs": 33.111
+    },
+    {
+      "frame": "oc://renderer/main.tsx:904:",
+      "selfMs": 23.718
+    },
+    {
+      "frame": "oc://renderer/@fs/C:/Users/slooshied/WebstormProjects/opencode/packages/desktop/test/.fg-0befadf6-inACTM/vite-cache/deps/chunk-2BHOIBII.js?v=08522f7d:730:runComputation",
+      "selfMs": 15.631
+    },
+    {
+      "frame": "oc://renderer/@fs/C:/Users/slooshied/WebstormProjects/opencode/packages/sdk/js/src/v2/gen/client/utils.gen.ts:125:headersEntries",
+      "selfMs": 13.827
+    },
+    {
+      "frame": "oc://renderer/main.tsx:445:authenticatedFetch",
+      "selfMs": 11.14
+    },
+    {
+      "frame": "oc://renderer/@fs/C:/Users/slooshied/WebstormProjects/opencode/packages/desktop/test/.fg-0befadf6-inACTM/vite-cache/deps/chunk-YOV2HKIQ.js?v=08522f7d:44:unwrap",
+      "selfMs": 10.212
+    },
+    {
+      "frame": "oc://renderer/@vite/client:1060:updateStyle",
+      "selfMs": 8.471
+    },
+    {
+      "frame": ":0:(garbage collector)",
+      "selfMs": 8.322
+    },
+    {
+      "frame": ":0:appendChild",
+      "selfMs": 8.291
+    },
+    {
+      "frame": "oc://renderer/main.tsx:326:sampleFrame",
+      "selfMs": 6.815
+    }
+  ],
+  "longAnimationFrameTrace": [
+    {
+      "scenario": "startup",
+      "startTime": 59.5,
+      "duration": 77.29999995231628,
+      "blockingDuration": 0,
+      "renderStart": 136.29999995231628,
+      "styleAndLayoutStart": 136.29999995231628,
+      "scripts": []
+    },
+    {
+      "scenario": "startup",
+      "startTime": 5210.199999928474,
+      "duration": 117.5,
+      "blockingDuration": 67.39,
+      "renderStart": 5326.699999928474,
+      "styleAndLayoutStart": 5327.5,
+      "scripts": []
+    },
+    {
+      "scenario": "startup",
+      "startTime": 6966.5,
+      "duration": 65.5,
+      "blockingDuration": 2.945,
+      "renderStart": 7010.799999952316,
+      "styleAndLayoutStart": 7031.100000023842,
+      "scripts": []
+    },
+    {
+      "scenario": "startup",
+      "startTime": 20200.5,
+      "duration": 75.69999992847443,
+      "blockingDuration": 17.018,
+      "renderStart": 20276,
+      "styleAndLayoutStart": 20276.199999928474,
+      "scripts": []
+    },
+    {
+      "scenario": "startup",
+      "startTime": 22513,
+      "duration": 72.60000002384186,
+      "blockingDuration": 22.321,
+      "renderStart": 22585.399999976158,
+      "styleAndLayoutStart": 22585.600000023842,
+      "scripts": []
+    },
+    {
+      "scenario": "startup",
+      "startTime": 30151.5,
+      "duration": 155.39999997615814,
+      "blockingDuration": 96.072,
+      "renderStart": 30271,
+      "styleAndLayoutStart": 30306,
+      "scripts": []
+    },
+    {
+      "scenario": "history-seed",
+      "startTime": 33539.199999928474,
+      "duration": 50.300000071525574,
+      "blockingDuration": 0,
+      "renderStart": 33589.10000002384,
+      "styleAndLayoutStart": 33589.39999997616,
+      "scripts": []
+    },
+    {
+      "scenario": "history-seed",
+      "startTime": 47716.799999952316,
+      "duration": 54.60000002384186,
+      "blockingDuration": 0,
+      "renderStart": 47768.299999952316,
+      "styleAndLayoutStart": 47770.60000002384,
+      "scripts": []
+    },
+    {
+      "scenario": "history-seed",
+      "startTime": 58298.89999997616,
+      "duration": 50.89999997615814,
+      "blockingDuration": 0,
+      "renderStart": 58344.5,
+      "styleAndLayoutStart": 58348.39999997616,
+      "scripts": []
+    }
+  ],
+  "limitations": [
+    "Instrumented development module graph and diagnostic entrypoint are not packaged startup.",
+    "The 100.5 ms module-evaluation task and 32.8 ms forced layout are startup trace findings, not proof of the owner of later activation frames.",
+    "No production patch follows from cumulative sampling alone.",
+    "The running development app and unrelated workers were not restarted."
+  ]
+}

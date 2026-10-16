@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "sourceEvidence": "packages/desktop/test/.fg-dae1cbb8-HZpETR/evidence.json",
+  "sourceFingerprint": "5419b85b22213a034c21431f72e74d1bd8ffc6af38a89629c1d8de3ed6e1ac57",
+  "sourceFingerprintAfterRun": "5419b85b22213a034c21431f72e74d1bd8ffc6af38a89629c1d8de3ed6e1ac57",
+  "assertions": 137,
+  "newSession": {
+    "completePageRequestedOnEntry": true,
+    "fastInputUsableMs": 27.300000071525574,
+    "composerUsableMs": 2232,
+    "modules": [
+      "draft-route.tsx",
+      "new-session.tsx",
+      "new-session-enhanced.tsx"
+    ]
+  },
+  "streams": [
+    {
+      "count": 1,
+      "admissionMs": 15.600000023841858,
+      "selectedTailMs": 0.3999999761581421,
+      "idleConvergenceMs": 116.30000007152557
+    },
+    {
+      "count": 3,
+      "admissionMs": 54.10000002384186,
+      "selectedTailMs": 119.60000002384186,
+      "idleConvergenceMs": 4.799999952316284
+    },
+    {
+      "count": 6,
+      "admissionMs": 148,
+      "selectedTailMs": 261.3000000715256,
+      "idleConvergenceMs": 28.09999990463257
+    }
+  ],
+  "reasoningStop": {
+    "visibleChunkLagMs": 144,
+    "clickToInterruptAckMs": 75,
+    "backgroundLiveAtStop": 5,
+    "selectedProviderClosedMs": 12
+  },
+  "runningToolOutput": {
+    "chars": 96043,
+    "completeWhileRunning": true,
+    "elapsedMs": 172.5,
+    "historyReadDelta": 0
+  },
+  "eventGapRepair": {
+    "historyReads": 1,
+    "sseOpenDelta": 1,
+    "sessionIdleBeforeStreamRelease": true,
+    "promptVisible": true,
+    "assistantTailVisible": true
+  },
+  "frames": {
+    "longAnimationFrames": 27,
+    "maxLongAnimationFrameMs": 138,
+    "maxFrameGapMs": 95.20000004768372
+  },
+  "errors": {
+    "renderer": [],
+    "console": []
+  },
+  "limitations": [
+    "Single run; latency differences are not a stable percentage guarantee.",
+    "Broad workload still has long animation frames; startup and packaged/live delivery remain open.",
+    "Private fixture processes only; no running user app/server restarted; no OXP calls."
+  ]
+}

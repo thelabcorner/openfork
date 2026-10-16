@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "sourceEvidence": "packages/desktop/test/.fg-6bb9d3d2-tJFmBy/evidence.json",
+  "sourceFingerprint": "a47ea8a46d68358072ef32c00c74136ece8ef2f14caa1b0aba8a23bb7630d276",
+  "sourceFingerprintAfterRun": "a47ea8a46d68358072ef32c00c74136ece8ef2f14caa1b0aba8a23bb7630d276",
+  "assertions": 134,
+  "draftControllerHashBeforePatch": "b8d4aabdc35cdb591855736d3181a45593e705489457583e054f89e5ef5883a6",
+  "loadedDraftModules": [
+    "draft-route.tsx",
+    "new-session.tsx",
+    "session-composer-region.tsx",
+    "session-composer-state.ts",
+    "session-composer-region-controller.ts",
+    "new-session-enhanced.tsx"
+  ],
+  "routeModuleMarks": [
+    {
+      "name": "draft-route.tsx",
+      "startTime": 7496.600000023842
+    },
+    {
+      "name": "new-session-import-start",
+      "startTime": 7507.100000023842
+    },
+    {
+      "name": "new-session-import-resolved",
+      "startTime": 7547.200000047684
+    },
+    {
+      "name": "new-session.tsx",
+      "startTime": 7547
+    },
+    {
+      "name": "new-session-enhanced-import-start",
+      "startTime": 7558.600000023842
+    },
+    {
+      "name": "new-session-enhanced-import-resolved",
+      "startTime": 9482.700000047684
+    },
+    {
+      "name": "new-session-enhanced.tsx",
+      "startTime": 9482.700000047684
+    }
+  ],
+  "composerUsableMs": 2506.3000000715256,
+  "fastInputMs": 42.60000002384186,
+  "limitations": [
+    "Private source-built development renderer, not packaged startup.",
+    "The gate holds enhancement until it verifies the basic editor, then releases it immediately.",
+    "Import timings are wall-clock module graph loading, not isolated CPU service time."
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "scenario": "Four interactive jobs occupy noncritical capacity; visible stream interest cannot use critical reserve",
+  "criticalStarted": true,
+  "streamStartedBeforeCatalogRelease": false,
+  "queuedInteractive": 1,
+  "streamStartedAfterRelease": true
+}

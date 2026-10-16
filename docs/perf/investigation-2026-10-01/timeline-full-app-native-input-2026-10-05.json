@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "sourceEvidence": "packages/desktop/test/.fg-bec42625-ADZD5i/evidence.json",
+  "sourceFingerprint": "655f52a1a31b7c9f79b720fb3747723266ea6c149b279e75dd412ab20cf9e42a",
+  "sourceFingerprintAfterRun": "655f52a1a31b7c9f79b720fb3747723266ea6c149b279e75dd412ab20cf9e42a",
+  "assertions": 134,
+  "validationScope": "Source-built private Electron application, native Node sidecar, V1 mock-provider streams; native tool-accordion click with reducer-injected running part",
+  "scenarios": [
+    {
+      "count": 1,
+      "admissionMs": 38.90000009536743,
+      "selectedTailMs": 0.7999999523162842
+    },
+    {
+      "count": 3,
+      "admissionMs": 67,
+      "selectedTailMs": 79.79999995231628
+    },
+    {
+      "count": 6,
+      "admissionMs": 100.10000002384186,
+      "selectedTailMs": 197.30000007152557
+    }
+  ],
+  "reasoningFirstPaintMs": 150,
+  "interruptAckMs": 82,
+  "providerClosedMs": 13,
+  "runningToolOutput": {
+    "chars": 96043,
+    "completeWhileRunning": true,
+    "elapsedMs": 163.69999992847443,
+    "historyReadDelta": 0
+  },
+  "gapHistoryReads": 1,
+  "gapFrames": 1,
+  "gapSseReopens": 1,
+  "rendererErrors": [],
+  "consoleErrors": [],
+  "maxLongAnimationFrameMs": 148.09999990463257,
+  "limitations": [
+    "Packaged startup and live deployment are unmeasured.",
+    "Broad-workload long frames remain above a frame budget.",
+    "The running-tool probe validates the presentation contract, not a shell process.",
+    "An earlier reasoning-only replay race remains separately recorded in the ledger."
+  ],
+  "longAnimationFrameTrace": [
+    {
+      "scenario": "startup",
+      "startTime": 54.299999952316284,
+      "duration": 68.90000009536743,
+      "blockingDuration": 0,
+      "renderStart": 122.89999997615814,
+      "styleAndLayoutStart": 122.89999997615814,
+      "scripts": []
+    },
+    {
+      "scenario": "startup",
+      "startTime": 4925.700000047684,
+      "duration": 148.09999990463257,
+      "blockingDuration": 98.117,
+      "renderStart": 5073.299999952316,
+      "styleAndLayoutStart": 5073.700000047684,
+      "scripts": []
+    },
+    {
+      "scenario": "startup",
+      "startTime": 10432.700000047684,
+      "duration": 53.299999952316284,
+      "blockingDuration": 0,
+      "renderStart": 10485.799999952316,
+      "styleAndLayoutStart": 10486,
+      "scripts": []
+    },
+    {
+      "scenario": "startup",
+      "startTime": 15896.100000023842,
+      "duration": 112.79999995231628,
+      "blockingDuration": 60.198,
+      "renderStart": 15989.200000047684,
+      "styleAndLayoutStart": 16008,
+      "scripts": []
+    },
+    {
+      "scenario": "history-seed",
+      "startTime": 23320.200000047684,
+      "duration": 51.5,
+      "blockingDuration": 0,
+      "renderStart": 23368.200000047684,
+      "styleAndLayoutStart": 23370.600000023842,
+      "scripts": []
+    }
+  ],
+  "defaultInvocation": true,
+  "gapCompletionBarrier": {
+    "sessionIdleBeforeStreamRelease": true,
+    "completionWaitMs": 96.60000002384186
+  },
+  "draftFirstEditorMs": 18.100000023841858,
+  "draftFullComposerMs": 3903.399999976158
+}
