@@ -322,7 +322,11 @@ export class RuntimeArtifactStore {
         continue
       }
       const pid = this.lockPid(current)
-      if (pid === undefined || !this.processAlive(pid)) {
+      if (
+        pid === undefined ||
+        !this.processAlive(pid) ||
+        (current.startsWith("trial:") && (await this.expiredTrialLock()))
+      ) {
         await fs.rm(this.lockFile, { force: true }).catch(() => undefined)
         continue
       }
@@ -332,6 +336,15 @@ export class RuntimeArtifactStore {
       "busy",
       "A live OXP runtime artifact build did not release its lock before startup recovery timed out.",
     )
+  }
+
+  private async expiredTrialLock() {
+    try {
+      const info = await fs.stat(this.lockFile)
+      return Date.now() - info.mtimeMs > 2 * 60_000
+    } catch {
+      return true
+    }
   }
 
   async recoverAccepted() {

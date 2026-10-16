@@ -6,6 +6,7 @@ import {
   describeNetworkError,
   isAuthFailure,
   isUnreachableError,
+  pollFailureKind,
   outageConfirmed,
   outageRecovered,
   parseLoopbackHealthUrl,
@@ -35,13 +36,14 @@ describe("OXP OpenAI tunnel contract", () => {
   test("distinguishes fresh remote route proof from a sustained network outage", () => {
     const now = 1_000_000
     expect(routeObservation(now - 10_000, null, NO_OUTAGE, now)).toBe("connected")
-    // A readable zero means the tunnel client has completed its first poll
-    // cycle even before it has a successful timestamp; the standalone oracle
-    // treats that as locally/route ready rather than an indeterminate failure.
-    expect(routeObservation(0, null, NO_OUTAGE, now)).toBe("connected")
+    expect(routeObservation(0, null, NO_OUTAGE, now)).toBe("unknown")
+    expect(routeObservation(now - 200_000, null, NO_OUTAGE, now)).toBe("offline")
     expect(routeObservation(now - 200_000, now - 200_000, NO_OUTAGE, now)).toBe("offline")
-    expect(routeObservation(now - 200_000, null, { since: now - 40_000, handshakeBefore: now - 200_000 }, now)).toBe("offline")
+    expect(routeObservation(now - 200_000, null, { since: now - 40_000, handshakeBefore: now - 200_000 }, now)).toBe(
+      "offline",
+    )
     expect(routeObservation(null, now - 1_000, NO_OUTAGE, now)).toBe("unknown")
+    expect(routeObservation(null, null, { since: now - 40_000, handshakeBefore: null }, now)).toBe("offline")
   })
 
   test("requires a sustained outage and clears it only after a newer completed poll", () => {
@@ -50,7 +52,11 @@ describe("OXP OpenAI tunnel contract", () => {
     expect(outageConfirmed(run, now)).toBe(false)
     expect(outageConfirmed({ ...run, since: now - 36_000 }, now)).toBe(true)
     expect(outageRecovered(run, now - 80_000)).toBe(false)
-    expect(outageRecovered(run, now - 79_999)).toBe(true)
+    expect(outageRecovered(run, now - 79_999)).toBe(false)
+    expect(outageRecovered(run, now - 33_999)).toBe(true)
+    expect(outageRecovered({ ...run, lastFailureAt: now - 1_000 }, now - 2_000)).toBe(false)
+    expect(outageRecovered({ ...run, lastFailureAt: now - 1_000 }, now)).toBe(true)
+    expect(outageRecovered({ since: now - 10_000, handshakeBefore: null }, now - 11_000)).toBe(false)
     expect(outageRecovered({ since: now - 10_000, handshakeBefore: null }, now - 1_000)).toBe(true)
   })
 
@@ -60,6 +66,21 @@ describe("OXP OpenAI tunnel contract", () => {
     expect(isUnreachableError("mcp probe failed: i/o timeout")).toBe(false)
     expect(describeNetworkError("poll failed: no such host")).toBe("no internet connection")
     expect(describeNetworkError("poll failed: connection reset")).toBe("the connection dropped")
+  })
+
+  test("classifies retryable remote poll errors without absorbing tool, auth or configuration failures", () => {
+    const poll = "poll failed; backing off: controlplane client: unexpected status "
+    for (const status of [500, 502, 503, 504]) expect(pollFailureKind(`${poll}${status}`)).toBe("service")
+    expect(
+      pollFailureKind(
+        `${poll}503: tunnel_transport_unavailable: Tunnel transport temporarily unavailable; retry the request`,
+      ),
+    ).toBe("service")
+    expect(pollFailureKind(`${poll}429: rate_limit_exceeded`)).toBe("rate-limit")
+    expect(pollFailureKind("poll timed out; backing off: dial tcp: i/o timeout")).toBe("network")
+    for (const status of [400, 401, 403, 404, 409]) expect(pollFailureKind(`${poll}${status}`)).toBeNull()
+    expect(pollFailureKind("MCP upstream returned HTTP 503")).toBeNull()
+    expect(pollFailureKind("response post failed: HTTP 503")).toBeNull()
   })
 
   test("treats credential/tunnel authorization failures as terminal and bounds restart backoff", () => {
@@ -75,10 +96,10 @@ describe("OXP OpenAI tunnel contract", () => {
   test("redacts both connector credentials and secret loopback routes from child diagnostics", () => {
     const apiKey = "sk-should-never-leak"
     const localUrl = "http://127.0.0.1:4567/mcp/secret-route"
-    const text = redactTunnelText(
-      `WARN request failed apiKey=${apiKey} MCP_SERVER_URL=url=${localUrl},channel=main`,
-      [apiKey, localUrl],
-    )
+    const text = redactTunnelText(`WARN request failed apiKey=${apiKey} MCP_SERVER_URL=url=${localUrl},channel=main`, [
+      apiKey,
+      localUrl,
+    ])
     expect(text).not.toContain(apiKey)
     expect(text).not.toContain(localUrl)
     expect(text.match(/\[REDACTED\]/g)?.length).toBe(2)

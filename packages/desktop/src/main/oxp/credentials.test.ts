@@ -96,6 +96,21 @@ describe("OXP secure credential storage", () => {
     expect(await store.getOpenAiApiKey()).toBe("canonical")
   })
 
+  test("stores Cloudflare tunnel credentials and its public route token under separate secure keys", async () => {
+    const dir = await temp()
+    const storage = codec()
+    const store = new OxpCredentialStore(dir, storage, "win32")
+    expect(await store.getStoredCloudflareRouteToken()).toBeNull()
+    await store.setCloudflareTunnelToken("cf-secret-token")
+    const routeToken = await store.getCloudflareRouteToken()
+    expect(routeToken).toMatch(/^[A-Za-z0-9_-]{40,}$/)
+    expect(await store.getCloudflareTunnelToken()).toBe("cf-secret-token")
+    expect(await store.getStoredCloudflareRouteToken()).toBe(routeToken)
+    const ciphertext = await fs.readFile(path.join(dir, "oxp-secrets.bin"))
+    const persisted = await storage.decryptStringAsync(ciphertext)
+    expect(JSON.parse(persisted.result)).toMatchObject({ cloudflareTunnelToken: "cf-secret-token", cloudflareRouteToken: routeToken })
+  })
+
   test("purges the rejected generic credential registry while preserving the purpose-specific OpenAI key", async () => {
     const dir = await temp()
     const storage = codec()

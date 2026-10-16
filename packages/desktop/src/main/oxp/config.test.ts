@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
-import { OxpDesktopConfigStore, isValidTunnelID } from "./config"
+import { OxpDesktopConfigStore, isValidCloudflareHostname, isValidTunnelID } from "./config"
 
 const roots: string[] = []
 afterEach(async () => {
@@ -25,6 +25,8 @@ describe("OXP desktop config", () => {
     expect(value.get()).toEqual({
       version: 1,
       tunnelID: "",
+      cloudflareHostname: "",
+      cloudflareAutoConnect: false,
       lifecycle: { autoConnect: false, launchAtLogin: false, startHidden: false, closeToTray: false },
       migration: {},
     })
@@ -49,6 +51,19 @@ describe("OXP desktop config", () => {
     await expect(value.setTunnelID("not-a-tunnel")).rejects.toThrow(/Tunnel ID/)
   })
 
+  test("persists the public Cloudflare hostname and backup auto-connect preference", async () => {
+    const { root, value } = await store()
+    expect(isValidCloudflareHostname("mcp.example.com")).toBe(true)
+    expect(isValidCloudflareHostname("https://mcp.example.com/path")).toBe(false)
+    await value.setCloudflareHostname("MCP.Example.com")
+    await value.setCloudflareAutoConnect(true)
+    const reloaded = new OxpDesktopConfigStore(root)
+    await reloaded.initialize()
+    expect(reloaded.get().cloudflareHostname).toBe("mcp.example.com")
+    expect(reloaded.get().cloudflareAutoConnect).toBe(true)
+    await expect(value.setCloudflareHostname("bad host")).rejects.toThrow(/hostname/i)
+  })
+
   test("serializes the full read-modify-write transaction for concurrent settings changes", async () => {
     const { value } = await store()
     const tunnelID = `tunnel_${"b".repeat(32)}`
@@ -60,6 +75,8 @@ describe("OXP desktop config", () => {
     expect(value.get()).toEqual({
       version: 1,
       tunnelID,
+      cloudflareHostname: "",
+      cloudflareAutoConnect: false,
       lifecycle: { autoConnect: true, launchAtLogin: false, startHidden: false, closeToTray: true },
       migration: {},
     })
