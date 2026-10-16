@@ -1,10 +1,20 @@
 import * as GeneralUsage from "../src/capacity/general-usage"
-import { observeYieldStatistic, type YieldStatisticState } from "@opencode-ai/core/usage/yield-statistics"
+import { observeYieldStatistic, snapshotYieldStatistic, type YieldStatisticState } from "@opencode-ai/core/usage/yield-statistics"
 import type { UsageYield } from "@opencode-ai/core/usage/yield"
+import { pathToFileURL } from "node:url"
+import { resolve } from "node:path"
 
 const sizes = [100, 500, 8_000] as const
 const iterations = 20
 const warmups = 3
+// Point this to a temporary reference implementation for local A/B comparison.
+// Production does not depend on any reference module.
+const reference: typeof GeneralUsage | undefined = process.env.GENERAL_USAGE_REFERENCE
+  ? await import(pathToFileURL(resolve(process.env.GENERAL_USAGE_REFERENCE)).href)
+  : undefined
+const implementations = reference
+  ? ([{ name: "reference", build: reference.build }, { name: "optimized", build: GeneralUsage.build }] as const)
+  : ([{ name: "optimized", build: GeneralUsage.build }] as const)
 
 function stateFor(seed: number): YieldStatisticState {
   let state: YieldStatisticState | undefined
@@ -42,29 +52,53 @@ function percentile(sorted: readonly number[], q: number) {
 }
 
 for (const size of sizes) {
-  const input = entries(size)
-  for (let index = 0; index < warmups; index++) GeneralUsage.build(input)
+  const raw = entries(size)
+  // Core UsageYield.list() returns snapshotYieldStatistic(row.state), so this
+  // represents the real Capacity.general input; raw states remain a useful
+  // independent benchmark of the pure builder API.
+  for (const [stateKind, input] of [
+    ["raw", raw],
+    ["finalized", raw.map((entry) => ({ ...entry, state: snapshotYieldStatistic(entry.state) }))],
+  ] as const) {
+    const records = implementations.map((implementation) => ({
+      implementation,
+      samples: [] as number[],
+      snapshot: undefined as GeneralUsage.Snapshot | undefined,
+    }))
+    for (let index = 0; index < warmups; index++) {
+      for (const record of records) record.implementation.build(input)
+    }
+    for (let index = 0; index < iterations; index++) {
+      // Alternate ordering so one implementation cannot always benefit from
+      // the other one's warm caches or suffer first-in-iteration GC pressure.
+      const order = index % 2 === 0 ? records : [...records].reverse()
+      for (const record of order) {
+        const started = performance.now()
+        record.snapshot = record.implementation.build(input)
+        record.samples.push(performance.now() - started)
+      }
+    }
+    if (records.length === 2 && JSON.stringify(records[0]!.snapshot) !== JSON.stringify(records[1]!.snapshot))
+      throw new Error(`general-usage output mismatch for ${size} scopes (${stateKind})`)
 
-  const samples: number[] = []
-  let snapshot!: GeneralUsage.Snapshot
-  for (let index = 0; index < iterations; index++) {
-    const started = performance.now()
-    snapshot = GeneralUsage.build(input)
-    samples.push(performance.now() - started)
+    for (const record of records) {
+      record.samples.sort((left, right) => left - right)
+      const snapshot = record.snapshot!
+      console.log(
+        JSON.stringify({
+          implementation: record.implementation.name,
+          stateKind,
+          modelScopes: size,
+          medianMs: percentile(record.samples, 0.5),
+          p95Ms: percentile(record.samples, 0.95),
+          minMs: record.samples[0],
+          maxMs: record.samples.at(-1),
+          wireBytes: Buffer.byteLength(JSON.stringify(snapshot)),
+          directModels: snapshot.models.length,
+          corpusSize: snapshot.corpus.length,
+          source: snapshot.source,
+        }),
+      )
+    }
   }
-  samples.sort((left, right) => left - right)
-
-  console.log(
-    JSON.stringify({
-      modelScopes: size,
-      medianMs: percentile(samples, 0.5),
-      p95Ms: percentile(samples, 0.95),
-      minMs: samples[0],
-      maxMs: samples.at(-1),
-      wireBytes: Buffer.byteLength(JSON.stringify(snapshot)),
-      directModels: snapshot.models.length,
-      corpusSize: snapshot.corpus.length,
-      source: snapshot.source,
-    }),
-  )
 }
