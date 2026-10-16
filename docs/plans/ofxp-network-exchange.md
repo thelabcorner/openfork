@@ -564,6 +564,7 @@ PeerGrant {
   git
   integrations
   browser
+  code
   filesReceive
   filesSend
   automation
@@ -581,6 +582,11 @@ PeerGrant {
 ~~~
 
 The exact persisted shape may normalize these into multiple tables. The semantic rule is what matters.
+
+`code` is an independent default-off, rootless peer authority for stateless
+`search | describe | run` orchestration only. It grants no leaf authority and
+no native Session durability: every generated leaf must still pass the ordinary
+capability/root policy, while replay/save/saved-call ownership remains native/ACP.
 
 Grant changes are operator-owned and revisioned.
 

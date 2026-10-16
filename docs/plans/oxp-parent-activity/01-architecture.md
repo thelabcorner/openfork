@@ -39,8 +39,9 @@ workspace/runtime dependency.
 ```text
 HTTP OXP call
    |
-   +-- correlation pseudonymizer
+   +-- optional activity correlation pseudonymizer
    |      raw correlation exists only transiently
+   |      failure cannot block ordinary OXP operations
    |
    +-- OxpParentActivity.observeParent(...)
    |
@@ -60,6 +61,13 @@ owners must not depend on activity-history persistence.
 If activity recording fails, OXP operation correctness/authority must remain
 truthful. Observability failure may be surfaced diagnostically, but must not
 retroactively redefine whether the operation committed.
+
+Conversation pseudonymization is also capability-scoped. Only an operation whose
+authorization contract needs a stable ChatGPT conversation principal (currently
+the browser capability) may require the HMAC digest. Other OXP calls must not
+read that key or wait for its availability. A browser binding failure is a typed
+OXP tool error, and no unexpected exception may escape the MCP `tools/call`
+boundary as JSON-RPC `-32603`.
 
 ## 4. Epoch relationship
 

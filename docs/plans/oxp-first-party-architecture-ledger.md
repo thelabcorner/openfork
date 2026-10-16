@@ -758,7 +758,7 @@ The current four-tool OpenCode Control experiment is cache-friendly, but OXP sho
 Preserve and re-evaluate the current action inventory:
 
 - **info/discovery**: status, capabilities, providers, models, agents, limits, usage;
-- **session supervision**: list, get, messages, children, selection, set_selection, send/turn where explicitly authorized, pause, resume, abort, background_subagents;
+- **session supervision**: list, get, messages, children, selection, set_selection, steer/send/turn where explicitly authorized, pause, resume, abort, background_subagents; `steer` is durable safe-boundary guidance, `send` durably queues/wakes without waiting for execution, and `turn` durably queues then waits for that exact turn;
 - **worker delegation**: model_policy, set_default_model, clear_default_model, start/list/get/wait/result/continue/cancel, grouped worker operations. `set_default_model` / `clear_default_model` are user-directed preference mutations: the external agent may call them when the user explicitly asks, but must never autonomously rewrite the user's default as an optimization decision;
 - **request supervision**: list, reply_permission, answer_question, reject_question.
 
@@ -1477,7 +1477,7 @@ This section records the first source-level pass. It is deliberately stricter th
 | external MCP | localMCP plugin manager + integration list/inspect/call | MCP.Service + mcp/catalog.ts + existing lazy tool broker | Direct domain reuse + OXP projection | Do not port the standalone MCP child/plugin runtime. Reuse OpenFork clients/OAuth/resources/prompts and publish them through a stable progressive OXP gateway. |
 | lazy capability broker | localMCP integration tool | tool/access.ts + SessionTools.catalog concepts | Extract protocol-neutral catalog/broker | OpenFork already has the exact stable list/describe/call pattern. Current implementation calls Tool.Def with Tool.Context; OXP needs a broker over OXP-safe capability definitions, not arbitrary agent tools by default. |
 | Session info/history | OpenCode Control backend HTTP/SSE | Session.Service + durable database/read projections | **Supervision projection** | Eliminate same-machine discovery/pairing/HTTP hop. Filter every target Session through OXP supervision grant + approved-root authority. Reading it does not make ChatGPT that Session's resident agent. |
-| Session send/turn/pause/resume/abort | OpenCode Control opencode_session | SessionPrompt.Service + SessionRunState/SessionStatus + Session.Service | **Supervision projection with external provenance admission** | OXP-issued Session actions need actor=external OXP principal + target=native Session provenance. Do not inject them as ordinary human turns or resident-model tool emissions. |
+| Session steer/send/turn/pause/resume/abort | OpenCode Control opencode_session | SessionPrompt.Service + durable SessionInput + SessionRunState/SessionStatus + Session.Service | **Supervision projection with external provenance admission** | OXP-issued Session actions need actor=external OXP principal + target=native Session provenance. `steer` is durable safe-boundary guidance; `send` is a durable queued turn whose success proves admission, not execution; `turn` fences completion to the exact admitted turn. Do not inject them as ordinary human turns or resident-model tool emissions. |
 | Worker/group start/wait/continue/cancel | OpenCode Control opencode_worker + plugin ownership groups | SessionPrompt dispatch + SessionGroup + BackgroundJob + Session metadata/provenance | **Delegation projection** after policy convergence | Creates/drives subordinate OpenFork Sessions. Preserve durable recovery, user-authorized model/agent selection, nested-delegation policy, and causal lineage. Rename LocalMCP swarm semantics to worker groups/batches; do not conflate with OpenSwarm. |
 | Permission/Question mediation | OpenCode Control opencode_request | Permission.Service + Question.Service | **Supervision projection** | OXP only exposes requests belonging to authorized target Sessions. Replying is an external supervisory action and must never be attributed to the resident agent. |
 
@@ -1895,6 +1895,7 @@ Suggested v0 grant:
       git: boolean
       integrations: boolean
       browser: boolean
+      code: boolean
       filesReceive: boolean
       filesSend: boolean
       automation: boolean
@@ -1921,6 +1922,7 @@ Notes:
 - filesReceive requires write at execution time but remains a distinct remote-ingress grant;
 - automation is a distinct default-off grant for durable future execution; read/write/process authority does not imply it;
 - browser should default off until its separate external-control threat model is closed.
+- code is a separate default-off, rootless augmentation grant for the confined stateless Code interpreter only; every generated leaf re-enters its ordinary authority owner, so code never implies read/write/process/git/integrations/browser authority, and native Session replay/save/call durability remains native/ACP-owned (see `docs/architecture/code-mode.md`).
 
 ### 28.4 Effective authority
 
@@ -3623,7 +3625,7 @@ Tests must prove:
 - supervision list cannot reveal Sessions outside approved roots/policy;
 - direct SessionID for an unauthorized target rejects even if the ID exists;
 - fork/child Session location authority is evaluated from durable Session truth, not caller metadata;
-- a supervisory send/turn/pause/resume/abort is attributed to the external OXP actor targeting the Session, never to its resident agent;
+- a supervisory steer/send/turn/pause/resume/abort is attributed to the external OXP actor targeting the Session, never to its resident agent; `send` admission alone must never be interpreted as execution, while `turn` must fence the exact admitted turn;
 - public MCP input cannot forge OXP external-agent or human provenance;
 - delegated worker model/agent choice obeys exact user-authorized policy;
 - worker creation is impossible when delegation is disabled;
@@ -4014,6 +4016,8 @@ closeout must additionally prove:
 Do not call OXP a standalone LocalMCP replacement until all replacement blockers pass.
 
 **Gate N local continuity implementation/certification (2026-09-19): complete; installed ChatGPT/packaged soak remains before final close.** The common OXP HTTP/MCP boundary now owns one bounded process-local `OxpParentToolEpochTracker`. It prefers the documented tool-call `_meta["openai/session"]` conversation identifier; a bounded `Mcp-Session-Id` is accepted only as handshake-era/unspecified-protocol compatibility correlation with unknown scope. The correlation policy refuses that fallback for explicitly declared MCP `2026-07-28` or later; the v2 OXP ingress now serves that modern era directly and receives per-request metadata through the SDK handler context. `openai/subject` is never used as conversation identity. Raw values are hashed before tracker storage and HMAC-pseudonymized before durable Core activity state. The tracker holds at most 256 parents, runs no timer, and refuses to infer identity from sockets, tunnel processes, request IDs, connector identity, native Session identity, or user identity. Calls within an observed epoch update activity only; the first call at/after 20 minutes receives the durable-worker handoff notice; the next successful call at/after 25 minutes starts a fresh observed epoch.
+
+Conversation correlation is optional at the tool boundary. Only browser capability calls bind the local browser principal to the ChatGPT conversation; status, discovery, repository, process, Session, and other calls must continue when activity-key pseudonymization is unavailable. Activity recording remains best-effort and cannot turn an unrelated tool operation into an MCP internal error.
 
 The continuity decorator is applied to both success and error results. Worker start/continue/batch-start/batch-continue establish durable-continuation evidence even when the external caller receives a post-commit error whose metadata truthfully says `committed=true`; a pre-commit denial does not. This preserves Gate-J commit truth and prevents the near-expiry advisory from suggesting duplicate delegation after a worker already became durable.
 
@@ -4481,4 +4485,22 @@ Review questions:
 - Is every durable config write atomic and serialized?
 - Did we create a generic abstraction wider than OXP actually needs?
 
+### October 4 MCP boundary: optional conversation correlation
+
+Ordinary MCP tool calls must not depend on the local conversation-pseudonymization key. ChatGPT may attach `openai/session` metadata to every invocation, but only browser operations that bind a local browser principal require a stable conversation digest. Status, capability discovery, approved-root file reads, process execution, and Session listing now skip that binding step; activity-history recording remains best-effort and cannot turn a completed operation into a connector failure. Browser binding still fails closed with a typed `OXP_DEPENDENCY_UNAVAILABLE` result if its key is unavailable.
+
+The real OXP MCP transport regression deliberately supplies a malformed activity key and verifies `openfork_info status`, capability list/describe/call, approved-root read, process execution, and Session list return normal MCP results, while browser binding returns the typed failure. `bun test test/oxp/server.test.ts` passes **14 tests / 114 assertions**. The local tunnel health endpoint also returned `ready`; that proves local tunnel readiness only, not a live ChatGPT connector invocation. The workstation's current correlation-key file has the expected 43-character encoding. Live connector confirmation remains pending because this investigation intentionally does not invoke the failing OXP connector.
+
 Only after those answers are mechanically strong should Gate B begin.
+
+### October 5 incident: runtime refresh endpoint-generation fencing
+
+The OXP bridge incident after runtime refresh had a concrete desktop handoff defect. `OxpHost` endpoint generations are module-local and restart from one when the runtime artifact is hot-imported. Electron's `OxpEndpointGenerationTracker` is sidecar-epoch-wide and correctly rejects generation rollback. The sidecar previously forwarded a refreshed runtime's local generation unchanged, so Electron could reject the new endpoint while the sidecar still acknowledged the refresh as accepted. The control-plane poll could remain healthy while MCP requests continued toward the retired loopback endpoint.
+
+The sidecar now owns an `OxpRuntimeStateProjection` for its entire process lifetime. It lifts endpoint identity changes across runtime replacement and rollback into a monotonic generation, preserves the durable config revision, and rejects late snapshots from retired hosts or older revisions within the active host. Runtime trial publication fails closed if it cannot project the state, and Electron acknowledges a trial only when an owner explicitly accepts the exact state. The projection tests cover refresh from local generation 4 to 1, rollback to the original host, stale-host publication, same-host stale state, schema changes, stopped-state projection, and direct admission through Electron's endpoint tracker. Dispatch tests prove an empty/rejecting/throwing observer set cannot acknowledge a trial. Desktop typecheck and focused generation/dispatch tests pass: **11 tests / 36 assertions**.
+
+Adjacent MCP OAuth cleanup was also corrected. Pending OAuth transports now live inside their owning MCP service layer rather than module-global state. Replacing a pending flow, failing token exchange/commit, removing auth, and disposing the service close the transport. The focused lifecycle and OAuth regressions pass: **11 tests / 39 assertions**. This leak is a real resource-lifecycle defect but is not established as the cause of the observed OXP bridge outage.
+
+Final OXP refresh/artifact/protocol/projection/dispatch regression batch passes **35 tests / 181 assertions**. The focused OAuth store + authentication tests pass **11 tests / 39 assertions**; desktop and OpenCode package typechecks report no diagnostics in the files changed for this fix. The full OpenCode package typecheck remains red on unrelated diagnostics elsewhere in the shared dirty tree.
+
+Historical OXP activity and tunnel metrics showed successful control-plane polls alongside service-level 502 responses. Runtime logs recorded candidate activation and acceptance, while OXP invocation rows stopped before that publication. This matches the source-level generation mismatch but does not prove every earlier outage had the same trigger. No live connector call was used for verification; the currently running desktop/server was left untouched.

@@ -1150,6 +1150,7 @@ type OfxpPeerGrant = {
   process: GrantMode
   integrations: GrantMode
   browser: GrantMode
+  code: GrantMode
   filesReceive: GrantMode
   filesSend: GrantMode
 
@@ -1168,6 +1169,11 @@ type GrantMode = "deny" | "allow" // "ask" may be added once remote approval flo
 The initial implementation may normalize onto OXP's existing booleans/modes if
 that is the shared owner. Do not add `ask` accidentally without defining how an
 unattended remote caller observes and resumes an approval request.
+
+`code` is independently default-off and rootless at the peer-grant layer. It
+admits only stateless external Code discovery/execution (`search | describe | run`);
+generated leaves still require their ordinary capability and root grants. OFXP
+does not fabricate native Session replay, save, or saved-call durability.
 
 ### 11.2 Root grants
 
