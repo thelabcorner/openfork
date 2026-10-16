@@ -2,19 +2,21 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { promises as fs } from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { ago, probeReady, readClientStatus, readPollHealth, type TunnelHealth } from "./tunnel-health"
+import { nativeT } from "../native-translations"
+import { ago, probeReady, readPollHealth, type TunnelHealth } from "./tunnel-health"
 import {
   NO_OUTAGE,
   boundedTunnelLineReader,
   describeNetworkError,
   isAuthFailure,
-  isUnreachableError,
+  pollFailureKind,
   outageRecovered,
   parseLoopbackHealthUrl,
   redactTunnelText,
   restartBackoffMs,
   routeObservation,
   type Outage,
+  type PollFailureKind,
 } from "./tunnel-contract"
 
 export type OxpTunnelState = "disconnected" | "starting" | "connected" | "offline" | "auth-failed" | "unavailable"
@@ -133,7 +135,10 @@ async function terminateTree(child: ChildProcess | null, timeoutMs = 6_000) {
     return child.exitCode !== null || child.signalCode !== null
   }
   try {
-    const killer = spawn("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" })
+    const killer = spawn("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
+      windowsHide: true,
+      stdio: "ignore",
+    })
     const taskkillSucceeded = await new Promise<boolean>((resolve) => {
       let done = false
       const finish = (value: boolean) => {
@@ -142,12 +147,15 @@ async function terminateTree(child: ChildProcess | null, timeoutMs = 6_000) {
         clearTimeout(timer)
         resolve(value)
       }
-      const timer = setTimeout(() => {
-        try {
-          killer.kill()
-        } catch {}
-        finish(false)
-      }, Math.min(timeoutMs, 4_000))
+      const timer = setTimeout(
+        () => {
+          try {
+            killer.kill()
+          } catch {}
+          finish(false)
+        },
+        Math.min(timeoutMs, 4_000),
+      )
       timer.unref?.()
       killer.once("close", (code) => finish(code === 0))
       killer.once("error", () => finish(false))
@@ -198,6 +206,7 @@ export async function startTunnelSupervisor(input: {
     lastHandshake: number | null
     outage: Outage
     unreachableReason: string
+    retryKind: PollFailureKind | null
     unreadySince: number
     lastError: string
     shown: "connected" | "offline" | "unknown" | null
@@ -234,7 +243,15 @@ export async function startTunnelSupervisor(input: {
     run.shown = "offline"
     publish({
       state: "offline",
-      detail: `This PC cannot reach OpenAI — ${run.unreachableReason}. Last verified handshake ${ago(run.lastHandshake)}. The tunnel keeps retrying automatically.`,
+      detail:
+        run.retryKind === "service" || run.retryKind === "rate-limit"
+          ? nativeT(
+              run.retryKind === "service" ? "desktop.oxp.tunnel.serviceUnavailable" : "desktop.oxp.tunnel.rateLimited",
+              {
+                handshake: ago(run.lastHandshake),
+              },
+            )
+          : `This PC cannot reach OpenAI — ${run.unreachableReason}. Last verified handshake ${ago(run.lastHandshake)}. The tunnel keeps retrying automatically.`,
       ...(run.lastHandshake ? { handshakeAt: run.lastHandshake } : {}),
       health: run.health,
     })
@@ -248,28 +265,43 @@ export async function startTunnelSupervisor(input: {
       health: run.health,
     })
   }
-  const noteUnreachable = (run: Run, raw: string) => {
+  const notePollFailure = (run: Run, raw: string, kind: PollFailureKind) => {
     if (stopped || current !== run) return
-    run.unreachableReason = describeNetworkError(raw)
-    if (run.outage.since) return
-    run.outage = { since: Date.now(), handshakeBefore: run.lastHandshake }
-    input.log?.("OpenAI tunnel route is retrying after a network failure", { reason: run.unreachableReason }, "info")
+    run.retryKind = kind
+    run.unreachableReason = kind === "network" ? describeNetworkError(raw) : ""
+    const now = Date.now()
+    if (run.outage.since) {
+      run.outage = { ...run.outage, lastFailureAt: now }
+      return
+    }
+    run.outage = { since: now, handshakeBefore: run.lastHandshake, lastFailureAt: now }
+    input.log?.("OpenAI tunnel control-plane poll is retrying", { kind, detail: run.lastError }, "info")
   }
-  const refreshHealth = async (run: Run) => {
+  const refreshHealth = async (run: Run, readyDetail: string) => {
     if (!run.healthBase) return null
-    const [poll, client] = await Promise.all([readPollHealth(run.healthBase), readClientStatus(run.healthBase)])
+    const poll = await readPollHealth(run.healthBase)
     if (stopped || current !== run) return undefined
     if (poll?.lastSuccessMs) run.lastHandshake = poll.lastSuccessMs
     if (outageRecovered(run.outage, run.lastHandshake)) {
+      input.log?.(
+        "OpenAI tunnel control-plane poll recovered",
+        {
+          outageMs: Date.now() - run.outage.since,
+          pollErrors: poll?.errors ?? null,
+        },
+        "info",
+      )
       run.outage = NO_OUTAGE
       run.unreachableReason = ""
+      run.retryKind = null
+      run.lastError = ""
     }
     run.health = {
       pollErrors: poll?.errors ?? null,
-      uptimeSeconds: client?.uptimeSeconds ?? null,
-      route: client?.route ?? null,
-      probe: client?.probe ?? null,
-      clientVersion: client?.version ?? null,
+      uptimeSeconds: poll?.uptimeSeconds ?? null,
+      route: null,
+      probe: readyDetail || "ready",
+      clientVersion: null,
     }
     // A present metrics endpoint with a zero/absent successful-poll timestamp
     // is not remote-route proof. Preserve null so routeObservation cannot turn
@@ -304,37 +336,40 @@ export async function startTunnelSupervisor(input: {
   const watch = (run: Run) => {
     if (stopped || current !== run || !run.healthBase) return
     clearTimer()
-    timer = setTimeout(() => {
-      void (async () => {
-        if (stopped || current !== run || !run.healthBase) return
-        const ready = await probeReady(run.healthBase)
-        if (stopped || current !== run) return
-        if (!ready.ok) {
-          const now = Date.now()
-          if (!run.unreadySince) {
-            run.unreadySince = now
-            watch(run)
+    timer = setTimeout(
+      () => {
+        void (async () => {
+          if (stopped || current !== run || !run.healthBase) return
+          const ready = await probeReady(run.healthBase)
+          if (stopped || current !== run) return
+          if (!ready.ok) {
+            const now = Date.now()
+            if (!run.unreadySince) {
+              run.unreadySince = now
+              watch(run)
+              return
+            }
+            if (now - run.unreadySince < UNREADY_CONFIRM_MS) {
+              watch(run)
+              return
+            }
+            scheduleRestart(run, ready.detail || "Tunnel client stopped responding.", true)
             return
           }
-          if (now - run.unreadySince < UNREADY_CONFIRM_MS) {
-            watch(run)
-            return
-          }
-          scheduleRestart(run, ready.detail || "Tunnel client stopped responding.", true)
-          return
-        }
-        run.unreadySince = 0
-        const poll = await refreshHealth(run)
-        if (poll === undefined || stopped || current !== run) return
-        const observation = routeObservation(poll, run.lastHandshake, run.outage)
-        if (observation === "connected") showConnected(run)
-        else if (observation === "offline") {
-          if (!run.unreachableReason) run.unreachableReason = "it stopped answering"
-          showOffline(run)
-        } else showUnknown(run)
-        watch(run)
-      })()
-    }, run.shown === "offline" ? OFFLINE_RECHECK_MS : WATCH_INTERVAL_MS)
+          run.unreadySince = 0
+          const poll = await refreshHealth(run, ready.detail)
+          if (poll === undefined || stopped || current !== run) return
+          const observation = routeObservation(poll, run.lastHandshake, run.outage)
+          if (observation === "connected") showConnected(run)
+          else if (observation === "offline") {
+            if (!run.unreachableReason) run.unreachableReason = "it stopped answering"
+            showOffline(run)
+          } else showUnknown(run)
+          watch(run)
+        })()
+      },
+      run.shown === "offline" ? OFFLINE_RECHECK_MS : WATCH_INTERVAL_MS,
+    )
     timer.unref?.()
   }
 
@@ -357,6 +392,7 @@ export async function startTunnelSupervisor(input: {
       lastHandshake: null,
       outage: NO_OUTAGE,
       unreachableReason: "",
+      retryKind: null,
       unreadySince: 0,
       lastError: "",
       shown: null,
@@ -378,12 +414,28 @@ export async function startTunnelSupervisor(input: {
         const message = String(event.msg ?? "tunnel-client event")
         const error = event.error ? String(event.error) : ""
         const diagnostic = redactTunnelText(`${message}${error ? `: ${error}` : ""}`, input.secrets)
-        if (level === "WARN" && message === "harpoon host auto-registration failed" && event.inclusion_reason === "loopback") {
+        if (
+          level === "WARN" &&
+          message === "harpoon host auto-registration failed" &&
+          event.inclusion_reason === "loopback"
+        ) {
+          return
+        }
+        // The dispatcher emits this after the local MCP server intentionally
+        // returns a tools/call result with isError=true. Delivery to the control
+        // plane succeeded; this is application-level tool feedback, not a tunnel
+        // transport warning. Do not poison lastError or duplicate every rejected
+        // OXP call in the desktop console.
+        if (
+          level === "WARN" &&
+          message === "dispatcher received MCP upstream error; posted error response to control plane"
+        ) {
           return
         }
         if (level === "ERROR" || level === "FATAL" || level === "WARN") {
           run.lastError = `${level} ${diagnostic}`.slice(0, 400)
-          if (isUnreachableError(diagnostic)) noteUnreachable(run, diagnostic)
+          const kind = pollFailureKind(diagnostic)
+          if (kind) notePollFailure(run, diagnostic, kind)
           else input.log?.("tunnel-client reported a warning", { detail: run.lastError }, "warn")
         }
         return
@@ -391,7 +443,8 @@ export async function startTunnelSupervisor(input: {
       const diagnostic = redactTunnelText(line, input.secrets)
       if (/\b(error|fatal|warn)\b/i.test(diagnostic)) {
         run.lastError = diagnostic.slice(0, 400)
-        if (isUnreachableError(diagnostic)) noteUnreachable(run, diagnostic)
+        const kind = pollFailureKind(diagnostic)
+        if (kind) notePollFailure(run, diagnostic, kind)
         else input.log?.("tunnel-client reported an unstructured warning", { detail: run.lastError }, "warn")
       }
     }
@@ -414,7 +467,7 @@ export async function startTunnelSupervisor(input: {
         if (ready.ok && !stopped && current === run) {
           attempts = 0
           run.healthBase = base
-          const poll = await refreshHealth(run)
+          const poll = await refreshHealth(run, ready.detail)
           if (poll !== undefined && !stopped && current === run) {
             const observation = routeObservation(poll, run.lastHandshake, run.outage)
             if (observation === "connected") showConnected(run)
@@ -430,7 +483,8 @@ export async function startTunnelSupervisor(input: {
       }
       await new Promise((resolve) => setTimeout(resolve, 1_000))
     }
-    if (!stopped && current === run) scheduleRestart(run, run.lastError || "Tunnel did not become ready within 60 seconds.", true)
+    if (!stopped && current === run)
+      scheduleRestart(run, run.lastError || "Tunnel did not become ready within 60 seconds.", true)
   }
 
   void launch()

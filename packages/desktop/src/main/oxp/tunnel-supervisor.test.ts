@@ -46,6 +46,11 @@ async function launch(mode: string, options?: { child?: boolean }) {
   const launches = path.join(dir, "launches.txt")
   const childPid = path.join(dir, "child.pid")
   const reports: OxpTunnelReport[] = []
+  const logs: Array<{
+    message: string
+    extra?: Record<string, unknown>
+    level?: "info" | "warn" | "error"
+  }> = []
   const handle = await startTunnelSupervisor({
     binary: process.execPath,
     launch: (healthFile) => ({
@@ -58,18 +63,15 @@ async function launch(mode: string, options?: { child?: boolean }) {
     }),
     secrets: ["fake-secret", "http://127.0.0.1:1/mcp/fake"],
     report: (report) => reports.push(report),
+    log: (message, extra, level) => logs.push({ message, extra, level }),
   })
   handles.push(handle)
-  return { dir, launches, childPid, reports, handle }
+  return { dir, launches, childPid, reports, logs, handle }
 }
 
 async function launchPids(file: string) {
   try {
-    return (await fs.readFile(file, "utf8"))
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean)
-      .map(Number)
+    return (await fs.readFile(file, "utf8")).trim().split(/\s+/).filter(Boolean).map(Number)
   } catch {
     return []
   }
@@ -139,6 +141,15 @@ describe("OXP tunnel supervisor", () => {
     await run.handle.stop()
   }, 8_000)
 
+  test("does not report a successfully forwarded MCP application error as a tunnel warning", async () => {
+    const run = await launch("mcp-error-forwarded")
+    await waitFor(() => run.reports.find((report) => report.state === "connected"))
+    await Bun.sleep(100)
+    expect(run.logs.some((entry) => entry.message === "tunnel-client reported a warning")).toBe(false)
+    expect(run.reports.some((report) => report.detail?.includes("MCP upstream error"))).toBe(false)
+    await run.handle.stop()
+  }, 8_000)
+
   test("stop racing a scheduled reconnect wins and prevents a replacement tree", async () => {
     const run = await launch("exit")
     await waitFor(() => run.reports.find((report) => report.detail?.includes("Reconnecting in 2s")))
@@ -150,7 +161,8 @@ describe("OXP tunnel supervisor", () => {
   test("projects stale control-plane proof as offline while keeping the client alive", async () => {
     const run = await launch("offline")
     const report = await waitFor(() => run.reports.find((item) => item.state === "offline"))
-    expect(report.health?.clientVersion).toBe("fake-1")
+    expect(report.health?.probe).toBe("ready")
+    expect(report.health?.clientVersion).toBeNull()
     expect((await launchPids(run.launches)).length).toBe(1)
     await run.handle.stop()
   }, 8_000)
@@ -164,4 +176,42 @@ describe("OXP tunnel supervisor", () => {
     expect(run.reports.some((item) => item.state === "connected")).toBe(false)
     await run.handle.stop()
   }, 8_000)
+
+  for (const mode of ["retry-service", "retry-text", "retry-rate-limit"]) {
+    test(`coalesces ${mode} diagnostics and leaves retry ownership with the client`, async () => {
+      const run = await launch(mode)
+      await waitFor(() => run.logs.find((entry) => entry.message === "OpenAI tunnel control-plane poll is retrying"))
+      await Bun.sleep(1_300)
+      expect(run.logs).toHaveLength(1)
+      expect(run.logs[0].level).toBe("info")
+      expect(run.logs[0].extra?.kind).toBe(mode === "retry-rate-limit" ? "rate-limit" : "service")
+      expect((await launchPids(run.launches)).length).toBe(1)
+      expect(run.reports.some((report) => report.state === "connected" || report.state === "auth-failed")).toBe(false)
+      await run.handle.stop()
+    }, 8_000)
+  }
+
+  test("recovers after 503 retries only when metrics prove a new successful poll", async () => {
+    const run = await launch("retry-recover")
+    await waitFor(() => run.logs.find((entry) => entry.message === "OpenAI tunnel control-plane poll is retrying"))
+    await waitFor(() => run.reports.find((report) => report.state === "connected"), 22_000)
+    expect(run.logs.map((entry) => entry.message)).toEqual([
+      "OpenAI tunnel control-plane poll is retrying",
+      "OpenAI tunnel control-plane poll recovered",
+    ])
+    expect((await launchPids(run.launches)).length).toBe(1)
+    await run.handle.stop()
+  }, 25_000)
+
+  test("reports a sustained remote 503 outage even before any successful poll", async () => {
+    const run = await launch("retry-service")
+    const report = await waitFor(() => run.reports.find((item) => item.state === "offline"), 52_000)
+    expect(report.detail).toContain("OpenAI's tunnel service is temporarily unavailable")
+    expect(report.detail).toContain("never")
+    expect(report.handshakeAt).toBeUndefined()
+    expect(report.health?.pollErrors).toBeGreaterThan(0)
+    expect(run.logs).toHaveLength(1)
+    expect((await launchPids(run.launches)).length).toBe(1)
+    await run.handle.stop()
+  }, 55_000)
 })

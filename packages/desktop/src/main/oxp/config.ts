@@ -11,6 +11,8 @@ export type OxpLifecycle = {
 export type OxpDesktopConfig = {
   version: 1
   tunnelID: string
+  cloudflareHostname: string
+  cloudflareAutoConnect: boolean
   lifecycle: OxpLifecycle
   migration: {
     localMcpConfigPath?: string
@@ -22,6 +24,8 @@ export type OxpDesktopConfig = {
 const DEFAULT_CONFIG: OxpDesktopConfig = {
   version: 1,
   tunnelID: "",
+  cloudflareHostname: "",
+  cloudflareAutoConnect: false,
   lifecycle: {
     autoConnect: false,
     launchAtLogin: false,
@@ -32,12 +36,18 @@ const DEFAULT_CONFIG: OxpDesktopConfig = {
 }
 
 const TUNNEL_ID = /^tunnel_[0-9a-f]{32}$/
+const CLOUDFLARE_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/
+
+export function isValidCloudflareHostname(value: string) {
+  return CLOUDFLARE_HOSTNAME.test(value)
+}
 
 function parse(raw: unknown): OxpDesktopConfig {
   const value = raw && typeof raw === "object" ? (raw as Partial<OxpDesktopConfig>) : {}
   const lifecycle: Partial<OxpLifecycle> =
     value.lifecycle && typeof value.lifecycle === "object" ? value.lifecycle : {}
   const tunnelID = typeof value.tunnelID === "string" ? value.tunnelID.trim() : ""
+  const cloudflareHostname = typeof value.cloudflareHostname === "string" ? value.cloudflareHostname.trim().toLowerCase() : ""
   const migrationRaw =
     value.migration && typeof value.migration === "object"
       ? value.migration as Partial<OxpDesktopConfig["migration"]>
@@ -60,6 +70,8 @@ function parse(raw: unknown): OxpDesktopConfig {
   return {
     version: 1,
     tunnelID: tunnelID && TUNNEL_ID.test(tunnelID) ? tunnelID : "",
+    cloudflareHostname: isValidCloudflareHostname(cloudflareHostname) ? cloudflareHostname : "",
+    cloudflareAutoConnect: value.cloudflareAutoConnect === true,
     lifecycle: {
       autoConnect: lifecycle.autoConnect === true,
       launchAtLogin: lifecycle.launchAtLogin === true,
@@ -127,6 +139,22 @@ export class OxpDesktopConfigStore {
     }
     return this.update((draft) => {
       draft.tunnelID = tunnelID
+    })
+  }
+
+  async setCloudflareHostname(value: string) {
+    const hostname = value.trim().toLowerCase()
+    if (hostname && !isValidCloudflareHostname(hostname)) {
+      throw new Error("Enter a valid Cloudflare hostname, such as mcp.example.com.")
+    }
+    return this.update((draft) => {
+      draft.cloudflareHostname = hostname
+    })
+  }
+
+  async setCloudflareAutoConnect(value: boolean) {
+    return this.update((draft) => {
+      draft.cloudflareAutoConnect = value
     })
   }
 

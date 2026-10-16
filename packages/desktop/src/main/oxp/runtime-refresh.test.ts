@@ -79,6 +79,8 @@ function fakeModule(
     restoreErrors?: readonly (Error | undefined)[]
     disposeError?: Error
     protocolVersion?: number
+    onRestore?: () => void
+    onDispose?: () => void
   } = {},
 ) {
   let control: RuntimeRefreshControl | undefined
@@ -99,6 +101,7 @@ function fakeModule(
       getState: returnState,
       async restore() {
         counters.restore += 1
+        options.onRestore?.()
         const restoreError =
           options.restoreErrors?.[counters.restore - 1] ?? options.restoreError
         if (restoreError) throw restoreError
@@ -106,6 +109,7 @@ function fakeModule(
       },
       async dispose() {
         counters.dispose += 1
+        options.onDispose?.()
         if (options.disposeError) throw options.disposeError
       },
       start: returnState,
@@ -195,11 +199,15 @@ async function exists(filepath: string) {
 }
 
 describe("OXP transactional runtime refresh coordinator", () => {
-  test("moves the ordinary HTTP backend only after candidate OXP readiness passes", async () => {
+  test("moves the ordinary HTTP backend before candidate OXP readiness so one runtime graph owns shared services", async () => {
     const { root, artifact } = await fixture()
     const events: string[] = []
-    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
-    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001), {
+      onDispose: () => events.push("previous:oxp-dispose"),
+    })
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002), {
+      onRestore: () => events.push("candidate:oxp-restore"),
+    })
     const transition = backendTransition(previous.module, events)
     transition.name(previous.module, "previous")
     transition.name(candidate.module, "candidate")
@@ -224,12 +232,18 @@ describe("OXP transactional runtime refresh coordinator", () => {
     await waitFor(() => coordinator.status().trial?.phase === "active")
 
     expect(transition.current()).toBe(candidate.module)
-    expect(events).toEqual(["probe:2", "previous->candidate", "publish"])
+    expect(events).toEqual([
+      "previous:oxp-dispose",
+      "previous->candidate",
+      "candidate:oxp-restore",
+      "probe:2",
+      "publish",
+    ])
     await coordinator.acceptFromHost(staged.status.trial!.id)
     await coordinator.dispose()
   })
 
-  test("never moves the ordinary HTTP backend when candidate OXP readiness fails", async () => {
+  test("restores the ordinary HTTP backend when candidate OXP readiness fails after graph cutover", async () => {
     const { root, artifact } = await fixture()
     const events: string[] = []
     const previous = fakeModule(artifact, state("1".repeat(64), 31001))
@@ -258,7 +272,7 @@ describe("OXP transactional runtime refresh coordinator", () => {
     await waitFor(() => coordinator.status().state === "stable")
 
     expect(transition.current()).toBe(previous.module)
-    expect(events).toEqual([])
+    expect(events).toEqual(["previous->candidate", "candidate->previous"])
     expect(coordinator.status().runtimeID).toBe(previousID)
     await coordinator.dispose()
   })

@@ -1,12 +1,13 @@
 import { POLL_FRESH_MS } from "./tunnel-health"
 
-export type Outage = { since: number; handshakeBefore: number | null }
+export type Outage = { since: number; handshakeBefore: number | null; lastFailureAt?: number }
 export const NO_OUTAGE: Outage = Object.freeze({ since: 0, handshakeBefore: null })
 export const UNREACHABLE_CONFIRM_MS = 35_000
 export const MAX_RESTART_BACKOFF_MS = 60_000
 export const MAX_TUNNEL_LOG_LINE_CHARS = 16_384
 const CONTROL_PLANE_POLL = /\bpoll (?:failed|timed out(?:;\s*backing off)?)\b/i
-const UNREACHABLE_NETWORK = /no such host|dial tcp|i\/o timeout|timed out|context deadline exceeded|connection (was )?(aborted|refused|reset)|network is (unreachable|down)|no route to host|tls handshake timeout|temporary failure in name resolution|forcibly closed/i
+const UNREACHABLE_NETWORK =
+  /no such host|dial tcp|i\/o timeout|timed out|context deadline exceeded|connection (was )?(aborted|refused|reset)|network is (unreachable|down)|no route to host|tls handshake timeout|temporary failure in name resolution|forcibly closed/i
 const AUTH_FAILURE = /\b(401|403|unauthorized|invalid[_ ]api[_ ]key|invalid_request_error|forbidden)\b/i
 
 export function isAuthFailure(raw: string) {
@@ -30,6 +31,16 @@ export function describeNetworkError(raw: string) {
 export function isUnreachableError(raw: string) {
   const text = String(raw || "")
   return CONTROL_PLANE_POLL.test(text) && UNREACHABLE_NETWORK.test(text)
+}
+
+export type PollFailureKind = "network" | "service" | "rate-limit"
+
+export function pollFailureKind(raw: string): PollFailureKind | null {
+  if (!CONTROL_PLANE_POLL.test(raw)) return null
+  // These are remote responses, not evidence that this PC lost its network.
+  if (/\b(?:unexpected status|HTTP)\s+429\b/i.test(raw)) return "rate-limit"
+  if (/\b(?:unexpected status|HTTP)\s+5\d\d\b|\btunnel_transport_unavailable\b/i.test(raw)) return "service"
+  return isUnreachableError(raw) ? "network" : null
 }
 
 export function redactTunnelText(raw: unknown, secrets: readonly string[]) {
@@ -89,7 +100,12 @@ export function outageConfirmed(run: Outage, now: number) {
 
 export function outageRecovered(run: Outage, lastHandshake: number | null) {
   if (run.since === 0 || lastHandshake === null) return false
-  return run.handshakeBefore === null || lastHandshake > run.handshakeBefore
+  // Metrics can lag stderr. A newly observed timestamp may still precede the
+  // failure, including a later failure in the same outage episode.
+  return (
+    lastHandshake > (run.lastFailureAt ?? run.since) &&
+    (run.handshakeBefore === null || lastHandshake > run.handshakeBefore)
+  )
 }
 
 export function tunnelLaunchSpec(input: { localUrl: string; tunnelID: string; apiKey: string; healthFile: string }) {
@@ -120,8 +136,7 @@ export function routeObservation(
   outage: Outage,
   now = Date.now(),
 ): "connected" | "offline" | "unknown" {
-  if (pollLastSuccess === null) return "unknown"
   if (outageConfirmed(outage, now)) return "offline"
-  if (lastHandshake === null) return "connected"
-  return now - lastHandshake > POLL_FRESH_MS ? "offline" : "connected"
+  if (pollLastSuccess === null || pollLastSuccess <= 0) return "unknown"
+  return now - (lastHandshake ?? pollLastSuccess) > POLL_FRESH_MS ? "offline" : "connected"
 }

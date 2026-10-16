@@ -13,6 +13,8 @@ import { OxpLifecycleOwner } from "./lifecycle"
 import { findLocalMcpMigrationFile, readLocalMcpMigration, retireLocalMcpConfig } from "./migration"
 import { normalizeProjectRootsForHost } from "./project-roots"
 import { startOpenAiTunnel, type OxpTunnelReport, type TunnelHandle } from "./tunnel"
+import { startCloudflareTunnel } from "./cloudflare-tunnel"
+import { startOxpCloudflareRelay, type OxpCloudflareRelay } from "./cloudflare-relay"
 
 const DEFAULT_CONNECTOR = Object.freeze({ id: "unavailable", label: "OpenFork OXP" })
 
@@ -49,6 +51,9 @@ export class OxpController {
   private readonly endpointGeneration = new OxpEndpointGenerationTracker()
   private tunnel: TunnelHandle | undefined
   private tunnelReport: OxpTunnelReport = { state: "disconnected", detail: "Disconnected." }
+  private cloudflareTunnel: TunnelHandle | undefined
+  private cloudflareReport: OxpTunnelReport = { state: "disconnected", detail: "Cloudflare Tunnel is not connected." }
+  private cloudflareRelay: OxpCloudflareRelay | undefined
   private connectionGeneration = 0
   private operation: Promise<void> = Promise.resolve()
   private projectionGeneration = 0
@@ -97,6 +102,7 @@ export class OxpController {
     const desktop = this.config.get()
     const sidecar = this.sidecarState
     const apiKeyPresent = this.secureStorage.available ? await this.credentials.hasOpenAiApiKey().catch(() => false) : false
+    const cloudflareTokenPresent = this.secureStorage.available ? await this.credentials.hasCloudflareTunnelToken().catch(() => false) : false
     const importedAt = desktop.migration.importedAt
     const retiredAt = desktop.migration.retiredAt
     const migrationVerified =
@@ -114,7 +120,7 @@ export class OxpController {
       connector: sidecar?.connector ?? DEFAULT_CONNECTOR,
       configRevision: sidecar?.configRevision ?? 0,
       roots: sidecar?.roots.map((root) => ({ ...root })) ?? [],
-      grant: { ...(sidecar?.grant ?? EMPTY_GRANT) },
+      grant: { ...EMPTY_GRANT, ...(sidecar?.grant ?? {}) },
       workerPolicy: sidecar
         ? {
             models: sidecar.workerPolicy.models.map((model) => ({ ...model })),
@@ -152,6 +158,16 @@ export class OxpController {
         tunnelID: desktop.tunnelID,
         ...(this.tunnelReport.handshakeAt ? { lastHandshakeAt: this.tunnelReport.handshakeAt } : {}),
         ...(this.tunnelReport.detail ? { detail: this.tunnelReport.detail } : {}),
+      },
+      cloudflare: {
+        state: this.cloudflareReport.state,
+        hostname: desktop.cloudflareHostname,
+        autoConnect: desktop.cloudflareAutoConnect,
+        ...(desktop.cloudflareHostname && (await this.credentials.getStoredCloudflareRouteToken().catch(() => null))
+          ? { endpointUrl: `https://${desktop.cloudflareHostname}/mcp/${await this.credentials.getStoredCloudflareRouteToken()}` }
+          : {}),
+        tunnelTokenPresent: cloudflareTokenPresent,
+        ...(this.cloudflareReport.detail ? { detail: this.cloudflareReport.detail } : {}),
       },
       openai: { apiKeyPresent },
       secureStorage: { ...this.secureStorage, credentialState: this.credentials.credentialState() },
@@ -199,6 +215,7 @@ export class OxpController {
     let retirementBlocked = false
     try {
       await this.stopTunnelOnly()
+      await this.stopCloudflareTunnel()
     } catch {
       // The replacement sidecar still becomes the authoritative local runtime,
       // but an unproven old tunnel tree remains owned and blocks all future
@@ -210,10 +227,19 @@ export class OxpController {
       ? { state: "unavailable", detail: "The previous tunnel process could not be stopped safely." }
       : { state: "disconnected", detail: "Local OpenFork runtime changed. Reconnect when ready." }
     this.sidecarSubscription = sidecar.subscribe((state) => {
-      if (this.shuttingDown) return
-      if (this.sidecarEpoch !== epoch || this.sidecar !== sidecar) return
+      if (this.shuttingDown) return false
+      if (this.sidecarEpoch !== epoch || this.sidecar !== sidecar) return false
       const observed = this.observeSidecarState(sidecar, state)
-      if (!observed.accepted) return
+      if (!observed.accepted) return false
+      if (observed.endpointChanged && this.cloudflareRelay) {
+        const endpoint = this.sidecarState?.endpoint
+        const route = this.cloudflareReport.state !== "disconnected" ? this.lastProjection?.cloudflare.endpointUrl : undefined
+        if (endpoint?.state === "ready" && endpoint.url && route) {
+          this.cloudflareRelay.setTarget(endpoint.url, route)
+        } else {
+          this.cloudflareRelay.setTarget(undefined)
+        }
+      }
       if (observed.endpointChanged && (this.tunnel !== undefined || activeTunnel(this.tunnelReport.state))) {
         // A tunnel is bound to one exact secret local URL. Invalidate callbacks
         // immediately even if Connect is still starting and has not installed
@@ -241,9 +267,10 @@ export class OxpController {
             await this.refreshProjection()
           })
         })
-        return
+        return true
       }
       void this.refreshProjection()
+      return true
     })
     this.sidecarClosedSubscription = sidecar.onClosed(() => {
       if (this.shuttingDown) return
@@ -256,6 +283,7 @@ export class OxpController {
       this.sidecarClosedSubscription = undefined
       this.connectionGeneration += 1
       this.tunnelReport = { state: "unavailable", detail: "The local OpenFork runtime stopped." }
+      void this.stopCloudflareTunnel().finally(() => this.refreshProjection())
       void this.stopTunnelOnly()
         .catch((error) => {
           writeLog("oxp", "could not prove the tunnel tree stopped after sidecar exit", undefined, "error")
@@ -266,6 +294,7 @@ export class OxpController {
     })
     let initialStateRead = false
     let autoConnectScheduled = false
+    let cloudflareAutoConnectScheduled = false
     const scheduleAutoConnect = () => {
       if (autoConnectScheduled || retirementBlocked || !this.config.get().lifecycle.autoConnect) return
       autoConnectScheduled = true
@@ -279,12 +308,25 @@ export class OxpController {
         await this.refreshProjection().catch(() => undefined)
       })
     }
+    const scheduleCloudflareAutoConnect = () => {
+      if (cloudflareAutoConnectScheduled || retirementBlocked || !this.config.get().cloudflareAutoConnect) return
+      cloudflareAutoConnectScheduled = true
+      void this.connectCloudflare().catch(async (error) => {
+        const detail = projectOxpIpcError(error).message
+        writeLog("oxp", "automatic Cloudflare backup connection failed", { detail }, "warn")
+        this.cloudflareReport = { state: "unavailable", detail }
+        await this.refreshProjection().catch(() => undefined)
+      })
+    }
     try {
       const state = await sidecar.request({ action: "get-state" })
       if (this.sidecarEpoch !== epoch || this.sidecar !== sidecar) return
       const accepted = this.acceptSidecarState(sidecar, state)
       initialStateRead = true
-      if (accepted.enabled) scheduleAutoConnect()
+      if (accepted.enabled) {
+        scheduleAutoConnect()
+        scheduleCloudflareAutoConnect()
+      }
       this.secureStorage = await this.credentials.status()
       // Electron main is the sole durable credential owner. Every sidecar
       // attachment receives the same OXP OpenAI key (or an explicit clear), so
@@ -304,6 +346,7 @@ export class OxpController {
         this.acceptSidecarState(sidecar, synced)
       }
       await this.refreshProjection()
+      if (accepted.enabled) scheduleCloudflareAutoConnect()
     } catch {
       if (this.sidecarEpoch !== epoch || this.sidecar !== sidecar) return
       writeLog("oxp", "could not read OXP state from sidecar", undefined, "warn")
@@ -311,6 +354,7 @@ export class OxpController {
       // If the first state read itself raced sidecar recovery, Connect retries
       // that read and still checks the durable enabled flag before launching.
       if (!initialStateRead) scheduleAutoConnect()
+      if (!initialStateRead) scheduleCloudflareAutoConnect()
     }
   }
 
@@ -355,6 +399,11 @@ export class OxpController {
         } catch (error) {
           tunnelError = error
         }
+        try {
+          await this.stopCloudflareTunnel()
+        } catch (error) {
+          tunnelError ??= error
+        }
         // The local listener must still retire after authority has been revoked,
         // even if the old remote process tree could not be proven dead.
         this.acceptSidecarState(sidecar, await sidecar.request({ action: "stop" }))
@@ -375,6 +424,14 @@ export class OxpController {
           await this.refreshProjection().catch(() => undefined)
         })
       }
+      if (this.config.get().cloudflareAutoConnect) {
+        void this.connectCloudflare().catch(async (error) => {
+          const detail = projectOxpIpcError(error).message
+          writeLog("oxp", "automatic Cloudflare backup connection failed", { detail }, "warn")
+          this.cloudflareReport = { state: "unavailable", detail }
+          await this.refreshProjection().catch(() => undefined)
+        })
+      }
       return state
     })
   }
@@ -383,7 +440,7 @@ export class OxpController {
     await this.initialize()
     return this.enqueue(async () => {
       const sidecar = this.requireSidecar()
-      const current = this.sidecarState?.grant ?? EMPTY_GRANT
+      const current = { ...EMPTY_GRANT, ...(this.sidecarState?.grant ?? {}) }
       const normalized = normalizeGrantPatch(current, patch)
       const delta = Object.fromEntries(
         Object.entries(normalized).filter(([key, value]) => current[key as keyof SidecarOxpGrant] !== value),
@@ -522,6 +579,103 @@ export class OxpController {
       if (reconnect) await this.connectNow()
       return this.refreshProjection()
     })
+  }
+
+  async setCloudflareHostname(value: string) {
+    await this.initialize()
+    return this.enqueue(async () => {
+      const reconnect = this.cloudflareTunnel !== undefined && value.trim().toLowerCase() !== this.config.get().cloudflareHostname
+      if (reconnect) await this.stopCloudflareTunnel()
+      await this.config.setCloudflareHostname(value)
+      if (reconnect && this.config.get().cloudflareAutoConnect && value.trim()) return this.connectCloudflareNow()
+      return this.refreshProjection()
+    })
+  }
+
+  async setCloudflareTunnelToken(value: string) {
+    await this.initialize()
+    return this.enqueue(async () => {
+      const reconnect = this.cloudflareTunnel !== undefined && value.trim().length > 0
+      if (this.cloudflareTunnel) await this.stopCloudflareTunnel()
+      await this.credentials.setCloudflareTunnelToken(value)
+      this.secureStorage = await this.credentials.status()
+      if (!value.trim()) await this.config.setCloudflareAutoConnect(false)
+      if (reconnect) return this.connectCloudflareNow()
+      return this.refreshProjection()
+    })
+  }
+
+  connectCloudflare() {
+    return this.initialize().then(() => this.enqueue(() => this.connectCloudflareNow()))
+  }
+
+  private async connectCloudflareNow() {
+    if (this.cloudflareTunnel && activeTunnel(this.cloudflareReport.state)) return this.refreshProjection()
+    const sidecar = this.requireSidecar()
+    const current = this.sidecarState ?? this.acceptSidecarState(sidecar, await sidecar.request({ action: "get-state" }))
+    if (!current.enabled) throw new Error("Enable OXP before connecting the Cloudflare backup.")
+    const desktop = this.config.get()
+    const token = await this.credentials.getCloudflareTunnelToken()
+    if (!token) throw new Error("Save a Cloudflare Tunnel token first.")
+    if (!desktop.cloudflareAutoConnect) await this.config.setCloudflareAutoConnect(true)
+    this.cloudflareReport = { state: "starting", detail: "Preparing the Cloudflare backup endpoint…" }
+    await this.refreshProjection()
+    const started = this.acceptSidecarState(sidecar, await sidecar.request({ action: "start" }))
+    if (started.endpoint.state !== "ready" || !started.endpoint.url) throw new Error("The sidecar did not provide a ready OXP endpoint.")
+    const routeToken = await this.credentials.getCloudflareRouteToken()
+    const publicUrl = desktop.cloudflareHostname ? `https://${desktop.cloudflareHostname}/mcp/${routeToken}` : undefined
+    try {
+      this.cloudflareRelay ??= await startOxpCloudflareRelay(42991)
+      this.cloudflareRelay.setTarget(started.endpoint.url, publicUrl)
+      const handle = await startCloudflareTunnel({
+        token,
+        endpointUrl: publicUrl,
+        report: (report) => {
+          if (this.sidecar !== sidecar) return
+          this.cloudflareReport = report
+          void this.refreshProjection()
+        },
+      })
+      this.cloudflareTunnel = handle
+      return this.refreshProjection()
+    } catch (error) {
+      this.cloudflareReport = { state: "unavailable", detail: error instanceof Error ? error.message : "Unable to start Cloudflare Tunnel." }
+      this.cloudflareRelay?.setTarget(undefined)
+      await this.refreshProjection()
+      throw error
+    }
+  }
+
+  disconnectCloudflare() {
+    return this.initialize().then(() => this.enqueue(async () => {
+      await this.stopCloudflareTunnel()
+      await this.config.setCloudflareAutoConnect(false)
+      this.cloudflareReport = { state: "disconnected", detail: "Cloudflare backup disconnected." }
+      return this.refreshProjection()
+    }))
+  }
+
+  private async stopCloudflareTunnel() {
+    const tunnel = this.cloudflareTunnel
+    this.cloudflareRelay?.setTarget(undefined)
+    const relay = this.cloudflareRelay
+    let failure: unknown
+    try {
+      if (tunnel) await tunnel.stop()
+    } catch (error) {
+      failure = error
+    }
+    if (this.cloudflareTunnel === tunnel && !failure) this.cloudflareTunnel = undefined
+    try {
+      if (relay) await relay.stop()
+      if (this.cloudflareRelay === relay) this.cloudflareRelay = undefined
+    } catch (error) {
+      failure ??= error
+    }
+    this.cloudflareReport = failure
+      ? { state: "unavailable", detail: "Cloudflare tunnel shutdown could not be fully confirmed; the local route has been revoked." }
+      : { state: "disconnected", detail: "Cloudflare backup disconnected." }
+    if (failure) throw failure
   }
 
   async setOpenAiApiKey(value: string) {
@@ -842,6 +996,10 @@ export class OxpController {
         ...state,
         roots: state.roots.map(({ path: _path, ...root }) => root),
         tunnel: { ...state.tunnel, tunnelID: state.tunnel.tunnelID ? "[configured]" : "" },
+        cloudflare: {
+          ...state.cloudflare,
+          endpointUrl: state.cloudflare.endpointUrl ? "[configured]" : undefined,
+        },
       },
     }
     await fs.writeFile(file, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 })
@@ -871,6 +1029,12 @@ export class OxpController {
     } catch (error) {
       tunnelError = error
       writeLog("oxp", "could not prove tunnel process-tree termination during shutdown", undefined, "error")
+    }
+    try {
+      await this.stopCloudflareTunnel()
+    } catch (error) {
+      tunnelError ??= error
+      writeLog("oxp", "could not stop Cloudflare tunnel during shutdown", undefined, "error")
     }
     if (sidecar) await sidecar.request({ action: "stop" }).catch(() => undefined)
     this.sidecarSubscription?.()

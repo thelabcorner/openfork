@@ -1,6 +1,5 @@
 export const POLL_FRESH_MS = 95_000
 const MAX_METRICS_BYTES = 256 * 1024
-const MAX_STATUS_BYTES = 64 * 1024
 const MAX_READY_BYTES = 4 * 1024
 
 export type TunnelHealth = {
@@ -11,7 +10,12 @@ export type TunnelHealth = {
   clientVersion: string | null
 }
 
-type PollHealth = { lastSuccessMs: number | null; polls: number | null; errors: number | null }
+type PollHealth = {
+  lastSuccessMs: number | null
+  polls: number | null
+  errors: number | null
+  uptimeSeconds: number | null
+}
 
 export function readMetric(text: string, name: string): number | null {
   let total: number | null = null
@@ -30,12 +34,35 @@ export function readMetric(text: string, name: string): number | null {
   return total
 }
 
-function parsePollHealth(metrics: string): PollHealth {
-  const seconds = readMetric(metrics, "commands_poll_last_successful_timestamp_seconds")
+export function parsePollHealth(metrics: string, now = Date.now()): PollHealth | null {
+  const values = new Map<string, number>()
+  const names = new Set([
+    "commands_poll_last_successful_timestamp_seconds",
+    "commands_poll_cycles_total",
+    "commands_poll_errors_total",
+    "process_start_time_seconds",
+  ])
+  for (const line of metrics.split("\n")) {
+    if (!line || line.startsWith("#")) continue
+    const separator = line.search(/[ {]/)
+    if (separator < 1) continue
+    const name = line.slice(0, separator)
+    if (!names.has(name)) continue
+    const rest = line.slice(separator)
+    const sample = rest.replace(/^\{[^}]*\}/, "").trim().split(/\s+/)[0]
+    if (!sample) continue
+    const value = Number(sample)
+    if (!Number.isFinite(value)) continue
+    values.set(name, (values.get(name) ?? 0) + value)
+  }
+  const seconds = values.get("commands_poll_last_successful_timestamp_seconds")
+  if (seconds === undefined) return null
+  const processStarted = values.get("process_start_time_seconds")
   return {
-    lastSuccessMs: seconds !== null && seconds > 0 ? Math.round(seconds * 1000) : null,
-    polls: readMetric(metrics, "commands_poll_cycles_total"),
-    errors: readMetric(metrics, "commands_poll_errors_total"),
+    lastSuccessMs: seconds > 0 ? Math.round(seconds * 1000) : null,
+    polls: values.get("commands_poll_cycles_total") ?? null,
+    errors: values.get("commands_poll_errors_total") ?? null,
+    uptimeSeconds: processStarted === undefined ? null : Math.max(0, Math.floor(now / 1000 - processStarted)),
   }
 }
 
@@ -79,35 +106,7 @@ async function fetchText(url: string, maxBytes: number, timeoutMs = 3000) {
 
 export async function readPollHealth(base: string): Promise<PollHealth | null> {
   const text = await fetchText(`${base}/metrics`, MAX_METRICS_BYTES)
-  if (text === null || readMetric(text, "commands_poll_last_successful_timestamp_seconds") === null) return null
-  return parsePollHealth(text)
-}
-
-export async function readClientStatus(base: string) {
-  const text = await fetchText(`${base}/api/status`, MAX_STATUS_BYTES)
-  if (text === null) return null
-  try {
-    const raw = JSON.parse(text) as Record<string, unknown>
-    const channels = Array.isArray(raw.channels) ? raw.channels : []
-    const main = channels.find(
-      (item) => item && typeof item === "object" && (item as Record<string, unknown>).name === "main",
-    ) as Record<string, unknown> | undefined
-    const string = (value: unknown) => (typeof value === "string" && value ? value : null)
-    const route = raw.control_plane_route && typeof raw.control_plane_route === "object"
-      ? (raw.control_plane_route as Record<string, unknown>)
-      : {}
-    const target = string(route.target)
-    const mode = string(route.route_mode)
-    const proxy = string(route.proxy_source)
-    return {
-      version: string(raw.version),
-      probe: string(main?.probe_status),
-      uptimeSeconds: typeof raw.uptime_seconds === "number" ? raw.uptime_seconds : null,
-      route: target ? `${target} · ${proxy && proxy !== "none" ? `via ${proxy}` : (mode ?? "direct")}` : null,
-    }
-  } catch {
-    return null
-  }
+  return text === null ? null : parsePollHealth(text)
 }
 
 export async function probeReady(base: string): Promise<{ ok: boolean; detail: string }> {

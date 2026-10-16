@@ -805,10 +805,15 @@ export class RuntimeRefreshCoordinator {
       // validated, and passed the host probe.
       this.markNotServing(trial.previous)
       await trial.previous.module.OxpHost.dispose()
+      // The ordinary HTTP listener owns the runtime module's shared service
+      // graph (Database, OFXP discovery, process-global services, etc.). Move
+      // that graph first so candidate OXP restoration reuses the candidate
+      // graph instead of briefly constructing a second imported graph beside
+      // the still-live previous backend against the same durable stores.
+      await this.transitionBackendTo(trial.candidate)
       const state = await trial.candidate.module.OxpHost.restore()
       await this.validateRestoredState(state, trial.connectorID)
       await this.probe(state)
-      await this.transitionBackendTo(trial.candidate)
       this.activateRecord(trial.candidate)
 
       const now = this.now()
@@ -835,7 +840,11 @@ export class RuntimeRefreshCoordinator {
         trialID,
         runtimeID: trial.candidate.runtimeID,
       })
-    } catch {
+    } catch (activationError) {
+      this.log("error", "OXP runtime candidate activation rejected", {
+        trialID,
+        error: activationError instanceof Error ? activationError.message : String(activationError),
+      })
       await this.restorePreviousAfterFailedActivation(trial)
     }
   }
@@ -1002,10 +1011,14 @@ export class RuntimeRefreshCoordinator {
         await store
           .restore(accepted.snapshotPath, accepted.runtimeID)
           .catch(failArtifact)
+        // Restore the ordinary previous runtime graph before OXP. This mirrors
+        // activation ordering and prevents rollback from constructing the
+        // previous Database/OFXP graph while the candidate HTTP graph is still
+        // alive.
+        await this.transitionBackendTo(trial.previous)
         restored = await trial.previous.module.OxpHost.restore()
         await this.validateRestoredState(restored, trial.connectorID)
         await this.probe(restored)
-        await this.transitionBackendTo(trial.previous)
         this.activateRecord(trial.previous)
       } catch (restoreError) {
         this.markNotServing(trial.previous)
@@ -1212,10 +1225,10 @@ export class RuntimeRefreshCoordinator {
         )
       }
       await store.restore(accepted.snapshotPath, accepted.runtimeID).catch(failArtifact)
+      await this.transitionBackendTo(trial.previous)
       const restored = await trial.previous.module.OxpHost.restore()
       await this.validateRestoredState(restored, trial.connectorID)
       await this.probe(restored)
-      await this.transitionBackendTo(trial.previous)
       this.activateRecord(trial.previous)
       previousState = restored
     } catch {
@@ -1265,10 +1278,10 @@ export class RuntimeRefreshCoordinator {
       await store
         .restore(trial.candidateSnapshot, trial.candidate.runtimeID)
         .catch(failArtifact)
+      await this.transitionBackendTo(trial.candidate)
       candidateState = await trial.candidate.module.OxpHost.restore()
       await this.validateRestoredState(candidateState, trial.connectorID)
       await this.probe(candidateState)
-      await this.transitionBackendTo(trial.candidate)
       this.activateRecord(trial.candidate)
     } catch (candidateError) {
       this.markNotServing(trial.candidate)

@@ -178,6 +178,10 @@ export function registerOxpIpc(controller: OxpController, trust: RendererTrust) 
   handler("oxp-remove-root", (_event, rootID: unknown) => controller.removeRoot(boundedString(rootID, "root ID", 64)))
   handler("oxp-reveal-root", (_event, rootID: unknown) => controller.revealRoot(boundedString(rootID, "root ID", 64)))
   handler("oxp-set-tunnel-id", (_event, value: unknown) => controller.setTunnelID(boundedString(value, "tunnel ID", 128)))
+  handler("oxp-set-cloudflare-hostname", (_event, value: unknown) => controller.setCloudflareHostname(boundedString(value, "Cloudflare hostname", 253)))
+  handler("oxp-set-cloudflare-tunnel-token", (_event, value: unknown) => controller.setCloudflareTunnelToken(boundedString(value, "Cloudflare Tunnel token", 16 * 1024)))
+  handler("oxp-connect-cloudflare", () => controller.connectCloudflare())
+  handler("oxp-disconnect-cloudflare", () => controller.disconnectCloudflare())
   handler("oxp-set-openai-api-key", (_event, value: unknown) =>
     controller.setOpenAiApiKey(boundedString(value, "OXP OpenAI API key", 16 * 1024)),
   )

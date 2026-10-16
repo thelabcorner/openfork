@@ -1,6 +1,7 @@
 
 import { promises as fs } from "node:fs"
 import path from "node:path"
+import { randomBytes } from "node:crypto"
 
 const FILE_NAME = "oxp-secrets.bin"
 const LINUX_BASIC_TEXT_PREFIX = Buffer.from("v10", "ascii")
@@ -187,6 +188,46 @@ export class OxpCredentialStore {
 
   async hasOpenAiApiKey() {
     return (await this.getOpenAiApiKey()) !== null
+  }
+
+  async getCloudflareTunnelToken() {
+    const value = (await this.readAll()).cloudflareTunnelToken
+    return value?.trim() || null
+  }
+
+  async hasCloudflareTunnelToken() {
+    return (await this.getCloudflareTunnelToken()) !== null
+  }
+
+  async getCloudflareRouteToken() {
+    const existing = (await this.readAll()).cloudflareRouteToken
+    if (existing) return existing
+    const generated = randomBytes(32).toString("base64url")
+    await this.enqueue(async () => {
+      const current = await this.readAll()
+      if (this.cache === null) throw new Error("Secure credential state is unavailable; refusing to overwrite it.")
+      if (current.cloudflareRouteToken) return
+      await this.writeAll({ ...current, cloudflareRouteToken: generated })
+    })
+    return (await this.readAll()).cloudflareRouteToken ?? generated
+  }
+
+  async getStoredCloudflareRouteToken() {
+    const value = (await this.readAll()).cloudflareRouteToken
+    return value?.trim() || null
+  }
+
+  setCloudflareTunnelToken(value: string) {
+    return this.enqueue(async () => {
+      if (!(await this.status()).available) throw new Error("Secure OS credential storage is unavailable.")
+      const current = await this.readAll()
+      if (this.cache === null) throw new Error("Secure credential state is unavailable; refusing to overwrite it.")
+      const next = { ...current }
+      const trimmed = value.trim()
+      if (trimmed) next.cloudflareTunnelToken = trimmed
+      else delete next.cloudflareTunnelToken
+      await this.writeAll(next)
+    })
   }
 
 

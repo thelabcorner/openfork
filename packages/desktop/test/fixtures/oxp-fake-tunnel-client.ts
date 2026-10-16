@@ -37,6 +37,35 @@ if (process.argv.includes("--sleeper")) {
   } else if (effectiveMode === "exit") {
     setTimeout(() => process.exit(7), 50)
   } else {
+    const retryMode = effectiveMode.startsWith("retry-")
+    let recovered = false
+    let errors = 0
+    if (retryMode) {
+      const emit = () => {
+        errors++
+        const error =
+          effectiveMode === "retry-rate-limit"
+            ? "controlplane client: unexpected status 429: rate_limit_exceeded"
+            : "controlplane client: unexpected status 503: tunnel_transport_unavailable: Tunnel transport temporarily unavailable; retry the request"
+        if (effectiveMode === "retry-text") console.error(`WARN poll failed; backing off: ${error}`)
+        else console.error(JSON.stringify({ level: "WARN", msg: "poll failed; backing off", error }))
+      }
+      emit()
+      const retries = setInterval(emit, 100)
+      if (effectiveMode === "retry-recover")
+        setTimeout(() => {
+          recovered = true
+          clearInterval(retries)
+        }, 2_000)
+    }
+    if (effectiveMode === "mcp-error-forwarded") {
+      console.error(
+        JSON.stringify({
+          level: "WARN",
+          msg: "dispatcher received MCP upstream error; posted error response to control plane",
+        }),
+      )
+    }
     if (!healthFile) throw new Error("missing --health-file")
     const server = Bun.serve({
       hostname: "127.0.0.1",
@@ -46,12 +75,20 @@ if (process.argv.includes("--sleeper")) {
         if (url.pathname === "/readyz") return new Response("ready")
         if (url.pathname === "/metrics") {
           const now = Math.floor(Date.now() / 1_000)
-          const last = effectiveMode === "offline" ? now - 300 : effectiveMode === "unproven" ? 0 : now
+          const last = retryMode
+            ? recovered
+              ? now
+              : 0
+            : effectiveMode === "offline"
+              ? now - 300
+              : effectiveMode === "unproven"
+                ? 0
+                : now
           return new Response(
             [
               `commands_poll_last_successful_timestamp_seconds ${last}`,
               "commands_poll_cycles_total 1",
-              `commands_poll_errors_total ${effectiveMode === "offline" ? 1 : 0}`,
+              `commands_poll_errors_total ${retryMode ? errors : effectiveMode === "offline" ? 1 : 0}`,
             ].join("\n"),
           )
         }

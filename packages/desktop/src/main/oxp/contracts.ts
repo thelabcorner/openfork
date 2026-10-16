@@ -1,6 +1,8 @@
 import type { SidecarOxpGrant, SidecarOxpWorkerPolicy } from "../sidecar-protocol"
 import type { OxpLifecycle } from "./config"
 
+export type OxpDesktopGrant = Omit<SidecarOxpGrant, "code"> & { code: boolean }
+
 export type OxpConnectionState =
   | "disconnected"
   | "starting"
@@ -17,7 +19,7 @@ export type OxpDesktopState = {
   connector: { id: string; label: string }
   configRevision: number
   roots: Array<{ id: string; alias: string; path: string; available: boolean; managedByProject: boolean }>
-  grant: SidecarOxpGrant
+  grant: OxpDesktopGrant
   workerPolicy: SidecarOxpWorkerPolicy
   endpoint: {
     state: "stopped" | "starting" | "ready" | "error"
@@ -28,6 +30,14 @@ export type OxpDesktopState = {
     state: OxpConnectionState
     tunnelID: string
     lastHandshakeAt?: number
+    detail?: string
+  }
+  cloudflare: {
+    state: OxpConnectionState
+    hostname: string
+    autoConnect: boolean
+    endpointUrl?: string
+    tunnelTokenPresent: boolean
     detail?: string
   }
   openai: {
@@ -63,10 +73,11 @@ export type OxpDesktopState = {
 
 export type OxpStateListener = (state: OxpDesktopState) => void
 
-export const EMPTY_GRANT: SidecarOxpGrant = Object.freeze({
+export const EMPTY_GRANT: OxpDesktopGrant = Object.freeze({
   read: false,
   write: false,
   process: false,
+  code: false,
   git: false,
   integrations: false,
   browser: false,
