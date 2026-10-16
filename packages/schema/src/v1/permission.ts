@@ -27,6 +27,7 @@ export type Ruleset = typeof Ruleset.Type
 export const Request = Schema.Struct({
   id: ID,
   sessionID: SessionID,
+  executionID: Schema.optional(Schema.String),
   permission: Schema.String,
   patterns: Schema.Array(Schema.String),
   metadata: Schema.Record(Schema.String, Schema.Unknown),
@@ -35,7 +36,7 @@ export const Request = Schema.Struct({
 }).annotate({ identifier: "PermissionRequest" })
 export type Request = typeof Request.Type
 
-export const Reply = Schema.Literals(["once", "always", "reject"])
+export const Reply = Schema.Literals(["once", "run", "always", "reject"])
 export type Reply = typeof Reply.Type
 
 export const ReplyBody = Schema.Struct({ reply: Reply, message: Schema.optional(Schema.String) }).annotate({

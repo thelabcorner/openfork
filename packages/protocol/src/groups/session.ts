@@ -153,7 +153,9 @@ export const SessionsCursor = Schema.String.pipe(
 export type SessionsCursor = typeof SessionsCursor.Type
 
 const SessionActive = Schema.Struct({
-  type: Schema.Literals(["running", "paused"]),
+  // A durably fenced generation without live execution proof is actionable
+  // recovery state, not a running provider and not an ordinary idle Session.
+  type: Schema.Literals(["running", "paused", "interrupted"]),
 }).annotate({ identifier: "SessionActive" })
 
 const SessionHistoryLimit = PositiveInt.check(Schema.isLessThanOrEqualTo(100))
@@ -273,7 +275,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
           identifier: "v2.session.active",
           summary: "List active sessions",
           description:
-            "Retrieve active sessions: foreground drains currently owned by this OpenFork process (type: running) and durable-paused sessions (type: paused). Sessions absent from the result are inactive.",
+             "Retrieve execution-backed session states: proved-live drains (running), explicitly paused sessions (paused), and fenced generations without live proof (interrupted). Sessions absent from the result are inactive.",
         }),
       ),
     )

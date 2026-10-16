@@ -113,6 +113,8 @@ export type Event =
   | EventSessionGroupDeleted
   | EventSessionGroupSessionAdded
   | EventSessionGroupSessionRemoved
+  | EventSessionLimitRecoveryUpdated
+  | EventSessionLimitRecoveryCleared
   | EventLspUpdated
   | EventPermissionAsked
   | EventPermissionReplied
@@ -224,6 +226,20 @@ export type SnapshotFileDiff = {
   status?: "added" | "deleted" | "modified"
 }
 
+export type ProviderRouteIntent =
+  | {
+      kind: "auto"
+      strategy?: ProviderRouteIntentStrategy
+    }
+  | {
+      kind: "public"
+    }
+  | {
+      kind: "account"
+      accountID: ProviderRouteIntentAccountId
+      pin?: ProviderRouteIntentPin
+    }
+
 export type PermissionAction = "allow" | "deny" | "ask"
 
 export type PermissionRule = {
@@ -235,6 +251,7 @@ export type PermissionRule = {
 export type PermissionRuleset = Array<PermissionRule>
 
 export type Session = {
+  humanInterjection?: boolean
   id: string
   slug: string
   projectID: string
@@ -268,6 +285,7 @@ export type Session = {
     providerID: string
     accountID?: string
     variant?: string
+    routeIntent?: ProviderRouteIntent
   }
   version: string
   metadata?: {
@@ -340,6 +358,7 @@ export type UserMessage = {
     accountID?: string
     variant?: string
     subProvider?: string
+    routeIntent?: ProviderRouteIntent
   }
   system?: string
   tools?: {
@@ -575,6 +594,34 @@ export type ToolStatePending = {
   raw: string
 }
 
+export type CodeRunTraceFrame = {
+  frameID: string
+  parentFrameID?: string
+  ref: string
+  kind: "native" | "lazy" | "mcp" | "mcp-resource" | "saved"
+  depth: number
+  startedAt: number
+  finishedAt?: number
+  durationMs?: number
+  status: "running" | "succeeded" | "failed" | "cancelled"
+  title?: string
+  attachmentCount?: number
+}
+
+export type CodeRunTrace = {
+  version: 1
+  rootFrameID: string
+  frames: Array<CodeRunTraceFrame>
+  counters: {
+    calls: number
+    failed: number
+    active: number
+  }
+  truncated?: {
+    frames?: number
+  }
+}
+
 export type ToolStateRunning = {
   status: "running"
   input: {
@@ -582,7 +629,8 @@ export type ToolStateRunning = {
   }
   title?: string
   metadata?: {
-    [key: string]: unknown
+    trace?: CodeRunTrace
+    [key: string]: unknown | CodeRunTrace | undefined
   }
   time: {
     start: number
@@ -597,7 +645,8 @@ export type ToolStateCompleted = {
   output: string
   title: string
   metadata: {
-    [key: string]: unknown
+    trace?: CodeRunTrace
+    [key: string]: unknown | CodeRunTrace | undefined
   }
   time: {
     start: number
@@ -614,7 +663,8 @@ export type ToolStateError = {
   }
   error: string
   metadata?: {
-    [key: string]: unknown
+    trace?: CodeRunTrace
+    [key: string]: unknown | CodeRunTrace | undefined
   }
   time: {
     start: number
@@ -633,7 +683,8 @@ export type ToolPart = {
   tool: string
   state: ToolState
   metadata?: {
-    [key: string]: unknown
+    trace?: CodeRunTrace
+    [key: string]: unknown | CodeRunTrace | undefined
   }
 }
 
@@ -715,6 +766,8 @@ export type CompactionPart = {
   auto: boolean
   continueAfter?: boolean
   overflow?: boolean
+  pending?: boolean
+  checkpoint_message_id?: string
   tail_start_id?: string
 }
 
@@ -737,19 +790,6 @@ export type Prompt = {
   files?: Array<PromptFileAttachment>
   agents?: Array<PromptAgentAttachment>
 }
-
-export type ProviderRouteIntent =
-  | {
-      kind: "auto"
-    }
-  | {
-      kind: "public"
-    }
-  | {
-      kind: "account"
-      accountID: ProviderRouteIntentAccountId
-      pin?: ProviderRouteIntentPin
-    }
 
 export type Pty = {
   id: string
@@ -797,6 +837,9 @@ export type SessionStatus =
     }
   | {
       type: "busy"
+    }
+  | {
+      type: "interrupted"
     }
 
 export type QuestionOption = {
@@ -1870,9 +1913,29 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "session.limit_recovery.updated"
+        properties: {
+          recovery: SessionLimitRecoveryInfo
+        }
+      }
+    | {
+        id: string
+        type: "session.limit_recovery.cleared"
+        properties: {
+          sessionID: string
+          generation: number
+        }
+      }
+    | {
+        id: string
         type: "lsp.updated"
         properties: {
-          [key: string]: unknown
+          servers: Array<{
+            id: string
+            name: string
+            root: string
+            status: "connected"
+          }>
         }
       }
     | {
@@ -1881,6 +1944,7 @@ export type GlobalEvent = {
         properties: {
           id: string
           sessionID: string
+          executionID?: string
           permission: string
           patterns: Array<string>
           metadata: {
@@ -1899,7 +1963,7 @@ export type GlobalEvent = {
         properties: {
           sessionID: string
           requestID: string
-          reply: "once" | "always" | "reject"
+          reply: "once" | "run" | "always" | "reject"
         }
       }
     | {
@@ -2028,12 +2092,14 @@ export type GlobalEvent = {
             turnStartedAt?: number
             phaseStartedAt?: number
             updatedAt: number
+            isCompaction?: boolean
             turnElapsedMs?: number
             phaseElapsedMs?: number
             sampledAt?: number
             model?: {
               providerID: string
               modelID: string
+              accountID?: string
               name?: string
               variant?: string
               contextLimit?: number
@@ -2042,6 +2108,7 @@ export type GlobalEvent = {
               model: {
                 providerID: string
                 modelID: string
+                accountID?: string
                 name?: string
                 variant?: string
                 contextLimit?: number
@@ -2326,12 +2393,14 @@ export type GlobalSessionTelemetryResult = {
     turnStartedAt?: number
     phaseStartedAt?: number
     updatedAt: number
+    isCompaction?: boolean
     turnElapsedMs?: number
     phaseElapsedMs?: number
     sampledAt?: number
     model?: {
       providerID: string
       modelID: string
+      accountID?: string
       name?: string
       variant?: string
       contextLimit?: number
@@ -2340,6 +2409,7 @@ export type GlobalSessionTelemetryResult = {
       model: {
         providerID: string
         modelID: string
+        accountID?: string
         name?: string
         variant?: string
         contextLimit?: number
@@ -2460,10 +2530,6 @@ export type OxpResourceProvenanceInfo = {
 export type OxpAttributionTool = {
   tool: string
   calls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  uniqueRequestChars: number
-  uniqueResultChars: number
-  uniqueChars: number
-  uniqueTokens: number
   requestChars: number
   resultChars: number
   chars: number
@@ -2482,7 +2548,6 @@ export type OxpAttributionSourceBreakdown = {
   source: OxpAttributionSource
   requestCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   resultCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  uniqueChars: number
   requestChars: number
   resultChars: number
   chars: number
@@ -2494,12 +2559,9 @@ export type OxpAttributionSourceBreakdown = {
 export type OxpAttributionTotals = {
   calls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   activities: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  inferredRounds: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  uniqueRequestChars: number
-  uniqueResultChars: number
-  uniqueChars: number
-  uniqueTokens: number
-  amplification: number
+  inferredTurns: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  estimatedSurroundingTokens: number
+  estimatedTotalTokens: number
   requestChars: number
   resultChars: number
   chars: number
@@ -2532,24 +2594,29 @@ export type OxpAttributionCoverage = {
 
 export type OxpAttributionCalibration = {
   productionDigest: string
+  payloadDigest: string
   sourceDigest: string
   calibratedAt: string
   observations: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   corpus: {
-    observations: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    activities: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    tools: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    toolStatusGroups: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    minStartedAt: number
+    pairedMessages: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    sessions: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    usageRows: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    toolRows: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
     maxStartedAt: number
-    maxCompletedAt: number
+  }
+  tokenizer: {
+    encoding: string
+    sampledInvocations: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   }
   validation: {
-    toolPriorChars: number
-    statusPriorChars: number
-    statusSpecialization: string
-    exposureAggregateBiasRMSE: number
-    exposureWAPE: number
+    cvSessionWAPE: number
+    cvSessionMedianAPE: number
+    cvSessionP90APE: number
+    maxAbsFoldBias: number
+    labeledGaps: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    boundaryRawError: number
+    boundaryBalancedError: number
   }
 }
 
@@ -2561,44 +2628,27 @@ export type OxpAttributionSnapshot = {
     activityID?: string
   }
   totals: OxpAttributionTotals
-  sensitivity: {
-    low: {
-      rho: 0.75
-      tokens: number
-    }
-    calibrated: {
-      rho: number
-      tokens: number
-    }
-    high: {
-      rho: 0.99
-      tokens: number
-    }
-  }
   coverage: OxpAttributionCoverage
   model: {
-    kind: "geometric-context-residency"
-    rho: number
-    gapThresholdMs: number
+    kind: "empirical-tool-usage"
     requestCharsPerToken: number
     resultCharsPerToken: number
+    turnGapThresholdMs: number
     components: {
-      callTranscript: true
-      returnedContent: true
-      repeatedContextExposure: true
+      observedToolPayload: true
+      estimatedOxpTokens: true
+      empiricallyEstimatedUpstream: true
+      geometricResidency: false
       availabilitySchema: false
     }
     calibration: OxpAttributionCalibration
-  }
-  causalAttribution: {
-    available: false
-    reason: "trace-chain-unavailable"
   }
 }
 
 export type GlobalOxpActivityPatch = {
   title?: string
   clearTitle?: boolean
+  regenerateTitle?: boolean
   archived?: boolean
 }
 
@@ -2637,6 +2687,11 @@ export type OfxpConfig = {
   enabled?: boolean
 }
 
+export type UsageLimitRecoveryConfig = {
+  auto_resume?: boolean
+  snooze_until_reset?: boolean
+}
+
 export type PermissionActionConfig = "ask" | "allow" | "deny"
 
 export type PermissionObjectConfig = {
@@ -2663,6 +2718,7 @@ export type PermissionConfig =
       lsp?: PermissionRuleConfig
       doom_loop?: PermissionActionConfig
       skill?: PermissionRuleConfig
+      code?: PermissionRuleConfig
       [key: string]: PermissionRuleConfig | PermissionActionConfig | undefined
     }
 
@@ -2876,6 +2932,7 @@ export type Config = {
   logLevel?: LogLevel
   server?: ServerConfig
   ofxp?: OfxpConfig
+  usage_limit_recovery?: UsageLimitRecoveryConfig
   command?: {
     [key: string]: {
       template: string
@@ -3112,6 +3169,44 @@ export type ServiceUnavailableError = {
 export type InvalidCursorError = {
   _tag: "InvalidCursorError"
   message: string
+}
+
+export type TelegramNotificationStatus = {
+  enabled: boolean
+  configured: boolean
+  connected: boolean
+  botUsername?: string
+  chatLabel?: string
+  pairingUrl?: string
+  pairingExpiresAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  owner: boolean
+  services: Array<{
+    id: string
+    title: string
+    enabled: boolean
+  }>
+  error?: string
+  lastAttemptAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  lastSuccessAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type ApiTelegramError = {
+  message: string
+}
+
+export type TelegramQuotaSubscription = {
+  providerId: string
+  scope: "provider" | "account" | "model" | "account-model"
+  accountId?: string
+  model?: string
+  windowKey: string
+  enabled: boolean
+}
+
+export type TelegramQuotaSettings = {
+  enabled: boolean
+  subscriptions: Array<TelegramQuotaSubscription>
+  scheduled: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
 export type Agent = {
@@ -3507,11 +3602,13 @@ export type GlobalSession = {
     providerID: string
     accountID?: string
     variant?: string
+    routeIntent?: ProviderRouteIntent
   }
   version: string
   metadata?: {
     [key: string]: unknown
   }
+  humanInterjection?: boolean
   time: {
     created: number
     updated: number
@@ -3657,19 +3754,6 @@ export type ExternalPermissionDeniedError = {
   }
 }
 
-export type Path = {
-  home: string
-  state: string
-  config: string
-  worktree: string
-  directory: string
-}
-
-export type VcsInfo = {
-  branch?: string
-  default_branch?: string
-}
-
 export type VcsFileStatus = {
   file: string
   additions: number
@@ -3715,6 +3799,19 @@ export type FormatterStatus = {
   name: string
   extensions: Array<string>
   enabled: boolean
+}
+
+export type Path = {
+  home: string
+  state: string
+  config: string
+  worktree: string
+  directory: string
+}
+
+export type VcsInfo = {
+  branch?: string
+  default_branch?: string
 }
 
 export type McpStatusConnected = {
@@ -3786,6 +3883,7 @@ export type QuestionRequest = {
 export type PermissionRequest = {
   id: string
   sessionID: string
+  executionID?: string
   permission: string
   patterns: Array<string>
   metadata: {
@@ -3906,6 +4004,10 @@ export type SubtaskPartInput = {
     modelID: string
   }
   command?: string
+}
+
+export type EffectHttpApiErrorConflict = {
+  _tag: "Conflict"
 }
 
 export type SessionBusyError = {
@@ -4060,6 +4162,7 @@ export type ToolKillResponse = {
    * Background job status when jobId was targeted
    */
   status?: string
+  generation?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
 export type EventTuiPromptAppend = {
@@ -4303,6 +4406,12 @@ export type CheckpointDiff = {
 
 export type SessionMessagesResponse = {
   data: Array<SessionMessage>
+  windowed: Array<{
+    messageID: string
+    omittedContentItems: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    truncatedStrings: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }>
+  bytes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   cursor: {
     previous?: string
     next?: string
@@ -4324,6 +4433,20 @@ export type OutputFormat1 =
       schema: JsonSchema
       retryCount?: number
     }
+
+export type CodeRunTrace1 = {
+  version: 1
+  rootFrameID: string
+  frames: Array<CodeRunTraceFrame>
+  counters: {
+    calls: number
+    failed: number
+    active: number
+  }
+  truncated?: {
+    frames?: number
+  }
+}
 
 export type SessionStatus2 = {
   id: string
@@ -4490,6 +4613,8 @@ export type V2Event =
   | SessionGroupDeleted
   | SessionGroupSessionAdded
   | SessionGroupSessionRemoved
+  | SessionLimitRecoveryUpdated
+  | SessionLimitRecoveryCleared
   | LspUpdated
   | PermissionAsked
   | PermissionReplied
@@ -4612,6 +4737,12 @@ export type MoveSessionDestination = {
   directory: string
 }
 
+export type ProviderRouteIntentStrategy = "adaptive" | "round-robin"
+
+export type ProviderRouteIntentAccountId = string
+
+export type ProviderRouteIntentPin = "hard" | "soft"
+
 export type SessionMessageProvenance =
   | {
       owner: "user"
@@ -4631,6 +4762,7 @@ export type ModelRef = {
   providerID: string
   accountID?: string
   variant?: string
+  routeIntent?: ProviderRouteIntent
 }
 
 export type LocationRef = {
@@ -4687,10 +4819,6 @@ export type SessionSyntheticOrigin = {
 export type SessionSyntheticDelegatedTurnAuthority = {
   authorizedAgentNames?: Array<string>
 }
-
-export type ProviderRouteIntentAccountId = string
-
-export type ProviderRouteIntentPin = "hard" | "soft"
 
 export type SessionInputSyntheticExecution = {
   agent: string
@@ -5035,6 +5163,9 @@ export type SwarmModelRequirement =
   | "output_pdf"
 
 export type SwarmMemberExecutionProfile = {
+  /**
+   * Agent mode for this managed worker; fixed to swarm-m by the Swarm role. Select provider/model independently.
+   */
   agent: string
   model: ModelRef
   permissionBoundary: PermissionV2Boundary
@@ -5341,6 +5472,34 @@ export type SessionGroupInfo = {
     updated: number
     archived?: number
   }
+}
+
+export type SessionLimitRecoveryFailureClass = "account-quota" | "public-quota" | "account-rate-limit" | "rate-limit"
+
+export type SessionLimitRecoveryResetSource = "retry-after" | "provider" | "observed" | "local" | "inferred"
+
+export type SessionLimitRecoveryInfo = {
+  sessionID: string
+  sourceAssistantMessageID: string
+  sourceUserMessageID?: string
+  providerID: string
+  accountID?: string
+  modelID: string
+  failureClass: SessionLimitRecoveryFailureClass
+  failureCode?: string
+  resetAt?: number
+  resetSource?: SessionLimitRecoveryResetSource
+  resetObservedAt?: number
+  expectedLatestUserSeq?: number
+  generation: number
+  autoResume: boolean
+  manualResume: boolean
+  snoozeUntil?: number
+  continuationID: string
+  claimOwner?: string
+  claimExpiresAt?: number
+  timeCreated: number
+  timeUpdated: number
 }
 
 export type ProjectVcs = "git"
@@ -6571,6 +6730,7 @@ export type OfxpGrant = {
   write: boolean
   git: boolean
   process: boolean
+  code?: boolean
   integrations: boolean
   browser: boolean
   filesReceive: boolean
@@ -6820,6 +6980,39 @@ export type SwarmHttpApiRecoveryResponse = {
     name: string
     bindingGeneration: number
   }>
+}
+
+export type SessionAttachmentEligibility = "eligible" | "unsupported-origin" | "unsupported-mime" | "over-budget"
+
+export type SessionAttachmentIndexEntry = {
+  handle: string
+  id: string
+  filename?: string
+  mime: string
+  byteLength: number
+  eligibility: SessionAttachmentEligibility
+  sourceMessageID: string
+  sourcePartID: string
+  timeCreated: number
+}
+
+export type SessionAttachmentIndexPage = {
+  sessionID: string
+  items: Array<SessionAttachmentIndexEntry>
+  nextCursor?: string
+}
+
+export type SessionAttachmentHandoffStatus = {
+  selected: boolean
+  authorized: boolean
+  resolved: boolean
+  includedInProviderRequest: boolean
+  reason?: string
+}
+
+export type SessionAttachmentRecipientStatus = {
+  handle: string
+  status: SessionAttachmentHandoffStatus
 }
 
 export type DeviceInfo = {
@@ -9797,6 +9990,41 @@ export type SessionGroupSessionRemoved = {
   }
 }
 
+export type SessionLimitRecoveryUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.limit_recovery.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    recovery: SessionLimitRecoveryInfo
+  }
+}
+
+export type SessionLimitRecoveryCleared = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.limit_recovery.cleared"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    generation: number
+  }
+}
+
 export type LspUpdated = {
   id: string
   metadata?: {
@@ -9810,7 +10038,12 @@ export type LspUpdated = {
   }
   location?: LocationRef
   data: {
-    [key: string]: unknown
+    servers: Array<{
+      id: string
+      name: string
+      root: string
+      status: "connected"
+    }>
   }
 }
 
@@ -9829,6 +10062,7 @@ export type PermissionAsked = {
   data: {
     id: string
     sessionID: string
+    executionID?: string
     permission: string
     patterns: Array<string>
     metadata: {
@@ -9857,7 +10091,7 @@ export type PermissionReplied = {
   data: {
     sessionID: string
     requestID: string
-    reply: "once" | "always" | "reject"
+    reply: "once" | "run" | "always" | "reject"
   }
 }
 
@@ -10088,12 +10322,14 @@ export type SessionTelemetryUpdated = {
       turnStartedAt?: number
       phaseStartedAt?: number
       updatedAt: number
+      isCompaction?: boolean
       turnElapsedMs?: number
       phaseElapsedMs?: number
       sampledAt?: number
       model?: {
         providerID: string
         modelID: string
+        accountID?: string
         name?: string
         variant?: string
         contextLimit?: number
@@ -10102,6 +10338,7 @@ export type SessionTelemetryUpdated = {
         model: {
           providerID: string
           modelID: string
+          accountID?: string
           name?: string
           variant?: string
           contextLimit?: number
@@ -11725,11 +11962,33 @@ export type EventSessionGroupSessionRemoved = {
   }
 }
 
+export type EventSessionLimitRecoveryUpdated = {
+  id: string
+  type: "session.limit_recovery.updated"
+  properties: {
+    recovery: SessionLimitRecoveryInfo
+  }
+}
+
+export type EventSessionLimitRecoveryCleared = {
+  id: string
+  type: "session.limit_recovery.cleared"
+  properties: {
+    sessionID: string
+    generation: number
+  }
+}
+
 export type EventLspUpdated = {
   id: string
   type: "lsp.updated"
   properties: {
-    [key: string]: unknown
+    servers: Array<{
+      id: string
+      name: string
+      root: string
+      status: "connected"
+    }>
   }
 }
 
@@ -11739,6 +11998,7 @@ export type EventPermissionAsked = {
   properties: {
     id: string
     sessionID: string
+    executionID?: string
     permission: string
     patterns: Array<string>
     metadata: {
@@ -11758,7 +12018,7 @@ export type EventPermissionReplied = {
   properties: {
     sessionID: string
     requestID: string
-    reply: "once" | "always" | "reject"
+    reply: "once" | "run" | "always" | "reject"
   }
 }
 
@@ -11844,12 +12104,14 @@ export type EventSessionTelemetryUpdated = {
       turnStartedAt?: number
       phaseStartedAt?: number
       updatedAt: number
+      isCompaction?: boolean
       turnElapsedMs?: number
       phaseElapsedMs?: number
       sampledAt?: number
       model?: {
         providerID: string
         modelID: string
+        accountID?: string
         name?: string
         variant?: string
         contextLimit?: number
@@ -11858,6 +12120,7 @@ export type EventSessionTelemetryUpdated = {
         model: {
           providerID: string
           modelID: string
+          accountID?: string
           name?: string
           variant?: string
           contextLimit?: number
@@ -14349,6 +14612,14 @@ export type UsageSummaryResponses = {
       messages: number
       sessions: number
     }>
+    activity: {
+      activeDays: number
+      longestStreak: number
+      busiestDay: {
+        start: number
+        messages: number
+      }
+    }
     dow: [
       {
         cost: number
@@ -14806,12 +15077,14 @@ export type UsageSessionContextResponses = {
       turnStartedAt?: number
       phaseStartedAt?: number
       updatedAt: number
+      isCompaction?: boolean
       turnElapsedMs?: number
       phaseElapsedMs?: number
       sampledAt?: number
       model?: {
         providerID: string
         modelID: string
+        accountID?: string
         name?: string
         variant?: string
         contextLimit?: number
@@ -14820,6 +15093,7 @@ export type UsageSessionContextResponses = {
         model: {
           providerID: string
           modelID: string
+          accountID?: string
           name?: string
           variant?: string
           contextLimit?: number
@@ -15654,6 +15928,108 @@ export type RevisionDraftConsumeResponses = {
    */
   200: unknown
 }
+
+export type PromptRevisionProgressData = {
+  body?: never
+  path?: never
+  query: {
+    operationID: string
+  }
+  url: "/prompt/revise/progress"
+}
+
+export type PromptRevisionProgressErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PromptRevisionProgressError = PromptRevisionProgressErrors[keyof PromptRevisionProgressErrors]
+
+export type PromptRevisionProgressResponses = {
+  /**
+   * Latest advisory revision progress
+   */
+  200: {
+    operationID: string
+    percent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    phase?: string
+    note?: string
+    updatedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type PromptRevisionProgressResponse = PromptRevisionProgressResponses[keyof PromptRevisionProgressResponses]
+
+export type PromptRevisionRunStatusData = {
+  body?: never
+  path?: never
+  query: {
+    kind: "prompt" | "goal" | "scheduled_task"
+    key: string
+  }
+  url: "/prompt/revise/run"
+}
+
+export type PromptRevisionRunStatusErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PromptRevisionRunStatusError = PromptRevisionRunStatusErrors[keyof PromptRevisionRunStatusErrors]
+
+export type PromptRevisionRunStatusResponses = {
+  /**
+   * In-flight or recently failed revision run, or null when untracked
+   */
+  200:
+    | {
+        state: "running"
+        sourceFingerprint: string
+        operationID?: string
+        startedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      }
+    | {
+        state: "failed"
+        sourceFingerprint: string
+        message: string
+        at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      }
+}
+
+export type PromptRevisionRunStatusResponse = PromptRevisionRunStatusResponses[keyof PromptRevisionRunStatusResponses]
+
+export type PromptCancelRevisionData = {
+  body?: {
+    kind: "prompt" | "goal" | "scheduled_task"
+    key: string
+    operationID?: string
+  }
+  path?: never
+  query?: never
+  url: "/prompt/revise/cancel"
+}
+
+export type PromptCancelRevisionErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PromptCancelRevisionError = PromptCancelRevisionErrors[keyof PromptCancelRevisionErrors]
+
+export type PromptCancelRevisionResponses = {
+  /**
+   * Whether an in-flight run was cancelled
+   */
+  200: boolean
+}
+
+export type PromptCancelRevisionResponse = PromptCancelRevisionResponses[keyof PromptCancelRevisionResponses]
 
 export type ScheduledTaskListData = {
   body?: never
@@ -16969,6 +17345,525 @@ export type SwarmRecoverResponses = {
 
 export type SwarmRecoverResponse = SwarmRecoverResponses[keyof SwarmRecoverResponses]
 
+export type TelegramStatusData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/telegram"
+}
+
+export type TelegramStatusErrors = {
+  /**
+   * ApiTelegramError
+   */
+  400: ApiTelegramError
+}
+
+export type TelegramStatusError = TelegramStatusErrors[keyof TelegramStatusErrors]
+
+export type TelegramStatusResponses = {
+  /**
+   * Sanitized Telegram connection and registered notification services
+   */
+  200: TelegramNotificationStatus
+}
+
+export type TelegramStatusResponse = TelegramStatusResponses[keyof TelegramStatusResponses]
+
+export type TelegramUpdateData = {
+  body?: {
+    enabled: boolean
+  }
+  path?: never
+  query?: never
+  url: "/global/telegram"
+}
+
+export type TelegramUpdateErrors = {
+  /**
+   * ApiTelegramError
+   */
+  400: ApiTelegramError
+}
+
+export type TelegramUpdateError = TelegramUpdateErrors[keyof TelegramUpdateErrors]
+
+export type TelegramUpdateResponses = {
+  /**
+   * TelegramNotificationStatus
+   */
+  200: TelegramNotificationStatus
+}
+
+export type TelegramUpdateResponse = TelegramUpdateResponses[keyof TelegramUpdateResponses]
+
+export type TelegramDisconnectData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/telegram/bot"
+}
+
+export type TelegramDisconnectErrors = {
+  /**
+   * ApiTelegramError
+   */
+  400: ApiTelegramError
+}
+
+export type TelegramDisconnectError = TelegramDisconnectErrors[keyof TelegramDisconnectErrors]
+
+export type TelegramDisconnectResponses = {
+  /**
+   * TelegramNotificationStatus
+   */
+  200: TelegramNotificationStatus
+}
+
+export type TelegramDisconnectResponse = TelegramDisconnectResponses[keyof TelegramDisconnectResponses]
+
+export type TelegramConfigureData = {
+  body?: {
+    token: string
+  }
+  path?: never
+  query?: never
+  url: "/global/telegram/bot"
+}
+
+export type TelegramConfigureErrors = {
+  /**
+   * ApiTelegramError
+   */
+  400: ApiTelegramError
+}
+
+export type TelegramConfigureError = TelegramConfigureErrors[keyof TelegramConfigureErrors]
+
+export type TelegramConfigureResponses = {
+  /**
+   * TelegramNotificationStatus
+   */
+  200: TelegramNotificationStatus
+}
+
+export type TelegramConfigureResponse = TelegramConfigureResponses[keyof TelegramConfigureResponses]
+
+export type TelegramBeginPairingData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/telegram/pairing"
+}
+
+export type TelegramBeginPairingErrors = {
+  /**
+   * ApiTelegramError
+   */
+  400: ApiTelegramError
+}
+
+export type TelegramBeginPairingError = TelegramBeginPairingErrors[keyof TelegramBeginPairingErrors]
+
+export type TelegramBeginPairingResponses = {
+  /**
+   * TelegramNotificationStatus
+   */
+  200: TelegramNotificationStatus
+}
+
+export type TelegramBeginPairingResponse = TelegramBeginPairingResponses[keyof TelegramBeginPairingResponses]
+
+export type TelegramCheckPairingData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/telegram/pairing/check"
+}
+
+export type TelegramCheckPairingErrors = {
+  /**
+   * ApiTelegramError
+   */
+  400: ApiTelegramError
+}
+
+export type TelegramCheckPairingError = TelegramCheckPairingErrors[keyof TelegramCheckPairingErrors]
+
+export type TelegramCheckPairingResponses = {
+  /**
+   * TelegramNotificationStatus
+   */
+  200: TelegramNotificationStatus
+}
+
+export type TelegramCheckPairingResponse = TelegramCheckPairingResponses[keyof TelegramCheckPairingResponses]
+
+export type TelegramTestData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/telegram/test"
+}
+
+export type TelegramTestErrors = {
+  /**
+   * ApiTelegramError
+   */
+  400: ApiTelegramError
+}
+
+export type TelegramTestError = TelegramTestErrors[keyof TelegramTestErrors]
+
+export type TelegramTestResponses = {
+  /**
+   * TelegramNotificationStatus
+   */
+  200: TelegramNotificationStatus
+}
+
+export type TelegramTestResponse = TelegramTestResponses[keyof TelegramTestResponses]
+
+export type TelegramQuotaStatusData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/telegram/services/quota"
+}
+
+export type TelegramQuotaStatusErrors = {
+  /**
+   * ApiTelegramError
+   */
+  400: ApiTelegramError
+}
+
+export type TelegramQuotaStatusError = TelegramQuotaStatusErrors[keyof TelegramQuotaStatusErrors]
+
+export type TelegramQuotaStatusResponses = {
+  /**
+   * Provider quota notification subscription state
+   */
+  200: TelegramQuotaSettings
+}
+
+export type TelegramQuotaStatusResponse = TelegramQuotaStatusResponses[keyof TelegramQuotaStatusResponses]
+
+export type TelegramQuotaUpdateData = {
+  body?: {
+    enabled: boolean
+    subscriptions: Array<TelegramQuotaSubscription>
+  }
+  path?: never
+  query?: never
+  url: "/global/telegram/services/quota"
+}
+
+export type TelegramQuotaUpdateErrors = {
+  /**
+   * ApiTelegramError
+   */
+  400: ApiTelegramError
+}
+
+export type TelegramQuotaUpdateError = TelegramQuotaUpdateErrors[keyof TelegramQuotaUpdateErrors]
+
+export type TelegramQuotaUpdateResponses = {
+  /**
+   * TelegramQuotaSettings
+   */
+  200: TelegramQuotaSettings
+}
+
+export type TelegramQuotaUpdateResponse = TelegramQuotaUpdateResponses[keyof TelegramQuotaUpdateResponses]
+
+export type SessionLimitRecoveryCancelData = {
+  body?: {
+    generation: number
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/limit-recovery"
+}
+
+export type SessionLimitRecoveryCancelErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionLimitRecoveryCancelError = SessionLimitRecoveryCancelErrors[keyof SessionLimitRecoveryCancelErrors]
+
+export type SessionLimitRecoveryCancelResponses = {
+  /**
+   * Cancelled session recovery
+   */
+  204: void
+}
+
+export type SessionLimitRecoveryCancelResponse =
+  SessionLimitRecoveryCancelResponses[keyof SessionLimitRecoveryCancelResponses]
+
+export type SessionLimitRecoveryGetData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/limit-recovery"
+}
+
+export type SessionLimitRecoveryGetErrors = {
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionLimitRecoveryGetError = SessionLimitRecoveryGetErrors[keyof SessionLimitRecoveryGetErrors]
+
+export type SessionLimitRecoveryGetResponses = {
+  /**
+   * Current session limit recovery
+   */
+  200: SessionLimitRecoveryInfo
+}
+
+export type SessionLimitRecoveryGetResponse = SessionLimitRecoveryGetResponses[keyof SessionLimitRecoveryGetResponses]
+
+export type SessionLimitRecoveryAutoResumeData = {
+  body?: {
+    generation: number
+    enabled: boolean
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/limit-recovery/auto-resume"
+}
+
+export type SessionLimitRecoveryAutoResumeErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionLimitRecoveryAutoResumeError =
+  SessionLimitRecoveryAutoResumeErrors[keyof SessionLimitRecoveryAutoResumeErrors]
+
+export type SessionLimitRecoveryAutoResumeResponses = {
+  /**
+   * Updated recovery settings
+   */
+  200: SessionLimitRecoveryInfo
+}
+
+export type SessionLimitRecoveryAutoResumeResponse =
+  SessionLimitRecoveryAutoResumeResponses[keyof SessionLimitRecoveryAutoResumeResponses]
+
+export type SessionLimitRecoveryResumeData = {
+  body?: {
+    generation: number
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/limit-recovery/resume"
+}
+
+export type SessionLimitRecoveryResumeErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionLimitRecoveryResumeError = SessionLimitRecoveryResumeErrors[keyof SessionLimitRecoveryResumeErrors]
+
+export type SessionLimitRecoveryResumeResponses = {
+  /**
+   * Requested immediate manual recovery
+   */
+  200: SessionLimitRecoveryInfo
+}
+
+export type SessionLimitRecoveryResumeResponse =
+  SessionLimitRecoveryResumeResponses[keyof SessionLimitRecoveryResumeResponses]
+
+export type SessionLimitRecoverySnoozeData = {
+  body?: {
+    generation: number
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/limit-recovery/snooze-until-reset"
+}
+
+export type SessionLimitRecoverySnoozeErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionLimitRecoverySnoozeError = SessionLimitRecoverySnoozeErrors[keyof SessionLimitRecoverySnoozeErrors]
+
+export type SessionLimitRecoverySnoozeResponses = {
+  /**
+   * Snoozed session until its reset
+   */
+  200: SessionLimitRecoveryInfo
+}
+
+export type SessionLimitRecoverySnoozeResponse =
+  SessionLimitRecoverySnoozeResponses[keyof SessionLimitRecoverySnoozeResponses]
+
+export type SessionLimitRecoveryWakeData = {
+  body?: {
+    generation: number
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/limit-recovery/wake"
+}
+
+export type SessionLimitRecoveryWakeErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SessionLimitRecoveryWakeError = SessionLimitRecoveryWakeErrors[keyof SessionLimitRecoveryWakeErrors]
+
+export type SessionLimitRecoveryWakeResponses = {
+  /**
+   * Cleared recovery snooze
+   */
+  200: SessionLimitRecoveryInfo
+}
+
+export type SessionLimitRecoveryWakeResponse =
+  SessionLimitRecoveryWakeResponses[keyof SessionLimitRecoveryWakeResponses]
+
+export type SessionAttachmentIndexData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    cursor?: string
+    limit?: string
+  }
+  url: "/session/{sessionID}/attachment"
+}
+
+export type SessionAttachmentIndexErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionAttachmentIndexError = SessionAttachmentIndexErrors[keyof SessionAttachmentIndexErrors]
+
+export type SessionAttachmentIndexResponses = {
+  /**
+   * Paginated eligible session uploads
+   */
+  200: SessionAttachmentIndexPage
+}
+
+export type SessionAttachmentIndexResponse = SessionAttachmentIndexResponses[keyof SessionAttachmentIndexResponses]
+
+export type SessionAttachmentStatusData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/attachment/status"
+}
+
+export type SessionAttachmentStatusErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionAttachmentStatusError = SessionAttachmentStatusErrors[keyof SessionAttachmentStatusErrors]
+
+export type SessionAttachmentStatusResponses = {
+  /**
+   * Per-recipient attachment handoff status for a child session
+   */
+  200: {
+    sessionID: string
+    statuses: Array<SessionAttachmentRecipientStatus>
+  }
+}
+
+export type SessionAttachmentStatusResponse = SessionAttachmentStatusResponses[keyof SessionAttachmentStatusResponses]
+
 export type AppAgentsData = {
   body?: never
   path?: never
@@ -17165,6 +18060,7 @@ export type SessionCreateData = {
       providerID: string
       accountID?: string
       variant?: string
+      routeIntent?: ProviderRouteIntent
     }
     metadata?: {
       [key: string]: unknown
@@ -17204,7 +18100,7 @@ export type SessionCreateResponse = SessionCreateResponses[keyof SessionCreateRe
 
 export type PermissionReplyData = {
   body?: {
-    reply: "once" | "always" | "reject"
+    reply: "once" | "run" | "always" | "reject"
     message?: string
   }
   path: {
@@ -17241,7 +18137,7 @@ export type PermissionReplyResponse = PermissionReplyResponses[keyof PermissionR
 
 export type PermissionRespondData = {
   body?: {
-    response: "once" | "always" | "reject"
+    response: "once" | "run" | "always" | "reject"
   }
   path: {
     sessionID: string
@@ -17275,6 +18171,40 @@ export type PermissionRespondResponses = {
 }
 
 export type PermissionRespondResponse = PermissionRespondResponses[keyof PermissionRespondResponses]
+
+export type PermissionAutoAcceptPolicyData = {
+  body?: {
+    autoAccept: {
+      [key: string]: boolean
+    }
+    mode: "hydrate" | "patch"
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/permission/auto-accept"
+}
+
+export type PermissionAutoAcceptPolicyErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PermissionAutoAcceptPolicyError = PermissionAutoAcceptPolicyErrors[keyof PermissionAutoAcceptPolicyErrors]
+
+export type PermissionAutoAcceptPolicyResponses = {
+  /**
+   * Auto-accept policy synchronized
+   */
+  200: boolean
+}
+
+export type PermissionAutoAcceptPolicyResponse =
+  PermissionAutoAcceptPolicyResponses[keyof PermissionAutoAcceptPolicyResponses]
 
 export type QuestionReplyData = {
   body?: {
@@ -17600,6 +18530,7 @@ export type SessionPromptData = {
       providerID: string
       modelID: string
       accountID?: string
+      routeIntent?: ProviderRouteIntent
     }
     agent?: string
     noReply?: boolean
@@ -17723,6 +18654,173 @@ export type SessionMessageResponses = {
 }
 
 export type SessionMessageResponse = SessionMessageResponses[keyof SessionMessageResponses]
+
+export type SessionMessagePartsData = {
+  body?: never
+  path: {
+    sessionID: string
+    messageID: string
+  }
+  query?: {
+    cursor?: string
+  }
+  url: "/session/{sessionID}/message/{messageID}/parts"
+}
+
+export type SessionMessagePartsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionMessagePartsError = SessionMessagePartsErrors[keyof SessionMessagePartsErrors]
+
+export type SessionMessagePartsResponses = {
+  /**
+   * Bounded message part inspection page
+   */
+  200: {
+    data: Array<{
+      partID: string
+      type: string
+      offset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      totalChars: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      text: string
+    }>
+    nextCursor?: string
+  }
+}
+
+export type SessionMessagePartsResponse = SessionMessagePartsResponses[keyof SessionMessagePartsResponses]
+
+export type SessionMessageTimelinePartsData = {
+  body?: never
+  path: {
+    sessionID: string
+    messageID: string
+  }
+  query?: {
+    cursor?: string
+  }
+  url: "/session/{sessionID}/message/{messageID}/timeline-parts"
+}
+
+export type SessionMessageTimelinePartsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionMessageTimelinePartsError =
+  SessionMessageTimelinePartsErrors[keyof SessionMessageTimelinePartsErrors]
+
+export type SessionMessageTimelinePartsResponses = {
+  /**
+   * Complete structured timeline content page
+   */
+  200: {
+    data: Array<Part>
+    nextCursor?: string
+  }
+}
+
+export type SessionMessageTimelinePartsResponse =
+  SessionMessageTimelinePartsResponses[keyof SessionMessageTimelinePartsResponses]
+
+export type SessionTimelinePartsBatchData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query: {
+    messageIDs: Array<string> | string
+    cursor?: string
+  }
+  url: "/session/{sessionID}/timeline-parts"
+}
+
+export type SessionTimelinePartsBatchErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionTimelinePartsBatchError = SessionTimelinePartsBatchErrors[keyof SessionTimelinePartsBatchErrors]
+
+export type SessionTimelinePartsBatchResponses = {
+  /**
+   * Bounded session-page timeline recovery page
+   */
+  200: {
+    data: Array<{
+      messageID: string
+      part: Part
+    }>
+    nextCursor?: string
+    completeMessageIDs: Array<string>
+  }
+}
+
+export type SessionTimelinePartsBatchResponse =
+  SessionTimelinePartsBatchResponses[keyof SessionTimelinePartsBatchResponses]
+
+export type SessionMessageToolOutputData = {
+  body?: never
+  path: {
+    sessionID: string
+    messageID: string
+    partID: string
+  }
+  query?: {
+    offset?: string
+  }
+  url: "/session/{sessionID}/message/{messageID}/tool-output/{partID}"
+}
+
+export type SessionMessageToolOutputErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionMessageToolOutputError = SessionMessageToolOutputErrors[keyof SessionMessageToolOutputErrors]
+
+export type SessionMessageToolOutputResponses = {
+  /**
+   * Lossless bounded page from the durable session-owned tool output
+   */
+  200: {
+    text: string
+    offset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    totalChars: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    totalLines: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    complete: boolean
+    nextOffset?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type SessionMessageToolOutputResponse =
+  SessionMessageToolOutputResponses[keyof SessionMessageToolOutputResponses]
 
 export type SessionAbortData = {
   body?: never
@@ -18792,62 +19890,6 @@ export type InstanceDisposeResponses = {
 
 export type InstanceDisposeResponse = InstanceDisposeResponses[keyof InstanceDisposeResponses]
 
-export type PathGetData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/path"
-}
-
-export type PathGetErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type PathGetError = PathGetErrors[keyof PathGetErrors]
-
-export type PathGetResponses = {
-  /**
-   * Path
-   */
-  200: Path
-}
-
-export type PathGetResponse = PathGetResponses[keyof PathGetResponses]
-
-export type VcsGetData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/vcs"
-}
-
-export type VcsGetErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type VcsGetError = VcsGetErrors[keyof VcsGetErrors]
-
-export type VcsGetResponses = {
-  /**
-   * VCS info
-   */
-  200: VcsInfo
-}
-
-export type VcsGetResponse = VcsGetResponses[keyof VcsGetResponses]
-
 export type VcsStatusData = {
   body?: never
   path?: never
@@ -19082,6 +20124,62 @@ export type FormatterStatusResponses = {
 }
 
 export type FormatterStatusResponse = FormatterStatusResponses[keyof FormatterStatusResponses]
+
+export type PathGetData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/path"
+}
+
+export type PathGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PathGetError = PathGetErrors[keyof PathGetErrors]
+
+export type PathGetResponses = {
+  /**
+   * Path information
+   */
+  200: Path
+}
+
+export type PathGetResponse = PathGetResponses[keyof PathGetResponses]
+
+export type VcsGetData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/vcs"
+}
+
+export type VcsGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type VcsGetError = VcsGetErrors[keyof VcsGetErrors]
+
+export type VcsGetResponses = {
+  /**
+   * VCS info
+   */
+  200: VcsInfo
+}
+
+export type VcsGetResponse = VcsGetResponses[keyof VcsGetResponses]
 
 export type McpStatusData = {
   body?: never
@@ -19385,34 +20483,6 @@ export type ProjectListResponses = {
 
 export type ProjectListResponse = ProjectListResponses[keyof ProjectListResponses]
 
-export type ProjectCurrentData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/project/current"
-}
-
-export type ProjectCurrentErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type ProjectCurrentError = ProjectCurrentErrors[keyof ProjectCurrentErrors]
-
-export type ProjectCurrentResponses = {
-  /**
-   * Current project information
-   */
-  200: Project
-}
-
-export type ProjectCurrentResponse = ProjectCurrentResponses[keyof ProjectCurrentResponses]
-
 export type ProjectInitGitData = {
   body?: never
   path?: never
@@ -19508,6 +20578,34 @@ export type ProjectDirectoriesResponses = {
 }
 
 export type ProjectDirectoriesResponse = ProjectDirectoriesResponses[keyof ProjectDirectoriesResponses]
+
+export type ProjectCurrentData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/project/current"
+}
+
+export type ProjectCurrentErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProjectCurrentError = ProjectCurrentErrors[keyof ProjectCurrentErrors]
+
+export type ProjectCurrentResponses = {
+  /**
+   * Current project information
+   */
+  200: Project
+}
+
+export type ProjectCurrentResponse = ProjectCurrentResponses[keyof ProjectCurrentResponses]
 
 export type ExperimentalProjectCopyGenerateNameData = {
   body?: {
@@ -20247,6 +21345,51 @@ export type SessionSummarizeResponses = {
 
 export type SessionSummarizeResponse = SessionSummarizeResponses[keyof SessionSummarizeResponses]
 
+export type SessionSwitchModelData = {
+  body?: {
+    assistantMessageID: string
+    requestSentAt: number
+    providerID: string
+    modelID: string
+    accountID?: string
+    variant?: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/model-switch"
+}
+
+export type SessionSwitchModelErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * Conflict
+   */
+  409: EffectHttpApiErrorConflict
+}
+
+export type SessionSwitchModelError = SessionSwitchModelErrors[keyof SessionSwitchModelErrors]
+
+export type SessionSwitchModelResponses = {
+  /**
+   * Model switch accepted
+   */
+  200: boolean
+}
+
+export type SessionSwitchModelResponse = SessionSwitchModelResponses[keyof SessionSwitchModelResponses]
+
 export type SessionPromptAsyncData = {
   body?: {
     messageID?: string
@@ -20254,6 +21397,7 @@ export type SessionPromptAsyncData = {
       providerID: string
       modelID: string
       accountID?: string
+      routeIntent?: ProviderRouteIntent
     }
     agent?: string
     noReply?: boolean
@@ -20304,6 +21448,7 @@ export type SessionCommandData = {
     agent?: string
     model?: string
     accountID?: string
+    routeIntent?: ProviderRouteIntent
     arguments: string
     command: string
     variant?: string
@@ -20359,6 +21504,7 @@ export type SessionShellData = {
       providerID: string
       modelID: string
       accountID?: string
+      routeIntent?: ProviderRouteIntent
     }
     command: string
   }
@@ -20672,6 +21818,103 @@ export type SessionContextLedgerResponses = {
 }
 
 export type SessionContextLedgerResponse = SessionContextLedgerResponses[keyof SessionContextLedgerResponses]
+
+export type SessionContextLedgerPageData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+    limit?: number
+    cursor?: string
+  }
+  url: "/session/{sessionID}/context/ledger/page"
+}
+
+export type SessionContextLedgerPageErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionContextLedgerPageError = SessionContextLedgerPageErrors[keyof SessionContextLedgerPageErrors]
+
+export type SessionContextLedgerPageResponses = {
+  /**
+   * Bounded Context ledger page
+   */
+  200: {
+    sessionID: string
+    entries: Array<SessionContextLedgerEntry>
+    authoritativeTotals?: {
+      messageCount: number
+      excludedCount: number
+      pinnedCount: number
+      editedCount: number
+      estimatedTokens: number
+      estimatedTokensExcluded: number
+    }
+    revision: number
+    hasMore: boolean
+    nextCursor?: string
+    mode: "chronological" | "compacted"
+  }
+}
+
+export type SessionContextLedgerPageResponse =
+  SessionContextLedgerPageResponses[keyof SessionContextLedgerPageResponses]
+
+export type SessionContextLedgerTotalsData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/context/ledger/totals"
+}
+
+export type SessionContextLedgerTotalsErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionContextLedgerTotalsError = SessionContextLedgerTotalsErrors[keyof SessionContextLedgerTotalsErrors]
+
+export type SessionContextLedgerTotalsResponses = {
+  /**
+   * Authoritative full-history Context totals when producer facts permit
+   */
+  200: {
+    revision: number
+    totals?: {
+      messageCount: number
+      excludedCount: number
+      pinnedCount: number
+      editedCount: number
+      estimatedTokens: number
+      estimatedTokensExcluded: number
+    }
+  }
+}
+
+export type SessionContextLedgerTotalsResponse =
+  SessionContextLedgerTotalsResponses[keyof SessionContextLedgerTotalsResponses]
 
 export type SessionContextPreviewData = {
   body?: never
@@ -22102,7 +23345,7 @@ export type ToolKillError = ToolKillErrors[keyof ToolKillErrors]
 
 export type ToolKillResponses = {
   /**
-   * Shell kill result
+   * Tool stop result
    */
   200: ToolKillResponse
 }
@@ -22730,6 +23973,7 @@ export type PromptReviseData = {
       key: string
       sourceFingerprint: string
     }
+    operationID?: string
     draft?: {
       mentions: Array<
         | {
@@ -23160,12 +24404,14 @@ export type V2SessionTelemetryResponses = {
             turnStartedAt?: number | null
             phaseStartedAt?: number | null
             updatedAt: number
+            isCompaction?: boolean | null
             turnElapsedMs?: number | null
             phaseElapsedMs?: number | null
             sampledAt?: number | null
             model?: {
               providerID: string
               modelID: string
+              accountID?: string | null
               name?: string | null
               variant?: string | null
               contextLimit?: number | null
@@ -23174,6 +24420,7 @@ export type V2SessionTelemetryResponses = {
               model: {
                 providerID: string
                 modelID: string
+                accountID?: string | null
                 name?: string | null
                 variant?: string | null
                 contextLimit?: number | null

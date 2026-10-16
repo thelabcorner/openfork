@@ -116,6 +116,9 @@ export const AutomationRuntime = Schema.Union([
     phase: Schema.Literal("audit_error"),
     since: DateTimeUtcFromMillis,
     error: Schema.String,
+    /** A transient infrastructure failure remains recoverable automatically.
+     * Never imply the user must restart a Goal whose worker work is complete. */
+    retryAt: DateTimeUtcFromMillis.pipe(optional),
   }),
 ]).annotate({ identifier: "Goal.AutomationRuntime" })
 export type AutomationRuntime = typeof AutomationRuntime.Type

@@ -55,11 +55,24 @@ export const BrowserErrorTag = Schema.Literals([
 ])
 export type BrowserErrorTag = Schema.Schema.Type<typeof BrowserErrorTag>
 
+/**
+ * Forward-boundary certainty for a broker-generated failure.
+ *
+ * This is a verified property of WHERE the failure happened, never inferred
+ * from message text. Absent means the failure is a host-reported error arm: the
+ * host itself answered, so the broker has no post-forward uncertainty to record.
+ */
+export const BrowserErrorCertainty = Schema.Literals(["not_dispatched", "dispatched_unconfirmed"]).annotate({
+  identifier: "Browser.BrowserErrorCertainty",
+})
+export type BrowserErrorCertainty = Schema.Schema.Type<typeof BrowserErrorCertainty>
+
 export const BrokerError = Schema.Struct({
   tag: BrowserErrorTag,
   message: Schema.String,
   retryable: Schema.Boolean,
   details: Schema.optional(Schema.Unknown),
+  certainty: Schema.optional(BrowserErrorCertainty),
 })
 export type BrokerError = Schema.Schema.Type<typeof BrokerError>
 

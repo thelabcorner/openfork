@@ -12,7 +12,7 @@
 // already own a live corpus (via `getUsageTables()`) can pass it in to upgrade
 // the sort to the current live workload without changing call sites.
 
-import type { ModelCost, Workload } from "./usage-yield"
+import type { ModelCost, PricingRegime, Workload } from "./usage-yield"
 import {
   FALLBACK_WORKLOAD_CORPUS,
   FALLBACK_CORPUS_FINGERPRINT,
@@ -21,7 +21,7 @@ import {
   classifyMonetaryClass,
   compareModelsByUsageYield,
   compilePricingRegimes,
-  priceWorkload,
+  priceWorkloadExpected,
 } from "./usage-yield"
 import { freeTierOf, hasPublishedPricing, isUnlimitedModel } from "./badges"
 import type { UsageProfile } from "./usage-profile"
@@ -137,8 +137,8 @@ export function compareByCheapness(
   const rb = compilePricingRegimes(b as CheapnessModel & { provider: { id: string } }, effectiveCostB, tb)
   const hitRateA = hitRates?.get(keyA) ?? hitRateFallback?.get(a.id)
   const hitRateB = hitRates?.get(keyB) ?? hitRateFallback?.get(b.id)
-  const corpusA = median(effectiveCorpus.map((w) => priceWorkload(w, ra, hitRateA).expected))
-  const corpusB = median(effectiveCorpus.map((w) => priceWorkload(w, rb, hitRateB).expected))
+  const corpusA = medianPriceForRegimes(effectiveCorpus, ra, hitRateA)
+  const corpusB = medianPriceForRegimes(effectiveCorpus, rb, hitRateB)
 
   // Blend in personal measured $/request when available — heavily weighted
   // (§31, user feedback). Both are $/request, so blending is linear in cost.
@@ -155,11 +155,59 @@ export function compareByCheapness(
   return a.name.localeCompare(b.name) || a.id.localeCompare(b.id) || a.provider.id.localeCompare(b.provider.id)
 }
 
-function median(values: number[]): number {
+/** Pre-size the short-lived median buffer: no callback allocation or growing
+ * array in the paid ranking hot path. The median owns and mutates this buffer. */
+function medianPriceForRegimes(corpus: readonly Workload[], regimes: PricingRegime[], hitRate: number | undefined): number {
+  const values = new Array<number>(corpus.length)
+  for (let index = 0; index < corpus.length; index++) {
+    values[index] = priceWorkloadExpected(corpus[index]!, regimes, hitRate)
+  }
+  return medianCost(values)
+}
+
+/**
+ * Expected-linear-time selection for a freshly materialized workload-cost array.
+ * Mutates `values`: callers produce this array exclusively for the reduction.
+ *
+ * Sorting the full corpus used to pay O(K log K) for every model (and clone
+ * the array first) although only its central order statistic is needed.
+ * Typical K is 16, capped at 64 by the workload builder. A NaN input retains
+ * the historical Array.sort comparator behavior instead of poisoning a pivot.
+ */
+export function medianCost(values: number[]): number {
   if (values.length === 0) return 0
-  const s = [...values].sort((x, y) => x - y)
-  const m = Math.floor(s.length / 2)
-  return s.length % 2 === 0 ? (s[m - 1]! + s[m]!) / 2 : s[m]!
+  for (const value of values) {
+    if (!Number.isNaN(value)) continue
+    values.sort((x, y) => x - y)
+    const midpoint = values.length >> 1
+    return values.length % 2 === 0 ? (values[midpoint - 1]! + values[midpoint]!) / 2 : values[midpoint]!
+  }
+  const nth = values.length >> 1
+  let left = 0
+  let right = values.length - 1
+  while (left < right) {
+    const pivot = values[(left + right) >> 1]!
+    let i = left
+    let j = right
+    while (i <= j) {
+      while (values[i]! < pivot) i++
+      while (values[j]! > pivot) j--
+      if (i > j) break
+      const previous = values[i]!
+      values[i] = values[j]!
+      values[j] = previous
+      i++
+      j--
+    }
+    if (nth <= j) right = j
+    else if (nth >= i) left = i
+    else break
+  }
+  const upper = values[nth]!
+  if (values.length % 2 !== 0) return upper
+  let lower = Number.NEGATIVE_INFINITY
+  for (let i = 0; i < nth; i++) if (values[i]! > lower) lower = values[i]!
+  return (lower + upper) / 2
 }
 
 /** Workload-corpus median $/request for an already-resolved cost — shared by
@@ -177,7 +225,7 @@ function corpusMedianCost(
   const t = thresholdPricingMap?.get(key)
   const regimes = compilePricingRegimes(m as CheapnessModel & { provider: { id: string } }, cost, t)
   const hr = hitRates?.get(key) ?? hitRateFallback?.get(m.id)
-  return median(effectiveCorpus.map((w) => priceWorkload(w, regimes, hr).expected))
+  return medianPriceForRegimes(effectiveCorpus, regimes, hr)
 }
 
 /**
@@ -266,6 +314,13 @@ export function buildPricingFallbackMap(models: CheapnessModel[]): Map<string, M
 
 export type FuzzyPricingMatch = { cost: ModelCost; score: number; donorId: string }
 
+// Multiset signature, not a fuzzy hash: Dice=1 iff both normalized strings
+// have exactly the same character-bigram counts. Exact signatures protect
+// first-donor/non-OpenRouter tie behavior even for distinct anagram strings.
+function bigramSignature(counts: Map<string, number>): string {
+  return [...counts].sort((a, b) => a[0].localeCompare(b[0])).map(([gram, count]) => `${gram}:${count}`).join("|")
+}
+
 /**
  * Fuzzy pricing fallback: for a model with no published pricing and no exact
  * model-id sibling (`buildPricingFallbackMap` already covers that case), find
@@ -278,117 +333,175 @@ export type FuzzyPricingMatch = { cost: ModelCost; score: number; donorId: strin
  * prefers an exact match over a fuzzy one). Ties prefer non-openrouter donors,
  * mirroring `buildPricingFallbackMap`'s preference.
  *
- * Candidate admission uses exact q-gram prefix + length filtering over an
- * inverted bigram index. For Dice threshold t and query bigram count A, any
- * valid donor has B in [tA/(2-t), A(2-t)/t] and must overlap a prefix of
- * A-ceil(t(A+Bmin)/2)+1 query grams. We order that prefix by donor frequency
- * (rarest first), probe only those postings, then verify survivors with the
- * original exact multiset-Dice function. No approximation or recall loss.
+ * Computes exact multiset-Dice overlaps using an inverted bigram posting index,
+ * without allocating candidate Sets, sorting candidates, or repeatedly
+ * intersecting per-donor Maps. For threshold t and query bigram count A,
+ * valid donors have B in [tA/(2-t), A(2-t)/t]. Reused typed-array stamps
+ * accumulate min(queryCount, donorCount) for every shared bigram; one stable
+ * donor-order pass resolves scores and preserves the original tie semantics.
+ * This is exact, including duplicated bigrams; there is no recall loss.
  */
-export function buildFuzzyPricingFallbackMap(models: CheapnessModel[], threshold = 0.75): Map<string, FuzzyPricingMatch> {
-  const paid = models.filter((m) => hasPublishedPricing(m.cost))
-  const unpriced = models.filter((m) => !hasPublishedPricing(m.cost))
-  if (paid.length === 0 || unpriced.length === 0) return new Map<string, FuzzyPricingMatch>()
-
-  // Collapse donors by normalized name — pricing is per-model, not per-provider
-  // row, so `model|provider` duplicates are identical work (Y1). Prefer
-  // non-openrouter on collision to preserve tie-breaking.
+export function buildFuzzyPricingFallbackMap(
+  models: CheapnessModel[],
+  threshold = 0.75,
+  exactCovered?: { has(id: string): boolean },
+): Map<string, FuzzyPricingMatch> {
+  // Exact donor/group deduplication avoids doing the same fuzzy work for each
+  // provider replica of a model.
   const donorByKey = new Map<string, CheapnessModel>()
-  for (const m of paid) {
-    const key = normalizeModelName(m.name || m.id)
+  const queryGroups = new Map<string, CheapnessModel[]>()
+  for (const model of models) {
+    const published = hasPublishedPricing(model.cost)
+    // Exact coverage comes from a fully built published-donor map. A covered
+    // unpriced row is dead work even before expensive name normalization.
+    if (!published && exactCovered?.has(model.id)) continue
+    const key = normalizeModelName(model.name || model.id)
     if (!key) continue
-    const existing = donorByKey.get(key)
-    if (!existing) donorByKey.set(key, m)
-    else if (existing.provider.id === "openrouter" && m.provider.id !== "openrouter") donorByKey.set(key, m)
-  }
-  const dedupedDonors = Array.from(donorByKey, ([key, model]) => ({ key, model, counts: bigramCounts(key) }))
-  const donorIndexByKey = new Map<string, number>()
-  const postings = new Map<string, Array<{ index: number; count: number }>>()
-  for (let index = 0; index < dedupedDonors.length; index++) {
-    const donor = dedupedDonors[index]!
-    donorIndexByKey.set(donor.key, index)
-    for (const [gram, count] of donor.counts) {
-      const list = postings.get(gram)
-      if (list) list.push({ index, count })
-      else postings.set(gram, [{ index, count }])
-    }
-  }
-
-  // Group unpriced queries by normalized key so one similarity scan serves all
-  // provider replicas of the same model (same 49× redundancy).
-  const queryGroups = new Map<string, { models: CheapnessModel[]; counts: Map<string, number> }>()
-  for (const m of unpriced) {
-    const q = normalizeModelName(m.name || m.id)
-    if (!q) continue
-    const g = queryGroups.get(q)
-    if (g) g.models.push(m)
-    else queryGroups.set(q, { models: [m], counts: bigramCounts(q) })
-  }
-
-  const map = new Map<string, FuzzyPricingMatch>()
-  for (const [query, { models: group, counts: qCounts }] of queryGroups) {
-    let best: { model: CheapnessModel; score: number } | undefined
-    let candidateIndices: number[]
-    let minDonorBigrams = 0
-    let maxDonorBigrams = Number.POSITIVE_INFINITY
-
-    if (threshold <= 0) {
-      // Preserve the public helper's edge-case semantics: score 0 qualifies.
-      candidateIndices = dedupedDonors.map((_, index) => index)
-    } else if (threshold > 1) {
-      candidateIndices = []
-    } else if (query.length < 2) {
-      const exactIndex = donorIndexByKey.get(query)
-      candidateIndices = exactIndex === undefined ? [] : [exactIndex]
+    if (published) {
+      const current = donorByKey.get(key)
+      if (!current || (current.provider.id === "openrouter" && model.provider.id !== "openrouter")) {
+        donorByKey.set(key, model)
+      }
     } else {
-      const queryBigrams = query.length - 1
-      minDonorBigrams = Math.ceil((threshold * queryBigrams) / (2 - threshold) - 1e-12)
-      maxDonorBigrams = Math.floor((queryBigrams * (2 - threshold)) / threshold + 1e-12)
-      const minRequiredOverlap = Math.ceil((threshold * (queryBigrams + minDonorBigrams)) / 2 - 1e-12)
-      const prefixLength = Math.max(1, Math.min(queryBigrams, queryBigrams - minRequiredOverlap + 1))
-
-      // Prefix filtering is exact for any token order. Ordering query bigram
-      // occurrences by posting-list length simply makes that exact prefix as
-      // selective as possible for the current donor corpus.
-      const prefix: string[] = []
-      for (const [gram, count] of qCounts) for (let occurrence = 0; occurrence < count; occurrence++) prefix.push(gram)
-      prefix.sort(
-        (a, b) =>
-          (postings.get(a)?.length ?? 0) - (postings.get(b)?.length ?? 0) || a.localeCompare(b),
-      )
-
-      const candidates = new Set<number>()
-      for (let i = 0; i < prefixLength; i++) {
-        for (const posting of postings.get(prefix[i]!) ?? []) candidates.add(posting.index)
-      }
-      // Original exhaustive scan resolves equal-score/equal-provider-preference
-      // ties by donor insertion order. Numeric donor index restores that exact
-      // order after set-based candidate generation.
-      candidateIndices = [...candidates].sort((a, b) => a - b)
+      // The merged consumer always prefers exact-id published prices. A query
+      // whose id is already covered cannot contribute to that merged result;
+      // skip only the query, never published donors needed by other models.
+      // Standalone callers omit exactCovered and retain historical behavior.
+      const group = queryGroups.get(key)
+      if (group) group.push(model)
+      else queryGroups.set(key, [model])
     }
+  }
+  const result = new Map<string, FuzzyPricingMatch>()
+  if (donorByKey.size === 0 || queryGroups.size === 0 || threshold > 1) return result
 
-    for (const index of candidateIndices) {
-      const candidate = dedupedDonors[index]!
-      if (threshold > 0 && query.length >= 2) {
-        const donorBigrams = candidate.key.length - 1
-        if (donorBigrams < minDonorBigrams || donorBigrams > maxDonorBigrams) continue
+  const donors = Array.from(donorByKey, ([key, model]) => ({
+    key,
+    model,
+    length: key.length - 1,
+    counts: bigramCounts(key),
+  }))
+  // Most provider catalogs replicate the same model name under both free and
+  // paid SKUs. Such queries have a known maximum score of 1; the expensive
+  // posting traversal is unnecessary. Only construct signature groups when at
+  // least one exact normalized donor exists among the queries. A signature
+  // group preserves exhaustive-scan tie behavior, including bigram anagrams.
+  let perfectDonors: Map<string, CheapnessModel> | undefined
+  let hasDirectDonor = false
+  if (Number.isFinite(threshold) && threshold <= 1) {
+    for (const query of queryGroups.keys()) {
+      if (query.length < 2 || !donorByKey.has(query)) continue
+      hasDirectDonor = true
+      break
+    }
+  }
+  if (hasDirectDonor) {
+    perfectDonors = new Map()
+    for (const donor of donors) {
+      if (donor.key.length < 2) continue
+      const signature = bigramSignature(donor.counts)
+      const current = perfectDonors.get(signature)
+      if (!current || (current.provider.id === "openrouter" && donor.model.provider.id !== "openrouter")) {
+        perfectDonors.set(signature, donor.model)
       }
-      const score = similarityWithCounts(query, qCounts, candidate.key, candidate.counts)
-      if (score < threshold) continue
-      if (
-        !best ||
-        score > best.score ||
-        (score === best.score && best.model.provider.id === "openrouter" && candidate.model.provider.id !== "openrouter")
-      ) {
-        best = { model: candidate.model, score }
+    }
+  }
+  // Posting counts encode a multiset, not just existence: repeated bigrams
+  // contribute min(queryCount, donorCount) to exact Dice overlap.
+  // When every query has an exact normalized donor, the perfect-signature
+  // lookup already proves the global maximal Dice score of 1. Constructing a
+  // postings index for that catalog would be pure cold-open overhead. Likewise,
+  // threshold<=0 must scan even zero-overlap donors, so postings are unused.
+  let needPostings = false
+  if (threshold > 0) {
+    for (const query of queryGroups.keys()) {
+      if (query.length < 2 || donorByKey.has(query)) continue
+      needPostings = true
+      break
+    }
+  }
+  const postings = new Map<string, Array<{ index: number; count: number }>>()
+  if (needPostings) {
+    for (let index = 0; index < donors.length; index++) {
+      for (const [gram, count] of donors[index]!.counts) {
+        const list = postings.get(gram)
+        if (list) list.push({ index, count })
+        else postings.set(gram, [{ index, count }])
+      }
+    }
+  }
+
+  // Reused stamp arrays eliminate one candidate Set + numeric sort + Map scan
+  // per query. Traverse donors in original insertion order to preserve exact
+  // previous tie-breaking (including OpenRouter/non-OpenRouter preferences).
+  const overlaps = new Uint32Array(donors.length)
+  const marks = new Uint32Array(donors.length)
+  const touched: number[] = []
+  let generation = 0
+  for (const [query, group] of queryGroups) {
+    const counts = bigramCounts(query)
+    const queryLength = query.length - 1
+    let best: { model: CheapnessModel; score: number } | undefined
+    if (perfectDonors && query.length >= 2 && donorByKey.has(query)) {
+      const perfect = perfectDonors.get(bigramSignature(counts))
+      if (perfect) best = { model: perfect, score: 1 }
+    }
+    // A perfect score is maximal and cannot be improved by another donor.
+    if (!best && threshold <= 0) {
+      // Keep the public threshold=0 contract: even a zero-Dice donor can win.
+      for (const donor of donors) {
+        const score = similarityWithCounts(query, counts, donor.key, donor.counts)
+        if (score < threshold) continue
+        if (
+          !best ||
+          score > best.score ||
+          (score === best.score && best.model.provider.id === "openrouter" && donor.model.provider.id !== "openrouter")
+        ) best = { model: donor.model, score }
+      }
+    } else if (!best && query.length < 2) {
+      const donor = donorByKey.get(query)
+      if (donor) best = { model: donor, score: 1 }
+    } else if (!best) {
+      const minLength = Math.ceil((threshold * queryLength) / (2 - threshold) - 1e-12)
+      const maxLength = Math.floor((queryLength * (2 - threshold)) / threshold + 1e-12)
+      generation++
+      touched.length = 0
+      for (const [gram, queryCount] of counts) {
+        const list = postings.get(gram)
+        if (!list) continue
+        for (const posting of list) {
+          const candidate = donors[posting.index]!
+          if (candidate.length < minLength || candidate.length > maxLength) continue
+          if (marks[posting.index] !== generation) {
+            marks[posting.index] = generation
+            overlaps[posting.index] = 0
+            touched.push(posting.index)
+          }
+          overlaps[posting.index]! += queryCount < posting.count ? queryCount : posting.count
+        }
+      }
+      const sparse = touched.length * 6 < donors.length
+      if (sparse) touched.sort((a, b) => a - b)
+      const count = sparse ? touched.length : donors.length
+      for (let offset = 0; offset < count; offset++) {
+        const index = sparse ? touched[offset]! : offset
+        if (marks[index] !== generation) continue
+        const donor = donors[index]!
+        const score = (2 * overlaps[index]!) / (queryLength + donor.length)
+        if (score < threshold) continue
+        if (
+          !best ||
+          score > best.score ||
+          (score === best.score && best.model.provider.id === "openrouter" && donor.model.provider.id !== "openrouter")
+        ) best = { model: donor.model, score }
       }
     }
     if (!best) continue
-    for (const m of group) {
-      if (!map.has(m.id)) map.set(m.id, { cost: best.model.cost, score: best.score, donorId: best.model.id })
+    for (const model of group) {
+      if (!result.has(model.id)) result.set(model.id, { cost: best.model.cost, score: best.score, donorId: best.model.id })
     }
   }
-  return map
+  return result
 }
 
 /**
