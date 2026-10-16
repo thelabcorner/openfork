@@ -291,12 +291,23 @@ function detectNode(text: string | undefined, files: ReadonlySet<string>): Stack
   for (const key of ["main", "module"] as const) if (typeof pkg[key] === "string") entryPoints.push(pkg[key] as string)
   const bin = pkg.bin
   if (typeof bin === "string") entryPoints.push(bin)
-  else if (bin && typeof bin === "object") entryPoints.push(...Object.values(bin).filter((value): value is string => typeof value === "string"))
-  for (const rel of ["src/main.ts", "src/main.js", "src/main.tsx", "src/index.ts", "src/index.js", "index.js", "index.ts"]) {
+  else if (bin && typeof bin === "object")
+    entryPoints.push(...Object.values(bin).filter((value): value is string => typeof value === "string"))
+  for (const rel of [
+    "src/main.ts",
+    "src/main.js",
+    "src/main.tsx",
+    "src/index.ts",
+    "src/index.js",
+    "index.js",
+    "index.ts",
+  ]) {
     if (files.has(rel)) entryPoints.push(rel)
   }
   const enginesNode =
-    engines && typeof engines === "object" && "node" in engines && typeof engines.node === "string" ? engines.node : undefined
+    engines && typeof engines === "object" && "node" in engines && typeof engines.node === "string"
+      ? engines.node
+      : undefined
   return {
     ecosystem: "node",
     monorepo,
@@ -317,10 +328,16 @@ function detectPython(text: string | undefined, files: ReadonlySet<string>): Sta
   const projectName = /^\s*name\s*=\s*"([^"]+)"/m.exec(projectSection.join("\n"))?.[1]
   const requiresPython = /^\s*requires-python\s*=\s*"([^"]+)"/m.exec(projectSection.join("\n"))?.[1]
   const deps = new Set<string>()
-  for (const section of ["project", "project.dependencies", "tool.poetry.dependencies", "project.optional-dependencies"]) {
+  for (const section of [
+    "project",
+    "project.dependencies",
+    "tool.poetry.dependencies",
+    "project.optional-dependencies",
+  ]) {
     for (const line of sectionLines(section, text)) {
       const match = /^\s*"?([a-zA-Z0-9_.-]+)"?\s*(?:,|=|>|<|~|\[|$)/.exec(line.trim())
-      if (match && match[1] !== "name" && match[1] !== "requires-python" && match[1] !== "dependencies") deps.add(match[1]!)
+      if (match && match[1] !== "name" && match[1] !== "requires-python" && match[1] !== "dependencies")
+        deps.add(match[1]!)
     }
   }
   const tools: string[] = []
@@ -421,7 +438,14 @@ function detectRuby(text: string | undefined): StackInfo | undefined {
   if (gems.has("rails")) frameworks.push("Rails")
   if (gems.has("sinatra")) frameworks.push("Sinatra")
   if (gems.has("rspec")) frameworks.push("RSpec")
-  return { ecosystem: "ruby", monorepo: false, frameworks: frameworks.slice(0, 3), deps: [...gems].slice(0, MAX_REQ_DEPS), entryPoints: [], notes: [] }
+  return {
+    ecosystem: "ruby",
+    monorepo: false,
+    frameworks: frameworks.slice(0, 3),
+    deps: [...gems].slice(0, MAX_REQ_DEPS),
+    entryPoints: [],
+    notes: [],
+  }
 }
 
 function detectPhp(text: string | undefined): StackInfo | undefined {
@@ -433,7 +457,14 @@ function detectPhp(text: string | undefined): StackInfo | undefined {
   const frameworks: string[] = []
   if (deps.includes("laravel/framework")) frameworks.push("Laravel")
   if (deps.some((dep) => dep.startsWith("symfony/"))) frameworks.push("Symfony")
-  return { ecosystem: "php", monorepo: false, frameworks: frameworks.slice(0, 3), deps: deps.slice(0, MAX_REQ_DEPS), entryPoints: [], notes: [] }
+  return {
+    ecosystem: "php",
+    monorepo: false,
+    frameworks: frameworks.slice(0, 3),
+    deps: deps.slice(0, MAX_REQ_DEPS),
+    entryPoints: [],
+    notes: [],
+  }
 }
 
 export function annotateScripts(text: string | undefined): readonly ScriptInfo[] | undefined {
@@ -445,7 +476,9 @@ export function annotateScripts(text: string | undefined): readonly ScriptInfo[]
     .slice(0, MAX_SCRIPTS)
     .map(([name, cmd]) => ({
       name,
-      category: LIFECYCLE.has(name) ? "lifecycle" : (SCRIPT_CATEGORIES.find(([regex]) => regex.test(name))?.[1] ?? "other"),
+      category: LIFECYCLE.has(name)
+        ? "lifecycle"
+        : (SCRIPT_CATEGORIES.find(([regex]) => regex.test(name))?.[1] ?? "other"),
       cmd: cmd.length > MAX_SCRIPT_CMD ? `${cmd.slice(0, MAX_SCRIPT_CMD)}…` : cmd,
     }))
 }
@@ -499,7 +532,38 @@ export function detectStack(
   return { stack, lockfile, versionPins }
 }
 
-export const escapeXml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+/**
+ * Single shared native/OXP XML escape. Project metadata is controlled by the
+ * inspected repository; quotes, embedded newlines and invalid XML scalars
+ * must not be able to break a quoted attribute or forge another XML node.
+ * One pass avoids repeatedly allocating intermediate strings on large trees.
+ */
+export const escapeXml = (text: string) =>
+  text.replace(
+    /[&<>"'\t\n\r\u0000-\u0008\u000B\u000C\u000E-\u001F]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    (character) => {
+      switch (character) {
+        case "&":
+          return "&amp;"
+        case "<":
+          return "&lt;"
+        case ">":
+          return "&gt;"
+        case '"':
+          return "&quot;"
+        case "'":
+          return "&apos;"
+        case "\t":
+          return "&#x9;"
+        case "\n":
+          return "&#xA;"
+        case "\r":
+          return "&#xD;"
+        default:
+          return ""
+      }
+    },
+  )
 
 export function humanSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -510,7 +574,8 @@ export function humanSize(bytes: number): string {
     value /= 1024
     unit++
   }
-  const rounded = value >= 100 ? Math.round(value) : value >= 10 ? Math.round(value * 10) / 10 : Math.round(value * 100) / 100
+  const rounded =
+    value >= 100 ? Math.round(value) : value >= 10 ? Math.round(value * 10) / 10 : Math.round(value * 100) / 100
   return `${rounded} ${units[unit]}`
 }
 
@@ -601,7 +666,12 @@ function renderChildren(node: TreeNode, depth: number, prefix: string, budget: {
   return { lines, moreFiles, moreBytes }
 }
 
-export function tree(files: readonly string[], sizes: ReadonlyMap<string, number>, depth?: number, maxEntries?: number): TreeProjection {
+export function tree(
+  files: readonly string[],
+  sizes: ReadonlyMap<string, number>,
+  depth?: number,
+  maxEntries?: number,
+): TreeProjection {
   const root = buildTree(files, sizes)
   const boundedDepth = Math.min(Math.max(depth ?? DEFAULT_TREE_DEPTH, 1), MAX_TREE_DEPTH)
   const boundedEntries = Math.min(Math.max(maxEntries ?? DEFAULT_TREE_ENTRIES, 1), MAX_TREE_ENTRIES)
@@ -697,10 +767,12 @@ export const inspect = Effect.fn("ProjectInspection.inspect")(function* (
 ) {
   const root = path.resolve(input.root)
   const scope = path.resolve(input.scope ?? root)
-  if (!isContained(root, scope)) return yield* new InvalidInput({ message: `Project inspection scope escapes root: ${scope}` })
+  if (!isContained(root, scope))
+    return yield* new InvalidInput({ message: `Project inspection scope escapes root: ${scope}` })
   const stat = yield* Effect.tryPromise(() => fs.stat(scope)).pipe(Effect.catch(() => Effect.succeed(undefined)))
   if (!stat) return yield* new InvalidInput({ message: `Project inspection path not found: ${scope}` })
-  if (!stat.isDirectory()) return yield* new InvalidInput({ message: `Project inspection path is not a directory: ${scope}` })
+  if (!stat.isDirectory())
+    return yield* new InvalidInput({ message: `Project inspection path is not a directory: ${scope}` })
 
   const listed = input.files
     ? input.files.slice(0, MAX_FILES + 1).map((path) => ({ path }))
@@ -711,14 +783,18 @@ export const inspect = Effect.fn("ProjectInspection.inspect")(function* (
   const scopeRelativeNative = path.relative(root, scope)
   const scopeRelative = scopeRelativeNative ? scopeRelativeNative.replaceAll("\\", "/") : "."
   const prefix = scopeRelative === "." ? "" : `${scopeRelative}/`
-  const files = prefix ? rootFiles.filter((file) => file.startsWith(prefix)).map((file) => file.slice(prefix.length)) : rootFiles
+  const files = prefix
+    ? rootFiles.filter((file) => file.startsWith(prefix)).map((file) => file.slice(prefix.length))
+    : rootFiles
 
   let totalBytes = 0
   const sizes = new Map<string, number>()
   const byExt = new Map<string, { files: number; bytes: number }>()
   for (const relative of files) {
     if (input.signal?.aborted) break
-    const info = yield* Effect.tryPromise(() => fs.stat(path.join(scope, relative))).pipe(Effect.catch(() => Effect.succeed(undefined)))
+    const info = yield* Effect.tryPromise(() => fs.stat(path.join(scope, relative))).pipe(
+      Effect.catch(() => Effect.succeed(undefined)),
+    )
     if (!info?.isFile()) continue
     sizes.set(relative, info.size)
     totalBytes += info.size
@@ -732,7 +808,8 @@ export const inspect = Effect.fn("ProjectInspection.inspect")(function* (
   const manifests = yield* readManifests(scope, root)
   const notes: string[] = []
   for (const [name, result] of manifests) {
-    if (result && "tooLarge" in result) notes.push(`${name} skipped: too large (${Math.round(result.tooLarge / 1024)} KB)`)
+    if (result && "tooLarge" in result)
+      notes.push(`${name} skipped: too large (${Math.round(result.tooLarge / 1024)} KB)`)
   }
 
   const fileSet = new Set(rootFiles)
@@ -798,7 +875,9 @@ export const recent = Effect.fn("ProjectInspection.recent")(function* (
   const rows: Array<{ readonly path: string; readonly mtime: number }> = []
   for (const relative of files) {
     if (signal?.aborted) break
-    const stat = yield* Effect.tryPromise(() => fs.stat(path.join(root, relative))).pipe(Effect.catch(() => Effect.succeed(undefined)))
+    const stat = yield* Effect.tryPromise(() => fs.stat(path.join(root, relative))).pipe(
+      Effect.catch(() => Effect.succeed(undefined)),
+    )
     if (stat?.isFile()) rows.push({ path: relative, mtime: stat.mtimeMs })
   }
   return rows.sort((a, b) => b.mtime - a.mtime).slice(0, capped)

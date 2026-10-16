@@ -18,7 +18,7 @@ describe("RuntimeFlags", () => {
     }),
   )
 
-  it.effect("Code Mode defaults on and keeps the upstream flag as an explicit opt-out", () =>
+  it.effect("parses the deprecated Code Mode flag for compatibility without selecting the provider surface", () =>
     Effect.gen(function* () {
       const defaults = yield* readFlags.pipe(Effect.provide(fromConfig({})))
       const disabled = yield* readFlags.pipe(

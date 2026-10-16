@@ -33,8 +33,29 @@ export function pluginSpecifier(plugin: ConfigPluginV1.Spec): string {
   return Array.isArray(plugin) ? plugin[0] : plugin
 }
 
-export function pluginOptions(plugin: ConfigPluginV1.Spec): ConfigPluginV1.Options | undefined {
+/**
+ * External plugins are session-critical unless they explicitly opt into the
+ * restricted background event lane. The reserved host metadata is not part of
+ * the plugin's own options object.
+ */
+export type StartupLane = "session" | "background-events"
+
+export function pluginStartupLane(plugin: ConfigPluginV1.Spec): StartupLane {
+  const options = pluginOptionsRaw(plugin)
+  const metadata = options?.["$openfork"]
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return "session"
+  return (metadata as Record<string, unknown>).startup === "background-events" ? "background-events" : "session"
+}
+
+function pluginOptionsRaw(plugin: ConfigPluginV1.Spec): ConfigPluginV1.Options | undefined {
   return Array.isArray(plugin) ? plugin[1] : undefined
+}
+
+export function pluginOptions(plugin: ConfigPluginV1.Spec): ConfigPluginV1.Options | undefined {
+  const options = pluginOptionsRaw(plugin)
+  if (!options || !("$openfork" in options)) return options
+  const { $openfork: _host, ...runtime } = options
+  return Object.keys(runtime).length ? runtime : undefined
 }
 
 // Path-like specs are resolved relative to the config file that declared them so merges later on do not

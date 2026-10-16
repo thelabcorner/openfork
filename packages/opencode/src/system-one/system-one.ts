@@ -78,6 +78,7 @@ export const layer = Layer.effect(
       const routed = yield* provider.resolveTransientRoutedModel({
         providerID: input.providerID,
         modelID: input.modelID,
+        executionPurpose: "system-one",
         ...(accountID ? { accountID } : {}),
         ...(input.routeIntent ? { routeIntent: input.routeIntent } : {}),
       })

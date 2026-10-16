@@ -5,6 +5,7 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Effect, Exit, Layer, Option, Schema, Scope, Context, Stream } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Account } from "@/account/account"
+import { AccountID } from "@/account/schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { Provider } from "@/provider/provider"
@@ -13,9 +14,9 @@ import { Session } from "@/session/session"
 import { MessageV2 } from "@/session/message-v2"
 import type { SessionID } from "@/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
-import { eq } from "drizzle-orm"
+import { and, eq, notInArray, sql } from "drizzle-orm"
 import { Config } from "@/config/config"
-import { SessionShareTable } from "@opencode-ai/core/share/sql"
+import { SessionShareTable, ShareCleanupTable } from "@opencode-ai/core/share/sql"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -34,6 +35,9 @@ export type Req = {
   headers: Record<string, string>
   api: Api
   baseUrl: string
+  apiFamily: "share" | "shares"
+  accountID?: string
+  orgID?: string
 }
 
 const ShareSchema = Schema.Struct({
@@ -48,6 +52,8 @@ type State = {
   scope: Scope.Closeable
   shared: Map<SessionID, Share | null>
   flushing: Set<SessionID>
+  cleanupDraining: boolean
+  cleanupRequested: boolean
   closed: boolean
 }
 
@@ -175,7 +181,7 @@ const layer = Layer.effect(
     const state: InstanceState.InstanceState<State> = yield* InstanceState.make<State>(
       Effect.fn("ShareNext.state")(function* (_ctx) {
         const cache: State = {
-          queue: new Map(), scope: yield* Scope.make(), shared: new Map(), flushing: new Set(), closed: false,
+          queue: new Map(), scope: yield* Scope.make(), shared: new Map(), flushing: new Set(), cleanupDraining: false, cleanupRequested: false, closed: false,
         }
 
         yield* Effect.addFinalizer(() =>
@@ -186,6 +192,8 @@ const layer = Layer.effect(
                 cache.queue.clear()
                 cache.shared.clear()
                 cache.flushing.clear()
+                cache.cleanupDraining = false
+                cache.cleanupRequested = false
               }),
             ),
           ),
@@ -243,18 +251,141 @@ const layer = Layer.effect(
         yield* watch(Session.Event.Diff, (data) =>
           sync(data.sessionID, () => [{ type: "session_diff", data: structuredClone(data.diff) as SDK.SnapshotFileDiff[] }]),
         )
-        yield* watch(Session.Event.Deleted, (data) => remove(data.sessionID))
+        yield* watch(Session.Event.Deleted, (data) =>
+          Effect.gen(function* () {
+            const s = yield* InstanceState.get(state)
+            s.shared.delete(data.sessionID)
+            s.queue.delete(data.sessionID)
+            yield* db.update(ShareCleanupTable).set({ ready: 1 })
+              .where(eq(ShareCleanupTable.session_id, data.sessionID)).run().pipe(Effect.orDie)
+            yield* scheduleCleanupDrain()
+          }),
+        )
 
         return cache
       }),
     )
+
+    // Cleanup rows are independent of Session lifetime. Keep the worker owned
+    // by the ShareNext instance scope, but leave failed rows durable so a later
+    // init/retry can resume after shutdown. Each drain handles at most 100 rows
+    // and retries each at most three times with bounded backoff.
+    const scheduleCleanupDrain: () => Effect.Effect<void> = Effect.fn("ShareNext.scheduleCleanupDrain")(function* () {
+      const s = yield* InstanceState.get(state)
+      if (s.closed) return
+      if (s.cleanupDraining) {
+        s.cleanupRequested = true
+        return
+      }
+      const pending = yield* db.select({ id: ShareCleanupTable.share_id }).from(ShareCleanupTable)
+        .where(eq(ShareCleanupTable.ready, 1)).limit(1).get().pipe(Effect.orDie)
+      if (!pending) return
+      s.cleanupDraining = true
+      yield* Effect.gen(function* () {
+        // Cap each worker turn at 100 rows to bound foreground-adjacent work.
+        const processed = new Set<string>()
+        for (let batch = 0; batch < 5; batch++) {
+          const rows = yield* db.select().from(ShareCleanupTable)
+            .where(and(
+              eq(ShareCleanupTable.ready, 1),
+              processed.size ? notInArray(ShareCleanupTable.share_id, [...processed]) : undefined,
+            ))
+            .limit(20)
+            .pipe(Effect.orDie)
+          if (rows.length === 0) break
+          for (const row of rows) {
+            processed.add(row.share_id)
+            let removed = false
+            let lastError: unknown
+            for (let attempt = 0; attempt < 3 && !removed; attempt++) {
+              if (attempt > 0) yield* Effect.sleep(attempt * 250)
+              const result = yield* Effect.exit(Effect.gen(function* () {
+                const req = yield* Effect.gen(function* () {
+                  if (row.api_family === "shares") {
+                    if (!row.account_id || !row.org_id || !row.base_url) {
+                      return yield* Effect.fail(new Error("captured share route is incomplete"))
+                    }
+                    const token = yield* account.token(AccountID.make(row.account_id))
+                    if (Option.isNone(token)) {
+                      return yield* Effect.fail(new Error("captured share account token is unavailable"))
+                    }
+                    return {
+                      baseUrl: row.base_url,
+                      api: consoleApi,
+                      headers: { authorization: `Bearer ${token.value}`, "x-org-id": row.org_id },
+                    }
+                  }
+                  if (row.api_family !== "share") {
+                    return yield* Effect.fail(new Error("captured share API family is unavailable"))
+                  }
+                  if (!row.base_url) return yield* Effect.fail(new Error("captured share endpoint is unavailable"))
+                  return { baseUrl: row.base_url, api: legacyApi, headers: {} }
+                })
+                const res = yield* HttpClientRequest.delete(`${req.baseUrl}${req.api.remove(row.share_id)}`).pipe(
+                  HttpClientRequest.setHeaders(req.headers),
+                  HttpClientRequest.bodyJson({ secret: row.secret }),
+                  Effect.flatMap((r) => http.execute(r)),
+                )
+                if (res.status >= 400 && res.status !== 404) {
+                  return yield* Effect.fail(new Error(`share DELETE returned ${res.status}`))
+                }
+                yield* db.delete(ShareCleanupTable).where(eq(ShareCleanupTable.share_id, row.share_id)).run().pipe(Effect.orDie)
+                return true
+              }))
+              if (Exit.isSuccess(result)) {
+                removed = true
+              } else {
+                lastError = result.cause
+              }
+            }
+            if (!removed) {
+              yield* db.update(ShareCleanupTable).set({
+                attempts: row.attempts + 3,
+                last_error: String(lastError),
+              }).where(eq(ShareCleanupTable.share_id, row.share_id)).run().pipe(Effect.orDie)
+              yield* Effect.logWarning("remote share cleanup deferred after retries", {
+                sessionID: row.session_id,
+                shareID: row.share_id,
+                cause: lastError,
+              })
+            }
+          }
+        }
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logError("share cleanup drain failed", { cause })),
+        Effect.ensuring(Effect.sync(() => { s.cleanupDraining = false }).pipe(
+          Effect.andThen(Effect.suspend(() => {
+            if (!s.cleanupRequested) return Effect.void
+            s.cleanupRequested = false
+            return scheduleCleanupDrain()
+          })),
+        )),
+        Effect.forkIn(s.scope),
+        Effect.asVoid,
+      )
+    })
+
+    const recoverCleanup = Effect.fn("ShareNext.recoverCleanup")(function* () {
+      const prepared = yield* db.select().from(ShareCleanupTable)
+        .where(eq(ShareCleanupTable.ready, 0))
+        .limit(100)
+        .pipe(Effect.orDie)
+      for (const row of prepared) {
+        const session = yield* db.get<{ id: string }>(sql`SELECT id FROM session WHERE id = ${row.session_id}`)
+          .pipe(Effect.orDie)
+        if (!session) {
+          yield* db.update(ShareCleanupTable).set({ ready: 1 })
+            .where(eq(ShareCleanupTable.share_id, row.share_id)).run().pipe(Effect.orDie)
+        }
+      }
+    })
 
     const request = Effect.fn("ShareNext.request")(function* () {
       const headers: Record<string, string> = {}
       const active = yield* account.active()
       if (Option.isNone(active) || !active.value.active_org_id) {
         const baseUrl = (yield* cfg.get()).enterprise?.url ?? "https://opncd.ai"
-        return { headers, api: legacyApi, baseUrl } satisfies Req
+        return { headers, api: legacyApi, baseUrl, apiFamily: "share" } satisfies Req
       }
 
       const token = yield* account.token(active.value.id)
@@ -264,7 +395,14 @@ const layer = Layer.effect(
 
       headers.authorization = `Bearer ${token.value}`
       headers["x-org-id"] = active.value.active_org_id
-      return { headers, api: consoleApi, baseUrl: active.value.url } satisfies Req
+      return {
+        headers,
+        api: consoleApi,
+        baseUrl: active.value.url,
+        apiFamily: "shares",
+        accountID: active.value.id,
+        orgID: active.value.active_org_id,
+      } satisfies Req
     })
 
     const get = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -352,6 +490,8 @@ const layer = Layer.effect(
     const init = Effect.fn("ShareNext.init")(function* () {
       if (disabled) return
       yield* InstanceState.get(state)
+      yield* recoverCleanup()
+      yield* scheduleCleanupDrain()
     })
 
     const url = Effect.fn("ShareNext.url")(function* () {
@@ -370,10 +510,27 @@ const layer = Layer.effect(
       )
       yield* db
         .insert(SessionShareTable)
-        .values({ session_id: sessionID, id: result.id, secret: result.secret, url: result.url })
+        .values({
+          session_id: sessionID,
+          id: result.id,
+          secret: result.secret,
+          url: result.url,
+          delete_base_url: req.baseUrl,
+          delete_api_family: req.apiFamily,
+          delete_account_id: req.accountID,
+          delete_org_id: req.orgID,
+        })
         .onConflictDoUpdate({
           target: SessionShareTable.session_id,
-          set: { id: result.id, secret: result.secret, url: result.url },
+          set: {
+            id: result.id,
+            secret: result.secret,
+            url: result.url,
+            delete_base_url: req.baseUrl,
+            delete_api_family: req.apiFamily,
+            delete_account_id: req.accountID,
+            delete_org_id: req.orgID,
+          },
         })
         .run()
         .pipe(Effect.orDie)

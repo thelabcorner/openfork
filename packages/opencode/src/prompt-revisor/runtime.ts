@@ -5,7 +5,9 @@ import { MessageID, SessionID } from "@/session/schema"
 import { MCP } from "@/mcp"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { PromptRevisor } from "@opencode-ai/core/prompt-revisor"
+import { ProviderRoute } from "@opencode-ai/core/provider-route"
 import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
+import { OpencodeProviderRoute } from "@opencode-ai/core/plugin/provider/opencode-provider-route"
 import { type ToolChoiceCapabilityIdentity } from "@opencode-ai/core/tool-choice-compatibility"
 import { collectUntilTerminalTool } from "@opencode-ai/core/special-agent-completion"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -45,9 +47,13 @@ const usageRoute = (route?: ProviderRouteResolution.RouteAttribution) =>
       ? ({ routeKind: "public" } as const)
       : undefined
 
-const routedRef = (ref: ModelV2.Ref, route?: ProviderRouteResolution.RouteAttribution) =>
+type MaintenanceRoute =
+  | { readonly routeKind: "public" }
+  | { readonly routeKind: "account"; readonly accountID: string }
+
+const routedRef = (ref: ModelV2.Ref, route?: MaintenanceRoute) =>
   route?.routeKind === "account"
-    ? ModelV2.Ref.make({ ...ref, accountID: route.accountID! })
+    ? ModelV2.Ref.make({ ...ref, accountID: route.accountID })
     : route?.routeKind === "public"
       ? ModelV2.Ref.make({
           providerID: ref.providerID,
@@ -55,6 +61,20 @@ const routedRef = (ref: ModelV2.Ref, route?: ProviderRouteResolution.RouteAttrib
           ...(ref.variant ? { variant: ref.variant } : {}),
         })
       : ref
+
+const bindingAttribution = (binding: ProviderRoute.Binding): ProviderRouteResolution.RouteAttribution => ({
+  sessionID: binding.sessionID,
+  affinityDomain: binding.affinityDomain,
+  providerID: binding.providerID,
+  routeRevision: binding.routeRevision,
+  routeKind: binding.routeKind,
+  ...(binding.routeKind === "account" ? { accountID: binding.accountID } : {}),
+})
+
+const transientUsageRoute = (routed: Provider.TransientRoutedModel): MaintenanceRoute =>
+  routed.route.route.kind === "account"
+    ? { routeKind: "account", accountID: routed.route.route.accountID }
+    : { routeKind: "public" }
 
 /**
  * Production Prompt Revisor runtime. Model lookup and execution deliberately go
@@ -67,6 +87,7 @@ export const makeRuntime = (
   llm: SessionLLM.Interface,
   agents: Agent.Interface,
   mcp?: MCP.Interface,
+  routes?: ProviderRoute.Interface,
 ): PromptRevisor.Runtime => ({
   resolveModel: Effect.fn("PromptRevisorRuntime.resolveModel")(function* ({
     candidates,
@@ -83,46 +104,85 @@ export const makeRuntime = (
       if (seen.has(key)) continue
       seen.add(key)
 
-      if (session) {
-        const explicitOverride = explicit.has(key)
-        const inheritedProvider =
-          session.model === undefined || candidate.providerID === session.model.providerID
-        if (!explicitOverride && !inheritedProvider) continue
+      const explicitOverride = explicit.has(key)
+      const inheritedProvider = session?.model === undefined || candidate.providerID === session.model.providerID
+      if (session && !explicitOverride && !inheritedProvider) continue
 
-        const accountID =
-          explicitOverride || key === sessionModelKey ? candidate.accountID : undefined
-        const routed = yield* provider
-          .resolveRoutedModel({
-            sessionID: session.id,
-            providerID: candidate.providerID,
-            modelID: candidate.id,
-            ...(accountID ? { accountID } : {}),
-          })
-          .pipe(Effect.option)
-        if (routed._tag === "None") continue
-        if (routed.value) {
-          const route = routed.value.route.attribution
+      // Automatic same-provider fallbacks must not hard-pin stale account
+      // metadata. The actual Session model and explicit one-shot overrides keep
+      // their account intent.
+      const accountID = !session || explicitOverride || key === sessionModelKey ? candidate.accountID : undefined
+
+      if (session && routes) {
+        const binding = yield* routes.get(session.id, OpencodeProviderRoute.affinityDomain(candidate.providerID))
+        // Hosted Public may be a valid parent worker binding, but it is not an
+        // OpenFork special-agent transport. Resolve an account-backed transient
+        // route instead, without changing that parent binding.
+        if (binding && !(Provider.isHostedZenProvider(candidate.providerID) && binding.routeKind === "public")) {
+          if (accountID && (binding.routeKind !== "account" || binding.accountID !== accountID)) continue
+          const route = bindingAttribution(binding)
+          const inherited = yield* provider
+            .resolveInheritedRoutedModel({
+              sessionID: session.id,
+              providerID: candidate.providerID,
+              modelID: candidate.id,
+              route,
+              executionPurpose: "special-agent",
+            })
+            .pipe(Effect.option)
+          if (inherited._tag === "None") continue
+          if (Provider.isHostedZenProvider(candidate.providerID) && inherited.value.route.attribution?.routeKind !== "account") continue
           return {
-            ref: routedRef(candidate, route),
-            value: routed.value.model,
-            route: usageRoute(route),
-            capability: toolChoiceIdentity(routed.value.model),
+            ref: routedRef(candidate, usageRoute(inherited.value.route.attribution)),
+            value: inherited.value.model,
+            route: usageRoute(inherited.value.route.attribution),
+            capability: toolChoiceIdentity(inherited.value.model),
           }
         }
-        // The route owner positively reports this provider/model is outside its
-        // domain. Preserve direct-provider execution only for the inherited
-        // provider or an explicit override.
       }
 
+      // A committed route for this provider exists only for the owning primary
+      // turn. When it is absent, maintenance must not become the route owner:
+      // resolve a one-call route that materializes the exact Public/account
+      // transport without creating or rebinding durable Session affinity.
+      // Draft mode has no Session at all, but a hosted provider still requires a
+      // real route decision instead of ambient auth.
+      const shouldRouteTransiently = session !== undefined || Provider.isHostedZenProvider(candidate.providerID)
+      if (shouldRouteTransiently && typeof provider.resolveTransientRoutedModel === "function") {
+        const transient = yield* provider
+          .resolveTransientRoutedModel({
+            providerID: candidate.providerID,
+            modelID: candidate.id,
+            ...(accountID ? { accountID } : { routeIntent: { kind: "auto" as const } }),
+            executionPurpose: "special-agent",
+          })
+          .pipe(Effect.option)
+        if (transient._tag === "None") continue
+        if (transient.value) {
+          const route = transientUsageRoute(transient.value)
+          if (Provider.isHostedZenProvider(candidate.providerID) && route.routeKind !== "account") continue
+          return {
+            ref: routedRef(candidate, route),
+            value: transient.value.model,
+            route,
+            capability: toolChoiceIdentity(transient.value.model),
+          }
+        }
+        // A successful undefined result is the route owner's positive statement
+        // that this provider/model belongs to the legacy direct-provider path.
+      }
+
+      // A hosted provider always has an authoritative route owner. If the
+      // transient resolution above produced nothing, maintenance must fail
+      // closed rather than spend an ambient credential (or land on the hosted
+      // Public free tier) through a bare catalog lookup.
+      if (Provider.isHostedZenProvider(candidate.providerID)) continue
+
       const resolved = yield* provider
-        .getModel(
-          candidate.providerID,
-          candidate.id,
-          session && !explicit.has(key) && key !== sessionModelKey ? undefined : candidate.accountID,
-        )
+        .getModel(candidate.providerID, candidate.id, accountID)
         .pipe(Effect.option)
       if (resolved._tag === "Some") {
-        return { ref: candidate, value: resolved.value, capability: toolChoiceIdentity(resolved.value) }
+        return { ref: routedRef(candidate), value: resolved.value, capability: toolChoiceIdentity(resolved.value) }
       }
     }
 
@@ -136,28 +196,71 @@ export const makeRuntime = (
         .map((candidate) => `${candidate.providerID}/${candidate.id}${candidate.accountID ? `@${candidate.accountID}` : ""}`)
         .join(", ")
       return yield* new PromptRevisor.UnavailableError({
-        message: `No requested model is available for prompt revision: ${requested}`,
+        message: `No requested model is available for prompt revision: ${requested}` +
+          (candidates.some((item) => Provider.isHostedZenProvider(item.providerID))
+            ? ". Hosted OpenCode Public/free tier cannot execute OpenFork special agents; select an eligible account-backed model."
+            : ""),
       })
     }
 
-    const fallbackRef = yield* provider.defaultModel().pipe(
-      Effect.mapError(
-        (error) =>
-          new PromptRevisor.UnavailableError({
-            message: `No model is available for prompt revision: ${error.message}`,
-          }),
-      ),
-    )
+    const unavailable = (error: { readonly message: string }) =>
+      new PromptRevisor.UnavailableError({
+        message: `No model is available for prompt revision: ${error.message}`,
+      })
+
+    const fallbackRef = yield* provider.defaultModel().pipe(Effect.mapError(unavailable))
+    const fallbackCandidate = ModelV2.Ref.make({
+      providerID: fallbackRef.providerID,
+      id: fallbackRef.modelID,
+    })
+
+    // The provider default is a real streaming selection, not catalog metadata.
+    // It obeys the same invariant as an explicit candidate: a hosted provider
+    // must reach llm.stream through an actual route decision, so it fails closed
+    // instead of spending an ambient credential or landing on the hosted Public
+    // free tier through a bare catalog lookup.
+    const shouldRouteFallbackTransiently =
+      session !== undefined || Provider.isHostedZenProvider(fallbackRef.providerID)
+    if (shouldRouteFallbackTransiently && typeof provider.resolveTransientRoutedModel === "function") {
+      const transient = yield* provider
+        .resolveTransientRoutedModel({
+          providerID: fallbackRef.providerID,
+          modelID: fallbackRef.modelID,
+          routeIntent: { kind: "auto" },
+          executionPurpose: "special-agent",
+        })
+        .pipe(Effect.mapError(unavailable))
+      if (transient) {
+        const route = transientUsageRoute(transient)
+        if (Provider.isHostedZenProvider(fallbackRef.providerID) && route.routeKind !== "account") {
+          return yield* new PromptRevisor.UnavailableError({
+            message: "OpenCode Public free tier cannot execute an OpenFork special agent; select an account-backed model",
+          })
+        }
+        return {
+          ref: routedRef(fallbackCandidate, route),
+          value: transient.model,
+          route,
+          capability: toolChoiceIdentity(transient.model),
+        }
+      }
+      // A successful undefined result is the route owner's positive statement
+      // that this provider/model belongs to the legacy direct-provider path.
+    }
+
+    // A hosted provider always has an authoritative route owner: without one,
+    // maintenance must fail closed rather than stream with no route at all.
+    if (Provider.isHostedZenProvider(fallbackRef.providerID)) {
+      return yield* new PromptRevisor.UnavailableError({
+        message: `No model is available for prompt revision: ${fallbackRef.providerID}/${fallbackRef.modelID} has no authoritative route`,
+      })
+    }
+
     const fallback = yield* provider.getModel(fallbackRef.providerID, fallbackRef.modelID).pipe(
-      Effect.mapError(
-        (error) =>
-          new PromptRevisor.UnavailableError({
-            message: `No model is available for prompt revision: ${error.message}`,
-          }),
-      ),
+      Effect.mapError(unavailable),
     )
     return {
-      ref: { providerID: fallbackRef.providerID, id: fallbackRef.modelID },
+      ref: fallbackCandidate,
       value: fallback,
       capability: toolChoiceIdentity(fallback),
     }

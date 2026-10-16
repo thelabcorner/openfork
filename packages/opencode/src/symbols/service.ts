@@ -1,17 +1,15 @@
 import path from "path"
-import { Context, Effect, Layer, Ref, Schema } from "effect"
+import { Context, Effect, Layer, Option, Ref, Schema } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { PositiveInt } from "@opencode-ai/core/schema"
-import {
-  getOutline,
-  type CachedOutline,
-  type OutlineCacheRef,
-} from "@/tool/symbols/outline"
+import { getOutline, type CachedOutline, type OutlineCacheRef } from "@/tool/symbols/outline"
 import { findDefinitions, validateQuery, wordPattern } from "@/tool/symbols/search"
 import { usages, identifierAt, MAX_REF_SNIPPET } from "@/tool/symbols/usages"
+import { aroundWindow, AROUND_MAX } from "@/tool/read/inspect"
+import { ReadFilesystem } from "@/read/filesystem"
 
 /**
  * Protocol-neutral symbol intelligence shared by native agent tools and OXP.
@@ -100,6 +98,23 @@ export interface Interface {
     input: Input,
     context: ExecutionContext,
   ) => Effect.Effect<Result, InvalidInput | Ripgrep.Error | Ripgrep.InvalidPatternError | FSUtil.Error>
+  /** A narrow shared AST/cache-backed symbol locator, without reading its window. */
+  readonly locate: (
+    input: { readonly file: string; readonly symbol: string; readonly limit?: number },
+    context: ExecutionContext,
+  ) => Effect.Effect<
+    {
+      readonly offset: number
+      readonly limit: number
+      readonly symbolLine: number
+      readonly kind?: string
+      readonly name?: string
+      readonly fallback: boolean
+      /** Linearization guard: must equal the file snapshot read at execution. */
+      readonly fingerprint: string
+    },
+    InvalidInput | Ripgrep.Error | Ripgrep.InvalidPatternError | FSUtil.Error
+  >
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Symbols") {}
@@ -132,8 +147,7 @@ const requireQuery = Effect.fnUntraced(function* (query: string) {
     try: () => {
       validateQuery(query)
     },
-    catch: (cause) =>
-      new InvalidInput({ detail: cause instanceof Error ? cause.message : String(cause) }),
+    catch: (cause) => new InvalidInput({ detail: cause instanceof Error ? cause.message : String(cause) }),
   })
 })
 
@@ -147,6 +161,59 @@ const layer = Layer.effect(
     // One bounded cache is shared by native and OXP adapters. Absolute paths
     // are cache keys and every lookup still performs mtime+size validation.
     const cache: OutlineCacheRef = yield* Ref.make<Map<string, CachedOutline>>(new Map())
+
+    const locate: Interface["locate"] = Effect.fn("Symbols.locate")(function* (input, context) {
+      if (context.abort?.aborted) return yield* new InvalidInput({ detail: "symbol lookup was cancelled" })
+      if (!input.symbol.trim() || input.symbol.length > 256) {
+        return yield* new InvalidInput({ detail: "around requires a symbol name of 1-256 characters" })
+      }
+      const abs = resolvePath(context.directory, input.file)
+      yield* relativeToWorktree(context.worktree, abs)
+      if (context.authorize) yield* context.authorize(abs, "file")
+      const info = yield* fs.stat(abs).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (!info || info.type !== "File") return yield* new InvalidInput({ detail: `File not found: ${abs}` })
+      if (info.size > 1024 * 1024) {
+        return yield* new InvalidInput({ detail: "Symbol lookup requires a file of at most 1 MiB" })
+      }
+      const fingerprint = (row: typeof info) =>
+        `${Option.getOrElse(row.mtime, () => new Date(0)).getTime()}:${Number(row.size)}`
+      const admittedFingerprint = fingerprint(info)
+      const requested = Math.min(Math.max(input.limit ?? AROUND_MAX, 1), AROUND_MAX)
+      const outline = yield* getOutline(fs, cache, abs)
+      const window = outline ? aroundWindow(outline, input.symbol) : undefined
+      const settledFingerprint = Effect.fnUntraced(function* () {
+        const after = yield* fs.stat(abs).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (!after || after.type !== "File" || fingerprint(after) !== admittedFingerprint) {
+          return yield* new InvalidInput({ detail: "File changed during symbol location; retry" })
+        }
+        return admittedFingerprint
+      })
+      if (window) {
+        return {
+          offset: window.offset,
+          limit: Math.min(requested, window.limit),
+          symbolLine: window.symbol.line,
+          kind: window.symbol.kind,
+          name: window.symbol.name,
+          fallback: false,
+          fingerprint: yield* settledFingerprint(),
+        }
+      }
+      // Reuse native ReadFilesystem grep fallback rather than attempting a
+      // second regex or definition scanner in the OXP adapter.
+      const found = yield* ReadFilesystem.grep(fs, ripgrep, abs, input.symbol, context.abort).pipe(
+        Effect.mapError(() => new InvalidInput({ detail: "Unable to search the symbol fallback in this file" })),
+      )
+      const first = found.hits[0]
+      if (!first) return yield* new InvalidInput({ detail: `Symbol '${input.symbol}' was not found in this file` })
+      return {
+        offset: Math.max(1, first.line - 2),
+        limit: requested,
+        symbolLine: first.line,
+        fallback: true,
+        fingerprint: yield* settledFingerprint(),
+      }
+    })
 
     const grepCandidates = (
       cwd: string,
@@ -237,9 +304,12 @@ const layer = Layer.effect(
         ...lines,
       ]
       if (outline.parseErrors > 0) {
-        out.push(`  <note>parseErrors="${outline.parseErrors}" — file has syntax errors; symbols below are best-effort.</note>`)
+        out.push(
+          `  <note>parseErrors="${outline.parseErrors}" — file has syntax errors; symbols below are best-effort.</note>`,
+        )
       }
-      if (capped) out.push(`  <next>… ${outline.symbols.length - shown} more symbols — narrow with Find grep or Read.</next>`)
+      if (capped)
+        out.push(`  <next>… ${outline.symbols.length - shown} more symbols — narrow with Find grep or Read.</next>`)
       out.push("</symbols-outline>")
       return {
         title: `outline ${rel}`,
@@ -373,7 +443,8 @@ const layer = Layer.effect(
         for (const ref of shown) {
           lines.push(`    <ref line="${ref.line}" col="${ref.col}">${escapeXml(snippet(ref.text))}</ref>`)
         }
-        if (group.refs.length > shown.length) lines.push(`    <next>… ${group.refs.length - shown.length} more refs in this file</next>`)
+        if (group.refs.length > shown.length)
+          lines.push(`    <next>… ${group.refs.length - shown.length} more refs in this file</next>`)
         lines.push("  </group>")
         spillable.push(`# ${group.relFile} (${group.refs.length} refs)`)
         for (const ref of group.refs) spillable.push(`${group.relFile}:${ref.line}:${ref.col} ${ref.text}`)
@@ -426,7 +497,7 @@ const layer = Layer.effect(
       return yield* searchAction(context, input)
     })
 
-    return Service.of({ execute })
+    return Service.of({ execute, locate })
   }),
 )
 

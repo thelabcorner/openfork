@@ -137,6 +137,7 @@ export interface Interface {
   readonly hasClients: (file: string) => Effect.Effect<boolean>
   readonly touchFile: (input: string, diagnostics?: "document" | "full") => Effect.Effect<void>
   readonly diagnostics: () => Effect.Effect<Record<string, LSPClient.Diagnostic[]>>
+  readonly diagnosticsFor: (files: readonly string[]) => Effect.Effect<Record<string, LSPClient.Diagnostic[]>>
   readonly hover: (input: LocInput) => Effect.Effect<any>
   readonly definition: (input: LocInput) => Effect.Effect<any[]>
   readonly references: (input: LocInput) => Effect.Effect<any[]>
@@ -307,9 +308,16 @@ const layer = Layer.effect(
 
         return { result, updated }
       })
-      yield* Effect.forEach(Array.from({ length: clients.updated }), () => events.publish(Event.Updated, {}), {
-        discard: true,
-      })
+      if (clients.updated > 0) {
+        yield* events.publish(Event.Updated, {
+          servers: s.clients.map((client) => ({
+            id: client.serverID,
+            name: s.servers[client.serverID]!.id,
+            root: path.relative(ctx.directory, client.root),
+            status: "connected" as const,
+          })),
+        })
+      }
       return clients.result
     })
 
@@ -385,6 +393,17 @@ const layer = Layer.effect(
           arr.push(...diags)
           results[p] = arr
         }
+      }
+      return results
+    })
+
+    const diagnosticsFor = Effect.fn("LSP.diagnosticsFor")(function* (files: readonly string[]) {
+      const paths = [...new Set(files.map(FSUtil.normalizePath))]
+      const results: Record<string, LSPClient.Diagnostic[]> = Object.fromEntries(paths.map((file) => [file, []]))
+      if (paths.length === 0) return results
+      const all = yield* runAll(async (client) => paths.map((file) => [file, client.diagnosticsFor(file)] as const))
+      for (const clientResults of all) {
+        for (const [file, diags] of clientResults) results[file]?.push(...diags)
       }
       return results
     })
@@ -498,6 +517,7 @@ const layer = Layer.effect(
       hasClients,
       touchFile,
       diagnostics,
+      diagnosticsFor,
       hover,
       definition,
       references,

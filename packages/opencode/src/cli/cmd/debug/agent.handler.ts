@@ -7,7 +7,7 @@ import { Agent } from "../../../agent/agent"
 import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
 import type { MessageV2 } from "../../../session/message-v2"
-import { MessageID, PartID } from "../../../session/schema"
+import { MessageID } from "../../../session/schema"
 import { ToolRegistry } from "@/tool/registry"
 import { Permission } from "../../../permission"
 import { iife } from "../../../util/iife"
@@ -174,7 +174,7 @@ const createToolContext = Effect.fn("Cli.debug.agent.createToolContext")(functio
   return {
     sessionID: session.id,
     messageID,
-    callID: PartID.ascending(),
+    retention: "none" as const,
     agent: agent.name,
     abort: new AbortController().signal,
     messages: [],

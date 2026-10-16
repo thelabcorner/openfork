@@ -28,6 +28,29 @@ By contrast, upstream-operated remote OpenCode services consumed by this package
 are strict external contracts. Keep their wire/auth/stream/error/model/quota
 behavior compatible even when the local implementation diverges completely.
 
+## Executable tool parity across every supported entry point
+
+Before adding or modifying `src/tool/*`, `src/exchange/*`, `src/oxp/*`,
+`src/ofxp/*`, `src/acp/*`, `src/mcp/*`, the Code invocation gateway,
+or another tool-capable route, read
+`../../docs/architecture/tool-surface-parity.md` and root `AGENTS.md`.
+Normal chat/worker Session, lazy `@tool`, Code Mode, OXP, OFXP, ACP, MCP,
+and other supported entry points require **real executable semantic parity**,
+not matching catalog names or a transport coverage entry.
+
+- V1 `ToolRegistry` is the production native-builtin inventory;
+  `src/exchange/tool-coverage.ts` records external semantic dispositions,
+  not proof that a handler can execute. Keep one shared domain owner and
+  thin authorized adapters for each genuinely supported entry point.
+- Check per-action schemas, lazy exposure, caller/root/Session authority,
+  denial/revocation, side effects, cancellation, output and error behavior.
+  Never invent a `Tool.Context` or implicitly inherit local credentials.
+  MCP import and MCP export are different trust boundaries.
+- Update executable dispatch tests, action-level matrix, reviewed exceptions,
+  parity ledger, and `docs/map` together. OXP-only verification does not
+  establish OFXP/ACP/MCP parity. A transport that lacks a supported execution
+  entry point must be marked unsupported, not represented as passing.
+
 ## Server ownership and instance bootstrap — architecture before endpoint reuse
 
 Read the repository-root `AGENTS.md` architecture rules before changing server
@@ -74,6 +97,18 @@ routes, workspace routing, instance services, or any client-facing read path.
 - Add attribution when creating full instances. Logs/tests should answer which
   request created the instance, which explicit location it supplied, whether any
   fallback was used, and which runtime service justified the load.
+
+### Swarm runtime owner parity
+
+An HTTP or direct-runtime host that admits durable Swarm creation MUST also
+install the worker reconciliation, Session admission, dispatch and deadline
+owners. Compose `src/swarm/runtime-graph.ts` in both host graphs; never expose
+only `SwarmV2` and `SwarmMemberSessionWake`. That combination creates active
+Swarms whose managed members remain unbound, with no task runs and
+`recover.members.requested=false`. Keep runtime owners process-global and
+coalesced. The negative gate is `test/swarm/runtime-graph.test.ts`; preserve
+existing member binding, per-project authority and lease fences. See
+`../../docs/architecture/swarm-runtime-ownership.md`.
 
 ## Session turn provenance — semantic ownership before provider role
 

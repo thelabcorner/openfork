@@ -18,8 +18,8 @@ export interface ApplyPatchArgs {
 }
 
 export type Hunk =
-  | { type: "add"; path: string; contents: string }
-  | { type: "delete"; path: string }
+  | { type: "add"; path: string; contents: string; finalNewline?: boolean }
+  | { type: "delete"; path: string; chunks?: UpdateFileChunk[] }
   | { type: "update"; path: string; move_path?: string; chunks: UpdateFileChunk[] }
 
 export interface UpdateFileChunk {
@@ -148,6 +148,14 @@ function parseUpdateFileChunks(lines: string[], startIdx: number, filePath: stri
           throw new Error(
             `Invalid patch line ${i + 1} in ${filePath}: expected a context (' '), removal ('-'), or addition ('+') line`,
           )
+        } else if (isOperationSeparator(lines, i)) {
+          // Blank separators are allowed between hunks/file operations. A
+          // blank file-content line must still carry its patch prefix.
+          break
+        } else {
+          throw new Error(
+            `Invalid empty patch line ${i + 1} in ${filePath}: prefix an intentional blank line with ' ', '-', or '+'.`,
+          )
         }
 
         i++
@@ -171,6 +179,13 @@ function parseUpdateFileChunks(lines: string[], startIdx: number, filePath: stri
   return { chunks, nextIdx: i }
 }
 
+function isOperationSeparator(lines: readonly string[], index: number): boolean {
+  if (lines[index]?.trim() !== "") return false
+  let next = index + 1
+  while (next < lines.length && lines[next]!.trim() === "") next++
+  return next >= lines.length || lines[next]!.startsWith("@@") || lines[next]!.startsWith("***")
+}
+
 function parseAddFileContent(lines: string[], startIdx: number, filePath: string): { content: string; nextIdx: number } {
   let content = ""
   let i = startIdx
@@ -178,7 +193,9 @@ function parseAddFileContent(lines: string[], startIdx: number, filePath: string
   while (i < lines.length && !lines[i].startsWith("***")) {
     if (lines[i].startsWith("+")) {
       content += lines[i].substring(1) + "\n"
-    } else if (lines[i].trim() !== "") {
+    } else if (isOperationSeparator(lines, i)) {
+      break
+    } else {
       throw new Error(`Invalid patch line ${i + 1} in ${filePath}: Add File content lines must start with '+'`)
     }
     i++
@@ -212,7 +229,11 @@ export function normalizePatchText(text: string): string {
 }
 
 export function parsePatch(patchText: string): { hunks: Hunk[] } {
-  const cleaned = stripHeredoc(normalizePatchText(patchText).trim())
+  // Patch body bytes are line-oriented but meaningful: trimming the complete
+  // transport would silently remove trailing spaces from the final content
+  // line. Header and footer recognition already tolerates surrounding blank
+  // lines, so normalize separators without trimming content.
+  const cleaned = stripHeredoc(normalizePatchText(patchText))
   const lines = cleaned.split("\n")
   const hunks: Hunk[] = []
   let i = 0

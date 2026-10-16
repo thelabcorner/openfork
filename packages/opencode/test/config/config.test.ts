@@ -98,16 +98,18 @@ const configLayer = (
     auth?: Layer.Layer<Auth.Service>
     account?: Layer.Layer<Account.Service>
     client?: HttpClient.HttpClient
+    npm?: Layer.Layer<Npm.Service>
   } = {},
 ) =>
-  LayerNode.compile(LayerNode.group([Config.node, FSUtil.node, Env.node, CrossSpawnSpawner.node]), [
+  LayerNode.compile(LayerNode.group([Config.node, FSUtil.node, Env.node, CrossSpawnSpawner.node, ProjectV2.node]), [
     [Auth.node, options.auth ?? AuthTest.empty],
     [Account.node, options.account ?? AccountTest.empty],
-    [Npm.node, NpmTest.noop],
+    [Npm.node, options.npm ?? NpmTest.noop],
     [httpClient, Layer.succeed(HttpClient.HttpClient, options.client ?? unexpectedHttp)],
   ])
 
 const layer = configLayer()
+const npmInstallCalls: string[] = []
 
 const it = testEffect(layer)
 const configIt = (options?: Parameters<typeof configLayer>[0]) => testEffect(configLayer(options))
@@ -1196,7 +1198,7 @@ it.effect("creates a missing OPENCODE_CONFIG_DIR", () =>
   }).pipe(Effect.provide(testInstanceStoreLayer), Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
 )
 
-it.effect("installs dependencies in writable OPENCODE_CONFIG_DIR", () =>
+it.effect("creates ignore rules in writable OPENCODE_CONFIG_DIR", () =>
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped()
     const configDir = path.join(dir, "configdir")
@@ -1211,6 +1213,52 @@ it.effect("installs dependencies in writable OPENCODE_CONFIG_DIR", () =>
     )
 
     expect(yield* FSUtil.use.readFileString(path.join(configDir, ".gitignore"))).toContain("package-lock.json")
+  }).pipe(Effect.provide(testInstanceStoreLayer), Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
+)
+
+configIt({
+  npm: Layer.mock(Npm.Service)({
+    install: (dir) => Effect.sync(() => npmInstallCalls.push(dir)),
+  }),
+}).effect("skips plugin dependency setup for a config directory without plugins", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const configDir = path.join(dir, "configdir")
+    npmInstallCalls.length = 0
+    yield* FSUtil.use.ensureDir(configDir)
+
+    yield* withProcessEnv(
+      "OPENCODE_CONFIG_DIR",
+      configDir,
+      Config.Service.use((svc) => svc.get().pipe(Effect.andThen(svc.waitForDependencies()))).pipe(
+        provideInstanceEffect(dir),
+      ),
+    )
+
+    expect(npmInstallCalls).not.toContain(configDir)
+  }).pipe(Effect.provide(testInstanceStoreLayer), Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
+)
+
+configIt({
+  npm: Layer.mock(Npm.Service)({
+    install: (dir) => Effect.sync(() => npmInstallCalls.push(dir)),
+  }),
+}).effect("prepares plugin runtime dependencies in a config directory that owns a local plugin", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const configDir = path.join(dir, "configdir")
+    npmInstallCalls.length = 0
+    yield* FSUtil.use.writeWithDirs(path.join(configDir, "plugins", "fixture.ts"), "export default () => ({})")
+
+    yield* withProcessEnv(
+      "OPENCODE_CONFIG_DIR",
+      configDir,
+      Config.Service.use((svc) => svc.get().pipe(Effect.andThen(svc.waitForDependencies()))).pipe(
+        provideInstanceEffect(dir),
+      ),
+    )
+
+    expect(npmInstallCalls).toContain(configDir)
   }).pipe(Effect.provide(testInstanceStoreLayer), Effect.provide(LayerNode.compile(CrossSpawnSpawner.node))),
 )
 
@@ -1596,6 +1644,62 @@ test("config parser preserves permission order while ignoring unknown top-level 
   expect(Object.keys(config.permission!)).toEqual(["bash", "*", "edit"])
   expect(config).not.toHaveProperty("plugins")
 })
+
+test("config parser migrates legacy execute permission to code while explicit code always wins", () => {
+  const legacyFirst = ConfigParse.schema(
+    ConfigV1.Info,
+    {
+      permission: {
+        execute: "deny",
+        code: "allow",
+        "*": "ask",
+      },
+    },
+    "test",
+  )
+  expect(legacyFirst.permission).toEqual({ code: "allow", "*": "ask" })
+  expect(Object.keys(legacyFirst.permission!)).toEqual(["code", "*"])
+
+  const legacyLast = ConfigParse.schema(
+    ConfigV1.Info,
+    {
+      permission: {
+        code: "allow",
+        execute: "deny",
+      },
+    },
+    "test",
+  )
+  expect(legacyLast.permission).toEqual({ code: "allow" })
+})
+
+it.instance("migrates legacy top-level tools.execute to code permission", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      tools: { execute: false },
+    })
+
+    const config = yield* Config.use.get()
+    expect(config.permission?.code).toBe("deny")
+    expect(config.permission).not.toHaveProperty("execute")
+  }),
+)
+
+it.instance("explicit tools.code wins over legacy tools.execute regardless of key order", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfigEffect(test.directory, {
+      $schema: "https://opencode.ai/config.json",
+      tools: { code: true, execute: false },
+    })
+
+    const config = yield* Config.use.get()
+    expect(config.permission?.code).toBe("allow")
+    expect(config.permission).not.toHaveProperty("execute")
+  }),
+)
 
 // MCP config merging tests
 
@@ -2161,6 +2265,18 @@ describe("OPENCODE_PERMISSION env var", () => {
         const config = yield* Config.use.get()
         // Regression: load() used to throw before returning anything.
         expect(config).toBeDefined()
+      }),
+    ),
+  )
+
+  it.instance("explicit code wins over legacy execute regardless of env object order", () =>
+    withProcessEnv(
+      "OPENCODE_PERMISSION",
+      JSON.stringify({ code: "allow", execute: "deny" }),
+      Effect.gen(function* () {
+        const config = yield* Config.use.get()
+        expect(config.permission?.code).toBe("allow")
+        expect(config.permission).not.toHaveProperty("execute")
       }),
     ),
   )

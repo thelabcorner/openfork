@@ -627,6 +627,9 @@ export async function create(input: {
       }
       return result
     },
+    diagnosticsFor(filePath: string) {
+      return mergedDiagnostics(Filesystem.normalizePath(filePath))
+    },
     async waitForDiagnostics(request: { path: string; version: number; mode?: "document" | "full"; after?: number }) {
       const normalizedPath = Filesystem.normalizePath(
         path.isAbsolute(request.path) ? request.path : path.resolve(input.directory, request.path),

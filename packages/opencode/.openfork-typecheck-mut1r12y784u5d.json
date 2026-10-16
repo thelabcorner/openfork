@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "test/server/t3code-event-stream-contract.test.ts"
+  ],
+  "compilerOptions": {
+    "noEmit": true
+  }
+}

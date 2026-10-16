@@ -147,36 +147,58 @@ describe("bridge allocation gate", () => {
     }),
   )
 
-  it.effect("captures replay only while a compatibility range is connected", () =>
+  it.effect("retains bounded replay briefly after disconnect for SDK reconnects", () =>
     Effect.gen(function* () {
       const events = yield* EventV2Bridge.Service
-      yield* events.publish(Probe, { n: 0 })
-      expect(events.replayLatest()).toBe(0)
+      const originalNow = Date.now
+      let now = originalNow()
+      Date.now = () => now
+      try {
+        yield* events.publish(Probe, { n: 0 })
+        expect(events.replayLatest()).toBe(0)
 
-      const first = events.replayConnect()
-      expect(first.after).toBe(0)
-      yield* events.publish(Probe, { n: 1 })
-      expect(events.replayLatest()).toBe(1)
+        const first = events.replayConnect()
+        expect(first.after).toBe(0)
+        yield* events.publish(Probe, { n: 1 })
+        expect(events.replayLatest()).toBe(1)
 
-      const second = events.replayConnect()
-      expect(second.epoch).toBe(first.epoch)
-      expect(second.after).toBe(1)
-      yield* events.publish(Probe, { n: 2 })
-      expect(events.replayLatest()).toBe(2)
+        const second = events.replayConnect()
+        expect(second.epoch).toBe(first.epoch)
+        expect(second.after).toBe(1)
+        yield* events.publish(Probe, { n: 2 })
+        expect(events.replayLatest()).toBe(2)
 
-      first.release()
-      yield* events.publish(Probe, { n: 3 })
-      expect(events.replayLatest()).toBe(3)
-      second.release()
+        first.release()
+        yield* events.publish(Probe, { n: 3 })
+        expect(events.replayLatest()).toBe(3)
+        second.release()
 
-      // Idle publishes are not retained. The next compatibility range starts a
-      // fresh epoch/window rather than pretending it can replay the idle gap.
-      yield* events.publish(Probe, { n: 4 })
-      expect(events.replayLatest()).toBe(3)
-      const next = events.replayConnect()
-      expect(next.epoch).not.toBe(first.epoch)
-      expect(next.after).toBe(0)
-      next.release()
+        // Events during the grace period are retained within the existing
+        // count/byte-bounded replay ring and can be resumed with the old cursor.
+        now += 1_000
+        yield* events.publish(Probe, { n: 4 })
+        expect(events.replayLatest()).toBe(4)
+        const resumed = events.replayConnect()
+        expect(resumed.epoch).toBe(first.epoch)
+        expect(resumed.after).toBe(4)
+        const replay = events.replaySince(3)
+        expect(replay.kind).toBe("ok")
+        if (replay.kind === "ok")
+          expect(replay.frames.map((frame) => (frame.event.data as { n: number }).n)).toEqual([4])
+        resumed.release()
+
+        // After the grace expires the replay generation rotates, making an old
+        // cursor detectably stale rather than silently skipping idle events.
+        now += EventV2Bridge.LEGACY_REPLAY_GRACE_MS + 1
+        yield* events.publish(Probe, { n: 5 })
+        expect(events.replayLatest()).toBe(0)
+        const expired = events.replayConnect()
+        expect(expired.epoch).not.toBe(first.epoch)
+        expect(expired.after).toBe(0)
+        expired.release()
+      } finally {
+        Date.now = originalNow
+      }
     }),
   )
 

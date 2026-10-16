@@ -17,11 +17,13 @@ import { Account } from "@/account/account"
 import { isRecord } from "@/util/record"
 import type { ConsoleState } from "@opencode-ai/core/v1/config/console-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { InstanceState } from "@/effect/instance-state"
-import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
+import { InstanceRef } from "@/effect/instance-ref"
+import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, ScopedCache } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
-import { containsPath, type InstanceContext } from "../project/instance-context"
+import type { InstanceContext } from "../project/instance-context"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
 import { RemoteAuthError } from "@opencode-ai/core/v1/config/error"
@@ -41,6 +43,7 @@ import { ConfigPlugin } from "./plugin"
 import { ConfigVariable } from "./variable"
 import { ConfigV2Compat } from "./v2-compat"
 import { Npm } from "@opencode-ai/core/npm"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 
 // Custom merge function that concatenates array fields instead of replacing them
@@ -130,6 +133,8 @@ type State = {
 
 export interface Interface {
   readonly get: () => Effect.Effect<Info>
+  /** Resolve the effective config for an explicit directory without materializing execution state. */
+  readonly getForLocation: (input: { directory: string }) => Effect.Effect<Info>
   readonly getGlobal: () => Effect.Effect<Info>
   /** Read only the effective share policy for an explicit location without creating an execution Instance. */
   readonly sharePolicyForLocation: (input: { directory: string; worktree?: string }) => Effect.Effect<"auto" | "disabled" | undefined>
@@ -206,6 +211,7 @@ const layer = Layer.effect(
     const env = yield* Env.Service
     const npmSvc = yield* Npm.Service
     const http = yield* HttpClient.HttpClient
+    const projectV2 = yield* ProjectV2.Service
 
     const readConfigFile = (filepath: string) => fs.readFileStringSafe(filepath).pipe(Effect.orDie)
 
@@ -250,7 +256,7 @@ const layer = Layer.effect(
 
     const loadConfig = Effect.fnUntraced(function* (
       text: string,
-      options: { path: string } | { dir: string; source: string },
+      options: ({ path: string } | { dir: string; source: string }) & { readOnly?: boolean },
       env?: Record<string, string>,
     ) {
       const source = "path" in options ? options.path : options.source
@@ -258,7 +264,7 @@ const layer = Layer.effect(
         ConfigVariable.substitute(
           "path" in options
             ? { text, type: "path", path: options.path, env }
-            : { text, type: "virtual", ...options, env },
+            : { text, type: "virtual", dir: options.dir, source: options.source, env },
         ),
       )
       const parsed = ConfigParse.jsonc(expanded, source)
@@ -266,7 +272,7 @@ const layer = Layer.effect(
       if (!("path" in options)) return data
 
       yield* Effect.promise(() => resolveLoadedPlugins(data, options.path))
-      if (!data.$schema) {
+      if (!data.$schema && !options.readOnly) {
         data.$schema = "https://opencode.ai/config.json"
         const updated = text.replace(/^\s*\{/, '{\n  "$schema": "https://opencode.ai/config.json",')
         yield* fs.writeFileString(options.path, updated).pipe(Effect.catch(() => Effect.void))
@@ -274,18 +280,22 @@ const layer = Layer.effect(
       return data
     })
 
-    const loadFile = Effect.fnUntraced(function* (filepath: string, env?: Record<string, string>) {
+    const loadFile = Effect.fnUntraced(function* (
+      filepath: string,
+      env?: Record<string, string>,
+      options?: { readOnly?: boolean },
+    ) {
       yield* Effect.logInfo("loading", { path: filepath })
       const text = yield* readConfigFile(filepath)
       if (!text) return {} as Info
-      return yield* loadConfig(text, { path: filepath }, env)
+      return yield* loadConfig(text, { path: filepath, readOnly: options?.readOnly }, env)
     })
 
-    const loadGlobal = Effect.fnUntraced(function* (env?: Record<string, string>) {
+    const loadGlobal = Effect.fnUntraced(function* (env?: Record<string, string>, options?: { readOnly?: boolean }) {
       let result: Info = {}
       // Seed the default global config with the schema for editor completion, but avoid writing when the user
       // explicitly routes config through env-provided paths or content.
-      if (!Flag.OPENCODE_CONFIG && !Flag.OPENCODE_CONFIG_DIR && !Flag.OPENCODE_CONFIG_CONTENT) {
+      if (!options?.readOnly && !Flag.OPENCODE_CONFIG && !Flag.OPENCODE_CONFIG_DIR && !Flag.OPENCODE_CONFIG_CONTENT) {
         const file = globalConfigFile()
         if (!existsSync(file)) {
           yield* fs
@@ -293,9 +303,9 @@ const layer = Layer.effect(
             .pipe(Effect.catch(() => Effect.void))
         }
       }
-      result = mergeConfig(result, yield* loadFile(path.join(Global.Path.config, "config.json"), env))
+      result = mergeConfig(result, yield* loadFile(path.join(Global.Path.config, "config.json"), env, options))
       for (const file of ConfigPaths.serverFilesInDirectory(Global.Path.config)) {
-        result = mergeConfig(result, yield* loadFile(file, env))
+        result = mergeConfig(result, yield* loadFile(file, env, options))
       }
 
       const legacy = path.join(Global.Path.config, "config")
@@ -307,8 +317,10 @@ const layer = Layer.effect(
               if (provider && model) result.model = `${provider}/${model}`
               result["$schema"] = "https://opencode.ai/config.json"
               result = mergeConfig(result, rest)
-              await fsNode.writeFile(path.join(Global.Path.config, "config.json"), JSON.stringify(result, null, 2))
-              await fsNode.unlink(legacy)
+              if (!options?.readOnly) {
+                await fsNode.writeFile(path.join(Global.Path.config, "config.json"), JSON.stringify(result, null, 2))
+                await fsNode.unlink(legacy)
+              }
             })
             .catch(() => {}),
         )
@@ -321,6 +333,15 @@ const layer = Layer.effect(
       loadGlobal().pipe(
         Effect.tapError((error) =>
           Effect.logError("failed to load global config, using defaults", { error: String(error) }),
+        ),
+        Effect.orElseSucceed((): Info => ({})),
+      ),
+      Duration.infinity,
+    )
+    const [cachedGlobalReadOnly, invalidateGlobalReadOnly] = yield* Effect.cachedInvalidateWithTTL(
+      loadGlobal(undefined, { readOnly: true }).pipe(
+        Effect.tapError((error) =>
+          Effect.logError("failed to load global config for location projection", { error: String(error) }),
         ),
         Effect.orElseSucceed((): Info => ({})),
       ),
@@ -435,7 +456,7 @@ const layer = Layer.effect(
     })
 
     const loadInstanceState = Effect.fn("Config.loadInstanceState")(
-      function* (ctx: InstanceContext) {
+      function* (ctx: Pick<InstanceContext, "directory" | "worktree">, options?: { readOnly?: boolean }) {
         const auth = yield* authSvc.all().pipe(Effect.orDie)
 
         let result: Info = {}
@@ -446,7 +467,11 @@ const layer = Layer.effect(
         const pluginScopeForSource = Effect.fnUntraced(function* (source: string) {
           if (source.startsWith("http://") || source.startsWith("https://")) return "global"
           if (source === "OPENCODE_CONFIG_CONTENT") return "local"
-          if (containsPath(source, ctx)) return "local"
+          if (
+            FSUtil.contains(ctx.directory, source) ||
+            (ctx.worktree !== "/" && FSUtil.contains(ctx.worktree, source))
+          )
+            return "local"
           return "global"
         })
 
@@ -518,17 +543,21 @@ const layer = Layer.effect(
           }
         }
 
-        const global = Object.keys(authEnv).length ? yield* loadGlobal(authEnv) : yield* getGlobal()
+        const global = Object.keys(authEnv).length
+          ? yield* loadGlobal(authEnv, options)
+          : options?.readOnly
+            ? yield* cachedGlobalReadOnly
+            : yield* getGlobal()
         yield* merge(Global.Path.config, global, "global")
 
         if (Flag.OPENCODE_CONFIG) {
-          yield* merge(Flag.OPENCODE_CONFIG, yield* loadFile(Flag.OPENCODE_CONFIG, authEnv))
+          yield* merge(Flag.OPENCODE_CONFIG, yield* loadFile(Flag.OPENCODE_CONFIG, authEnv, options))
           yield* Effect.logDebug("loaded custom config", { path: Flag.OPENCODE_CONFIG })
         }
 
         if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG) {
           for (const file of yield* ConfigPaths.serverFiles(ctx.directory, ctx.worktree).pipe(Effect.orDie)) {
-            yield* merge(file, yield* loadFile(file, authEnv), "local")
+            yield* merge(file, yield* loadFile(file, authEnv, options), "local")
           }
         }
 
@@ -548,35 +577,14 @@ const layer = Layer.effect(
           if (ConfigPaths.isServerConfigDirectory(dir) || dir === Flag.OPENCODE_CONFIG_DIR) {
             for (const source of ConfigPaths.serverFilesInDirectory(dir)) {
               yield* Effect.logDebug(`loading config from ${source}`)
-              yield* merge(source, yield* loadFile(source, authEnv))
+              yield* merge(source, yield* loadFile(source, authEnv, options))
               result.agent ??= {}
               result.mode ??= {}
               result.plugin ??= []
             }
           }
 
-          yield* ensureGitignore(dir).pipe(Effect.orDie)
-
-          const dep = yield* npmSvc
-            .install(dir, {
-              add: [
-                {
-                  name: "@opencode-ai/plugin",
-                  version: InstallationPluginVersion,
-                },
-              ],
-            })
-            .pipe(
-              Effect.exit,
-              Effect.tap((exit) =>
-                Exit.isFailure(exit)
-                  ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
-                  : Effect.void,
-              ),
-              Effect.asVoid,
-              Effect.forkDetach,
-            )
-          deps.push(dep)
+          if (!options?.readOnly) yield* ensureGitignore(dir).pipe(Effect.orDie)
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
           result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
@@ -586,6 +594,42 @@ const layer = Layer.effect(
           // returns normalized Specs and we only need to attach origin metadata here.
           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
           yield* mergePluginOrigins(dir, list)
+
+          // The plugin API package is a runtime dependency for plugins owned by
+          // this directory. Installing it in every discovered config directory
+          // makes an ordinary project open invoke Arborist even when the
+          // directory only contains skills, commands, or no user config at all.
+          // Keep setup scoped to the directory that actually contributed a
+          // configured or auto-discovered plugin.
+          const hasPluginInDirectory =
+            list.length > 0 ||
+            (result.plugin_origins ?? []).some((origin) => {
+              if (origin.source === dir) return true
+              if (!path.isAbsolute(origin.source)) return false
+              return path.resolve(path.dirname(origin.source)) === path.resolve(dir)
+            })
+          if (!options?.readOnly && hasPluginInDirectory) {
+            const dep = yield* npmSvc
+              .install(dir, {
+                add: [
+                  {
+                    name: "@opencode-ai/plugin",
+                    version: InstallationPluginVersion,
+                  },
+                ],
+              })
+              .pipe(
+                Effect.exit,
+                Effect.tap((exit) =>
+                  Exit.isFailure(exit)
+                    ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
+                    : Effect.void,
+                ),
+                Effect.asVoid,
+                Effect.forkDetach,
+              )
+            deps.push(dep)
+          }
         }
 
         if (process.env.OPENCODE_CONFIG_CONTENT) {
@@ -611,8 +655,10 @@ const layer = Layer.effect(
               { concurrency: 2 },
             )
             if (Option.isSome(tokenOpt)) {
-              process.env["OPENCODE_CONSOLE_TOKEN"] = tokenOpt.value
-              yield* env.set("OPENCODE_CONSOLE_TOKEN", tokenOpt.value)
+              if (!options?.readOnly) {
+                process.env["OPENCODE_CONSOLE_TOKEN"] = tokenOpt.value
+                yield* env.set("OPENCODE_CONSOLE_TOKEN", tokenOpt.value)
+              }
             }
 
             if (Option.isSome(configOpt)) {
@@ -620,6 +666,7 @@ const layer = Layer.effect(
               const next = yield* loadConfig(JSON.stringify(configOpt.value), {
                 dir: path.dirname(source),
                 source,
+                readOnly: options?.readOnly,
               })
               for (const providerID of Object.keys(next.provider ?? {})) {
                 consoleManagedProviders.add(providerID)
@@ -639,7 +686,7 @@ const layer = Layer.effect(
         for (const managedDir of ConfigManaged.managedConfigDirs()) {
           if (existsSync(managedDir)) {
             for (const source of ConfigPaths.serverFilesInDirectory(managedDir)) {
-              yield* merge(source, yield* loadFile(source), "global")
+              yield* merge(source, yield* loadFile(source, undefined, options), "global")
             }
           }
         }
@@ -652,6 +699,7 @@ const layer = Layer.effect(
             yield* loadConfig(managed.text, {
               dir: path.dirname(managed.source),
               source: managed.source,
+              readOnly: options?.readOnly,
             }),
           )
         }
@@ -667,7 +715,9 @@ const layer = Layer.effect(
 
         if (Flag.OPENCODE_PERMISSION) {
           try {
-            result.permission = mergeDeep(result.permission ?? {}, JSON.parse(Flag.OPENCODE_PERMISSION))
+            const raw = JSON.parse(Flag.OPENCODE_PERMISSION) as unknown
+            const migrated = ConfigParse.schema(ConfigPermissionV1.Info, raw, "OPENCODE_PERMISSION")
+            result.permission = mergeDeep(result.permission ?? {}, migrated)
           } catch (err) {
             yield* Effect.logWarning("OPENCODE_PERMISSION contains invalid JSON, skipping", { err })
           }
@@ -675,7 +725,8 @@ const layer = Layer.effect(
 
         if (result.tools) {
           const perms: Record<string, ConfigPermissionV1.Action> = {}
-          for (const [tool, enabled] of Object.entries(result.tools)) {
+          const migratedTools = ConfigPermissionV1.normalizeLegacyKeys(result.tools)
+          for (const [tool, enabled] of Object.entries(migratedTools)) {
             const action: ConfigPermissionV1.Action = enabled ? "allow" : "deny"
             if (tool === "write" || tool === "edit" || tool === "patch") {
               perms.edit = action
@@ -726,8 +777,37 @@ const layer = Layer.effect(
       }),
     )
 
+    // GET /config is a Tier-2 read. Cache its effective location projection
+    // independently from InstanceState so the HTTP route can share work without
+    // opening the execution graph. The bound keeps unopened-project config from
+    // accumulating without limit.
+    const locationConfigCache = yield* ScopedCache.make<string, Info>({
+      capacity: 32,
+      lookup: (directory) =>
+        Effect.gen(function* () {
+          const project = yield* projectV2.resolve(AbsolutePath.make(directory))
+          const state = yield* loadInstanceState(
+            { directory, worktree: project.directory },
+            { readOnly: true },
+          )
+          return state.config
+        }).pipe(Effect.orDie),
+    })
+
     const get = Effect.fn("Config.get")(function* () {
       return yield* InstanceState.use(state, (s) => s.config)
+    })
+
+    const getForLocation = Effect.fn("Config.getForLocation")(function* (input: { directory: string }) {
+      if (!path.isAbsolute(input.directory)) {
+        return yield* Effect.die(new Error("Config.getForLocation requires an absolute directory"))
+      }
+      const directory = FSUtil.resolve(input.directory)
+      return yield* ScopedCache.get(locationConfigCache, directory).pipe(
+        Effect.onExit((exit) =>
+          Exit.isFailure(exit) ? ScopedCache.invalidate(locationConfigCache, directory) : Effect.void,
+        ),
+      )
     })
 
     const directories = Effect.fn("Config.directories")(function* () {
@@ -761,10 +841,16 @@ const layer = Layer.effect(
 
     const invalidate = Effect.fn("Config.invalidate")(function* () {
       yield* invalidateGlobal
+      yield* invalidateGlobalReadOnly
+      yield* ScopedCache.invalidateAll(locationConfigCache)
       // Config is location-scoped. Invalidating only the process-global config
       // cache leaves this directory's already-materialized InstanceState stale
       // after a local config write.
-      yield* InstanceState.invalidate(state)
+      // Global config edits and test cleanup can invalidate config without an
+      // active workspace Instance. Keep the process/location projections fresh
+      // in that case; invalidate the instance projection only when its owner is
+      // present in the request context.
+      if (yield* InstanceRef) yield* InstanceState.invalidate(state)
     })
 
     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
@@ -828,6 +914,7 @@ const layer = Layer.effect(
 
     return Service.of({
       get,
+      getForLocation,
       getGlobal,
       sharePolicyForLocation,
       getConsoleState,
@@ -844,7 +931,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [FSUtil.node, Auth.node, Account.node, Env.node, Npm.node, httpClient],
+  deps: [FSUtil.node, Auth.node, Account.node, Env.node, Npm.node, ProjectV2.node, httpClient],
 })
 
 export * as Config from "./config"

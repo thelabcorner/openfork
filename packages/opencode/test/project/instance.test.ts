@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
@@ -83,6 +83,9 @@ describe("InstanceStore", () => {
 
       expect(second).toBe(first)
       expect(initialized).toBe(1)
+      // A completed cache entry must remain runnable without the async
+      // scheduler; only callers that actually parked receive the yield fence.
+      expect(Effect.runSync(store.load({ directory: dir }))).toBe(first)
     }),
   )
 
@@ -118,6 +121,107 @@ describe("InstanceStore", () => {
       const [firstCtx, secondCtx] = yield* Effect.all([Fiber.join(first), Fiber.join(second)])
       expect(secondCtx).toBe(firstCtx)
       expect(initialized).toBe(1)
+    }),
+  )
+
+  it.live("resumes cold-load waiters after the Deferred producer stack", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const allWaitersStarted = yield* Deferred.make<void>()
+      const waiterCount = 8
+      let arrivals = 0
+      let initialized = 0
+      let producerCompletionStack = false
+      const continuationsOnProducerStack: boolean[] = []
+
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          initialized++
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(release)
+          yield* Effect.sync(() => {
+            producerCompletionStack = true
+            queueMicrotask(() => {
+              producerCompletionStack = false
+            })
+          })
+        }),
+      )
+
+      const owner = yield* store
+        .load({ directory: dir })
+        .pipe(
+          Effect.tap(() => Effect.sync(() => continuationsOnProducerStack.push(producerCompletionStack))),
+          Effect.forkScoped,
+        )
+      yield* Deferred.await(started)
+
+      const waiters = yield* Effect.forEach(
+        Array.from({ length: waiterCount }),
+        () =>
+          Effect.gen(function* () {
+            arrivals++
+            if (arrivals === waiterCount) yield* Deferred.succeed(allWaitersStarted, undefined)
+            const ctx = yield* store.load({ directory: dir })
+            continuationsOnProducerStack.push(producerCompletionStack)
+            return ctx
+          }).pipe(Effect.forkScoped),
+        { concurrency: "unbounded" },
+      )
+
+      yield* Deferred.await(allWaitersStarted)
+      // Let the waiter fibers pass their start barrier and park in load before
+      // releasing the single bootstrap owner.
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(release, undefined)
+
+      const ownerContext = yield* Fiber.join(owner)
+      const waiterContexts = yield* Effect.forEach(waiters, Fiber.join, { concurrency: "unbounded" })
+      expect(initialized).toBe(1)
+      expect(waiterContexts.every((ctx) => ctx === ownerContext)).toBe(true)
+      expect(continuationsOnProducerStack).toHaveLength(waiterCount + 1)
+      expect(continuationsOnProducerStack).toEqual(Array(waiterCount + 1).fill(false))
+    }),
+  )
+
+  it.live("interrupts a parked load waiter without waiting for bootstrap", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const waiterStarted = yield* Deferred.make<void>()
+      const interruptFinished = yield* Deferred.make<void>()
+      yield* setBootstrap(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(release)
+        }),
+      )
+
+      const owner = yield* store.load({ directory: dir }).pipe(Effect.forkScoped)
+      yield* Deferred.await(started)
+      const waiter = yield* Effect.gen(function* () {
+        yield* Deferred.succeed(waiterStarted, undefined)
+        return yield* store.load({ directory: dir })
+      }).pipe(Effect.forkScoped)
+      yield* Deferred.await(waiterStarted)
+      yield* Effect.yieldNow
+
+      // This must finish while the owner is still parked in bootstrap. The
+      // await fence adds one scheduler turn, never a dependency on the owner.
+      yield* Fiber.interrupt(waiter).pipe(
+        Effect.andThen(Deferred.succeed(interruptFinished, undefined)),
+        Effect.forkScoped,
+      )
+      yield* Deferred.await(interruptFinished)
+      yield* Deferred.succeed(release, undefined)
+      const interrupted = yield* Effect.exit(Fiber.join(waiter))
+      expect(Exit.hasInterrupts(interrupted)).toBe(true)
+      yield* Fiber.join(owner)
     }),
   )
 

@@ -10,13 +10,13 @@ import {
   type ShellJobDelivery,
   type ShellJobKind,
 } from "@/background/shell-jobs"
-import { withBackgroundProcessSlot } from "./process-concurrency"
+import { withBackgroundProcessSlot, withMonitorProcessSlot, needsBackgroundSnapshotMutationLease } from "./process-concurrency"
 import { MonitorDelivery } from "@/background/monitor-delivery"
 import { TRUNCATION_DIR } from "@/tool/truncation-dir"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
-import { Effect, Layer, Context, Stream, Scope } from "effect"
+import { Deferred, Effect, Layer, Context, Stream, Scope } from "effect"
 import { createWriteStream } from "node:fs"
 import path from "node:path"
 import * as Truncate from "@/tool/truncate"
@@ -76,6 +76,32 @@ export type LaunchResult = {
   jobId: string
   logPath: string
   metaPath: string
+  /** True only after the actual shell handle was registered. */
+  admitted: boolean
+}
+
+/** Producer-owned one-shot receipt: no repeated jobs.get()/background.get()
+ * scans while a shell is waiting for the machine admission queue. */
+export function awaitShellRegistration(
+  registered: Deferred.Deferred<boolean>,
+  timeoutMs = 2_000,
+): Effect.Effect<boolean> {
+  return Deferred.await(registered).pipe(
+    Effect.timeoutOption(timeoutMs),
+    Effect.map((result) => result._tag === "Some" && result.value),
+  )
+}
+
+/** This finalizer must enclose admission as well as execution. A queued
+ * monitor already has a delivery registration even when it never spawns. */
+export function withShellJobLifecycle<A, E, R>(
+  work: Effect.Effect<A, E, R>,
+  registered: Deferred.Deferred<boolean>,
+  disposeDelivery: Effect.Effect<void>,
+): Effect.Effect<A, E, R> {
+  return work.pipe(
+    Effect.ensuring(Deferred.succeed(registered, false).pipe(Effect.andThen(disposeDelivery))),
+  )
 }
 
 export interface Interface {
@@ -114,18 +140,6 @@ const layer = Layer.effect(
       return id
     })
 
-    const pollUntilRegistered = Effect.fn("ShellJob.pollUntilRegistered")(function* (jobId: string) {
-      let waited = 0
-      while (waited < 2000) {
-        const entry = yield* jobs.get(jobId)
-        if (entry) return
-        const info = yield* background.get(jobId)
-        if (info && info.status !== "running") return
-        yield* Effect.sleep("10 millis")
-        waited += 10
-      }
-    })
-
     const launch: Interface["launch"] = Effect.fn("ShellJob.launch")(function* (input, ctx) {
       const jobId = yield* ensureJobId(input.id)
       const logPath = jobLogPath(jobId)
@@ -135,6 +149,10 @@ const layer = Layer.effect(
       const kind = input.kind
       const delivery = input.delivery
       const description = input.description
+      // One producer-owned admission receipt replaces 200 status polls per
+      // launch. It retains proof for a process that starts and exits before
+      // the launching Session resumes, without retaining its live job handle.
+      const registered = yield* Deferred.make<boolean>()
 
       yield* fs.ensureDir(path.dirname(logPath))
       yield* fs.writeFileString(logPath, "")
@@ -250,6 +268,7 @@ const layer = Layer.effect(
               description,
             })
             yield* Effect.addFinalizer(() => jobs.remove(jobId).pipe(Effect.ignore))
+            yield* Deferred.succeed(registered, true)
 
             const recordChunk = (chunk: string) => {
               const size = Buffer.byteLength(chunk, "utf-8")
@@ -322,18 +341,38 @@ const layer = Layer.effect(
         return yield* previewText()
       })
 
+      const admittedRun = needsBackgroundSnapshotMutationLease(kind)
+        ? withBackgroundProcessSlot(snapshot.withMutation(run, `background:${kind}`))
+        : withMonitorProcessSlot(run)
+
       yield* background.start({
         id: jobId,
         type: "shell",
         title: input.command,
         metadata,
-        // The launch call returns while this effect continues running. Keep the
-        // Snapshot mutation lease on the actual process lifetime so captures
-        // cannot race a monitor/background command that is still writing files.
-        run: snapshot.withMutation(withBackgroundProcessSlot(run), `background:${kind}`),
+        // Capacity precedes mutation admission. A queued shell has not touched
+        // the worktree, so it must not hold Snapshot's read/mutation barrier
+        // while waiting for an unrelated machine process slot. Only actually
+        // executing finite shells retain that barrier for their whole lifetime.
+        // Monitors remain separate and do not acquire the mutation barrier.
+        // Ownership begins when background.start registers the job, *before*
+        // machine-slot admission. Even a cancelled queued monitor must revoke
+        // its delivery registration and settle its one-shot launch receipt.
+        run: withShellJobLifecycle(
+          admittedRun,
+          registered,
+          delivery.mode === "events" ? monitor.detach(jobId).pipe(Effect.ignore) : Effect.void,
+        ),
       })
 
-      yield* pollUntilRegistered(jobId)
+      const admitted = yield* awaitShellRegistration(registered)
+      if (!admitted) {
+        yield* Effect.logWarning("background shell process not yet admitted", {
+          jobID: jobId,
+          kind,
+          waitedMs: 2000,
+        })
+      }
 
       // For completion delivery, schedule notify wake (existing behavior)
       if (delivery.mode === "completion") {
@@ -397,7 +436,7 @@ const layer = Layer.effect(
         }
       }
 
-      return { jobId, logPath, metaPath }
+      return { jobId, logPath, metaPath, admitted }
     })
 
     return Service.of({ launch })

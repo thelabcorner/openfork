@@ -24,6 +24,7 @@ import { Question } from "@/question"
 import { Permission } from "@/permission"
 import { Todo } from "@/session/todo"
 import { Session } from "@/session/session"
+import { SessionOperatorRecovery } from "@/session/operator-stop"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionGroup } from "@/session/group"
 import { SessionStatus } from "@/session/status"
@@ -33,6 +34,7 @@ import { SessionCompaction } from "@/session/compaction"
 import { SessionRevert } from "@/session/revert"
 import { SessionSummary } from "@/session/summary"
 import { SessionPrompt } from "@/session/prompt"
+import { LimitRecoveryRunner } from "@/session/limit-recovery-runner"
 import { SubagentSupervision } from "@/session/subagent-supervision"
 import { Instruction } from "@/session/instruction"
 import { LLM } from "@/session/llm"
@@ -62,6 +64,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "./app-node-builder-v1"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { RuntimeOwner } from "@opencode-ai/core/runtime-owner"
 import { DirectoryMaintenanceGuard } from "@opencode-ai/core/directory-maintenance-guard"
 import { DirectoryActivityFence } from "@opencode-ai/core/directory-activity-fence"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
@@ -80,20 +83,7 @@ import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/se
 import { ScheduledTaskLease } from "@opencode-ai/core/scheduled-task/lease"
 import { ScheduledTaskExecutor } from "@/scheduled-task/executor"
 import { ScheduledTaskRunner } from "@/scheduled-task/runner"
-import { SwarmMemberSession } from "@/swarm/member-session"
-import { SwarmMemberSessionRunner } from "@/swarm/member-session-runner"
-import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
-import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
-import { SwarmSessionAdmission } from "@/swarm/session-admission"
-import { SwarmRuntimeRetention } from "@/swarm/runtime-retention"
-import { SwarmTaskExecutor } from "@/swarm/task-executor"
-import { SwarmMailExecutor } from "@/swarm/mail-executor"
-import { SwarmDispatcher } from "@/swarm/dispatcher"
-import { SwarmTaskRetirement } from "@/swarm/task-retirement"
-import { SwarmTaskClosure } from "@/swarm/task-closure"
-import { SwarmRecovery } from "@/swarm/recovery"
-import { SwarmDeadlineOwner } from "@/swarm/deadline-owner"
-import { SwarmV2 } from "@opencode-ai/core/swarm"
+import { SwarmRuntimeGraph } from "@/swarm/runtime-graph"
 import { SystemOne } from "@/system-one/system-one"
 import { WakaTime } from "@opencode-ai/core/wakatime"
 import { WakaTimeSessionFlush } from "@/wakatime/session-flush"
@@ -122,20 +112,9 @@ export const AppLayer = AppNodeBuilderV1.build(
     ScheduledTaskLease.node,
     ScheduledTaskExecutor.node,
     ScheduledTaskRunner.node,
-    SwarmV2.node,
-    SwarmMemberSessionWake.node,
-    SwarmMemberSession.node,
-    SwarmProfilePreflight.node,
-    SwarmMemberSessionRunner.node,
-    SwarmSessionAdmission.node,
-    SwarmRuntimeRetention.node,
-    SwarmTaskExecutor.node,
-    SwarmMailExecutor.node,
-    SwarmDispatcher.node,
-    SwarmTaskRetirement.node,
-    SwarmTaskClosure.node,
-    SwarmRecovery.node,
-    SwarmDeadlineOwner.node,
+    // Always install the same process-global Swarm execution owners as HTTP.
+    // OXP's lazy recovery adapter also consumes containment directly.
+    SwarmRuntimeGraph.node,
     Auth.node,
     ForkCredentials.node,
     Account.node,
@@ -170,6 +149,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     // Keep it explicit at the AppRuntime boundary so lazy OXP worker/session
     // entry can never observe a partially composed instance graph.
     SessionExecutionOwner.node,
+    RuntimeOwner.node,
     // Worktree fence authority must share SessionExecutionOwner's Database and
     // RuntimeOwner identity: guard admission and execution admission race for
     // the same SQLite writer reservation and must never observe split owner
@@ -177,6 +157,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     DirectoryMaintenanceGuard.node,
     DirectoryActivityFence.node,
     SessionStatus.node,
+    SessionOperatorRecovery.node,
     // Task supervision consumes this capability via serviceOption. Keep it
     // explicit at the AppRuntime boundary so production resolves the registry
     // instead of silently degrading to durable-metadata-only supervision.
@@ -190,6 +171,12 @@ export const AppLayer = AppNodeBuilderV1.build(
     SessionRevert.node,
     SessionSummary.node,
     SessionPrompt.node,
+    // Durable usage-limit recovery is process-global and must exist for direct
+    // AppRuntime execution (CLI/TUI/delegated/remote agents), not only for the
+    // served HTTP graph. LimitRecoveryRunner is a makeGlobalNode, so registering
+    // it in both graphs reuses one timer/listener per process rather than
+    // creating a second deadline owner.
+    LimitRecoveryRunner.node,
     Instruction.node,
     LLM.node,
     LSP.node,
@@ -264,5 +251,16 @@ export const AppRuntime: Runtime = {
   runCallback(effect) {
     return rt.runCallback(wrap(effect))
   },
-  dispose: () => rt.dispose(),
+  dispose: async () => {
+    // A Tier-1 memory reader has its own narrowly compiled runtime, but shares
+    // process-global database/memory layers with AppRuntime through memoMap.
+    // Release its lease before the main graph so shutdown/test teardown does
+    // not retain SQLite handles or location-scoped resources.
+    try {
+      const { dispose } = await import("@/exchange/memory-read-runtime")
+      await dispose()
+    } finally {
+      await rt.dispose()
+    }
+  },
 }

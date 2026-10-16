@@ -323,6 +323,49 @@ it.live("InstanceState first-waiter abort does not poison the cache", () =>
   }),
 )
 
+it.live("InstanceState first-waiter abort does not interrupt an existing concurrent waiter", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let n = 0
+    const state = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        n += 1
+        yield* Deferred.succeed(started, undefined)
+        yield* Deferred.await(release)
+        return { n }
+      }),
+    )
+
+    const first = yield* access(state, dir).pipe(Effect.forkScoped)
+    yield* Deferred.await(started)
+    const second = yield* access(state, dir).pipe(Effect.forkScoped)
+    yield* Effect.yieldNow
+    yield* Fiber.interrupt(first)
+    yield* Deferred.succeed(release, undefined)
+    const secondExit = yield* Fiber.await(second)
+
+    expect(secondExit._tag).toBe("Success")
+    if (secondExit._tag === "Success") expect(secondExit.value).toEqual({ n })
+  }),
+)
+
+it.live("InstanceState detached initialization preserves the typed error channel", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const state = yield* InstanceState.make(() =>
+      Effect.fail({ _tag: "InitBoom" as const, code: 7 }),
+    )
+
+    const code = yield* access(state, dir).pipe(
+      Effect.catchTag("InitBoom", (error) => Effect.succeed(error.code)),
+    )
+
+    expect(code).toBe(7)
+  }),
+)
+
 it.live("InstanceState dedupes concurrent lookups", () =>
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped()
