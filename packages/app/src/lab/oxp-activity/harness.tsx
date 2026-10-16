@@ -143,7 +143,9 @@ export function OxpActivityLab() {
                 activity={LAB_ACTIVITY}
                 minuteNow={now()}
                 onRename={async () => undefined}
+                onRegenerateTitle={() => undefined}
                 onArchive={() => undefined}
+                onUnarchive={() => undefined}
                 onDelete={() => undefined}
                 onRefresh={() => setDetails({})}
               />
@@ -245,7 +247,9 @@ function EmptyHeader() {
       activity={undefined}
       minuteNow={Date.now()}
       onRename={async () => undefined}
+      onRegenerateTitle={() => undefined}
       onArchive={() => undefined}
+      onUnarchive={() => undefined}
       onDelete={() => undefined}
       onRefresh={() => undefined}
     />

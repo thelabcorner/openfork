@@ -6,11 +6,16 @@
   min-height: 0;
   flex: 1;
   flex-direction: column;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   color: var(--v2-text-text-base);
 }
 
 [data-slot="oxp-attribution-header"] {
+  position: sticky;
+  top: 0;
+  z-index: 3;
   display: flex;
   min-height: 48px;
   flex: 0 0 auto;
@@ -109,8 +114,8 @@
 [data-slot="oxp-attribution-grid"] {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(250px, 320px);
-  min-height: 0;
-  flex: 1;
+  min-height: 220px;
+  flex: 0 0 auto;
   gap: 1px;
   background: var(--oxpa-line);
 }
@@ -147,6 +152,7 @@
 
 [data-slot="oxp-attribution-table-wrap"] {
   min-height: 0;
+  max-height: min(48vh, 420px);
   overflow: auto;
 }
 
@@ -299,6 +305,147 @@
   color: var(--v2-state-fg-danger);
 }
 
+/* Compact, contiguous API-equivalent ledger; no dashboard cards or gradients. */
+[data-slot="oxp-api-cost"] {
+  flex: 0 0 auto;
+  min-width: 0;
+  border-bottom: 1px solid var(--oxpa-line);
+  background: var(--oxpa-panel);
+}
+[data-slot="oxp-api-cost-header"] {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--oxpa-line);
+  padding: 4px 10px;
+}
+[data-slot="oxp-api-cost-header"] > div {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 10px;
+}
+[data-slot="oxp-api-cost-header"] strong {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 620;
+}
+[data-slot="oxp-api-cost-header"] span,
+[data-slot="oxp-api-cost-header"] a {
+  color: var(--v2-text-text-faint);
+  font-size: 10px;
+}
+[data-slot="oxp-api-cost-header"] a {
+  flex: 0 0 auto;
+  text-decoration: none;
+}
+[data-slot="oxp-api-cost-header"] a:hover {
+  color: var(--v2-text-text-base);
+  text-decoration: underline;
+}
+[data-slot="oxp-api-cost-controls"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  min-height: 34px;
+  border-bottom: 1px solid var(--oxpa-line);
+  padding: 4px 10px;
+}
+[data-slot="oxp-api-cost-controls"] label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--v2-text-text-faint);
+  font-size: 10px;
+  white-space: nowrap;
+}
+[data-slot="oxp-api-cost-controls"] select {
+  height: 24px;
+  max-width: 170px;
+  border: 1px solid var(--oxpa-line);
+  border-radius: 4px;
+  padding: 0 19px 0 7px;
+  background-color: var(--oxpa-inset);
+  color: var(--v2-text-text-base);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+[data-slot="oxp-api-cost-controls"] select:focus-visible {
+  outline: 2px solid var(--v2-text-text-accent);
+  outline-offset: 1px;
+}
+[data-slot="oxp-api-cost-scroll"] {
+  max-width: 100%;
+  overflow-x: auto;
+}
+[data-slot="oxp-api-cost-table"] {
+  width: 100%;
+  min-width: 610px;
+  border-collapse: collapse;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+[data-slot="oxp-api-cost-table"] thead th {
+  height: 25px;
+  border-bottom: 1px solid var(--oxpa-line);
+  background: var(--oxpa-inset);
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  font-weight: 550;
+  letter-spacing: 0.025em;
+}
+[data-slot="oxp-api-cost-table"] th,
+[data-slot="oxp-api-cost-table"] td {
+  padding: 0 10px;
+  text-align: right;
+  white-space: nowrap;
+}
+[data-slot="oxp-api-cost-table"] th:first-child {
+  text-align: left;
+}
+[data-slot="oxp-api-cost-table"] tbody tr {
+  height: 26px;
+  border-bottom: 1px solid var(--oxpa-line);
+}
+[data-slot="oxp-api-cost-table"] tbody tr:last-child {
+  border-bottom: 0;
+}
+[data-slot="oxp-api-cost-table"] tbody tr:hover {
+  background: color-mix(in oklab, var(--v2-text-text-base) 4%, transparent);
+}
+[data-slot="oxp-api-cost-table"] tbody th {
+  color: var(--v2-text-text-base);
+  font-weight: 560;
+}
+[data-slot="oxp-api-cost-table"] tbody td {
+  color: var(--v2-text-text-muted);
+}
+[data-slot="oxp-api-cost-table"] [data-cell="rates"] {
+  color: var(--v2-text-text-faint);
+}
+[data-slot="oxp-api-cost-table"] [data-cell="total"] {
+  color: var(--v2-text-text-base);
+  font-weight: 640;
+}
+[data-slot="oxp-api-cost-note"] {
+  margin: 0;
+  border-top: 1px solid var(--oxpa-line);
+  padding: 5px 10px 6px;
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  line-height: 13px;
+}
+@media (max-width: 760px) {
+  [data-slot="oxp-api-cost-header"] > div {
+    flex-direction: column;
+    gap: 0;
+  }
+}
+
 @media (max-width: 760px) {
   [data-slot="oxp-attribution-stats"] {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -319,5 +466,465 @@
 
   [data-slot="oxp-attribution-header"] {
     align-items: flex-start;
+  }
+}
+
+/* ===========================================================================
+   OXP workload inspector — timeline-inspired, dense, drilldown.
+
+   Same quiet zinc + hairline grammar as the rest of the attribution surface:
+   28px leaderboard rows, 27px column headers, 9–11px tabular metadata. The
+   leaderboard row expands inline (no fetch) to reveal the tool's already-
+   materialized outcome timings; the volume strip is a focusable timeline whose
+   buckets surface their window + counts on selection.
+   =========================================================================== */
+
+[data-slot="oxp-workload"] {
+  display: flex;
+  flex: 0 0 auto;
+  min-width: 0;
+  flex-direction: column;
+  border-bottom: 1px solid var(--oxpa-line);
+  background: var(--oxpa-panel);
+}
+
+[data-slot="oxp-workload-header"] {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--oxpa-line);
+  padding: 4px 10px;
+}
+
+[data-slot="oxp-workload-header"] > div {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+
+[data-slot="oxp-workload-header"] strong {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+[data-slot="oxp-workload-header"] span {
+  overflow: hidden;
+  color: var(--v2-text-text-faint);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-slot="oxp-workload-stats"] {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-bottom: 1px solid var(--oxpa-line);
+}
+
+[data-slot="oxp-workload-stat"] {
+  min-width: 0;
+  padding: 5px 10px;
+  border-right: 1px solid var(--oxpa-line);
+  border-bottom: 1px solid var(--oxpa-line);
+}
+
+[data-slot="oxp-workload-stat-label"],
+[data-slot="oxp-workload-stat-hint"] {
+  display: block;
+  overflow: hidden;
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  font-weight: 560;
+  line-height: 12px;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  letter-spacing: 0.035em;
+  white-space: nowrap;
+}
+
+[data-slot="oxp-workload-stat-value"] {
+  display: block;
+  margin-top: 1px;
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 640;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-slot="oxp-workload-stat-hint"] {
+  margin-top: 1px;
+  font-weight: 440;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* ── Volume / failure timeline ──────────────────────────────────────────── */
+
+[data-slot="oxp-workload-timeline"] {
+  flex: 0 0 auto;
+  min-width: 0;
+  border-bottom: 1px solid var(--oxpa-line);
+  padding: 8px 10px 7px;
+}
+
+[data-slot="oxp-workload-timeline-head"] {
+  display: flex;
+  min-height: 18px;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+[data-slot="oxp-workload-timeline-head"] strong {
+  font-size: 10px;
+  font-weight: 580;
+}
+
+[data-slot="oxp-workload-timeline-head"] span {
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-slot="oxp-workload-track"] {
+  display: flex;
+  height: 84px;
+  align-items: flex-end;
+  gap: 1px;
+}
+
+[data-slot="oxp-workload-bucket"] {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  align-items: flex-end;
+  border: 0;
+  border-radius: 1px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+[data-slot="oxp-workload-bucket"]:focus-visible {
+  outline: 2px solid var(--v2-text-text-accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+[data-slot="oxp-workload-bucket"][aria-pressed="true"] {
+  background: color-mix(in oklab, var(--v2-text-text-base) 6%, transparent);
+}
+
+[data-slot="oxp-workload-bar"] {
+  display: block;
+  width: 100%;
+  min-height: 1px;
+  background: color-mix(in oklab, var(--v2-text-text-faint) 34%, transparent);
+}
+
+[data-slot="oxp-workload-bar-fail"] {
+  display: block;
+  width: 100%;
+  background: color-mix(in oklab, var(--v2-state-fg-danger) 72%, transparent);
+}
+
+[data-slot="oxp-workload-readout"] {
+  margin-top: 6px;
+  overflow: hidden;
+  color: var(--v2-text-text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-slot="oxp-workload-axis"] {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 2px;
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Leaderboard + inline drilldown ─────────────────────────────────────── */
+
+[data-slot="oxp-workload-board"] {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+[data-slot="oxp-workload-board-head"] {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--oxpa-line);
+  padding: 0 10px;
+}
+
+[data-slot="oxp-workload-board-head"] strong {
+  font-size: 10px;
+  font-weight: 580;
+}
+
+[data-slot="oxp-workload-board-head"] > span {
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-slot="oxp-workload-board-toggle"] {
+  height: 22px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 7px;
+  background: transparent;
+  color: var(--v2-text-text-faint);
+  font-size: 10px;
+  font-weight: 560;
+  cursor: pointer;
+}
+
+[data-slot="oxp-workload-board-toggle"]:hover {
+  color: var(--v2-text-text-base);
+}
+
+[data-slot="oxp-workload-board-toggle"][aria-pressed="true"] {
+  background: var(--oxpa-inset);
+  color: var(--v2-text-text-base);
+}
+
+[data-slot="oxp-workload-board-toggle"]:focus-visible {
+  outline: 2px solid var(--v2-text-text-accent);
+  outline-offset: -1px;
+}
+
+[data-slot="oxp-workload-table-wrap"] {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+[data-slot="oxp-workload-table"] {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-slot="oxp-workload-table"] th {
+  height: 27px;
+  border-bottom: 1px solid var(--oxpa-line);
+  background: var(--oxpa-inset);
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  font-weight: 560;
+  text-align: right;
+  text-transform: uppercase;
+  letter-spacing: 0.035em;
+}
+
+[data-slot="oxp-workload-table"] th:first-child {
+  padding-left: 10px;
+  text-align: left;
+}
+
+[data-slot="oxp-workload-table"] th button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 9px;
+  font-weight: 560;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+[data-slot="oxp-workload-table"] th button:hover {
+  color: var(--v2-text-text-base);
+}
+
+[data-slot="oxp-workload-table"] th button:focus-visible {
+  outline: 2px solid var(--v2-text-text-accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+[data-slot="oxp-workload-table"] td {
+  height: 28px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--oxpa-line);
+  color: var(--v2-text-text-muted);
+  text-align: right;
+}
+
+[data-slot="oxp-workload-row"]:hover td {
+  background: color-mix(in oklab, var(--v2-text-text-base) 4%, transparent);
+}
+
+[data-slot="oxp-workload-row"][data-expanded="true"] td {
+  background: var(--oxpa-inset);
+}
+
+[data-slot="oxp-workload-row"][data-muted="true"] td {
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="oxp-workload-table"] td[data-cell="tool"] {
+  max-width: 260px;
+  text-align: left;
+}
+
+[data-slot="oxp-workload-table"] td[data-cell="danger"].is-danger {
+  color: var(--v2-state-fg-danger);
+}
+
+[data-slot="oxp-workload-row-toggle"] {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--v2-text-text-base);
+  font: inherit;
+  font-weight: 540;
+  text-align: left;
+  cursor: pointer;
+}
+
+[data-slot="oxp-workload-row-toggle"] [data-component="icon"] {
+  flex: 0 0 auto;
+  color: var(--v2-icon-icon-muted);
+}
+
+[data-slot="oxp-workload-row-toggle"]:hover span,
+[data-slot="oxp-workload-row-toggle"]:focus-visible span {
+  text-decoration: underline;
+}
+
+[data-slot="oxp-workload-row-toggle"]:focus-visible {
+  outline: 2px solid var(--v2-text-text-accent);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+[data-slot="oxp-workload-row-chevron"] {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--v2-text-text-faint);
+  opacity: 0.6;
+}
+
+[data-slot="oxp-workload-other"] {
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="oxp-workload-inspector"] td {
+  height: auto;
+  padding: 9px 10px 10px;
+  background: var(--oxpa-inset);
+  text-align: left;
+}
+
+[data-slot="oxp-workload-inspector-title"] {
+  margin-bottom: 6px;
+  color: var(--v2-text-text-base);
+  font-size: 10px;
+  font-weight: 610;
+}
+
+[data-slot="oxp-workload-inspector-group"] {
+  margin-bottom: 6px;
+}
+
+[data-slot="oxp-workload-inspector-group-label"] {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  font-weight: 620;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+[data-slot="oxp-workload-inspector-grid"] {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 4px 8px;
+}
+
+[data-slot="oxp-workload-inspector-cell"] {
+  min-width: 0;
+}
+
+[data-slot="oxp-workload-inspector-cell"] span {
+  display: block;
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  line-height: 12px;
+}
+
+[data-slot="oxp-workload-inspector-cell"] strong {
+  display: block;
+  color: var(--v2-text-text-base);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-slot="oxp-workload-inspector-cell"] strong.is-danger {
+  color: var(--v2-state-fg-danger);
+}
+
+[data-slot="oxp-workload-inspector-note"] {
+  margin: 2px 0 0;
+  border-top: 1px solid var(--oxpa-line);
+  padding-top: 6px;
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  line-height: 13px;
+}
+
+[data-slot="oxp-workload-note"] {
+  margin: 0;
+  border-top: 1px solid var(--oxpa-line);
+  padding: 5px 10px 7px;
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  line-height: 13px;
+}
+
+@media (min-width: 640px) {
+  [data-slot="oxp-workload-stats"] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1280px) {
+  [data-slot="oxp-workload-stats"] {
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+  }
+
+  [data-slot="oxp-workload-stat"] {
+    border-bottom: 0;
   }
 }

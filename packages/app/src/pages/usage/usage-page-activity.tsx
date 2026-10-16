@@ -22,6 +22,8 @@ const DOW_LABELS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Fri
 const DAY_MS = 24 * 60 * 60 * 1000
 const SESSION_TABLE_INITIAL_ROWS = 50
 const SESSION_TABLE_PAGE_ROWS = 200
+const PROJECT_TABLE_INITIAL_ROWS = 50
+const PROJECT_TABLE_PAGE_ROWS = 200
 
 /**
  * Activity, rebuilt from nothing.
@@ -57,7 +59,7 @@ export function UsagePageActivity(props: { data: UsageSummaryResponse; metric: M
           </span>
         }
       >
-        <UsageHeatmap days={props.data.days} metric={props.metric} />
+        <UsageHeatmap days={props.data.days} metric={props.metric} since={props.data.since} until={props.data.until} />
       </Panel>
 
       <UsageSessionsTable sessions={props.data.sessions} />
@@ -82,10 +84,23 @@ export function UsagePageActivity(props: { data: UsageSummaryResponse; metric: M
 function UsageActivityRhythm(props: { data: UsageSummaryResponse }) {
   const language = useLanguage()
   const totals = () => props.data.totals
+  // SDK schema regeneration is separate from this server-first change.
+  // A previous installed sidecar has no full-window scalar facts; keep a
+  // conservative recent-days fallback until client/server are both updated.
+  const activity = () => (props.data as UsageSummaryResponse & {
+    activity?: {
+      activeDays: number
+      longestStreak: number
+      busiestDay: { start: number; messages: number } | null
+    }
+  }).activity
 
-  const days = createMemo(() => [...props.data.days].sort((a, b) => a.start - b.start))
+  // Usage.summary already emits day buckets in chronological order after
+  // downsampling. Re-sorting these for the streak calculation duplicates
+  // backend work and allocates another array on every window change.
+  const days = () => props.data.days
 
-  const busiestDay = createMemo(() => {
+  const recentBusiestDay = createMemo(() => {
     let best: UsageSummaryResponse["days"][number] | undefined
     for (const day of days()) if (!best || day.messages > best.messages) best = day
     return best
@@ -94,7 +109,7 @@ function UsageActivityRhythm(props: { data: UsageSummaryResponse }) {
   // Consecutive calendar days with any activity. Day starts are local
   // midnights, so a DST shift makes the gap 23h or 25h rather than exactly
   // 24h — rounding the ratio absorbs that without a date library.
-  const longestStreak = createMemo(() => {
+  const recentLongestStreak = createMemo(() => {
     const list = days()
     let best = 0
     let run = 0
@@ -124,7 +139,9 @@ function UsageActivityRhythm(props: { data: UsageSummaryResponse }) {
     return { day: index, bucket: props.data.dow[index] }
   })
 
-  const activeDays = () => days().length
+  const busiestDay = () => activity()?.busiestDay ?? recentBusiestDay()
+  const longestStreak = () => activity()?.longestStreak ?? recentLongestStreak()
+  const activeDays = () => activity()?.activeDays ?? days().length
   const turnsPerActiveDay = () => (activeDays() > 0 ? totals().messages / activeDays() : 0)
   const turnsPerSession = () => (totals().sessions > 0 ? totals().messages / totals().sessions : 0)
   const totalTurns = () => totals().messages
@@ -205,9 +222,13 @@ function UsageSessionsTable(props: { sessions: UsageSummaryResponse["sessions"] 
         return session.end
     }
   })
-  const sorted = createMemo(() => sort.sort([...props.sessions]))
-  const visible = createMemo(() => sorted().slice(0, rowLimit()))
-  const hiddenCount = createMemo(() => Math.max(0, sorted().length - visible().length))
+  const visible = createMemo(() =>
+    // Usage.summary emits at most 50 sessions, already ranked by tokens.
+    sort.column() === "tokens" && sort.direction() === "desc"
+      ? props.sessions.slice(0, rowLimit())
+      : sort.prefix(props.sessions, rowLimit()),
+  )
+  const hiddenCount = createMemo(() => Math.max(0, props.sessions.length - visible().length))
 
   return (
     <Panel
@@ -230,7 +251,7 @@ function UsageSessionsTable(props: { sessions: UsageSummaryResponse["sessions"] 
         <SortHeader label={language.t("usage.table.span")} column="span" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
         <SortHeader label={language.t("usage.table.when")} column="when" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
       </div>
-      <Show when={sorted().length > 0} fallback={<EmptyLine>{language.t("usage.sessions.empty")}</EmptyLine>}>
+      <Show when={props.sessions.length > 0} fallback={<EmptyLine>{language.t("usage.sessions.empty")}</EmptyLine>}>
         <div class="flex flex-col">
           <For each={visible()}>
             {(session) => (
@@ -284,6 +305,7 @@ type ProjectSortColumn = "project" | "sessions" | "cost" | "tokens"
 function UsageProjectsPanel(props: { projects: UsageSummaryResponse["projects"]; metric: Metric }) {
   const language = useLanguage()
   type Row = UsageSummaryResponse["projects"][number]
+  const [rowLimit, setRowLimit] = createSignal(PROJECT_TABLE_INITIAL_ROWS)
 
   const sort = createColumnSort<Row, ProjectSortColumn>(props.metric === "tokens" ? "tokens" : "cost", (project, column) => {
     switch (column) {
@@ -298,16 +320,26 @@ function UsageProjectsPanel(props: { projects: UsageSummaryResponse["projects"];
     }
   })
   createEffect(() => sort.syncDefault(props.metric === "tokens" ? "tokens" : "cost"))
-  const sorted = createMemo(() => sort.sort([...props.projects]))
-
-  const max = createMemo(() =>
-    Math.max(...props.projects.map((project) => (props.metric === "tokens" ? project.tokens : project.cost)), 0),
+  const visible = createMemo(() =>
+    // Usage.summary orders project buckets by recorded cost descending.
+    sort.column() === "cost" && sort.direction() === "desc"
+      ? props.projects.slice(0, rowLimit())
+      : sort.prefix(props.projects, rowLimit()),
   )
+  const hiddenCount = createMemo(() => Math.max(0, props.projects.length - visible().length))
+
+  const max = createMemo(() => {
+    let largest = 0
+    for (const project of props.projects) {
+      largest = Math.max(largest, props.metric === "tokens" ? project.tokens : project.cost)
+    }
+    return largest
+  })
 
   return (
     <Panel title={language.t("usage.section.projects")}>
       <div class="flex flex-col gap-0.5">
-        <For each={sorted()}>
+        <For each={visible()}>
           {(project) => {
             const value = () => (props.metric === "tokens" ? project.tokens : project.cost)
             return (
@@ -335,6 +367,15 @@ function UsageProjectsPanel(props: { projects: UsageSummaryResponse["projects"];
             )
           }}
         </For>
+        <Show when={hiddenCount() > 0}>
+          <button
+            type="button"
+            class="w-full border-t border-[var(--usage-line)] px-3 py-2 text-left text-[10px] font-[560] text-v2-text-text-muted hover:bg-[var(--usage-hover)]"
+            onClick={() => setRowLimit((value) => value + PROJECT_TABLE_PAGE_ROWS)}
+          >
+            {language.t("common.showMore", { count: Math.min(PROJECT_TABLE_PAGE_ROWS, hiddenCount()) })}
+          </button>
+        </Show>
       </div>
     </Panel>
   )
@@ -362,7 +403,8 @@ function UsageCompositionPanel(props: { data: UsageSummaryResponse }) {
   })
 
   const variantRows = createMemo(() => {
-    const max = Math.max(...props.data.variants.map((variant) => variant.messages), 0)
+    let max = 0
+    for (const variant of props.data.variants) max = Math.max(max, variant.messages)
     return props.data.variants.map((variant) => ({
       label: variant.variant === null || variant.variant === "" ? language.t("usage.variant.default") : variant.variant,
       messages: variant.messages,

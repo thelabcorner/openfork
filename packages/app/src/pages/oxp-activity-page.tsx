@@ -8,6 +8,7 @@ import { OxpActivityHeader } from "@/pages/oxp/oxp-activity-header"
 import { OxpTimeline, type OxpTimelineSource } from "@/pages/oxp/oxp-timeline"
 import { isRunning } from "@/pages/oxp/oxp-presentation"
 import { OxpAttributionPanel } from "@/pages/oxp/oxp-attribution-panel"
+import { showToast } from "@/utils/toast"
 import "@/pages/oxp/oxp-activity.css"
 
 /**
@@ -63,6 +64,17 @@ export function OxpActivityPage() {
       error: current?.error ?? store.error(),
     }
   })
+
+  // The compact global list excludes archived rows. An explicitly opened
+  // activity detail may still be archived, so resolve this one summary by ID
+  // to keep its title and restore action available.
+  createEffect(
+    on(
+      () => params.activityID,
+      (activityID) => void store.refreshOne(activityID),
+      { defer: false },
+    ),
+  )
 
   // Two clocks, both shared, both conditional.
   //
@@ -157,16 +169,44 @@ export function OxpActivityPage() {
         minuteNow={minuteNow()}
         busy={busy()}
         onRename={(title) => store.rename(params.activityID, title)}
+        onRegenerateTitle={() => {
+          void withBusy(async () => {
+            const changed = await store.regenerateTitle(params.activityID)
+            if (!changed) throw new Error(language.t("oxpActivity.action.titleNotGenerated"))
+            showToast({ title: language.t("oxpActivity.action.titleRegenerated"), variant: "success" })
+          }).catch((error: unknown) =>
+            showToast({
+              title: language.t("oxpActivity.action.titleNotGenerated"),
+              description: error instanceof Error ? error.message : undefined,
+              variant: "error",
+            }),
+          )
+        }}
         onArchive={() =>
           void withBusy(async () => {
             await store.archive(params.activityID, true)
             navigate("/oxp")
           })
         }
+        onUnarchive={() => {
+          void withBusy(async () => {
+            const changed = await store.archive(params.activityID, false)
+            if (!changed) throw new Error(language.t("oxpActivity.action.unarchiveFailed"))
+            showToast({ title: language.t("oxpActivity.action.unarchivedToast"), variant: "success" })
+          }).catch((error: unknown) =>
+            showToast({
+              title: language.t("oxpActivity.action.unarchiveFailed"),
+              description: error instanceof Error ? error.message : undefined,
+              variant: "error",
+            }),
+          )
+        }}
         onDelete={() =>
           void withBusy(async () => {
+            // The shared OXP owner removes the deleted activity's tab and
+            // selects its next sibling; don't override that with a singleton
+            // landing-page navigation after the delete succeeds.
             await store.remove(params.activityID)
-            navigate("/oxp")
           })
         }
         onRefresh={() => {

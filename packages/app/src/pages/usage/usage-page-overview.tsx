@@ -11,6 +11,7 @@ import {
   formatUSDCompact,
 } from "@/components/usage/usage-format"
 import type { ModelGroup } from "@/components/usage/usage-model-groups"
+import { topRanked } from "@/components/usage/usage-top-ranked"
 import { subsidyShare } from "@/utils/usage-subsidy"
 import type { UsageValuation } from "./use-usage-valuation"
 import { DetailRows, EmptyLine, Panel, RankRow, RuleGrid, Stat } from "./usage-page-primitives"
@@ -134,21 +135,21 @@ export function UsageOverviewCache(props: { data: UsageSummaryResponse; modelGro
   const rates = () => props.data.rates
 
   const leaderboard = createMemo(() => {
-    const rows = props.modelGroups
-      .map((group) => {
-        const denominator = group.tokenBreakdown.input + group.tokenBreakdown.cacheRead
-        if (denominator <= 0) return undefined
-        return {
-          label: group.modelID,
-          hitRate: group.tokenBreakdown.cacheRead / denominator,
-          cached: group.tokenBreakdown.cacheRead,
-          savings: group.cacheSavings,
-          messages: group.messages,
-        }
-      })
-      .filter((row): row is NonNullable<typeof row> => !!row)
-      .sort((a, b) => b.cached - a.cached)
-      .slice(0, CACHE_LEADERBOARD_SIZE)
+    const rows = topRanked(
+      props.modelGroups,
+      CACHE_LEADERBOARD_SIZE,
+      (group) => group.tokenBreakdown.cacheRead,
+      (group) => group.tokenBreakdown.input + group.tokenBreakdown.cacheRead > 0,
+    ).map((group) => {
+      const denominator = group.tokenBreakdown.input + group.tokenBreakdown.cacheRead
+      return {
+        label: group.modelID,
+        hitRate: group.tokenBreakdown.cacheRead / denominator,
+        cached: group.tokenBreakdown.cacheRead,
+        savings: group.cacheSavings,
+        messages: group.messages,
+      }
+    })
     return rows
   })
 

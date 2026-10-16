@@ -22,7 +22,9 @@ export function OxpActivityHeader(props: {
   minuteNow: number
   busy?: boolean
   onRename: (title: string | undefined) => Promise<unknown>
+  onRegenerateTitle: () => void
   onArchive: () => void
+  onUnarchive: () => void
   onDelete: () => void
   onRefresh: () => void
 }) {
@@ -157,9 +159,24 @@ export function OxpActivityHeader(props: {
                   </span>
                 </MenuV2.Item>
                 <MenuV2.Separator />
-                <MenuV2.Item disabled={!props.activity || props.busy} onSelect={props.onArchive}>
-                  <Icon name="archive" size="small" />
-                  <span class="min-w-0 flex-1 truncate">{language.t("oxpActivity.action.archive")}</span>
+                <MenuV2.Item disabled={!props.activity || props.busy} onSelect={props.onRegenerateTitle}>
+                  <Icon name="reset" size="small" />
+                  <span class="min-w-0 flex-1 truncate">
+                    {language.t("oxpActivity.action.regenerateTitle")}
+                  </span>
+                </MenuV2.Item>
+                <MenuV2.Item
+                  disabled={!props.activity || props.busy}
+                  onSelect={props.activity?.archivedAt !== undefined ? props.onUnarchive : props.onArchive}
+                >
+                  <Icon name={props.activity?.archivedAt !== undefined ? "reset" : "archive"} size="small" />
+                  <span class="min-w-0 flex-1 truncate">
+                    {language.t(
+                      props.activity?.archivedAt !== undefined
+                        ? "oxpActivity.action.unarchive"
+                        : "oxpActivity.action.archive",
+                    )}
+                  </span>
                 </MenuV2.Item>
                 <Show
                   when={confirmDelete()}

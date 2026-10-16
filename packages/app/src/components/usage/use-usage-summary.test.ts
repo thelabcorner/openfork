@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { usageSummaryCacheKey } from "./use-usage-summary"
+import { usageSummaryCacheKey } from "./usage-summary-cache"
 
 describe("usageSummaryCacheKey", () => {
   test("includes the authoritative server owner", () => {

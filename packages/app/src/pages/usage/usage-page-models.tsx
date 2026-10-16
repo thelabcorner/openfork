@@ -14,6 +14,8 @@ import {
 import type { ModelGroup, TokenBreakdown } from "@/components/usage/usage-model-groups"
 import { SortHeader } from "@/components/usage/usage-table"
 import { createColumnSort } from "@/components/usage/usage-sort"
+import { topRanked } from "@/components/usage/usage-top-ranked"
+import { sortedUsagePrefix } from "@/components/usage/usage-prefix-sort"
 import { sortByCheapness, type CheapnessModel } from "@/utils/model-cost"
 import type { UsageValuation } from "./use-usage-valuation"
 import { DetailRows, EmptyLine, Panel, RankRow, RuleGrid, Stat } from "./usage-page-primitives"
@@ -37,6 +39,8 @@ import { DetailRows, EmptyLine, Panel, RankRow, RuleGrid, Stat } from "./usage-p
 const LEADERBOARD_SIZE = 5
 const MODEL_TABLE_INITIAL_ROWS = 50
 const MODEL_TABLE_PAGE_ROWS = 200
+const PROVIDER_TABLE_INITIAL_ROWS = 40
+const PROVIDER_TABLE_PAGE_ROWS = 100
 
 const TABLE_GRID = "grid-cols-[minmax(0,1fr)_50px_60px_68px_68px_62px_54px_46px]"
 
@@ -111,17 +115,10 @@ export function UsagePageModels(props: {
   )
   const blendedPaidRate = createMemo(() => (paidTokens() > 0 ? (spend() / paidTokens()) * 1_000_000 : 0))
 
-  const topSpend = createMemo(() =>
-    [...rows()].filter((row) => row.group.cost > 0).sort((a, b) => b.group.cost - a.group.cost).slice(0, LEADERBOARD_SIZE),
-  )
-  const topFree = createMemo(() =>
-    [...rows()].filter((row) => row.freeValue > 0).sort((a, b) => b.freeValue - a.freeValue).slice(0, LEADERBOARD_SIZE),
-  )
+  const topSpend = createMemo(() => topRanked(rows(), LEADERBOARD_SIZE, (row) => row.group.cost, (row) => row.group.cost > 0))
+  const topFree = createMemo(() => topRanked(rows(), LEADERBOARD_SIZE, (row) => row.freeValue, (row) => row.freeValue > 0))
   const fastest = createMemo(() =>
-    [...rows()]
-      .filter((row) => row.group.generationRecords > 0 && row.throughput > 0)
-      .sort((a, b) => b.throughput - a.throughput)
-      .slice(0, LEADERBOARD_SIZE),
+    topRanked(rows(), LEADERBOARD_SIZE, (row) => row.throughput, (row) => row.group.generationRecords > 0 && row.throughput > 0),
   )
 
   // Ranked by the shared cheapness engine, over the models actually used.
@@ -218,6 +215,7 @@ export function UsagePageModels(props: {
  * cannot show once a model spans several providers. */
 function UsageProvidersPanel(props: { data: UsageSummaryResponse; providerName: (id: string) => string }) {
   const language = useLanguage()
+  const [rowLimit, setRowLimit] = createSignal(PROVIDER_TABLE_INITIAL_ROWS)
 
   const rows = createMemo(() => {
     const list = props.data.providers.map((provider) => {
@@ -240,15 +238,28 @@ function UsageProvidersPanel(props: { data: UsageSummaryResponse; providerName: 
         generationRecords: provider.generationRecords,
       }
     })
-    return list.sort((a, b) => b.tokens - a.tokens)
+    return list
   })
-  const max = createMemo(() => Math.max(...rows().map((row) => row.tokens), 0))
+  const max = createMemo(() => {
+    let result = 0
+    for (const row of rows()) result = Math.max(result, row.tokens)
+    return result
+  })
+  const visible = createMemo(() => {
+    const source = rows()
+    // The direct numeric comparator is faster than a generalized heap for
+    // normal provider counts; the heap only wins for genuinely large lists.
+    return source.length <= 512
+      ? [...source].sort((a, b) => b.tokens - a.tokens).slice(0, rowLimit())
+      : sortedUsagePrefix(source, rowLimit(), (row) => row.tokens, "desc")
+  })
+  const hiddenCount = createMemo(() => Math.max(0, rows().length - rowLimit()))
 
   return (
     <Panel title={language.t("usage.section.providers")}>
       <Show when={rows().length > 0} fallback={<EmptyLine>{language.t("usage.models.empty")}</EmptyLine>}>
         <div class="flex flex-col gap-0.5">
-          <For each={rows()}>
+          <For each={visible()}>
             {(row) => (
               <RankRow
                 leading={<ProviderIcon id={row.id} class="size-3 shrink-0 opacity-50" />}
@@ -278,6 +289,15 @@ function UsageProvidersPanel(props: { data: UsageSummaryResponse; providerName: 
               />
             )}
           </For>
+          <Show when={hiddenCount() > 0}>
+            <button
+              type="button"
+              class="w-full rounded px-2 py-1 text-left text-[10px] font-[560] text-v2-text-text-muted hover:bg-[var(--usage-hover)]"
+              onClick={() => setRowLimit((value) => value + PROVIDER_TABLE_PAGE_ROWS)}
+            >
+              {language.t("common.showMore", { count: Math.min(PROVIDER_TABLE_PAGE_ROWS, hiddenCount()) })}
+            </button>
+          </Show>
         </div>
       </Show>
     </Panel>
@@ -365,6 +385,14 @@ function UsageModelsTable(props: { rows: ModelRow[] }) {
   const language = useLanguage()
   const [query, setQuery] = createSignal("")
   const [rowLimit, setRowLimit] = createSignal(MODEL_TABLE_INITIAL_ROWS)
+  // Only compile case-folded search terms after the first real search. Keep
+  // them across keystrokes while the model portfolio is unchanged.
+  const searchIndex = createMemo(() =>
+    props.rows.map((row) => [
+      row.group.modelID.toLowerCase(),
+      ...row.group.providers.flatMap((entry) => [entry.providerID.toLowerCase(), entry.modelID.toLowerCase()]),
+    ]),
+  )
 
   const sort = createColumnSort<ModelRow, SortColumn>("cost", (row, column) => {
     switch (column) {
@@ -390,17 +418,17 @@ function UsageModelsTable(props: { rows: ModelRow[] }) {
   const filtered = createMemo(() => {
     const needle = query().trim().toLowerCase()
     if (!needle) return props.rows
-    return props.rows.filter(
-      (row) =>
-        row.group.modelID.toLowerCase().includes(needle) ||
-        row.group.providers.some(
-          (entry) => entry.providerID.toLowerCase().includes(needle) || entry.modelID.toLowerCase().includes(needle),
-        ),
-    )
+    const index = searchIndex()
+    return props.rows.filter((_, row) => index[row].some((term) => term.includes(needle)))
   })
-  const sorted = createMemo(() => sort.sort(filtered()))
-  const visible = createMemo(() => sorted().slice(0, rowLimit()))
-  const hiddenCount = createMemo(() => Math.max(0, sorted().length - visible().length))
+  const visible = createMemo(() => {
+    const list = filtered()
+    // groupModelsByName returns models in descending total-cost order, and
+    // text filtering preserves it. Default sort therefore needs no ranking.
+    if (sort.column() === "cost" && sort.direction() === "desc") return list.slice(0, rowLimit())
+    return sort.prefix(list, rowLimit())
+  })
+  const hiddenCount = createMemo(() => Math.max(0, filtered().length - visible().length))
 
   return (
     <Panel
@@ -429,7 +457,7 @@ function UsageModelsTable(props: { rows: ModelRow[] }) {
         <SortHeader label={language.t("usage.table.throughput")} column="throughput" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
         <SortHeader label={language.t("usage.table.cacheHitRate")} column="cache" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
       </div>
-      <Show when={sorted().length > 0} fallback={<EmptyLine>{language.t("usage.models.empty")}</EmptyLine>}>
+      <Show when={filtered().length > 0} fallback={<EmptyLine>{language.t("usage.models.empty")}</EmptyLine>}>
         <div class="flex flex-col">
           <For each={visible()}>
             {(row) => <ModelTableRow row={row} />}

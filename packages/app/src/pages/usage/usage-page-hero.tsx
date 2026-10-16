@@ -1,13 +1,16 @@
-import { createEffect, createSignal, For } from "solid-js"
+import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { useLanguage } from "@/context/language"
 import type { UsageSummaryResponse } from "@opencode-ai/sdk/v2/client"
 import { SegmentedTabs } from "@/components/session/insights-primitives"
 import { UsageBarRow, UsageHeroAreaChart, type HeroChartMetric } from "@/components/usage/usage-chart"
 import { formatNumber, formatTokens, formatUSD, formatUSDCompact } from "@/components/usage/usage-format"
+import { sortedUsagePrefix } from "@/components/usage/usage-prefix-sort"
 import { UsageCard } from "./usage-page-primitives"
 
 type Metric = "cost" | "tokens"
+const INITIAL_PROVIDER_ROWS = 16
+const PROVIDER_PAGE_ROWS = 40
 
 /** Hero band: the headline number + provider legend on the left, a full-width axis-labeled area chart on the right — the page's answer to T3's total/chart split, denser and richer than the sidebar panel's stacked single column. */
 export function UsagePageHero(props: {
@@ -35,6 +38,7 @@ export function UsagePageHero(props: {
   // moved every number except the one chart people actually look at. Same
   // "default until touched" contract as `createColumnSort.syncDefault`.
   const [chartMetric, setChartMetric] = createSignal<HeroChartMetric>(props.metric)
+  const [providerLimit, setProviderLimit] = createSignal(INITIAL_PROVIDER_ROWS)
   let chartMetricTouched = false
   createEffect(() => {
     const pageMetric = props.metric
@@ -46,7 +50,7 @@ export function UsagePageHero(props: {
     setChartMetric(value)
   }
 
-  const providerBars = () => {
+  const providerBars = createMemo(() => {
     const rows = data().providers.map((provider) => {
       const cost = provider.cost + provider.estimatedCost
       const tokenSum =
@@ -54,22 +58,28 @@ export function UsagePageHero(props: {
       return { id: provider.providerID, label: props.providerName(provider.providerID), cost, tokens: tokenSum, share: provider.share, messages: provider.messages }
     })
     const tokenTotal = rows.reduce((sum, row) => sum + row.tokens, 0)
-    const max = Math.max(...rows.map((row) => (props.metric === "cost" ? row.cost : row.tokens)), 0)
-    return rows
-      .map((row) => ({
+    let max = 0
+    for (const row of rows) max = Math.max(max, props.metric === "cost" ? row.cost : row.tokens)
+    return rows.map((row) => ({
         id: row.id,
         label: row.label,
         value: props.metric === "cost" ? row.cost : row.tokens,
         max,
-        display:
-          props.metric === "cost" ? formatUSDCompact(row.cost, language.intl()) : formatTokens(row.tokens, language.intl()),
         share: props.metric === "cost" ? row.share : tokenTotal > 0 ? row.tokens / tokenTotal : 0,
         messages: row.messages,
         cost: row.cost,
         tokens: row.tokens,
       }))
-      .sort((a, b) => b.value - a.value)
-  }
+  })
+  const visibleProviderBars = createMemo(() => {
+    const source = providerBars()
+    // Server provider buckets are already ranked by recorded+estimated cost.
+    if (props.metric === "cost") return source.slice(0, providerLimit())
+    return source.length <= 512
+      ? [...source].sort((a, b) => b.value - a.value).slice(0, providerLimit())
+      : sortedUsagePrefix(source, providerLimit(), (row) => row.value, "desc")
+  })
+  const hiddenProviders = createMemo(() => Math.max(0, providerBars().length - providerLimit()))
 
   const periodTotal = () =>
     data().periods.reduce(
@@ -100,7 +110,7 @@ export function UsagePageHero(props: {
             {language.t("usage.section.providers")}
           </span>
           <div class="flex flex-col gap-1.5">
-            <For each={providerBars()}>
+            <For each={visibleProviderBars()}>
               {(provider) => (
                 <div class="flex items-center gap-1.5">
                   <ProviderIcon id={provider.id} class="size-3 shrink-0 opacity-60" />
@@ -109,7 +119,7 @@ export function UsagePageHero(props: {
                       label={provider.label}
                       value={provider.value}
                       max={provider.max}
-                      display={provider.display}
+                      display={props.metric === "cost" ? formatUSDCompact(provider.cost, language.intl()) : formatTokens(provider.tokens, language.intl())}
                       share={provider.share}
                       tooltipRows={[
                         // `value` is whichever metric the page toggle is on —
@@ -125,6 +135,15 @@ export function UsagePageHero(props: {
                 </div>
               )}
             </For>
+            <Show when={hiddenProviders() > 0}>
+              <button
+                type="button"
+                class="w-full rounded px-2 py-1 text-left text-[10px] font-[560] text-v2-text-text-muted hover:bg-[var(--usage-hover)]"
+                onClick={() => setProviderLimit((value) => value + PROVIDER_PAGE_ROWS)}
+              >
+                {language.t("common.showMore", { count: Math.min(PROVIDER_PAGE_ROWS, hiddenProviders()) })}
+              </button>
+            </Show>
           </div>
         </div>
       </div>

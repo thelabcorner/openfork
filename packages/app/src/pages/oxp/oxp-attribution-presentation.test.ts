@@ -2,35 +2,39 @@ import { describe, expect, test } from "bun:test"
 import { oxpActivityDict } from "@/i18n/en-oxp-activity"
 
 describe("OXP attribution presentation contract", () => {
-  test("labels exposure as modeled rather than provider-reported usage", () => {
-    const text = Object.values(oxpActivityDict).join(" ").toLowerCase()
-    expect(text).not.toContain("the oxp token usage")
-    expect(text).not.toContain("oxp token usage")
-    expect(
-      oxpActivityDict["oxpActivity.attribution.exposureHelp"].toLowerCase(),
-    ).toContain("not provider-reported token usage")
+  test("labels OXP payload tokens as an estimate without a residency multiplier", () => {
+    const help = oxpActivityDict["oxpActivity.attribution.oxpTokensHelp"].toLowerCase()
+    expect(help).toContain("requests and results")
+    expect(help).toContain("counted once")
+    expect(help).toContain("no context-residency multiplier")
   })
 
-  test("keeps residency sensitivity distinct from causal attribution", () => {
-    const note =
-      oxpActivityDict["oxpActivity.attribution.methodNote"].toLowerCase()
-    expect(note).toContain("context-residency assumption")
-    expect(note).toContain("does not infer causal attribution")
+  test("keeps upstream usage explicitly empirical and distinct from provider reporting", () => {
+    const surrounding = oxpActivityDict["oxpActivity.attribution.surroundingTokensHelp"].toLowerCase()
+    const total = oxpActivityDict["oxpActivity.attribution.totalTokensHelp"].toLowerCase()
+    expect(surrounding).toContain("learned from paired openfork")
+    expect(total).toContain("not provider-reported chatgpt usage")
+  })
+
+  test("documents the measured boundary and the learned outer estimate separately", () => {
+    const note = oxpActivityDict["oxpActivity.attribution.methodNote"].toLowerCase()
+    expect(note).toContain("request/result payload openfork actually observes")
+    expect(note).toContain("separate empirical estimate")
+    expect(note).toContain("never assumes old oxp payloads remain resident")
     expect(note).toContain("availability/tool-schema prompt tax is separate")
-    expect(oxpActivityDict["oxpActivity.attribution.causal"]).toBe(
-      "Causal trace",
-    )
-    expect(oxpActivityDict["oxpActivity.attribution.notMeasured"]).toBe(
-      "Not measured",
-    )
   })
 
-  test("names exact evidence and historical fallback separately in the UI copy", () => {
-    expect(
-      oxpActivityDict["oxpActivity.attribution.subtitle"].toLowerCase(),
-    ).toContain("exact evidence")
-    expect(
-      oxpActivityDict["oxpActivity.attribution.subtitle"].toLowerCase(),
-    ).toContain("historical fallback")
+  test("no production attribution copy carries obsolete geometric-residency wording", () => {
+    const copy = Object.entries(oxpActivityDict)
+      .filter(([key]) => key.startsWith("oxpActivity.attribution."))
+      .map(([, value]) => value)
+      .join(" ")
+      .toLowerCase()
+    for (const obsolete of ["amplification", /\brho\b/, "unique tokens", "exposure tokens"]) {
+      expect(copy).not.toMatch(obsolete)
+    }
+    // The only permitted mention of residency is the explicit negation.
+    expect(copy).toContain("there is no context-residency multiplier")
+    expect(copy.match(/residency/g) ?? []).toHaveLength(1)
   })
 })
