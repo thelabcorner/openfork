@@ -9,6 +9,7 @@ import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { useLanguage } from "@/context/language"
 import { showToast } from "@/utils/toast"
 import { ProjectExplorerTree, type ProjectExplorerTreeHandle } from "@/components/project-explorer-tree"
+import { createProjectExplorerMutationQueue } from "@/components/project-explorer-mutation-queue"
 import type { Kind } from "@/components/file-tree"
 import type { ProjectExplorerEditorPaneHandle } from "./project-explorer-editor-pane"
 import { notImplementedFileOpsPort, FileOpsNotImplementedError, type FileOpsPort } from "@/utils/file-ops-port"
@@ -89,48 +90,39 @@ export function ProjectExplorerPanel(props: {
   // multi-selection or a drag operation. Keep a small amount of parallelism
   // for real backends while preventing one gesture from opening an unbounded
   // set of requests and promise continuations on the renderer's event loop.
-  const MAX_MUTATION_QUEUE = 512
-  const mutationQueue: Array<() => Promise<unknown>> = []
-  let activeMutations = 0
+  const mutations = createProjectExplorerMutationQueue({
+    concurrency: 2,
+    maxQueued: 512,
+    onError: notImplementedToast,
+    onOverflow: () => showToast({
+      variant: "error",
+      title: language.t("common.requestFailed"),
+      description: "Too many file operations are queued; wait for the current batch to finish.",
+    }),
+  })
   let disposed = false
-  let mutationOverflowNotified = false
-  const pumpMutations = () => {
-    while (activeMutations < 2 && mutationQueue.length > 0) {
-      const operation = mutationQueue.shift()!
-      activeMutations += 1
-      void Promise.resolve()
-        .then(operation)
-        .catch((error) => {
-          // Active filesystem operations cannot be force-cancelled by every
-          // backend, but a panel that has unmounted must not enqueue a late
-          // toast or another renderer update when they settle.
-          if (!disposed) notImplementedToast(error)
-        })
-        .finally(() => {
-          activeMutations -= 1
-          if (mutationQueue.length < MAX_MUTATION_QUEUE / 2) mutationOverflowNotified = false
-          pumpMutations()
-        })
+  let lastUnsupportedMutationNotice = 0
+  const enqueueMutation = (
+    operation: () => Promise<unknown>,
+    kind: FileOpsNotImplementedError["operation"],
+  ) => {
+    if (disposed) return Promise.resolve(false)
+    // Do not generate thousands of rejected promises/toasts when a user
+    // bulk-deletes against the unimplemented fallback port. Explicitly reject
+    // admission; the backpressured producer will stop after its first chunk.
+    if (fileOps() === notImplementedFileOpsPort) {
+      const now = Date.now()
+      if (now - lastUnsupportedMutationNotice > 1500) {
+        lastUnsupportedMutationNotice = now
+        notImplementedToast(new FileOpsNotImplementedError(kind))
+      }
+      return Promise.resolve(false)
     }
-  }
-  const enqueueMutation = (operation: () => Promise<unknown>) => {
-    if (disposed) return
-    if (mutationQueue.length >= MAX_MUTATION_QUEUE) {
-      if (mutationOverflowNotified) return
-      mutationOverflowNotified = true
-      showToast({
-        variant: "error",
-        title: language.t("common.requestFailed"),
-        description: "Too many file operations are queued; wait for the current batch to finish.",
-      })
-      return
-    }
-    mutationQueue.push(operation)
-    pumpMutations()
+    return mutations.enqueue(operation)
   }
   onCleanup(() => {
     disposed = true
-    mutationQueue.length = 0
+    mutations.dispose()
   })
 
   const openFile = (path: string) => {
@@ -337,6 +329,7 @@ export function ProjectExplorerPanel(props: {
           <ProjectExplorerTree
             favorites={favorites}
             search={search.query}
+            onRevealClearSearch={clearSearch}
             gitStatus={props.gitStatus}
             ref={(handle) => (treeHandle = handle)}
             onSelectionChange={setTreeSelected}
@@ -344,9 +337,9 @@ export function ProjectExplorerPanel(props: {
               if (node.type === "file") openFile(node.path)
             }}
             onMention={addToChat}
-            onRename={(from, to) => enqueueMutation(() => fileOps().rename({ from, to }).catch(notImplementedToast))}
-            onDelete={(path) => enqueueMutation(() => fileOps().delete({ path }).catch(notImplementedToast))}
-            onCreate={(path, kind) => enqueueMutation(() => fileOps().mkdir({ path, kind }).catch(notImplementedToast))}
+            onRename={(from, to) => enqueueMutation(() => fileOps().rename({ from, to }), "rename")}
+            onDelete={(path) => enqueueMutation(() => fileOps().delete({ path }), "delete")}
+            onCreate={(path, kind) => enqueueMutation(() => fileOps().mkdir({ path, kind }), "mkdir")}
           />
         </ScrollView>
         {/* Divider on the tree's right edge: tree|editor, or tree|session. */}

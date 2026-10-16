@@ -18,6 +18,10 @@ type WatcherOps = {
   onInvalidate?: (path: string) => void
 }
 
+function isGitMetadataPath(file: string) {
+  return /(^|\/)\.git(\/|$)/i.test(file.replaceAll("\\", "/"))
+}
+
 export function invalidateFromWatcher(event: WatcherEvent, ops: WatcherOps) {
   if (event.type !== "file.watcher.updated") return
   const props =
@@ -29,7 +33,7 @@ export function invalidateFromWatcher(event: WatcherEvent, ops: WatcherOps) {
 
   const path = ops.normalize(rawPath)
   if (!path) return
-  if (path.startsWith(".git/")) return
+  if (isGitMetadataPath(path)) return
 
   ops.onInvalidate?.(path)
 

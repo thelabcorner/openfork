@@ -13,7 +13,7 @@ import { Schema } from "effect"
 import type { ServerConnection } from "@/context/server"
 import { sessionHref } from "@/utils/session-route"
 import { useServerSync } from "@/context/server-sync"
-import { pathKey } from "@/utils/path-key"
+import { isAbsoluteWorkspaceDirectory, pathKey } from "@/utils/path-key"
 
 export function DirectoryDataProvider(
   props: ParentProps<{
@@ -39,8 +39,24 @@ export function DirectoryDataProvider(
 
   const killShell = async (input: { sessionID: string; callID?: string; jobId?: string }) => {
     try {
-      const response = await sdk().client.tool.kill({ toolKillPayload: input }, { throwOnError: true })
-      if (!response.data.killed) {
+      const client = sdk().client
+      const response = await client.tool.kill({ toolKillPayload: input }, { throwOnError: true })
+      if (response.data.status === "recovered") {
+        showToast({
+          title: language.t("tool.stop.recovered.title"),
+          description: language.t("tool.stop.recovered.description"),
+        })
+      } else if (response.data.status === "stopping") {
+        showToast({
+          title: language.t("tool.stop.pending.title"),
+          description: language.t("tool.stop.pending.description"),
+        })
+      } else if (!response.data.killed && response.data.status !== undefined) {
+        showToast({
+          title: language.t("tool.stop.stale.title"),
+          description: language.t("tool.stop.stale.description"),
+        })
+      } else if (!response.data.killed) {
         showToast({
           title: language.t("ui.tool.shell.stop.notRunning.title"),
           description:
@@ -116,7 +132,7 @@ export type ProjectDirString = Schema.Schema.Type<typeof ProjectDirString>
 
 export function decodeDirectory(dir: string): ProjectDirString | undefined {
   const decoded = decode64(dir)
-  if (!decoded) return
+  if (!isAbsoluteWorkspaceDirectory(decoded)) return
   return ProjectDirString.make(decoded)
 }
 

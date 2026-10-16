@@ -206,6 +206,9 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           .requests.schedule(priority, () => sdk().client.file.list({ path: dir }), { key, kind: "file-tree" })
           .then((x) => x.data ?? [])
       },
+      promote: (dir) => {
+        serverSDK().requests.promote(`file-tree:${scope()}:${dir}`, "interactive")
+      },
       onError: (message) => {
         showToast({
           variant: "error",
@@ -811,6 +814,10 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         list: tree.listDir,
         refresh: (input: string) => tree.listDir(input, { force: true }),
         state: tree.dirState,
+        nodeRevision: tree.nodeRevision,
+        viewRevision: tree.viewRevision,
+        changesSince: tree.changesSince,
+        node: tree.node,
         children: tree.children,
         allNodes: tree.allNodes,
         hasNode: tree.hasNode,
