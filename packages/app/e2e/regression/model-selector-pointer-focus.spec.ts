@@ -156,14 +156,21 @@ test("scanning model rows with the mouse never takes DOM focus", async ({ page }
   await countRowFocusEvents(page)
 
   const rows = modelRows(page)
-  expect(await rows.count()).toBeGreaterThanOrEqual(4)
-  const first = await rows.first().boundingBox()
-  const last = await rows.last().boundingBox()
-  if (!first || !last) throw new Error("Model selector rows have no layout box")
+  const boxes = await rows.evaluateAll((elements) =>
+    elements
+      .map((element) => {
+        const rect = element.getBoundingClientRect()
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+      })
+      .filter((rect) => rect.width > 0 && rect.height > 0),
+  )
+  expect(boxes.length).toBeGreaterThanOrEqual(4)
+  const first = boxes[0]!
+  const last = boxes.at(-1)!
 
-  // One stepped move across the whole list: every row is crossed in a couple of
-  // milliseconds, far below the 64 ms hover-intent dwell. This is the fast-scan
-  // path production must keep CSS-only.
+  // One stepped move across the currently mounted list: every crossed row is
+  // traversed in a couple of milliseconds, far below the 64 ms hover-intent
+  // dwell. Virtualized offscreen locators are deliberately excluded.
   await page.mouse.move(first.x + first.width / 2, first.y + first.height / 2)
   await page.mouse.move(first.x + first.width / 2, last.y + last.height / 2, { steps: 12 })
 

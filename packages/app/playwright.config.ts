@@ -5,7 +5,8 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? `http://127.0.0.1:${port}`
 const serverHost = process.env.PLAYWRIGHT_SERVER_HOST ?? "127.0.0.1"
 const serverPort = process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"
 const command = `bun run dev -- --host 0.0.0.0 --port ${port}`
-const reuse = !process.env.CI
+// Local tests can explicitly reject an already-running (possibly stale) Vite instance.
+const reuse = !process.env.CI && process.env.PLAYWRIGHT_REUSE_EXISTING_SERVER !== "0"
 const workers = Number(process.env.PLAYWRIGHT_WORKERS ?? (process.env.CI ? 5 : 0)) || undefined
 export default defineConfig({
   testDir: "./e2e",

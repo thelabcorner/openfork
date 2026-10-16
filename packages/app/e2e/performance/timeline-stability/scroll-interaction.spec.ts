@@ -13,6 +13,7 @@ import {
   shell,
   textPart,
   userMessage,
+  waitForVisualSettle,
   type TimelineMessage,
 } from "./fixture"
 
@@ -33,6 +34,15 @@ test("does not reverse visible rows when the user wheels during shell remeasurem
     seedHistory: true,
   })
   const scroller = page.locator(".scroll-view__viewport", { has: page.locator("[data-timeline-row]") })
+  // The wheel test measures mutation under *user* scrolling, not asynchronous
+  // first-load Markdown replacement. Establish the settled baseline before
+  // starting its trace; otherwise initial fallback→Markdown height changes
+  // can be misattributed to the shell update under a throttled browser.
+  await expect(page.locator(`[data-timeline-part-id="${followingID}"]`)).toContainText("Following wheel interaction")
+  await waitForVisualSettle(page, [
+    `[data-timeline-part-id="${shellID}"]`,
+    `[data-timeline-part-id="${followingID}"]`,
+  ], 5)
   const regions = defineVisualRegions({
     shell: { selector: `[data-timeline-part-id="${shellID}"]`, closest: '[data-timeline-row="AssistantPart"]' },
     following: { selector: `[data-timeline-part-id="${followingID}"]`, closest: '[data-timeline-row="AssistantPart"]' },
@@ -263,6 +273,79 @@ test("jump to latest lands on stable final rows after offscreen growth", async (
   )
 })
 
+test("keeps the reading row stationary when a clipped predecessor grows during upward scrolling", async ({ page }) => {
+  await setupTimeline(page, {
+    messages: history(65),
+    viewport: { width: 1280, height: 720 },
+    reducedMotion: true,
+    // This scenario measures static history and intentionally emits no SSE events.
+    waitForConnection: false,
+  })
+  const scroller = page.locator(".scroll-view__viewport", { has: page.locator("[data-timeline-row]") })
+  await scroller.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: -250 }))
+  })
+  const target = await scroller.evaluate(async (element) => {
+    const viewport = element.getBoundingClientRect()
+    const margin = element.querySelector("[data-session-title]") ? 64 : 0
+    const top = viewport.top + margin
+    const settle = () => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+    const readRows = () => [...element.querySelectorAll<HTMLElement>("[data-timeline-key]")]
+      .map((node) => ({ key: node.dataset.timelineKey!, rect: node.getBoundingClientRect() }))
+      .sort((a, b) => a.rect.top - b.rect.top)
+    // Position a known, reasonably short row at the clipped top edge. Using an
+    // arbitrary percentage of a long virtualized history is not deterministic
+    // because row estimates and real heights can be very different.
+    // The virtualizer updates mounted rows after scroll frames. Seek a
+    // genuinely visible compact row instead of using one estimated percentage.
+    let candidate: ReturnType<typeof readRows>[number] | undefined
+    for (const fraction of [0.55, 0.45, 0.65, 0.35, 0.75]) {
+      element.scrollTop = Math.round((element.scrollHeight - element.clientHeight) * fraction) + 23
+      await settle()
+      candidate = readRows().find((row) =>
+        row.rect.top > top + 65 && row.rect.top < viewport.bottom - 190 &&
+        row.rect.height >= 72 && row.rect.height < 160)
+      if (candidate) break
+    }
+    if (!candidate) throw new Error(`No compact on-screen row available for the clipped-predecessor fixture: ${JSON.stringify({
+      scrollTop: element.scrollTop, scrollHeight: element.scrollHeight,
+      viewport: viewport.toJSON(), top, rows: readRows().map((row) => ({ key: row.key, top: row.rect.top, height: row.rect.height })),
+    })}`)
+    element.scrollTop += candidate.rect.top - top + 24
+    await settle()
+    const rows = readRows()
+    const clipped = rows.find((row) => row.key === candidate.key)
+    const next = rows.find((row) => row.key !== candidate.key &&
+      row.rect.top > top + 4 && row.rect.top < viewport.bottom - 60)
+    if (!clipped || !next || clipped.rect.top >= top - 2 || clipped.rect.bottom <= top + 8) {
+      throw new Error(`Failed to stage clipped row: ${JSON.stringify({
+        scrollTop: element.scrollTop, top, clipped: clipped?.rect.toJSON(), next: next?.rect.toJSON(),
+      })}`)
+    }
+    return { predecessor: clipped.key, anchor: next.key }
+  })
+  const predecessor = page.locator("[data-timeline-key]").filter({ has: page.locator("[data-index]") })
+    .and(page.locator(`[data-timeline-key="${target.predecessor}"]`))
+  const anchor = page.locator(`[data-timeline-key="${target.anchor}"]`)
+  const before = await anchor.boundingBox()
+  const predecessorBefore = await predecessor.boundingBox()
+  expect(before).not.toBeNull()
+  expect(predecessorBefore).not.toBeNull()
+  if (!before || !predecessorBefore) return
+  expect(await scroller.evaluate((element) => getComputedStyle(element).overflowAnchor)).toBe("none")
+
+  await predecessor.locator("[data-index]").evaluate((element) => {
+    ;(element as HTMLElement).style.paddingBottom = "300px"
+  })
+  await expect.poll(async () => (await predecessor.boundingBox())?.height ?? 0)
+    .toBeGreaterThan(predecessorBefore.height + 200)
+  await page.waitForTimeout(200)
+  const after = await anchor.boundingBox()
+  expect(after).not.toBeNull()
+  if (!after) return
+  expect(Math.abs(after.y - before.y), "A row entering above must not push visible reading content down").toBeLessThan(3)
+})
+
 test("handles a single row taller than the viewport", async ({ page }, testInfo) => {
   const shellID = "prt_tall_01_shell"
   const followingID = "prt_tall_02_following"
@@ -272,7 +355,11 @@ test("handles a single row taller than the viewport", async ({ page }, testInfo)
       assistantMessage([shell(shellID, "running"), textPart(followingID, "After tall row")], { completed: false }),
     ],
     settings: { shellToolPartsExpanded: true },
-    viewport: { width: 900, height: 360 },
+    // Leave room for the app titlebar/composer: a 360px browser leaves only
+    // ~122px of transcript viewport and the initial shell is already clipped
+    // out before the probe starts. The 100-line shell is still much taller
+    // than the effective transcript viewport at this size.
+    viewport: { width: 900, height: 640 },
     cpuRate: 4,
     seedHistory: true,
   })

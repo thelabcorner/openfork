@@ -373,6 +373,8 @@ async function openSession(
     auditorChildSessionID?: string
     events?: EventPayload[]
     pageMessages?: MockServerConfig["pageMessages"]
+    settingsGeneral?: Record<string, unknown>
+    normalAdmission?: boolean
   },
 ) {
   const auditorChildSessionID = options?.auditorChildSessionID
@@ -423,11 +425,26 @@ async function openSession(
       : {}),
   })
   await server.install(page)
-  await page.addInitScript(() => {
-    localStorage.setItem("settings.v3", JSON.stringify({ general: { newLayoutDesigns: true } }))
+  if (options?.normalAdmission) {
+    // A missing mock recovery record must not appear as a fenced generation.
+    await page.route(`**/session/${sessionID}/limit-recovery**`, async (route) => {
+      await route.fulfill({
+        status: 200, contentType: "application/json", body: "null",
+        headers: { "access-control-allow-origin": "*" },
+      })
+    })
+    await page.route("**/permission/auto-accept**", async (route) => {
+      await route.fulfill({
+        status: 200, contentType: "application/json", body: "true",
+        headers: { "access-control-allow-origin": "*" },
+      })
+    })
+  }
+  await page.addInitScript((general) => {
+    localStorage.setItem("settings.v3", JSON.stringify({ general: { newLayoutDesigns: true, ...general } }))
     localStorage.setItem("opencode-theme-id", "oc-2")
     localStorage.setItem("opencode-color-scheme", "dark")
-  })
+  }, options?.settingsGeneral ?? {})
   await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
   await expectAppVisible(page.locator('[data-component="prompt-input-v2"]'))
 }
@@ -551,6 +568,41 @@ test("quick Goal arming prepares durable Goal state before the first worker prom
   })
   expect(server.detail?.criteria).toHaveLength(1)
   await expect(page.locator('[data-component="goal-composer-shelf"]')).toContainText("Implement the quick Goal ordering contract")
+})
+
+test("opt-in prompt autocorrection preserves Goal objective and provider-request parity", async ({ page }) => {
+  const server = new GoalServer()
+  await openSession(page, server, {
+    all: [{
+      id: "opencode",
+      name: "OpenCode",
+      models: {
+        "goal-test-model": { id: "goal-test-model", name: "Goal Test Model", limit: { context: 200_000 } },
+      },
+    }],
+    connected: ["opencode"],
+    default: { providerID: "opencode", modelID: "goal-test-model" },
+  }, { settingsGeneral: { promptAutocorrection: true }, normalAdmission: true })
+
+  let submitted: unknown
+  await page.route(`**/session/${sessionID}/prompt_async`, async (route) => {
+    server.operations.push("worker.prompt")
+    submitted = route.request().postDataJSON()
+    await route.fulfill({ status: 204, headers: { "access-control-allow-origin": "*" } })
+  })
+
+  const composer = page.locator('[data-component="prompt-input-v2"]')
+  const goal = composer.getByRole("button", { name: "Goal", exact: true })
+  await goal.click()
+  await expect(goal).toHaveAttribute("data-goal-armed", "true")
+  await composer.locator('[data-component="prompt-input"]').fill("Contienu the reasearch")
+  await composer.getByRole("button", { name: "Send", exact: true }).click()
+
+  await expect.poll(() => submitted !== undefined).toBe(true)
+  expect(server.operations.slice(0, 2)).toEqual(["goal.prepare", "worker.prompt"])
+  expect(server.detail?.goal.objective).toBe("Continue the research")
+  expect(JSON.stringify(submitted)).toContain("Continue the research")
+  expect(JSON.stringify(submitted)).not.toContain("Contienu")
 })
 
 test("persists the auditor model per Goal through the real model picker", async ({ page }) => {

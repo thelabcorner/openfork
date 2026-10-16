@@ -63,7 +63,7 @@ benchmark.describe("performance: first navigation paint", () => {
       destinationSelector: messageSelector(fixture.expected.childMessageIDs.at(-1)!),
       contentSelector,
       navigate: async () => {
-        await page.locator(`a[href="${href}"]`, { has: page.locator('[data-component="task-tool-card"]') }).click()
+        await page.locator(`a[data-slot="collapsible-trigger"][href="${href}"]`).click()
         await expectSessionTitle(page, fixture.expected.childTitle)
       },
     })

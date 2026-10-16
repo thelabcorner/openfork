@@ -111,11 +111,12 @@ test("keeps the session rendered when @ opens while the tool catalog is pending"
   const composer = page.locator('[data-component="prompt-input-v2"]')
   const input = composer.locator('[data-component="prompt-input"]')
   await expectAppVisible(composer)
-  await expect.poll(() => catalogRequests).toBeGreaterThan(0)
+  expect(catalogRequests).toBe(0)
 
   try {
     await input.focus()
     await input.press("@")
+    await expect.poll(() => catalogRequests).toBeGreaterThan(0)
 
     // Regression: reading the pending catalog through the normal Solid
     // resource accessor used to suspend the nearest route boundary here,

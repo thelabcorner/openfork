@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test"
 import { createVirtualizer, defaultRangeExtractor, Virtualizer } from "@tanstack/solid-virtual"
-import { createRoot, createSignal } from "solid-js"
+import { createEffect, createRoot, createSignal } from "solid-js"
+import { measureRowElement } from "@/components/virtual-scroll-element"
 import { filterVirtualIndexes } from "@/pages/session/timeline/virtual-items"
 
 test("end anchoring survives consecutive resizes when the first scroll write is clamped", () => {
@@ -109,4 +110,64 @@ test("stale pinned indexes do not produce missing virtual items after count shri
     expect(() => new Map(virtualizer.getVirtualItems().map((item) => [item.key, item]))).not.toThrow()
     dispose()
   })
+})
+
+test("a row measured from an earlier-registered effect still resolves its index", () => {
+  // Why this test exists: Solid flushes createEffect callbacks in registration
+  // order, and it runs `ref` callbacks before writing reactive attributes. A
+  // row that measures itself from `onMount` -- registered before the JSX that
+  // writes `data-index` -- therefore sees a missing attribute. Without the
+  // explicit stamp, virtual-core logs
+  // "Missing attribute name 'data-index={index}' on measured element" twice
+  // per row and resizeItem drops the measurement (index resolves to -1).
+  const seen: Array<string | null> = []
+  const row = document.createElement("div")
+  const virtualizer = {
+    measureElement: (node: HTMLElement | null) => {
+      seen.push(node?.getAttribute("data-index") ?? null)
+    },
+  }
+
+  createRoot((dispose) => {
+    document.body.append(row)
+    // Stand-in for onMount(...measure(element)), registered first.
+    createEffect(() => {
+      virtualizer.measureElement(row)
+    })
+    // Stand-in for the compiled reactive `data-index={item().index}`.
+    createEffect(() => {
+      row.setAttribute("data-index", "4")
+    })
+    return dispose
+  })
+
+  // Effects flush at the end of createRoot, in registration order.
+  expect(seen).toEqual([null])
+  row.remove()
+})
+
+test("measureRowElement publishes the index before the virtualizer reads it", () => {
+  const seen: Array<string | null> = []
+  const row = document.createElement("div")
+  const virtualizer = {
+    measureElement: (node: HTMLElement | null) => {
+      seen.push(node?.getAttribute("data-index") ?? null)
+    },
+  }
+
+  createRoot((dispose) => {
+    document.body.append(row)
+    // Same registration order as the test above: the measuring effect is
+    // created before the reactive attribute effect.
+    createEffect(() => {
+      measureRowElement(virtualizer, row, 4)
+    })
+    createEffect(() => {
+      row.setAttribute("data-index", "4")
+    })
+    return dispose
+  })
+
+  expect(seen).toEqual(["4"])
+  row.remove()
 })

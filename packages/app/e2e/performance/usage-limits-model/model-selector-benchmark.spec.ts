@@ -543,13 +543,35 @@ benchmark.describe("performance: model selector", () => {
     expect(tooltipPoolMax).toBe(1)
     expect(hoverResult.longTaskCount).toBe(0)
     expect(mountedOptionsAfterHover).toBeLessThan(64)
-    // Completion is semantic, not merely "a tooltip mounted": this benchmark's
-    // fixture carries real 5h + week capacity points, so the production
-    // inspector must expose the exact window UX this performance path protects.
+    // Completion is semantic, not merely "a tooltip mounted". The performance
+    // loop above follows whichever rows ranking/virtualization made visible;
+    // those rows are not guaranteed to be among the fixture's bounded capacity
+    // estimates. Outside the measured window, target a known capacity-equipped
+    // model by identity so this assertion never depends on ranking order.
+    await search.evaluate((input: HTMLInputElement) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!
+      setter.call(input, "Model 0001")
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "0" }))
+    })
+    await settleSearchWindow(page)
+    const capacityRow = page.locator("[data-option-key]").filter({ hasText: "Model 0001" }).first()
+    await expect(capacityRow).toBeVisible()
+    await capacityRow.hover()
+    await page.waitForTimeout(75)
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())))
     await expect(inspector).toHaveCount(1)
     await expect(inspector).toContainText("5h window")
     await expect(inspector).toContainText("Week")
-    await expect(inspector).not.toContainText(/(?:Light|Heavy)/)
+    await expect(inspector).not.toContainText(/\b(?:Light|Heavy)\b/)
+
+    // Restore the neutral list state before optional lifecycle stress so that
+    // correctness-only targeting does not alter the lifecycle benchmark.
+    await search.evaluate((input: HTMLInputElement) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!
+      setter.call(input, "")
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }))
+    })
+    await settleSearchWindow(page)
 
     const cycles = lifecycleCycles()
     let heapBeforeBytes = 0

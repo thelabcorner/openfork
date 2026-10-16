@@ -90,6 +90,8 @@ export async function setupTimeline(
     messages?: TimelineMessage[]
     settings?: Record<string, boolean>
     sessions?: Session[]
+    /** Pending `/api/question/request` rows, forwarded verbatim to the mock server. */
+    questions?: unknown[] | (() => unknown[])
     cpuRate?: number
     viewport?: { width: number; height: number }
     eventRetry?: number
@@ -121,6 +123,7 @@ export async function setupTimeline(
     project: project(),
     provider: provider(),
     sessions,
+    questions: input.questions,
     sessionStatus: { [sessionID]: initialStatus },
     pageMessages: () => ({
       items: messages,
