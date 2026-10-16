@@ -98,6 +98,93 @@ describe("syncPromptModel", () => {
   })
 })
 
+describe("hosted account strategy synchronization", () => {
+  test("an unqualified legacy account selection means Adaptive, not an additional routing strategy", () => {
+    const calls: unknown[] = []
+    const local = {
+      model: {
+        current: () => ({ id: "hosted-model", provider: { id: "opencode-go" } }),
+        routeIntent: { current: () => ({ kind: "auto" as const }) },
+        set() {},
+        variant: { current: () => undefined, set() {} },
+      },
+    }
+    const prompt = (strategy: "adaptive" | "round-robin") => ({
+      model: {
+        current: () => ({
+          providerID: "opencode-go",
+          modelID: "hosted-model",
+          routeIntent: { kind: "auto" as const, strategy },
+        }),
+        set: (value: unknown) => calls.push(value),
+      },
+    })
+    syncPromptModel(local, prompt("adaptive"))
+    expect(calls).toHaveLength(0)
+    syncPromptModel(local, prompt("round-robin"))
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ routeIntent: { kind: "auto" } })
+  })
+
+  test("a hosted legacy missing intent and Adaptive selection do not rewrite each other", () => {
+    const calls: unknown[] = []
+    syncPromptModel({
+      model: {
+        current: () => ({ id: "model", provider: { id: "opencode-go" } }),
+        routeIntent: { current: () => undefined },
+        set() {},
+        variant: { current: () => undefined, set() {} },
+      },
+    }, {
+      model: {
+        current: () => ({
+          providerID: "opencode-go",
+          modelID: "model",
+          routeIntent: { kind: "auto", strategy: "adaptive" },
+        }),
+        set: (model) => calls.push(model),
+      },
+    })
+    expect(calls).toHaveLength(0)
+
+    const restored = restorePromptModel({
+      model: {
+        current: () => ({ id: "model", provider: { id: "opencode" } }),
+        routeIntent: { current: () => ({ kind: "auto" as const, strategy: "adaptive" as const }) },
+        set: (model) => calls.push(model),
+        variant: { current: () => undefined, set: (variant) => calls.push(variant) },
+      },
+    }, {
+      model: {
+        current: () => ({ providerID: "opencode", modelID: "model" }),
+        set() {},
+      },
+    })
+    expect(restored).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+
+  test("missing intent must not erase an explicit Round Robin or Public selection", () => {
+    for (const intent of [{ kind: "auto" as const, strategy: "round-robin" as const }, { kind: "public" as const }]) {
+      const calls: unknown[] = []
+      syncPromptModel({
+        model: {
+          current: () => ({ id: "model", provider: { id: "opencode" } }),
+          routeIntent: { current: () => undefined },
+          set() {},
+          variant: { current: () => undefined, set() {} },
+        },
+      }, {
+        model: {
+          current: () => ({ providerID: "opencode", modelID: "model", routeIntent: intent }),
+          set: (model) => calls.push(model),
+        },
+      })
+      expect(calls).toHaveLength(1)
+    }
+  })
+})
+
 describe("restorePromptModel", () => {
   test("restores the persisted prompt model into session selection", () => {
     const calls: unknown[] = []

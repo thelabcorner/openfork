@@ -11,7 +11,6 @@ import {
   JSX,
   on,
   onCleanup,
-  onMount,
   Show,
 } from "solid-js"
 import { createStore } from "solid-js/store"
@@ -51,7 +50,6 @@ import { decode64 } from "@/utils/base64"
 import { handleDocumentSearchKeydown } from "@/utils/search-keydown"
 import { createMenuDismissController } from "@/utils/menu-dismiss-controller"
 import { createEventListener } from "@solid-primitives/event-listener"
-import { createPolled } from "@solid-primitives/timer"
 import { DragDropProvider, PointerSensor } from "@dnd-kit/solid"
 import { isSortable, useSortable } from "@dnd-kit/solid/sortable"
 import { AutoScroller, Feedback, PointerActivationConstraints } from "@dnd-kit/dom"
@@ -65,6 +63,24 @@ import {
   type ModelSectionSelection,
 } from "./dialog-select-model-search"
 import { applySectionOrder } from "./dialog-select-model-order"
+import {
+  excludeModelSectionRows,
+  indexSelectorRows,
+  reconcileVirtualModelRows,
+  type SelectorVirtualRow,
+} from "./dialog-select-model-navigation"
+import {
+  compareModelsForFirstPaint,
+  createModelSearchOrderIndexCache,
+  createDisplayModelProjector,
+  fingerprintModelCatalog,
+  orderModelSearchMatches,
+  orderModelSearchMatchesIndexed,
+  pricingFallbackForCatalog,
+  sortModelsForFirstPaint,
+  sortWorkBuddyCreditModels,
+  type WorkBuddySortRate,
+} from "./dialog-select-model-sorting"
 import { useForkUsage, type CapacityWindow, type GeneralUsageView } from "@/context/fork-usage"
 import type { ForkCapacityPredictiveRange, ForkCapacityWindowCapacity } from "@/utils/fork-client"
 import { useWorkBuddyUsage, type WorkBuddyModelUsage } from "@/hooks/use-workbuddy-usage"
@@ -90,6 +106,15 @@ import {
 import { MULTI_ACCOUNT_PROVIDERS, type AutoPolicy } from "@/utils/multi-account-providers"
 import { splitModelIDForProvider } from "@/utils/model-account-identity"
 import { AccountOptionList, accountLabelForVariant, type AccountOptionUsage } from "./model-account-submenu"
+import {
+  hostedAccountDisplayGroup,
+  hostedAccountRosterRevision,
+  hostedAccountStillVisible,
+  hostedAccountRoutingStrategies,
+  isHostedAccountProvider,
+  pinnedHostedAccount,
+  showAccountSubmenu,
+} from "./model-hosted-account-selection"
 import { ModelStretchBar, stretchTone } from "./model-stretch-bar"
 import {
   getUsageTables,
@@ -99,22 +124,23 @@ import {
 import { deepSeekRatePeriod, isDeepSeekPeakPricedModel } from "@/utils/model-peak-pricing"
 import { isUnlimitedModel, stripUnlimitedSuffix, hasPublishedPricing } from "@/utils/model-badges"
 import {
-  buildFuzzyPricingFallbackMap,
   buildPersonalFallbackMap,
-  buildPricingFallbackMap,
-  mergePricingFallbacks,
   resolveEffectiveCost,
   sortByCheapness,
   isFreeModel,
 } from "@/utils/model-cost"
 import { buildStandardWorkloadCorpus, type CorpusBands } from "@/utils/model-usage-yield"
 import { evaluateGeneralUsageYield } from "@/utils/model-general-yield"
+import type { Strategy as ProviderRouteStrategy } from "@opencode-ai/schema/model-select/provider-route-intent"
+import { effectiveStrategy } from "@opencode-ai/schema/model-select/provider-route-intent"
 
 type LocalModelState = ReturnType<typeof useLocal>["model"]
 export type ModelSelectorModelState = Pick<
   LocalModelState,
   "current" | "recent" | "list" | "set" | "visible" | "favorite"
 > & {
+  /** Session/composer selections persist route policy; config-only pickers may omit it. */
+  routeIntent?: LocalModelState["routeIntent"]
   subProvider: Pick<LocalModelState["subProvider"], "get" | "set">
   order: Pick<LocalModelState["order"], "get" | "set" | "clear">
 }
@@ -279,14 +305,15 @@ const ModelList: Component<{
       items={models}
       current={model.current()}
       filterKeys={["provider.name", "name", "id"]}
-      sortBy={(a, b) => a.name.localeCompare(b.name)}
+      sortBy={compareModelsForFirstPaint}
       groupBy={(x) => x.provider.name}
       sortGroupsBy={(a, b) => {
         const aProvider = a.items[0].provider.id
         const bProvider = b.items[0].provider.id
-        if (popularProviders.includes(aProvider) && !popularProviders.includes(bProvider)) return -1
-        if (!popularProviders.includes(aProvider) && popularProviders.includes(bProvider)) return 1
-        return popularProviders.indexOf(aProvider) - popularProviders.indexOf(bProvider)
+        return sortModelGroups(
+          { category: aProvider, items: a.items },
+          { category: bProvider, items: b.items },
+        )
       }}
       itemWrapper={(item, node) => (
         <Tooltip
@@ -946,6 +973,8 @@ function MultiAccountRow(props: {
   selectedAccountID?: string
   auto?: ModelItem
   selectedAuto?: boolean
+  routingOptions?: readonly ProviderRouteStrategy[]
+  selectedRoutingStrategy?: ProviderRouteStrategy
   favorited: boolean
   usage?: ModelUsage
   priceLabel: string
@@ -967,6 +996,7 @@ function MultiAccountRow(props: {
   submenuOpen: boolean
   onSubmenuChange: (open: boolean) => void
   onSelectAuto: () => void
+  onSelectRoutingStrategy: (strategy: ProviderRouteStrategy) => void
   onSelectAccount: (accountID: string) => void
 }) {
   const language = useLanguage()
@@ -1048,10 +1078,13 @@ function MultiAccountRow(props: {
               variants={props.variants}
               auto={props.auto}
               selectedAuto={props.selectedAuto}
+              routingOptions={props.routingOptions}
+              selectedRoutingStrategy={props.selectedRoutingStrategy}
               selectedAccountID={props.selectedAccountID}
               usageForAccount={props.usageForAccount}
               accountLabels={props.accountLabels}
               onSelectAuto={props.onSelectAuto}
+              onSelectRoutingStrategy={props.onSelectRoutingStrategy}
               onSelect={props.onSelectAccount}
             />
           </MenuV2.SubContent>
@@ -1096,16 +1129,18 @@ function ModelFavoriteToggle(props: { favorited: boolean; onToggle: () => void }
 // and degrades to a live read when used outside that view (legacy dialog).
 function DeepSeekRateBadge(props: { model: ModelItem; v2?: boolean; period?: ReturnType<typeof deepSeekRatePeriod> }) {
   const language = useLanguage()
-  // Only create a fallback timer when the caller didn't provide a shared period
-  // and this row is actually a DeepSeek peak-priced model — avoids N timers for
-  // N rows (previously every row created a 60s interval unconditionally).
-  let fallbackNow: (() => Date) | undefined
-  if (props.period === undefined && isDeepSeekPeakPricedModel(props.model)) {
-    const now = createPolled(() => new Date(), 60_000)
-    fallbackNow = now
-  }
-  const period = () =>
-    props.period ?? (fallbackNow ? deepSeekRatePeriod(fallbackNow()) : deepSeekRatePeriod(new Date()))
+  // Legacy dialogs used to allocate a separate 60s interval for each visible
+  // DeepSeek row. V2 already supplies one shared period; standalone badges
+  // subscribe to the same globally-owned clock instead of spawning timers.
+  const standalone = props.period === undefined && isDeepSeekPeakPricedModel(props.model)
+  const standaloneNow = standalone ? useNow() : undefined
+  const standaloneMinute = createMemo(() => {
+    const tick = standaloneNow?.() ?? 0
+    return Math.floor(Math.max(tick, Date.now()) / 60_000)
+  })
+  const period = createMemo(() =>
+    props.period ?? deepSeekRatePeriod(new Date(standaloneMinute() * 60_000)),
+  )
   const label = () => (period() === "peak" ? language.t("model.tag.peak") : language.t("model.tag.offpeak"))
   const badge = () =>
     props.v2 ? (
@@ -1289,11 +1324,15 @@ export function ModelSelectorPopoverV2(props: {
       onToggleFavorite={controller.toggleFavorite}
       current={controller.current}
       currentVariant={controller.currentVariant}
+      currentRouteIntent={controller.currentRouteIntent}
+      supportsRouteIntent={controller.supportsRouteIntent}
       currentAccountID={controller.currentAccountID}
       groupOf={controller.groupOf}
       variants={controller.variants}
       selectVariant={controller.selectVariant}
+      selectPinnedAccount={controller.selectPinnedAccount}
       select={controller.select}
+      selectRoutingStrategy={controller.selectRoutingStrategy}
       subProviderGet={controller.subProviderGet}
       subProviderSet={controller.subProviderSet}
       pricingFallback={controller.mergedPricingFallback}
@@ -1474,32 +1513,11 @@ function createModelSelectorController(input: {
   // createMemo means the O(N) proof happens only when model.list itself changes,
   // not once for every downstream memo/open-order check.
   const catalogFp = createMemo(() => {
-    let raw: Array<{
-      id: string
-      name: string
-      family?: string
-      provider: { id: string; name?: string }
-      cost?: { input?: number; output?: number; cache?: { read?: number; write?: number } }
-    }> = []
     try {
-      raw = model.list() as unknown as typeof raw
+      return fingerprintModelCatalog(model.list())
     } catch {
       return ""
     }
-    if (raw.length === 0) return ""
-    let h = 0x811c9dc5
-    for (const item of raw) {
-      const cost = item.cost
-      h = mixFingerprint(
-        h,
-        `${item.provider.id}\u0000${item.provider.name ?? ""}\u0000${item.id}\u0000${item.name}\u0000${item.family ?? ""}`,
-      )
-      h = mixFingerprint(
-        h,
-        `${cost?.input ?? 0}|${cost?.output ?? 0}|${cost?.cache?.read ?? 0}|${cost?.cache?.write ?? 0}`,
-      )
-    }
-    return `${raw.length}:${(h >>> 0).toString(16).padStart(8, "0")}`
   })
   // Usage-table revision, likewise memoized. Threshold and time-regime metadata
   // are rank inputs too; omitting them allowed a live pricing-table update to
@@ -1579,16 +1597,21 @@ function createModelSelectorController(input: {
     return out
   })
 
-  const unsorted = createMemo(() =>
-    model
-      .list()
-      .filter((item) => model.visible({ modelID: item.id, providerID: item.provider.id }))
-      .filter((item) => (input.provider() ? item.provider.id === input.provider() : true))
-      .map((item) => ({
-        ...item,
-        provider: { ...item.provider, name: providerDisplayName(item.provider.id, item.provider.name) },
-      })),
-  )
+  const projectDisplayModel = createDisplayModelProjector<ModelItem>()
+  const unsorted = createMemo(() => {
+    // The old filter/filter/map pipeline allocated two intermediate arrays
+    // and checked the reactive provider constraint for every catalog item.
+    // Keep the exact row projection with a single pass and no intermediate
+    // catalog-sized allocations.
+    const provider = input.provider()
+    const result: ModelItem[] = []
+    for (const item of model.list()) {
+      if (provider && item.provider.id !== provider) continue
+      if (!model.visible({ modelID: item.id, providerID: item.provider.id })) continue
+      result.push(projectDisplayModel(item, providerDisplayName(item.provider.id, item.provider.name)))
+    }
+    return result
+  })
   const collapsedGroups = createMemo(() => collapseAccountVariants(unsorted(), MULTI_ACCOUNT_PROVIDERS))
   const groupIndex = createMemo(() => indexModelGroups(collapsedGroups()))
   const canonicalModels = createMemo(() => collapsedGroups().map((group) => group.canonical))
@@ -1606,131 +1629,28 @@ function createModelSelectorController(input: {
     if (!catalog) return ""
     return `${catalog}|${tablesFp()}|${visibleOrderFp()}`
   })
-  const alphabeticalModels = createMemo(() =>
-    [...canonicalModels()].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)),
-  )
+  // Even before deferred yield ranking, providers' genuine free tiers belong
+  // ahead of paid models. Use the same monetary taxonomy as the full ranker.
+  const preliminaryModels = createMemo(() => sortModelsForFirstPaint(canonicalModels()))
   // Pricing fallback: same model id across providers is ~same price (except
   // openrouter). If a model is unpriced on one provider, borrow a sibling's
   // published price instead of sorting it as unpriced/last. Build from the
   // full catalog (not just visible/filtered) so that a hidden sibling can
   // still donate its pricing.
-  const pricingFallback = createMemo(() => {
-    if (!isOpen() || !rankReady()) return undefined
-    const list = model.list()
-    if (list.length === 0) return undefined
-    const map = buildPricingFallbackMap(list as never)
-    return map.size > 0 ? map : undefined
-  })
-  // Fuzzy sibling of the exact-id fallback above: catches free-tier variants
-  // that ship under a different id than their paid counterpart (any provider,
-  // ≥75% name-similarity confidence — see string-similarity.ts). Merged with,
-  // never replacing, the exact map (exact always wins on a shared id).
-  const fuzzyPricingFallback = createMemo(() => {
-    if (!isOpen() || !rankReady()) return undefined
-    const list = model.list()
-    if (list.length === 0) return undefined
-    const map = buildFuzzyPricingFallbackMap(list as never)
-    return map.size > 0 ? map : undefined
-  })
   const mergedPricingFallback = createMemo(() => {
     // Cache-first: unchanged catalog fingerprint reuses the merged map
-    // (exact-wins-over-fuzzy preserved via mergePricingFallbacks) without
+    // (exact-wins-over-fuzzy retained in pricingFallbackForCatalog) without
     // rebuilding the O(unpriced × paid) fuzzy scan. Never caches the
     // empty-catalog case so the view's props.models("") fallback stays intact.
     const cfp = catalogFp()
     if (cfp && cachedMergedPricing && cachedMergedCatalogFp === cfp) return cachedMergedPricing
     if (!isOpen() || !rankReady()) return undefined
-    const merged = mergePricingFallbacks(pricingFallback(), fuzzyPricingFallback())
+    const merged = pricingFallbackForCatalog(model.list() as never, cfp || undefined)
     if (cfp && merged) {
       cachedMergedPricing = merged
       cachedMergedCatalogFp = cfp
     }
     return merged
-  })
-  // Pre-warm fuzzy + threshold + bands during idle after mount, not on click.
-  // Kicks the usage-tables fetch and builds the expensive maps from whatever
-  // catalog/tables are already available, so the first open hits warm caches.
-  // Identical builders → identical scores; no ranking behavior change.
-  onMount(() => {
-    if (lightweight) return
-    const warm = () => {
-      try {
-        const cfp = catalogFp()
-        if (cfp && cfp !== cachedMergedCatalogFp) {
-          try {
-            const list = model.list() as never
-            if ((list as unknown as Array<unknown>).length > 0) {
-              const exact = buildPricingFallbackMap(list)
-              const fuzzy = buildFuzzyPricingFallbackMap(list)
-              const merged = mergePricingFallbacks(
-                exact.size > 0 ? exact : undefined,
-                fuzzy.size > 0 ? fuzzy : undefined,
-              )
-              if (merged) {
-                cachedMergedPricing = merged
-                cachedMergedCatalogFp = cfp
-              }
-            }
-          } catch {}
-        }
-        void getUsageTables()
-          .then((t) => {
-            try {
-              if (!t) return
-              const live = t as import("@/utils/model-usage-profile").UsageTables
-              // Bands warm from the fetched profiles.
-              try {
-                if (live.profile.length > 0) {
-                  const built = buildStandardWorkloadCorpus(live.profile.map((e) => e.profile))
-                  void built
-                  // Cache under the resource fingerprint when available so the
-                  // open path hits; otherwise leave bands caching to open.
-                  const tfpNow = tablesFp()
-                  if (tfpNow) {
-                    cachedBands = built
-                    cachedBandsTablesFp = tfpNow
-                  }
-                }
-              } catch {}
-              // Threshold warm from fetched pricing + current catalog.
-              try {
-                const cfpNow = catalogFp()
-                const tfpNow = tablesFp()
-                const fpNow = cfpNow && tfpNow ? `${cfpNow}|${tfpNow}` : ""
-                if (fpNow && cachedThresholdFp !== fpNow && live.pricing.length > 0) {
-                  const raw = model.list()
-                  if (raw.length > 0) {
-                    const prepared = prepareThresholdIndex(live.pricing)
-                    const map = new Map<
-                      string,
-                      Array<{
-                        thresholdTokens: number
-                        operator: "<=" | ">"
-                        cost: { input: number; output: number; cache: { read: number; write: number } }
-                      }>
-                    >()
-                    for (const item of raw) {
-                      const tp = collectThresholdPricingFromIndex(prepared, {
-                        name: (item as { name: string }).name,
-                        family: (item as unknown as { family?: string }).family,
-                        id: (item as { id: string }).id,
-                      })
-                      if (tp) map.set(modelKey(item as ModelItem), tp as never)
-                    }
-                    if (map.size > 0) {
-                      cachedThreshold = map
-                      cachedThresholdFp = fpNow
-                    }
-                  }
-                }
-              } catch {}
-            } catch {}
-          })
-          .catch(() => {})
-      } catch {}
-    }
-    if (typeof requestIdleCallback !== "undefined") requestIdleCallback(() => warm(), { timeout: 2000 })
-    else setTimeout(warm, 100)
   })
   // Personal fallback: same model across providers shares your workload shape.
   // If you used claude-sonnet via anthropic (personal data exists) but not via
@@ -1812,7 +1732,7 @@ function createModelSelectorController(input: {
       // order and could preserve fallback-corpus ranking indefinitely.
       if (openOrder && structureFp && !structureMatches) clearOpenOrder()
       openEdgeUsageCheck = true
-      return alphabeticalModels()
+      return preliminaryModels()
     }
 
     if (!rankReady()) {
@@ -1823,7 +1743,7 @@ function createModelSelectorController(input: {
       // the pointer.
       if (openOrder && structureMatches) return applyOpenOrder(list)
       if (openOrder && structureFp && openEdgeUsageCheck) clearOpenOrder()
-      return alphabeticalModels()
+      return preliminaryModels()
     }
 
     const pCosts = personalCosts()
@@ -1868,6 +1788,9 @@ function createModelSelectorController(input: {
     return sorted
   })
   const searchableFields = createMemo(() => prepareModelGroupSearchFields(collapsedGroups()))
+  const searchOrderIndex = createModelSearchOrderIndexCache<ModelItem, ReturnType<typeof groupIndex>>(
+    (group, item) => group.get(modelKey(item))?.key ?? modelKey(item),
+  )
 
   const key = (item: ModelItem) => ({ modelID: item.id, providerID: item.provider.id })
   // `model.current()` values are `{ id, providerID, ... }` — they carry NO
@@ -1903,6 +1826,8 @@ function createModelSelectorController(input: {
   const currentAccountID = createMemo(() => {
     const value = model.current()
     if (!value) return undefined
+    const intent = model.routeIntent?.current()
+    if (intent?.kind === "account" && isHostedAccountProvider(value.providerID)) return intent.accountID
     const group = currentGroup(toCurrentRef(value))
     const byItem = group?.variants.find((variant) => variant.item.id === value.id)
     if (byItem) return byItem.accountID
@@ -1934,7 +1859,18 @@ function createModelSelectorController(input: {
     models: (search: string) => {
       const query = search.trim()
       if (!query) return allModels()
-      return filterPreparedModelGroupsForSearch(collapsedGroups(), query, searchableFields())
+      const matched = filterPreparedModelGroupsForSearch(collapsedGroups(), query, searchableFields())
+      if (matched.length <= 1) return matched
+      // Preserve account-variant matches, but order by the same canonical
+      // ranking as the unfiltered selector instead of raw catalog insertion.
+      const index = groupIndex()
+      const getGroup = (item: ModelItem) => index.get(modelKey(item))?.key ?? modelKey(item)
+      const ranked = allModels()
+      // Sparse query: reuse the per-catalog rank map (O(M log M)).
+      // Broad provider searches: linear scan remains better than sorting M≈N.
+      return matched.length * 2 < ranked.length
+        ? orderModelSearchMatchesIndexed(searchOrderIndex(ranked, index), matched, getGroup)
+        : orderModelSearchMatches(ranked, matched, getGroup)
     },
     groups: (models: ModelItem[]) => {
       const byProvider = new Map<string, ModelItem[]>()
@@ -1960,6 +1896,8 @@ function createModelSelectorController(input: {
     toggleFavorite: (item: ModelItem) => model.favorite.toggle(key(item)),
     current,
     currentVariant,
+    currentRouteIntent: () => model.routeIntent?.current(),
+    supportsRouteIntent: !!model.routeIntent,
     currentAccountID,
     groupOf: (item: ModelItem): ModelGroup<ModelItem> | undefined => groupIndex().get(modelKey(item)),
     variants: (item: ModelItem) => groupIndex().get(modelKey(item))?.variants ?? [],
@@ -1971,8 +1909,28 @@ function createModelSelectorController(input: {
         input.onSelect()
       }
     },
+    selectPinnedAccount: (item: ModelItem, accountID: string) => {
+      if (!model.routeIntent) return false
+      const selected = pinnedHostedAccount(item, accountID)
+      if (!selected) return false
+      model.set(selected, { recent: true })
+      input.onSelect()
+      return true
+    },
     select: (item: ModelItem) => {
       model.set({ modelID: item.id, providerID: item.provider.id }, { recent: true })
+      input.onSelect()
+    },
+    selectRoutingStrategy: (item: ModelItem, strategy: ProviderRouteStrategy) => {
+      if (!model.routeIntent || !isHostedAccountProvider(item.provider.id)) return
+      model.set(
+        {
+          modelID: splitModelIDForProvider(item.id, item.provider.id).baseModelID,
+          providerID: item.provider.id,
+          routeIntent: { kind: "auto", strategy },
+        },
+        { recent: true },
+      )
       input.onSelect()
     },
     subProviderGet: (item: ModelItem) => model.subProvider.get({ providerID: item.provider.id, modelID: item.id }),
@@ -1983,11 +1941,7 @@ function createModelSelectorController(input: {
   }
 }
 
-type NavRow = { navKey: string; item?: ModelItem }
-type SelectorRenderRow =
-  | { kind: "header"; key: string; provider?: string; title: string }
-  | { kind: "separator"; key: string }
-  | { kind: "item"; key: string; navKey: string; item: ModelItem }
+type SelectorRenderRow = SelectorVirtualRow<ModelItem>
 
 function ModelSelectorPopoverV2View(props: {
   trigger: ModelSelectorTrigger
@@ -1999,14 +1953,16 @@ function ModelSelectorPopoverV2View(props: {
   onToggleFavorite: (item: ModelItem) => void
   current: () => string | undefined
   currentVariant: () => { accountID: string; item: ModelItem } | undefined
-  /** Account id parsed from the current model's transport suffix (`@zen-…`,
-   * account suffix when the pinned variant is not in the group index (e.g. a
-   * synthesized submenu for go keys the catalog cache hasn't refreshed). */
+  currentRouteIntent: () => ReturnType<NonNullable<ModelState["routeIntent"]>["current"]>
+  supportsRouteIntent: boolean
+  /** Explicit route account first, legacy catalog suffix only for older selections. */
   currentAccountID?: () => string | undefined
   groupOf: (item: ModelItem) => ModelGroup<ModelItem> | undefined
   variants: (item: ModelItem) => { accountID: string; item: ModelItem }[]
   selectVariant: (item: ModelItem, selection: string | AutoPolicy) => void
+  selectPinnedAccount: (item: ModelItem, accountID: string) => boolean
   select: (item: ModelItem) => void
+  selectRoutingStrategy: (item: ModelItem, strategy: ProviderRouteStrategy) => void
   subProviderGet: (item: ModelItem) => string | undefined
   subProviderSet: (item: ModelItem, value: string | undefined) => void
   onCompare: () => void
@@ -2072,7 +2028,9 @@ function ModelSelectorPopoverV2View(props: {
     // fan-out. Direct quota-backed capacity follows immediately afterward.
     void forkUsage.ensureGeneralUsage().finally(() => void forkUsage.ensureCapacity())
   })
-  const limitsNow = props.lightweight ? () => Date.now() : useNow(() => store.open)
+  // Reuse the app-wide clock, rather than creating another interval for each
+  // mounted picker (including inactive composer instances).
+  const limitsNow = useNow(() => store.open)
   const limits = props.lightweight
     ? ({ providers: () => [] } as unknown as ReturnType<typeof useLimits>)
     : useLimits({ now: limitsNow, active: () => store.open })
@@ -2134,6 +2092,10 @@ function ModelSelectorPopoverV2View(props: {
     }
     return map
   })
+  // A refreshed pool can replace account A with B without changing its
+  // length. One roster revision per quota update avoids per-row scans and
+  // prevents the submenu from pinning an account that was just removed.
+  const zenRosterRevision = createMemo(() => hostedAccountRosterRevision(zenKeyLimits()))
   // Backend variants exist only for providers whose plugin emits them
   // (WorkBuddy and Zen's `opencode`). opencode-go keys live in the
   // fork credential store, so they never arrive as catalog variants. When a
@@ -2151,57 +2113,30 @@ function ModelSelectorPopoverV2View(props: {
     item: ModelItem,
     group: ModelGroup<ModelItem> | undefined,
   ): ModelGroup<ModelItem> | undefined => {
+    // The live account roster is authoritative for Zen/Go. Catalog variants
+    // can be stale after a key replacement or absent altogether. Display
+    // account rows without inventing model IDs or depending on variant count.
+    if (isHostedAccountProvider(item.provider.id) && props.supportsRouteIntent)
+      return hostedAccountDisplayGroup(item, zenKeyLimits(), group)
     if (group && group.variants.length > 1) return group
-    // Embed the label in parens on the synthesized variant name so the
-    // `accountLabelForVariant` fallback parser (used when the labels map
-    // hasn't been populated yet — e.g. quota still loading) can still show
-    // a human name instead of the raw accountID. accountLabels() is also
-    // populated for every key here as a belt-and-suspenders fallback.
-    const labeledClone = (accountID: string, label: string) =>
-      ({ ...item, id: `${item.id}@${accountID}`, name: label ? `${item.name} (${label})` : item.name }) as ModelItem
-    const plainClone = (accountID: string) => ({ ...item, id: `${item.id}@${accountID}` }) as ModelItem
-    const build = (variants: { accountID: string; item: ModelItem }[]) =>
-      ({
-        key: `${item.provider.id}:${item.id}`,
-        canonical: item,
-        label: item.name,
-        auto: item,
-        variants,
-      }) as ModelGroup<ModelItem>
-
-    // opencode and opencode-go share the Zen account pool (env + vault keys),
-    // so both synthesize from `zenKeyLimits()` — the pool's live accounts as
-    // reported by the `opencode` quota adapter. Ids are `zen-<hash>` in both
-    // cases, matching the catalog variants and the usage roster.
-    if ((item.provider.id === "opencode" || item.provider.id === "opencode-go") && zenKeyLimits().size > 1)
-      return build(
-        Array.from(zenKeyLimits().entries()).map(([keyId, info]) => ({
-          accountID: keyId,
-          item: labeledClone(keyId, info.label),
-        })),
-      )
-    // Suppress "unused param" for plainClone — kept for any future source
-    // that needs the un-labeled shape.
-    void plainClone
     return group
   }
-  const accountGroupCache = new Map<
-    string,
+  const accountGroupCache = new WeakMap<
+    ModelItem,
     {
       sourceGroup: ModelGroup<ModelItem> | undefined
-      zenSize: number
+      zenRosterRevision: string
       result: ModelGroup<ModelItem> | undefined
     }
   >()
-  onCleanup(() => accountGroupCache.clear())
   const accountGroupFor = (item: ModelItem): ModelGroup<ModelItem> | undefined => {
-    const key = modelKey(item)
     const sourceGroup = props.groupOf(item)
-    const zenSize = zenKeyLimits().size
-    const cached = accountGroupCache.get(key)
-    if (cached && cached.sourceGroup === sourceGroup && cached.zenSize === zenSize) return cached.result
+    // Non-hosted model groups do not depend on the live Zen account roster.
+    const revision = isHostedAccountProvider(item.provider.id) ? zenRosterRevision() : ""
+    const cached = accountGroupCache.get(item)
+    if (cached && cached.sourceGroup === sourceGroup && cached.zenRosterRevision === revision) return cached.result
     const result = buildAccountGroup(item, sourceGroup)
-    accountGroupCache.set(key, { sourceGroup, zenSize, result })
+    accountGroupCache.set(item, { sourceGroup, zenRosterRevision: revision, result })
     return result
   }
 
@@ -2216,14 +2151,26 @@ function ModelSelectorPopoverV2View(props: {
     const pricing = pricingTable()
     return pricing.length > 0 ? prepareThresholdIndex(pricing) : undefined
   })
+  // The prepared index is shared, but collecting matching tier rows was still
+  // repeated by the visible usage loop, tooltip, and row presentation. Cache
+  // per catalog object; replacing the table discards all previous matches.
+  let thresholdCacheIndex: ReturnType<typeof preparedThresholdPricing>
+  let thresholdCache = new WeakMap<ModelItem, ThresholdPricing | undefined>()
   const thresholdPricingFor = (item: ModelItem): ThresholdPricing | undefined => {
     const prepared = preparedThresholdPricing()
     if (!prepared) return undefined
-    return collectThresholdPricingFromIndex(prepared, {
+    if (thresholdCacheIndex !== prepared) {
+      thresholdCacheIndex = prepared
+      thresholdCache = new WeakMap()
+    }
+    if (thresholdCache.has(item)) return thresholdCache.get(item)
+    const value = collectThresholdPricingFromIndex(prepared, {
       name: item.name,
       family: (item as unknown as { family?: string }).family,
       id: item.id,
     }) as ThresholdPricing | undefined
+    thresholdCache.set(item, value)
+    return value
   }
   // OpenRouter endpoint metadata is server-scoped. Do not acquire the
   // directory-owned SDK merely to reach these unified-SDK routes; global
@@ -2240,53 +2187,23 @@ function ModelSelectorPopoverV2View(props: {
   // Pricing fallback for display: same model id across providers is ~same cost
   // (except openrouter). Build from the full catalog so that an unpriced
   // variant can show a borrowed sibling price instead of "—".
-  // Y2 dedup: reuse controller's mergedPricingFallback when available to avoid
-  // building the same two maps twice per open. The controller's maps are built
-  // from model.list() (full catalog); the view's fallback to props.models("")
-  // is preserved only for the empty-local-list edge case where the controller
-  // has no data.
-  const pricingFallbackForDisplay = createMemo(() => {
-    if (props.lightweight) return undefined
-    if (props.pricingFallback?.()) return undefined
-    if (!store.open) return undefined
-    let list: ModelItem[] = []
-    try {
-      const maybe = local?.model.list() ?? []
-      if (maybe.length > 0) list = maybe as ModelItem[]
-    } catch {}
-    if (list.length === 0) {
-      try {
-        list = props.models("") as ModelItem[]
-      } catch {}
-    }
-    if (list.length === 0) return undefined
-    const map = buildPricingFallbackMap(list as never)
-    return map.size > 0 ? map : undefined
-  })
-  // Fuzzy sibling of the exact-id display fallback above — see the matching
-  // comment on the controller-scoped `fuzzyPricingFallback` memo above.
-  const fuzzyPricingFallbackForDisplay = createMemo(() => {
-    if (props.lightweight) return undefined
-    if (props.pricingFallback?.()) return undefined
-    if (!store.open) return undefined
-    let list: ModelItem[] = []
-    try {
-      const maybe = local?.model.list() ?? []
-      if (maybe.length > 0) list = maybe as ModelItem[]
-    } catch {}
-    if (list.length === 0) {
-      try {
-        list = props.models("") as ModelItem[]
-      } catch {}
-    }
-    if (list.length === 0) return undefined
-    const map = buildFuzzyPricingFallbackMap(list as never)
-    return map.size > 0 ? map : undefined
-  })
+  // Ordinary selectors defer all fuzzy enrichment to their controller; a
+  // standalone custom picker without one computes its fallback on open.
+  // Both reuse the same weak catalog cache when they see the same snapshot.
   const mergedPricingFallbackForDisplay = createMemo(() => {
-    const fromController = props.pricingFallback?.()
-    if (fromController) return fromController
-    return mergePricingFallbacks(pricingFallbackForDisplay(), fuzzyPricingFallbackForDisplay())
+    if (props.pricingFallback) return props.pricingFallback()
+    if (props.lightweight || !store.open) return undefined
+    let list: ModelItem[] = []
+    try {
+      const full = local?.model.list() ?? []
+      if (full.length > 0) list = full as ModelItem[]
+    } catch {}
+    if (list.length === 0) {
+      try {
+        list = props.models("") as ModelItem[]
+      } catch {}
+    }
+    return pricingFallbackForCatalog(list as never)
   })
   // Hit rate maps: Usage-owned personal aggregate + OpenRouter endpoint telemetry.
   // Openrouter is built from openRouterStore endpoints.
@@ -2388,9 +2305,17 @@ function ModelSelectorPopoverV2View(props: {
   let focusFrame = 0
   let disposed = false
 
-  // Centralized DeepSeek period: one timer for the whole selector, not one per row.
-  const deepSeekNow = createPolled(() => new Date(), 60_000)
-  const deepSeekPeriod = createMemo(() => deepSeekRatePeriod(deepSeekNow()))
+  // The shared active-only clock already drives quota countdowns. Bucket it
+  // by minute so no second timer runs while the selector is closed, and rows
+  // receive updates only when the pricing period actually changes.
+  const deepSeekMinute = createMemo(() => {
+    // When all clock consumers were suspended, the shared signal retains its
+    // last tick. On reopening, use wall time immediately instead of painting
+    // a stale peak/off-peak period until the global clock effect subscribes.
+    const tick = limitsNow()
+    return Math.floor((store.open ? Date.now() : tick) / 60_000)
+  })
+  const deepSeekPeriod = createMemo(() => deepSeekRatePeriod(new Date(deepSeekMinute() * 60_000)))
 
   // Centralized OpenRouter endpoint cache: one store + one telemetry enrichment
   // path instead of per-row signals/fetches. Upstream ranking is deliberately
@@ -2584,7 +2509,38 @@ function ModelSelectorPopoverV2View(props: {
     if (store.rail === "" || store.rail === favoritesRailKey || store.rail === recentRailKey) return models()
     return models().filter((item) => item.provider.id === store.rail)
   })
-  const groups = createMemo(() => props.groups(railModels()))
+  // WorkBuddy publishes credits per REQUEST rather than token pricing. Reuse
+  // the already-fetched quota projection and its effective rateFor() resolver;
+  // the generic monetary ranker cannot infer a WorkBuddy free promotion from
+  // the model's (always-zero) token-price fields.
+  const workbuddySortRates = createMemo(() => {
+    if (!store.open || props.lightweight) return undefined
+    // Provider-specific and section-only rails cannot display WorkBuddy
+    // groups. Do not scan the catalog or subscribe to changing WorkBuddy quota
+    // rates while the user is browsing an unrelated provider's models.
+    if (store.rail && store.rail !== "workbuddy") return undefined
+    const items = railModels()
+    const rates = new Map<string, WorkBuddySortRate>()
+    const fingerprint: string[] = []
+    for (const item of items) {
+      if (item.provider.id !== "workbuddy") continue
+      const resolved = workbuddy.rateFor(item.id)
+      if (resolved) rates.set(item.id, { free: resolved.free, rate: resolved.rate })
+      fingerprint.push(`${item.id}\u0000${resolved?.free ? 1 : 0}\u0000${resolved?.rate ?? "?"}`)
+    }
+    if (fingerprint.length === 0) return undefined
+    return { key: fingerprint.join("\u001f"), rates }
+  }, undefined, { equals: (a, b) => a?.key === b?.key })
+  const groups = createMemo(() => {
+    const result = props.groups(railModels())
+    const rates = workbuddySortRates()?.rates
+    if (!rates) return result
+    return result.map((group) =>
+      group.category === "workbuddy"
+        ? { ...group, items: sortWorkBuddyCreditModels(group.items, rates) }
+        : group,
+    )
+  })
   const sections = createMemo(() => props.sections(models()))
   const favorites = createMemo(() => sections().favorites)
   const recents = createMemo(() => sections().recents)
@@ -2602,10 +2558,7 @@ function ModelSelectorPopoverV2View(props: {
     const consumed = new Set<string>()
     if (showFavorites()) for (const item of favorites()) consumed.add(modelKey(item))
     if (showRecents()) for (const item of recents()) consumed.add(modelKey(item))
-    if (consumed.size === 0) return groups()
-    return groups()
-      .map((group) => ({ ...group, items: group.items.filter((item) => !consumed.has(modelKey(item))) }))
-      .filter((group) => group.items.length > 0)
+    return excludeModelSectionRows(groups(), consumed, modelKey)
   })
   const hasContent = () => {
     if (store.rail === favoritesRailKey) return favorites().length > 0
@@ -2622,6 +2575,13 @@ function ModelSelectorPopoverV2View(props: {
   const setRowRef = (key: string) => {
     const existing = rowRefCallbacks.get(key)
     if (existing) return existing
+    // A long-lived composer may browse many catalog revisions. Retain
+    // callbacks for mounted rows, not indefinitely for long-gone models.
+    if (rowRefCallbacks.size >= 512) {
+      for (const cachedKey of rowRefCallbacks.keys()) {
+        if (!rowRefs.has(cachedKey)) rowRefCallbacks.delete(cachedKey)
+      }
+    }
     let current: HTMLElement | undefined
     const callback = (next: HTMLElement | undefined) => {
       if (next) {
@@ -2756,7 +2716,12 @@ function ModelSelectorPopoverV2View(props: {
     if (!active || active === manageKey) return undefined
     const plain = active.startsWith("fav:") ? active.slice(4) : active.startsWith("recent:") ? active.slice(7) : active
     const candidate = modelByKey().get(plain)
-    if (!candidate || candidate.provider.id === "openrouter" || (accountGroupFor(candidate)?.variants.length ?? 0) > 1)
+    const group = candidate && candidate.provider.id !== "openrouter" ? accountGroupFor(candidate) : undefined
+    if (
+      !candidate ||
+      candidate.provider.id === "openrouter" ||
+      (group && showAccountSubmenu(candidate.provider.id, group.variants.length, props.supportsRouteIntent))
+    )
       return undefined
     if (
       store.rail !== "" &&
@@ -2891,21 +2856,18 @@ function ModelSelectorPopoverV2View(props: {
     const result: SelectorRenderRow[] = []
     if (showRecents()) {
       result.push({ kind: "header", key: "header:recent", title: language.t("dialog.model.recent") })
-      result.push(
-        ...recents().map((item) => ({ kind: "item" as const, key: recentKey(item), navKey: recentKey(item), item })),
-      )
+      for (const item of recents()) {
+        const key = recentKey(item)
+        result.push({ kind: "item", key, navKey: key, item })
+      }
       result.push({ kind: "separator", key: "separator:recent" })
     }
     if (showFavorites()) {
       result.push({ kind: "header", key: "header:favorites", title: language.t("dialog.model.favorites") })
-      result.push(
-        ...favorites().map((item) => ({
-          kind: "item" as const,
-          key: favoriteKey(item),
-          navKey: favoriteKey(item),
-          item,
-        })),
-      )
+      for (const item of favorites()) {
+        const key = favoriteKey(item)
+        result.push({ kind: "item", key, navKey: key, item })
+      }
       result.push({ kind: "separator", key: "separator:favorites" })
     }
     if (showProviderGroups()) {
@@ -2916,37 +2878,18 @@ function ModelSelectorPopoverV2View(props: {
           provider: group.category,
           title: group.items[0].provider.name,
         })
-        result.push(
-          ...group.items.map((item) => ({ kind: "item" as const, key: modelKey(item), navKey: modelKey(item), item })),
-        )
+        for (const item of group.items) {
+          const key = modelKey(item)
+          result.push({ kind: "item", key, navKey: key, item })
+        }
       }
     }
     return result
   })
-  const renderRowIndex = createMemo(() => {
-    const byNavKey = new Map<string, number>()
-    const snapshot = renderRows()
-    for (let i = 0; i < snapshot.length; i++) {
-      const row = snapshot[i]
-      if (row.kind === "item") byNavKey.set(row.navKey, i)
-    }
-    return byNavKey
-  })
-  const rows = createMemo<NavRow[]>(() => [
-    ...renderRows().flatMap((row) => (row.kind === "item" ? [{ navKey: row.navKey, item: row.item }] : [])),
-    { navKey: manageKey },
-  ])
-  const navigation = createMemo(() => {
-    const keys: string[] = []
-    const byKey = new Map<string, NavRow>()
-    const indexByKey = new Map<string, number>()
-    for (const row of rows()) {
-      indexByKey.set(row.navKey, keys.length)
-      keys.push(row.navKey)
-      byKey.set(row.navKey, row)
-    }
-    return { keys, byKey, indexByKey }
-  })
+  // One pass serves virtual focus, keyboard navigation, and selection.
+  // Avoid allocating intermediate flatMap arrays for every model.
+  const navigation = createMemo(() => indexSelectorRows(renderRows(), manageKey))
+  const renderRowIndex = () => navigation().renderIndex
   const [scrollRoot, setScrollRoot] = createSignal<HTMLDivElement>()
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
     get count() {
@@ -2980,22 +2923,9 @@ function ModelSelectorPopoverV2View(props: {
   const virtualRows = createMemo<
     { virtualRow: ReturnType<typeof virtualizer.getVirtualItems>[number]; row: SelectorRenderRow | undefined }[]
   >((previous = []) => {
-    const prior = new Map(previous.flatMap((entry) => (entry.row ? [[entry.row.key, entry] as const] : [])))
-    return virtualizer.getVirtualItems().map((virtualRow) => {
-      const row = renderRows()[virtualRow.index]
-      const existing = prior.get(row?.key)
-      if (
-        existing &&
-        existing.row === row &&
-        existing.virtualRow.index === virtualRow.index &&
-        existing.virtualRow.start === virtualRow.start &&
-        existing.virtualRow.size === virtualRow.size
-      ) {
-        return existing
-      }
-      return { virtualRow, row }
-    })
+    return reconcileVirtualModelRows(renderRows(), virtualizer.getVirtualItems(), previous)
   })
+  let scrollIntentQueued = false
   createEffect(() => {
     if (!store.open || !store.active) return
     const active = store.active
@@ -3003,9 +2933,19 @@ function ModelSelectorPopoverV2View(props: {
     if (index < 0 || !scrollRoot()) return
     const range = virtualizer.range
     if (range && index >= range.startIndex && index <= range.endIndex) return
+    if (scrollIntentQueued) return
+    scrollIntentQueued = true
     queueMicrotask(() => {
-      const next = renderRowIndex().get(active) ?? -1
-      if (next >= 0) virtualizer.scrollToIndex(next, { align: "auto" })
+      scrollIntentQueued = false
+      // Keyboard auto-repeat can change focus multiple times in one task.
+      // Scroll once to the latest selection, never to stale intermediate rows
+      // or a dialog already closed/disposed before this microtask executed.
+      if (!store.open || disposed || !scrollRoot()) return
+      const next = renderRowIndex().get(store.active) ?? -1
+      if (next < 0) return
+      const visible = virtualizer.range
+      if (visible && next >= visible.startIndex && next <= visible.endIndex) return
+      virtualizer.scrollToIndex(next, { align: "auto" })
     })
   })
   // Usage bars are presentation metadata, not navigation data. Calculate them
@@ -3046,17 +2986,17 @@ function ModelSelectorPopoverV2View(props: {
       if (timeoutHandle !== undefined) clearTimeout(timeoutHandle)
     })
   })
-  const visibleUsageItems = createMemo(() =>
-    virtualizer
-      .getVirtualItems()
-      .filter((virtualRow) => {
-        const range = virtualizer.range
-        return !range || (virtualRow.index >= range.startIndex && virtualRow.index <= range.endIndex)
-      })
-      .map((virtualRow) => renderRows()[virtualRow.index])
-      .filter((row): row is Extract<SelectorRenderRow, { kind: "item" }> => row?.kind === "item")
-      .map((row) => row.item),
-  )
+  const visibleUsageItems = createMemo(() => {
+    const result: ModelItem[] = []
+    const snapshot = renderRows()
+    const range = virtualizer.range
+    for (const virtualRow of virtualizer.getVirtualItems()) {
+      if (range && (virtualRow.index < range.startIndex || virtualRow.index > range.endIndex)) continue
+      const row = snapshot[virtualRow.index]
+      if (row?.kind === "item") result.push(row.item)
+    }
+    return result
+  })
   const usageMap = createMemo(() => {
     const map = new Map<string, ReturnType<typeof usageFor>>()
     if (!usageReady() || !store.open) return map
@@ -3081,15 +3021,15 @@ function ModelSelectorPopoverV2View(props: {
   )
   createEffect(() => {
     if (!store.open) return
-    const options = navKeys()
-    if (options.includes(store.active)) return
-    setStore({ active: options[0] ?? manageKey, tooltip: "", submenu: "" })
+    const nav = navigation()
+    if (nav.indexByKey.has(store.active)) return
+    setStore({ active: nav.keys[0] ?? manageKey, tooltip: "", submenu: "" })
   })
   const initialActive = () => {
     const selected = props.current()
-    const options = navKeys()
-    if (selected && options.includes(selected)) return selected
-    return options[0] ?? ""
+    const nav = navigation()
+    if (selected && nav.indexByKey.has(selected)) return selected
+    return nav.keys[0] ?? ""
   }
   const setOpen = (open: boolean) => {
     if (open === store.open) return
@@ -3256,21 +3196,34 @@ function ModelSelectorPopoverV2View(props: {
     )
   })
 
-  // Account selection must always land on something the app can actually
-  // use. `local.model.set` writes any id, but `current()` resolves through
-  // `validModel`, which requires the id to exist in the provider catalog —
-  // writing an unknown id silently snaps back to the previous model. A
-  // synthesized submenu can offer an account the catalog doesn't expose
-  // yet (stale cache after a vault edit — quota reads the vault live,
-  // Provider.list is cached at load; or a different id domain like fork
-  // credentials), so resolve in order: real variant → catalog-known
-  // candidate → catalog refresh + retry → provider mechanism → honest
-  // automatic-routing fallback.
+  // Hosted Zen/Go accounts are first-class route intents, not per-account
+  // catalog entries. Pin the account with the base model id so current(),
+  // the composer snapshot and the runtime resolver agree. Older providers
+  // such as WorkBuddy retain their catalog-variant selection mechanism.
   // View-level (defined once, not once per row): `renderRow` runs for every
   // mounted virtual row, so a per-row `async` closure here would allocate the
   // whole resolve chain per row per render. Rows pass a tiny wrapper instead.
   const selectAccountFor = async (item: ModelItem, group: ModelGroup<ModelItem> | undefined, accountID: string) => {
     try {
+      // The hosted route owner accepts an explicit hard account pin even when
+      // the canonical catalog deliberately contains only account-neutral
+       // models. Never refresh a catalog or silently discard an account pin here.
+      if (isHostedAccountProvider(item.provider.id)) {
+        if (!props.supportsRouteIntent) throw new Error("This picker does not support account-specific routing")
+        // A quota/credential refresh may remove a row between submenu mount
+        // and its click. Re-check the most recent roster before committing an
+        // explicit hard pin; retain the previous model on a stale click.
+        if (!hostedAccountStillVisible(accountID, accountGroupFor(item)?.variants ?? [])) {
+          showToast({
+            title: language.t("dialog.model.account.pinUnavailable"),
+            description: language.t("dialog.model.account.pinUnavailableDescription"),
+            variant: "error",
+          })
+          return
+        }
+        if (!props.selectPinnedAccount(item, accountID)) throw new Error("Invalid hosted account selection")
+        return
+      }
       // 1. Real catalog variant — always routable.
       if (group?.variants.some((variant) => variant.accountID === accountID)) {
         props.selectVariant(item, accountID)
@@ -3311,17 +3264,12 @@ function ModelSelectorPopoverV2View(props: {
       } catch {
         // Fall through to the provider mechanism below.
       }
-      // 3. opencode-go (and Zen) account ids are real catalog variants with a
-      // `@zen-<id>` Pool suffix; no per-request activation is needed anymore —
-      // the request router resolves the pinned account from that suffix
-      // directly. A bare id routes to the pool default key.
-      // 4. Degraded: the account can't be pinned because the provider
-      // backend isn't exposing per-account models. Fall back to automatic
-      // routing with an explanation instead of a silent no-op.
-      props.select(item)
+      // 3. Account not routable through this provider's catalog. Keep the
+       // previous selection; silently replacing a hard pin with a strategy is destructive.
       showToast({
-        title: language.t("dialog.model.account.routingAutomatic"),
-        description: language.t("dialog.model.account.routingAutomaticDescription"),
+        title: language.t("dialog.model.account.pinUnavailable"),
+        description: language.t("dialog.model.account.pinUnavailableDescription"),
+        variant: "error",
       })
     } catch (error) {
       showToast({
@@ -3348,22 +3296,21 @@ function ModelSelectorPopoverV2View(props: {
         (estimate.remainingPercent !== undefined && estimate.remainingPercent <= 0),
     }
   }
-  const usageForAccountCache = new Map<
-    string,
-    { item: ModelItem; fn: (accountID: string) => AccountOptionUsage | undefined }
-  >()
-  onCleanup(() => usageForAccountCache.clear())
+  const usageForAccountCache = new WeakMap<ModelItem, (accountID: string) => AccountOptionUsage | undefined>()
   const usageForAccountFor = (item: ModelItem) => {
-    const key = modelKey(item)
-    const cached = usageForAccountCache.get(key)
-    if (cached && cached.item === item) return cached.fn
+    const cached = usageForAccountCache.get(item)
+    if (cached) return cached
     const fn = usageForCapacityAccount(item)
-    usageForAccountCache.set(key, { item, fn })
+    usageForAccountCache.set(item, fn)
     return fn
   }
 
   const renderRow = (item: ModelItem, navKey: string) => {
     const itemKey = modelKey(item)
+    const rowRef = setRowRef(navKey)
+    // Ref callbacks do not necessarily receive undefined on virtual unmount.
+    // Dispose explicitly to release detached DOM nodes retained in rowRefs.
+    onCleanup(() => rowRef(undefined))
     const current = () => props.current() === itemKey
     const usage = () => usageMap().get(itemKey)
     // Cross-provider + fuzzy-name pricing fallback for display: if this
@@ -3372,10 +3319,10 @@ function ModelSelectorPopoverV2View(props: {
     // borrowed price (with "~" to hint it's inferred) instead of "—" so the
     // user sees why it's sorted where it is. Sorting already uses the same
     // fallback (see mergedPricingFallback in the controller).
-    const effective = () => resolveEffectiveCost(item, mergedPricingFallbackForDisplay())
+    const effective = createMemo(() => resolveEffectiveCost(item, mergedPricingFallbackForDisplay()))
     const effectiveCost = () => effective().cost
     const isBorrowed = () => effective().borrowed
-    const effectiveItem = () => (isBorrowed() ? ({ ...item, cost: effectiveCost() } as ModelItem) : item)
+    const effectiveItem = createMemo(() => (isBorrowed() ? ({ ...item, cost: effectiveCost() } as ModelItem) : item))
     const group = props.groupOf(item)
     const displayGroup = accountGroupFor(item)
     // Thin per-row wrapper over the view-level `selectAccountFor` (defined
@@ -3415,12 +3362,12 @@ function ModelSelectorPopoverV2View(props: {
           usage={usage()}
           priceLabel={price()}
           freeLabel={workBuddyFreeLabel(workbuddy.rateFor(item.id))}
-          rowRef={setRowRef(navKey)}
+          rowRef={rowRef}
           endpoints={cached()?.endpoints}
           loading={cached()?.loading ?? false}
           period={deepSeekPeriod()}
           hitRate={hitRateForItem(item)}
-          thresholdPricing={thresholdPricingFor(effectiveItem())}
+          thresholdPricing={thresholdPricingFor(item)}
           onActivate={() => {
             activate(navKey)
           }}
@@ -3435,7 +3382,7 @@ function ModelSelectorPopoverV2View(props: {
         />
       )
     }
-    if (displayGroup && displayGroup.variants.length > 1) {
+    if (displayGroup && showAccountSubmenu(item.provider.id, displayGroup.variants.length, props.supportsRouteIntent)) {
       return (
         <MultiAccountRow
           item={effectiveItem()}
@@ -3443,21 +3390,37 @@ function ModelSelectorPopoverV2View(props: {
           variants={displayGroup.variants}
           navKey={navKey}
           current={current()}
-          selectedAccountID={current() ? (props.currentVariant()?.accountID ?? props.currentAccountID?.()) : undefined}
+          selectedAccountID={current() ? (props.currentAccountID?.() ?? props.currentVariant()?.accountID) : undefined}
           auto={displayGroup.auto}
           selectedAuto={current() && !props.currentVariant() && !props.currentAccountID?.()}
+           routingOptions={hostedAccountRoutingStrategies(item.provider.id, props.supportsRouteIntent)}
+          selectedRoutingStrategy={
+            (() => {
+              const intent = props.currentRouteIntent()
+              if (
+                !props.supportsRouteIntent ||
+                !current() ||
+                props.currentVariant() ||
+                props.currentAccountID?.() ||
+                (intent && intent.kind !== "auto")
+              ) {
+                return undefined
+              }
+               return effectiveStrategy(intent)
+            })()
+          }
           favorited={props.isFavorite(item)}
           usage={usage()}
           priceLabel={price()}
           freeLabel={workBuddyFreeLabel(workbuddy.rateFor(item.id))}
           hitRate={hitRateForItem(item)}
-          thresholdPricing={thresholdPricingFor(effectiveItem())}
+          thresholdPricing={thresholdPricingFor(item)}
           accountLabels={accountLabels()}
           // View-level cached picker (`usageForAccountFor`, defined once
           // above): the 4-branch closure tree used to be rebuilt per row per
           // render. O(1) map hit; resolvers read live memos when invoked.
           usageForAccount={usageForAccountFor(item)}
-          rowRef={setRowRef(navKey)}
+          rowRef={rowRef}
           onActivate={() => activate(navKey)}
           onDeactivate={() => deactivate(navKey)}
           onToggleFavorite={() => props.onToggleFavorite(item)}
@@ -3466,9 +3429,16 @@ function ModelSelectorPopoverV2View(props: {
           onSelectAuto={() => {
             dismiss.preventTriggerRestore()
             // Single closeWith: selectModel wraps in another closeWith, which
-            // bails on `!store.open` after unmount — nesting it here silently
-            // dropped every Auto selection. Call props.select directly.
-            closeWith(() => props.select(item))
+             // bails on `!store.open` after unmount — nesting it here silently
+             // dropped provider-default selection. Call props.select directly.
+             // Search can expand an account-specific variant into the row:
+             // selecting "Provider default" must use the actual bare catalog
+             // model, not the row's account-qualified search match.
+             closeWith(() => props.select(displayGroup.auto ?? item))
+          }}
+          onSelectRoutingStrategy={(strategy) => {
+            dismiss.preventTriggerRestore()
+            closeWith(() => props.selectRoutingStrategy(displayGroup.auto ?? item, strategy))
           }}
           onSelectAccount={(accountID) => {
             dismiss.preventTriggerRestore()
@@ -3479,7 +3449,7 @@ function ModelSelectorPopoverV2View(props: {
     }
     return (
       <MenuV2.Item
-        ref={setRowRef(navKey)}
+        ref={rowRef}
         data-option-key={navKey}
         data-pointer-focus={DEFERRED_POINTER_FOCUS}
         data-selected-model={current() ? true : undefined}

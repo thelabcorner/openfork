@@ -10,6 +10,7 @@ import { Persist, persisted } from "@/utils/persist"
 import { getUsageTables } from "@/utils/model-usage-profile"
 import { isRecentModelRelease, withinRecentWindow } from "@/utils/model-recency"
 import { normalizeOpenRouterEndpoints, warmOpenRouterEndpoints, type OpenRouterEndpoint } from "@/utils/openrouter-endpoints"
+import { selectOpenRouterPrewarmModels } from "@/utils/openrouter-prewarm-selection"
 import { rankOpenRouterEndpoints } from "@/utils/openrouter-endpoint-ranking"
 import { Model as ModelContract } from "@opencode-ai/schema/model"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
@@ -308,53 +309,26 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
     // soon as persisted model preferences + the Tier-0 client are available;
     // this does NOT require a workspace provider catalog.
     //
-    // Once a catalog is already available, append the remaining visible
-    // OpenRouter language models. This deliberately does not force lazy
-    // settings/scheduled-task scopes to fetch Tier-2 catalog state merely for a
-    // speculative warmup. The cache utility owns the 24h admission TTL,
-    // module-wide dedup, idle slicing and bounded concurrency, so several
-    // ModelsProvider mounts still collapse into one background producer.
+    // A large connected catalog should not induce a sweep of hundreds of
+    // speculative lookups. Explicit preferences go first; the remaining
+    // background budget admits visible language models lazily. The cache owns
+    // the 24h admission TTL, dedup, idle slicing, and bounded concurrency.
     createEffect(() => {
       if (!ready() || !openRouterEndpointsClient()) return
 
-      const prioritized: string[] = []
-      const seen = new Set<string>()
-      const push = (modelID: string | undefined) => {
-        if (!modelID || seen.has(modelID)) return
-        seen.add(modelID)
-        prioritized.push(modelID)
-      }
-
-      // Recents are the strongest predictor of the next submenu the user will
-      // inspect and are capped at RECENT_LIMIT.
-      for (const item of store.recent) {
-        if (item.providerID === "openrouter") push(item.modelID)
-      }
-
-      // Explicit favorites/visibility survive app restarts and should be warm
-      // before a lazy settings catalog has even been admitted.
-      for (const item of store.user) {
-        if (item.providerID !== "openrouter") continue
-        if (item.favorite || item.visibility === "show") push(item.modelID)
-      }
-
-      // A persisted provider pin is both high-intent and correctness-sensitive:
-      // warming it early lets the selector validate a provider that disappeared
-      // upstream without waiting for the submenu interaction.
-      for (const [key, value] of Object.entries(store.subProvider ?? {})) {
-        if (!value || !key.startsWith("openrouter:")) continue
-        push(key.slice("openrouter:".length))
-      }
-
-      const provider = connectedProviders().find((item) => item.id === "openrouter")
-      if (provider) {
-        const languageModels = Object.values(provider.models).filter((model) =>
-          ModelContract.isLanguageModel(provider.id, model),
-        )
-        for (const model of languageModels) {
-          if (visible({ providerID: "openrouter", modelID: model.id })) push(model.id)
+      const prioritized = selectOpenRouterPrewarmModels(store.recent, store.user, store.subProvider, function* () {
+        const provider = connectedProviders().find((item) => item.id === "openrouter")
+        if (!provider) return
+        // Iterate by key: Object.values materializes the entire large catalog
+        // even when the speculative budget has room for only a handful of IDs.
+        for (const id in provider.models) {
+          if (!Object.hasOwn(provider.models, id)) continue
+          const model = provider.models[id]
+          if (!model) continue
+          if (!ModelContract.isLanguageModel(provider.id, model)) continue
+          if (visible({ providerID: "openrouter", modelID: model.id })) yield model.id
         }
-      }
+      })
 
       if (prioritized.length === 0) return
       warmOpenRouterEndpoints(prioritized, fetchOpenRouterEndpoints)

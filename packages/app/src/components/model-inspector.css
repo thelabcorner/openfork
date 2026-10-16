@@ -561,7 +561,7 @@
       box-shadow: 0 0 6px var(--v2-background-bg-accent);
     }
 
-    /* Two-line rows (Auto routing with its hint). */
+    /* Two-line routing strategy rows with explanatory text. */
     &[data-tall] {
       height: 34px;
       min-height: 34px;
