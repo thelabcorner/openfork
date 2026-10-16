@@ -1,14 +1,24 @@
-import { describe, expect } from "bun:test"
+import { afterAll, describe, expect } from "bun:test"
 import { sql } from "drizzle-orm"
-import { Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
 import { ForkCredentials } from "../../src/fork/credentials"
 import { buildAggregateWindows, buildLocalWindows, FIVE_HOURS_MS, type WindowBounds } from "../../src/fork/usage-cache"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([ForkCredentials.node, SessionUsage.node, Database.node])))
+const isolatedDirectory = await mkdtemp(join(tmpdir(), "openfork-fork-usage-scan-"))
+const fileTest = testEffect(AppNodeBuilder.build(
+  LayerNode.group([ForkCredentials.node, SessionUsage.node, Database.node]),
+  [[Database.node, Database.layerFromPath(join(isolatedDirectory, "isolated.sqlite"))]],
+))
+afterAll(async () => { await rm(isolatedDirectory, { recursive: true, force: true }).catch(() => {}) })
 
 const HOUR_MS = 60 * 60 * 1000
 
@@ -103,6 +113,49 @@ const referenceAggregation = Effect.fn("referenceAggregation")(function* (
 })
 
 describe("usageByCredential grouped SQL", () => {
+  fileTest.live("grouped Go history completes while an unrelated foreground writer transaction is held", () =>
+    Effect.gen(function* () {
+      const { db, scanDb } = yield* Database.Service
+      const credentials = yield* ForkCredentials.Service
+      const usage = yield* SessionUsage.Service
+      const credential = yield* credentials.add({ key: "sk-isolated", label: "scan" })
+      yield* seed(db, [{ id: "isolated_message", offsetH: 1, cost: 2.25, credentialID: credential.id }])
+      const bounds = yield* usage.windows()
+      // Ensure that first-use credential migration/backfill work is not part
+      // of the blocked-writer experiment; only ordinary read routes are tested.
+      yield* credentials.list()
+      expect(yield* scanDb()).not.toBe(db)
+
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const writer = yield* db.transaction((tx) => Effect.gen(function* () {
+        yield* tx.run(sql`UPDATE message SET time_updated = time_updated WHERE id = 'isolated_message'`)
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(release)
+      }), { behavior: "immediate" }).pipe(Effect.forkScoped)
+      yield* Deferred.await(entered)
+      const grouped = yield* Effect.all([
+        credentials.usageByCredential(bounds),
+        credentials.list(),
+        credentials.active(),
+        credentials.credentialsForMessages(["isolated_message"]),
+      ], { concurrency: "unbounded" }).pipe(Effect.forkScoped)
+      const doneBeforeRelease = yield* Effect.race(
+        Fiber.await(grouped).pipe(Effect.as(true)),
+        Effect.sleep("750 millis").pipe(Effect.as(false)),
+      )
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(writer)
+      expect(doneBeforeRelease).toBe(true)
+      const [result, list, active, mapping] = yield* Fiber.join(grouped)
+      expect(result.byCredential.get(credential.id)?.[0]?.spentUSD).toBe(2.25)
+      expect(list.map((item) => item.id)).toContain(credential.id)
+      expect(active?.id).toBe(credential.id)
+      expect(mapping.get("isolated_message")).toBe(credential.id)
+    }),
+    15_000,
+  )
+
   it.effect("matches the old JS aggregation for mixed attribution", () =>
     Effect.gen(function* () {
       const credentials = yield* ForkCredentials.Service

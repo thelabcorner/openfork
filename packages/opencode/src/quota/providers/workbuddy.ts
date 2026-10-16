@@ -133,13 +133,19 @@ type PostOutcome =
   | { ok: true; body: unknown }
   | { ok: false; status?: number; message: string }
 
-async function postJson(url: string, headers: Record<string, string>, body: unknown, fetchImpl: WorkBuddyFetch): Promise<PostOutcome> {
+async function postJson(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  fetchImpl: WorkBuddyFetch,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<PostOutcome> {
   try {
     const res = await fetchImpl(url, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     })
     if (!res.ok) return { ok: false, status: res.status, message: `HTTP ${res.status}` }
     const json = await res.json().catch(() => undefined)
@@ -338,8 +344,12 @@ function planLabelFrom(paymentTypeBody: unknown): string | undefined {
  */
 type AccountFetchResult = { packages: NormalizedPackage[]; planLabel?: string; error?: string }
 
-async function fetchAccountUsage(cred: Credential, fetchImpl: WorkBuddyFetch): Promise<AccountFetchResult> {
-  const base = backendFor(cred)
+async function fetchAccountUsage(
+  cred: Credential,
+  fetchImpl: WorkBuddyFetch,
+  options: { balanceOnly?: boolean; timeoutMs?: number; backendOverride?: string } = {},
+): Promise<AccountFetchResult> {
+  const base = options.backendOverride ?? backendFor(cred)
   const headers = headersFor(cred)
   const now = new Date()
   const farFuture = new Date(now)
@@ -353,8 +363,10 @@ async function fetchAccountUsage(cred: Credential, fetchImpl: WorkBuddyFetch): P
       Status: [0, 3],
       PackageEndTimeRangeBegin: formatTencentDate(now),
       PackageEndTimeRangeEnd: formatTencentDate(farFuture),
-    }, fetchImpl),
-    postJson(`${base}/v2/billing/meter/get-payment-type`, headers, {}, fetchImpl),
+    }, fetchImpl, options.timeoutMs),
+    options.balanceOnly
+      ? Promise.resolve({ ok: false, message: "plan lookup skipped" } as PostOutcome)
+      : postJson(`${base}/v2/billing/meter/get-payment-type`, headers, {}, fetchImpl, options.timeoutMs),
   ])
 
   if (!resource.ok) {
@@ -366,6 +378,33 @@ async function fetchAccountUsage(cred: Credential, fetchImpl: WorkBuddyFetch): P
   const packages = rawPackages.map(normalizePackage).filter((p) => p.status === null || p.status === 0 || p.status === 3)
   const planLabel = payment.ok ? planLabelFrom(payment.body) : undefined
   return { packages, planLabel }
+}
+
+/**
+ * Authoritative, read-only recovery probe for an account that was previously
+ * blocked by an exhausted-credit response. This is invoked ONLY after actual
+ * generation demand finds a depleted pool. It reuses the exact same response
+ * decoder as the Limits adapter, without its unrelated plan/catalog requests.
+ *
+ * A failed/ambiguous response never clears a persisted hard quota block.
+ */
+export async function probeWorkBuddyCreditRecovery(
+  credentials: readonly Credential[],
+  options: { fetchImpl?: WorkBuddyFetch; backendOverride?: string; timeoutMs?: number } = {},
+): Promise<Array<{ accountId: string; remaining: number }>> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis)
+  const results = await mapLimited(credentials, async (credential) => {
+    const result = await fetchAccountUsage(credential, fetchImpl, {
+      balanceOnly: true,
+      timeoutMs: options.timeoutMs ?? 4_000,
+      ...(options.backendOverride ? { backendOverride: options.backendOverride } : {}),
+    })
+    if (result.error) return undefined
+    const remaining = combinedBucket(result.packages).remaining
+    if (remaining === null || !Number.isFinite(remaining)) return undefined
+    return { accountId: stableAccountIdentity(credential), remaining }
+  })
+  return results.filter((entry): entry is { accountId: string; remaining: number } => !!entry)
 }
 
 /** Test-only vault root override, mirroring the plugin's setTestAccountStore. */

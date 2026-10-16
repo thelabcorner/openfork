@@ -212,6 +212,71 @@ describe("OfficialUsageCache (L1 remote gate)", () => {
 })
 
 describe("LocalUsageCache (L2) + generation", () => {
+  test("64 concurrent callers and generation invalidation create exactly one outstanding history scan", async () => {
+    const cache = createLocalUsageCache()
+    const gate = Promise.withResolvers<number>()
+    let scans = 0
+    const compute = () => Effect.promise(() => {
+      scans++
+      return gate.promise
+    })
+    const pending = Array.from({ length: 64 }, () => Effect.runPromise(cache.get(compute)))
+    try {
+      for (let i = 0; i < 50 && scans === 0; i++) await Bun.sleep(2)
+      expect(scans).toBe(1)
+      bumpUsageCache()
+      const afterInvalidation = Effect.runPromise(cache.get(compute))
+      await Bun.sleep(15)
+      expect(scans).toBe(1)
+      gate.resolve(42)
+      const all = await Promise.all([...pending, afterInvalidation])
+      expect(all.length).toBe(65)
+      expect(all.every((value) => value === 42)).toBe(true)
+      const fresh = await Effect.runPromise(cache.get(() => Effect.sync(() => ++scans)))
+      expect(fresh).toBe(2)
+      expect(scans).toBe(2)
+    } finally {
+      gate.resolve(42)
+    }
+  })
+
+  test("the original caller can cancel without cancelling other waiters or poisoning the result", async () => {
+    const cache = createLocalUsageCache()
+    const gate = Promise.withResolvers<string>()
+    let scans = 0
+    const compute = () => Effect.promise(() => {
+      scans++
+      return gate.promise
+    })
+    const abort = new AbortController()
+    const first = Effect.runPromise(cache.get(compute), { signal: abort.signal })
+    const peer = Effect.runPromise(cache.get(compute))
+    try {
+      for (let i = 0; i < 50 && scans === 0; i++) await Bun.sleep(2)
+      expect(scans).toBe(1)
+      abort.abort()
+      expect((await Promise.allSettled([first]))[0]?.status).toBe("rejected")
+      gate.resolve("committed")
+      expect(await peer).toBe("committed")
+      expect(await Effect.runPromise(cache.get(compute))).toBe("committed")
+      expect(scans).toBe(1)
+    } finally {
+      gate.resolve("committed")
+    }
+  })
+
+  test("a failed shared computation is never permanently cached", async () => {
+    const cache = createLocalUsageCache()
+    let attempts = 0
+    const compute = () => Effect.sync(() => {
+      if (++attempts === 1) throw new Error("deliberate isolated scan failure")
+      return attempts
+    })
+    expect((await Promise.allSettled([Effect.runPromise(cache.get(compute))]))[0]?.status).toBe("rejected")
+    expect(await Effect.runPromise(cache.get(compute))).toBe(2)
+    expect(attempts).toBe(2)
+  })
+
   test("caches within TTL and invalidates on generation bump", async () => {
     let now = 10_000_000
     let computes = 0

@@ -126,6 +126,97 @@ it.live("configured chunkTimeout raises a retryable response stream error when S
   }),
 )
 
+for (const chunkTimeout of [1_000, false] as const) {
+it.live(`aborting an active SSE response propagates into AI SDK fullStream (chunkTimeout=${chunkTimeout})`, () =>
+  provideTmpdirInstance(
+    () => Effect.gen(function* () {
+      const provider = yield* Provider.Service
+      const configured = yield* provider.getProvider(ProviderV2.ID.make("test"))
+      configured.options.fetch = async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'))
+              // Remain open until consumer aborts.
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        )
+      const model = yield* provider.getModel(ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"))
+      const controller = new AbortController()
+      const result = streamText({
+        model: yield* provider.getLanguage(model),
+        abortSignal: controller.signal,
+        onError() {},
+        messages: [{ role: "user", content: "hello" }],
+      })
+      const outcome = yield* Effect.promise(() =>
+        Promise.race([
+          (async () => {
+            let aborted = false
+            try {
+              for await (const part of result.fullStream) {
+                if (part.type === "text-delta" && !aborted) {
+                  aborted = true
+                  controller.abort(new DOMException("intentional abort", "AbortError"))
+                }
+                if (part.type === "error" || part.type === "abort") return { aborted, settled: true }
+              }
+              return { aborted, settled: true }
+            } catch {
+              return { aborted, settled: true }
+            }
+          })(),
+          new Promise<{ aborted: boolean; settled: boolean }>((resolve) =>
+            setTimeout(() => resolve({ aborted: false, settled: false }), 1_000),
+          ),
+        ]),
+      )
+      expect(outcome.aborted).toBe(true)
+      expect(outcome.settled).toBe(true)
+    }),
+    { config: providerConfig("http://localhost:1", { chunkTimeout }) },
+  ),
+)
+}
+
+it.live("OpenAI-compatible SSE premature EOF surfaces a retryable stream error", () =>
+  provideTmpdirInstance(
+    () => Effect.gen(function* () {
+      const provider = yield* Provider.Service
+      const configured = yield* provider.getProvider(ProviderV2.ID.make("test"))
+      configured.options.fetch = async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'))
+              controller.close()
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        )
+      const model = yield* provider.getModel(ProviderV2.ID.make("test"), ModelV2.ID.make("test-model"))
+      const result = streamText({
+        model: yield* provider.getLanguage(model),
+        onError() {},
+        messages: [{ role: "user", content: "hello" }],
+      })
+      const error = yield* Effect.promise(() =>
+        Promise.race([
+          firstStreamError(result.fullStream),
+          new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("SSE EOF witness did not settle")), 1_000)),
+        ]),
+      )
+      expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+      expect((error as Error).message).toContain("before [DONE]")
+      expect(
+        SessionRetry.retryable(MessageV2.fromError(error, { providerID: model.providerID }), model.providerID),
+      ).toEqual({ message: "OpenAI-compatible SSE ended before [DONE]" })
+    }),
+    { config: providerConfig("http://localhost:1") },
+  ),
+)
+
 it.live("chunkTimeout can be disabled with false", () =>
   Effect.gen(function* () {
     const server = yield* Effect.acquireRelease(

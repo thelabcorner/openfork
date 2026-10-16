@@ -51,7 +51,6 @@ const PROVIDER_ID = "opencode"
 const GO_PROVIDER_ID = "opencode-go"
 export const ZEN_PUBLIC_API_KEY = "public"
 const VAULT_SYNC_TTL_MS = 15_000
-const DEFAULT_RETRY_AFTER_MS = 30_000
 const ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
 const ZEN_MODEL_DISCOVERY_TTL_MS = 5 * 60_000
 const ZEN_MODEL_DISCOVERY_STALE_GRACE_MS = 6 * 60 * 60_000
@@ -192,7 +191,7 @@ function parseBodyModel(init: RequestInit | undefined): { body: any; model?: str
   }
 }
 
-function retryAfterMs(response: Response): number {
+function retryAfterMs(response: Response): number | undefined {
   const raw = response.headers.get("retry-after")
   if (raw) {
     const seconds = Number(raw)
@@ -200,7 +199,7 @@ function retryAfterMs(response: Response): number {
     const date = Date.parse(raw)
     if (Number.isFinite(date)) return date
   }
-  return Date.now() + DEFAULT_RETRY_AFTER_MS
+  return undefined
 }
 
 /**
@@ -247,6 +246,18 @@ function bearerApiKey(headers: Headers): string | undefined {
   const match = /^Bearer\s+(.+)$/i.exec(raw)
   const token = match?.[1]?.trim()
   return token || undefined
+}
+
+/** Hosted Zen accepts OpenAI Bearer and Anthropic x-api-key transports. */
+function committedCredentialStatus(headers: Headers, selectedApiKey: string): "valid" | "missing" | "mismatch" {
+  const bearer = bearerApiKey(headers)
+  const anthropic = headers.get("x-api-key")?.trim()
+  if (!selectedApiKey || (!bearer && !anthropic)) return "missing"
+  // Reject malformed or foreign credentials in either channel, including
+  // mixed-protocol requests. The committed account is the sole authority.
+  if (headers.has("authorization") && bearer !== selectedApiKey) return "mismatch"
+  if (headers.has("x-api-key") && anthropic !== selectedApiKey) return "mismatch"
+  return "valid"
 }
 
 /**
@@ -532,7 +543,12 @@ async function routedZenProviderFetch(
   const baseFetch = testFetch ?? fetch
   const headers = new Headers(init?.headers)
   const { body, model: requestedModel } = parseBodyModel(init)
-  const route = await resolveZenRequest(requestedModel, bearerApiKey(headers), providerID)
+  const usesAnthropicKey = headers.has("x-api-key")
+  const route = await resolveZenRequest(
+    requestedModel,
+    bearerApiKey(headers) ?? headers.get("x-api-key")?.trim(),
+    providerID,
+  )
   if (route.missingAccountID) {
     throw new Error(`Selected OpenCode account ${route.missingAccountID} is no longer available`)
   }
@@ -540,7 +556,13 @@ async function routedZenProviderFetch(
 
   let nextInit = init
   if (route.apiKey) {
-    headers.set("Authorization", `Bearer ${route.apiKey}`)
+    if (usesAnthropicKey) {
+      headers.set("x-api-key", route.apiKey)
+      headers.delete("authorization")
+    } else {
+      headers.set("Authorization", `Bearer ${route.apiKey}`)
+      headers.delete("x-api-key")
+    }
     nextInit = { ...init, headers }
   }
   if (qualified && route.modelID && body) {
@@ -574,12 +596,17 @@ export function zenGoProviderFetch(url: RequestInfo | URL, init?: RequestInit): 
  */
 export function committedZenProviderFetch(
   accountID: string,
+  selectedApiKey: string,
 ): (url: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
   return async (url: RequestInfo | URL, init?: RequestInit) => {
     const baseFetch = testFetch ?? fetch
     const headers = new Headers(init?.headers)
-    if (!bearerApiKey(headers)) {
+    const credential = committedCredentialStatus(headers, selectedApiKey)
+    if (credential === "missing") {
       throw new Error("Committed OpenCode route is missing its selected credential")
+    }
+    if (credential === "mismatch") {
+      throw new Error("Committed OpenCode route does not match the selected credential")
     }
     const { body, model: requestedModel } = parseBodyModel(init)
     const split = typeof requestedModel === "string" ? resolveZenModelParts(requestedModel) : undefined
@@ -612,7 +639,7 @@ export function committedPublicZenProviderFetch(
 ): Promise<Response> {
   const baseFetch = testFetch ?? fetch
   const headers = new Headers(init?.headers)
-  if (bearerApiKey(headers) !== ZEN_PUBLIC_API_KEY) {
+  if (committedCredentialStatus(headers, ZEN_PUBLIC_API_KEY) !== "valid") {
     throw new Error("Committed Public OpenCode route is missing its public credential")
   }
   const { body, model: requestedModel } = parseBodyModel(init)
@@ -647,7 +674,7 @@ function observedError(info: any):
   }
 }
 
-function retryAfterFromHeaders(headers: Record<string, string> | undefined): number {
+function retryAfterFromHeaders(headers: Record<string, string> | undefined): number | undefined {
   const raw = headers?.["retry-after"] ?? headers?.["Retry-After"]
   if (raw) {
     const seconds = Number(raw)
@@ -655,7 +682,7 @@ function retryAfterFromHeaders(headers: Record<string, string> | undefined): num
     const date = Date.parse(raw)
     if (Number.isFinite(date)) return date
   }
-  return Date.now() + DEFAULT_RETRY_AFTER_MS
+  return undefined
 }
 
 async function zenEventHook({ event }: { event: any }) {

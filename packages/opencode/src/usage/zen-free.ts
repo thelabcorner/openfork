@@ -153,23 +153,29 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Us
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db, scanDb } = yield* Database.Service
+    const { scanDb, withScanDb } = yield* Database.Service
     const queryPermit = yield* Semaphore.make(1)
     let cache: { at: number; value: ZenFreeSnapshot } | undefined
 
-    // These narrow time indexes keep the 90-day historical scan cheap even on
-    // large long-lived OpenCode databases. JSON predicates remain post-filtered.
-    yield* db.run(sql`CREATE INDEX IF NOT EXISTS idx_part_time_created ON part (time_created)`).pipe(Effect.orDie)
-    yield* db.run(sql`CREATE INDEX IF NOT EXISTS idx_message_time_updated ON message (time_updated)`).pipe(Effect.orDie)
-
+    // The source-of-truth UsageRecord model/time index is created by Core's
+    // schema migration. Do not issue ad hoc CREATE INDEX writes while the
+    // quota service starts, or repeatedly scan unrelated Part rows.
     const snapshot = Effect.fn("Usage.ZenFree.snapshot")(function* () {
-      const now = Date.now()
-      if (cache && now - cache.at < SNAPSHOT_CACHE_TTL_MS) return cache.value
-      const since = zenUtcDayStart(now - ZEN_FREE_HISTORY_MS)
+      const requestedAt = Date.now()
+      if (cache && requestedAt - cache.at < SNAPSHOT_CACHE_TTL_MS) return cache.value
 
-      const value = yield* queryPermit.withPermits(1)(
+      // Cache authority must be checked AND published under the same permit.
+      // Previously concurrent callers all missed before admission, queued,
+      // then each scanned 90 days even after the first request filled the cache.
+      return yield* queryPermit.withPermits(1)(
         Effect.gen(function* () {
-          const conn = yield* scanDb()
+          const now = Date.now()
+          if (cache && now - cache.at < SNAPSHOT_CACHE_TTL_MS) return cache.value
+          const since = zenUtcDayStart(now - ZEN_FREE_HISTORY_MS)
+          // Zen quota reads share the same bounded lease authority as OXP
+          // searches and Usage summaries. A direct scanDb() caller could run
+          // inside another consumer's pinned WAL read transaction.
+          const load = (conn: Database.DatabaseShape) => Effect.gen(function* () {
           const [requests, limitErrors] = yield* Effect.all(
             [
               conn
@@ -177,15 +183,18 @@ const layer = Layer.effect(
                   SELECT
                     p.time_created AS at,
                     json_extract(m.data, '$.modelID') AS model_id
-                  FROM part p
-                  JOIN message m ON m.id = p.message_id
-                  JOIN usage_record u ON u.message_id = m.id
-                  WHERE p.time_created >= ${since}
+                  FROM usage_record u INDEXED BY usage_record_model_completed_idx
+                  CROSS JOIN message m
+                  CROSS JOIN part p
+                  WHERE u.provider_id = 'opencode'
+                    AND u.route_kind = 'public'
+                    AND m.id = u.message_id
+                    AND p.message_id = m.id
+                    AND p.time_created >= ${since}
                     AND p.time_created < ${now}
                     AND json_extract(p.data, '$.type') = 'step-finish'
                     AND json_extract(m.data, '$.role') = 'assistant'
                     AND json_extract(m.data, '$.providerID') = 'opencode'
-                    AND u.route_kind = 'public'
                   ORDER BY p.time_created ASC
                 `)
                 .pipe(Effect.orDie),
@@ -198,16 +207,18 @@ const layer = Layer.effect(
                       m.time_created
                     ) AS at,
                     json_extract(m.data, '$.modelID') AS model_id
-                  FROM message m
-                  JOIN usage_record u ON u.message_id = m.id
-                  WHERE COALESCE(
+                  FROM usage_record u INDEXED BY usage_record_model_completed_idx
+                  CROSS JOIN message m
+                  WHERE u.provider_id = 'opencode'
+                    AND u.route_kind = 'public'
+                    AND m.id = u.message_id
+                    AND COALESCE(
                       json_extract(m.data, '$.time.completed'),
                       m.time_updated,
                       m.time_created
                     ) >= ${since}
                     AND json_extract(m.data, '$.role') = 'assistant'
                     AND json_extract(m.data, '$.providerID') = 'opencode'
-                    AND u.route_kind = 'public'
                     AND json_extract(m.data, '$.error.name') = 'APIError'
                     AND instr(
                       COALESCE(json_extract(m.data, '$.error.data.responseBody'), ''),
@@ -220,7 +231,7 @@ const layer = Layer.effect(
             { concurrency: 2 },
           )
 
-          return buildZenFreeSnapshot({
+          const value = buildZenFreeSnapshot({
             now,
             requests: requests.flatMap((row) =>
               typeof row.at === "number" && typeof row.model_id === "string"
@@ -233,11 +244,13 @@ const layer = Layer.effect(
                 : [],
             ),
           })
+          return value
+          })
+          const value = yield* (withScanDb ? withScanDb(load) : Effect.flatMap(scanDb(), load))
+          cache = { at: Date.now(), value }
+          return value
         }),
       )
-
-      cache = { at: now, value }
-      return value
     })
 
     return Service.of({ snapshot })

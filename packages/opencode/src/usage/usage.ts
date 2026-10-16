@@ -11,6 +11,17 @@ import { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attribution
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { SessionTelemetry as SessionTelemetrySchema } from "@opencode-ai/schema/session-telemetry"
 import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
+import type { UsageInspectionRequest, UsageInspectionResult } from "./inspection"
+import { runInspection } from "./inspection-query"
+import { cacheSavings as estimateCacheSavings, estimateCost, type ModelRates } from "./valuation"
+import { rollupUsagePeriods, topUsageBy, topUsageSeries, usageBucketFloor, usageModelSeriesBudget } from "./series"
+import { usageSummaryServerCacheKey } from "./summary-cache-key"
+import { usageSummaryDimensionsQuery, usageSummaryRawRowsQuery, usageSummaryRowsQuery, usageSummaryMaintenanceRowsQuery } from "./summary-row-query"
+import { shouldIndexUsageProject } from "./project-read-plan"
+import { summarizeUsageActivity } from "./activity-summary"
+import { makeUsageRatesCache } from "./model-rates-cache"
+import { runWorkload } from "./workload-query"
+import type { WorkloadRequest, WorkloadSnapshot } from "./workload"
 
 /**
  * Global usage aggregation across every session in the database.
@@ -296,6 +307,12 @@ export const UsageSummary = Schema.Struct({
   projects: Schema.Array(ProjectBucket),
   periods: Schema.Array(PeriodBucket),
   days: Schema.Array(DayBucket),
+  /** Full-window activity facts, unlike `days` (bounded to recent days). */
+  activity: Schema.Struct({
+    activeDays: Schema.Finite,
+    longestStreak: Schema.Finite,
+    busiestDay: Schema.NullOr(Schema.Struct({ start: Schema.Finite, messages: Schema.Finite })),
+  }),
   /** Day of week, JS order: 0 = Sunday … 6 = Saturday. */
   dow: Schema.Tuple([
     CountBucket,
@@ -505,6 +522,9 @@ export type SessionContextSnapshot = Schema.Schema.Type<typeof SessionContextSna
 
 export interface Interface {
   readonly summary: (request: UsageSummaryRequest) => Effect.Effect<UsageSummary>
+  /** Compact grouped analytics for agent/tool consumers; never hydrates generation rows into JS. */
+  readonly inspect: (request: UsageInspectionRequest) => Effect.Effect<UsageInspectionResult>
+  readonly workload: (request: WorkloadRequest) => Effect.Effect<WorkloadSnapshot>
   readonly modelProfile: () => Effect.Effect<ModelProfile>
   readonly pricingCatalog: () => Effect.Effect<PricingCatalog>
   readonly sessionContext: (sessionID: string) => Effect.Effect<SessionContextHistory | undefined>
@@ -513,7 +533,7 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Usage") {}
 
-type UsageRow = {
+export type UsageRow = {
   id: string
   session_id: string
   provider_id: string | null
@@ -538,7 +558,10 @@ type UsageRow = {
   mode: string | null
 }
 
-type MaintenanceUsageRow = {
+export type UsageDimensionRow = Pick<UsageRow, "session_id" | "project_id" | "directory" | "session_title" | "project_name">
+export type RawUsageRow = Omit<UsageRow, "id" | "project_id" | "directory" | "session_title" | "project_name"> & { id?: string }
+
+export type MaintenanceUsageRow = {
   agent: string
   provider_id: string
   model_id: string
@@ -678,8 +701,6 @@ export type MaintenanceRecordInput = {
   completedAt?: number
 }
 
-type ModelRates = { input: number; output: number; cacheRead: number; cacheWrite: number }
-
 const HOUR_MS = 60 * 60 * 1000
 const DAY_MS = 24 * HOUR_MS
 
@@ -699,7 +720,32 @@ const MAX_SERIES_VALUES = 60_000
 // generation invalidates them without adding a database watermark query to the
 // hot path.
 const SUMMARY_CACHE_TTL_MS = 3_000
+const MAX_SUMMARY_CACHE = 100
 const summaryCache = new Map<string, { at: number; revision: number; value: UsageSummary }>()
+function cachedUsageSummary(key: string, revision: number) {
+  const hit = summaryCache.get(key)
+  if (!hit) return undefined
+  if (hit.revision !== revision || Date.now() - hit.at >= SUMMARY_CACHE_TTL_MS) {
+    summaryCache.delete(key)
+    return undefined
+  }
+  // Usage windows are often revisited in bursts. Promote hits to the LRU
+  // tail but never prolong the entry's factual TTL.
+  summaryCache.delete(key)
+  summaryCache.set(key, hit)
+  return hit.value
+}
+function storeUsageSummary(key: string, revision: number, value: UsageSummary) {
+  summaryCache.delete(key)
+  summaryCache.set(key, { at: Date.now(), revision, value })
+  // Clearing *every* entry after 100 distinct windows created a cold-scan
+  // stampede on subsequent revisits. Evict only the least recently used.
+  while (summaryCache.size > MAX_SUMMARY_CACHE) {
+    const oldest = summaryCache.keys().next().value
+    if (oldest === undefined) break
+    summaryCache.delete(oldest)
+  }
+}
 const MODEL_PROFILE_CACHE_TTL_MS = 10_000
 let modelProfileCache: { at: number; database: string; revision: number; value: ModelProfile } | undefined
 
@@ -727,6 +773,25 @@ const sessionContextProjectionCache = new Map<
   }
 >()
 
+/** Check durable invalidation in constant time and promote hits to the LRU tail. */
+function cachedSessionContextProjection(cacheKey: string, row: SessionContextSessionRow) {
+  const entry = sessionContextProjectionCache.get(cacheKey)
+  if (
+    !entry ||
+    Date.now() - entry.at >= SESSION_CONTEXT_CACHE_TTL_MS ||
+    entry.eventSeq !== row.event_seq ||
+    entry.updatedAt !== row.updated_ms ||
+    entry.latestUsageCompletedAt !== row.latest_usage_completed_at ||
+    entry.latestUsageMessageID !== row.latest_usage_message_id
+  ) return undefined
+
+  // Maps retain insertion order; refreshing recency prevents a repeatedly
+  // inspected large session from being evicted by unrelated cold sessions.
+  sessionContextProjectionCache.delete(cacheKey)
+  sessionContextProjectionCache.set(cacheKey, entry)
+  return entry.value
+}
+
 /** Invalidate process-local analytics after an out-of-band history mutation. */
 export const resetUsageSummaryCache = () => {
   summaryCache.clear()
@@ -737,22 +802,6 @@ export const resetUsageSummaryCache = () => {
   // personal-model ranking for MODEL_PROFILE_CACHE_TTL_MS after the underlying
   // records have already been removed or rewritten.
   modelProfileCache = undefined
-}
-
-function downsample<T>(list: T[], max: number): T[] {
-  if (list.length <= max) return list
-  const step = Math.ceil(list.length / max)
-  const out: T[] = []
-  for (let i = 0; i < list.length; i += step) out.push(list[i])
-  const last = list[list.length - 1]
-  if (out[out.length - 1] !== last) out.push(last)
-  return out
-}
-
-const localDayStart = (ms: number) => {
-  const date = new Date(ms)
-  date.setHours(0, 0, 0, 0)
-  return date.getTime()
 }
 
 const utcDayStart = (ms: number) => Math.floor(ms / DAY_MS) * DAY_MS
@@ -766,12 +815,16 @@ function emptyBucket(): Mutable<CountBucket> {
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db, readDb, scanDb, filename } = yield* Database.Service
+    const { db, readDb, scanDb, withScanDb, filename } = yield* Database.Service
     const modelsDev = yield* ModelsDev.Service
-    // Client aborts stop response delivery, but SQLite work already handed to
-    // a separate connection may continue. Serialize analytics scans so rapid
-    // range/project changes cannot create a concurrent scan storm.
-    const queryPermit = yield* Semaphore.make(1)
+    const ratesFor = makeUsageRatesCache()
+    // Database owns bounded, exclusive analytics-reader admission and native
+    // worker lifetimes. Never borrow a connection beyond one complete callback.
+    // Test/legacy injected Database implementations can predate the lease API:
+    // keep their multi-statement scan serialized rather than sharing a reader.
+    const legacyPermit = yield* Semaphore.make(1)
+    const readLease: NonNullable<Database.Interface["withScanDb"]> = withScanDb ??
+      ((read) => legacyPermit.withPermits(1)(Effect.flatMap(scanDb(), read)))
     // Session Context is an interactive, session-local read. Keep it off the
     // global Usage scan permit and reuse Database's persistent query-only lane
     // instead of opening/configuring a fresh SQLite handle on every panel fetch.
@@ -780,101 +833,144 @@ const layer = Layer.effect(
     const summary = Effect.fn("Usage.summary")(function* (request: UsageSummaryRequest) {
       const projectID = request.projectID ?? null
 
-      // Key by semantic range, not the exact millisecond timestamps generated
-      // by the renderer. Exact timestamps made the old cache miss on every
-      // request. A short TTL bounds staleness while avoiding any shared-DB
-      // watermark query on the hot path.
-      const range = request.since === 0 ? "all" : String(request.until - request.since)
-      const key = `${filename}:${range}:${request.resolution}:${projectID ?? ""}`
+      // Recent sliding windows share a bounded cache. Historical/custom fixed
+      // windows require exact bounds: two equal-duration disjoint ranges are
+      // not interchangeable and must never leak each other's usage data.
+      const key = usageSummaryServerCacheKey({
+        database: filename,
+        since: request.since,
+        until: request.until,
+        resolution: request.resolution,
+        projectID,
+        now: Date.now(),
+        ttlMs: SUMMARY_CACHE_TTL_MS,
+      })
       const revision = UsageRecord.revision()
-      const hit = summaryCache.get(key)
-      if (hit && hit.revision === revision && Date.now() - hit.at < SUMMARY_CACHE_TTL_MS) return hit.value
+      const hit = cachedUsageSummary(key, revision)
+      if (hit) return hit
 
+      // Model catalogs may require disk access or a cold network fetch.
+      // Never hold the SQLite history admission permit during that I/O:
+      // modelProfile and other unrelated indexed reads use the same permit.
       const catalog = yield* modelsDev.get()
-      const rates = buildRates(catalog)
-
       // Run the scan on a dedicated connection so a large aggregation can
       // never block the app's shared connection, which serializes live
       // session/message queries (that starvation is what made the app stutter
       // while this pane refreshed). The scan lane is lazy and persistent, so
       // Node pays worker/open/configure cost once per Database lifetime.
-      const result = yield* queryPermit.withPermits(1)(
+      const result = yield* readLease((conn) =>
         Effect.gen(function* () {
-          const conn = yield* scanDb()
-          const rows = yield* conn
-            .all<UsageRow>(
-              sql`
-                SELECT
-                  r.message_id AS id,
-                  r.session_id,
-                  r.provider_id,
-                  r.model_id,
-                  r.variant,
-                  r.created_at AS created_ms,
-                  r.completed_at AS completed_ms,
-                  r.request_sent_at AS request_sent_ms,
-                  r.first_token_at AS first_token_ms,
-                  r.streamed_at AS streamed_ms,
-                  r.cost_usd,
-                  r.input_tokens,
-                  r.cache_read_tokens,
-                  r.cache_write_tokens,
-                  r.output_tokens,
-                  r.reasoning_tokens,
-                  COALESCE(s.project_id, us.project_id, '__historical__') AS project_id,
-                  COALESCE(s.directory, us.directory, 'Historical usage') AS directory,
-                  COALESCE(s.title, us.title, 'Deleted session') AS session_title,
-                  COALESCE(p.name, us.project_name) AS project_name,
-                  r.agent,
-                  r.mode
-                FROM usage_record r
-                LEFT JOIN session s ON s.id = r.session_id
-                LEFT JOIN project p ON p.id = s.project_id
-                LEFT JOIN usage_session us ON us.session_id = r.session_id
-                WHERE r.completed_at >= ${request.since}
-                  AND r.completed_at < ${request.until}
-                  AND (${projectID} IS NULL OR COALESCE(s.project_id, us.project_id, '__historical__') = ${projectID})
-                ORDER BY completed_ms ASC
-
-              `,
-            )
-            .pipe(Effect.orDie)
-          const maintenanceRows = yield* conn
+          // Every caller checks the cache before waiting, but many concurrent
+          // misses can accumulate behind this permit. Recheck once admitted:
+          // only the first caller should perform a cold SQLite history scan.
+          const scanRevision = UsageRecord.revision()
+          const queuedHit = cachedUsageSummary(key, scanRevision)
+          if (queuedHit) return queuedHit
+          // Only the first admitted miss needs valuation. Cache a priced
+          // projection per immutable ModelsDev snapshot, and let waiting
+          // callers reuse the filled Usage summary without rebuilding rates.
+          const rates = ratesFor(catalog)
+          const indexedProject = projectID !== null && projectID !== "__historical__"
+            ? yield* shouldIndexUsageProject(conn, projectID)
+            : false
+          const collectSnapshot = (reader: Pick<typeof conn, "all" | "get">) => Effect.gen(function* () {
+          const collector = createSummaryAccumulator(rates, request)
+          if (!indexedProject) {
+            // Resolve session/project dimensions ONCE per Session, not once
+            // per turn. The slim indexed time scan contains no metadata joins.
+            // A read transaction pins attribution and raw turns to one WAL
+            // snapshot even if concurrent sessions are renamed or deleted.
+            const dimensionRows = yield* reader
+              .all<UsageDimensionRow>(usageSummaryDimensionsQuery(request))
+              .pipe(Effect.orDie)
+            const dimensions = new Map(dimensionRows.map((row) => [row.session_id, row] as const))
+            const longWindow = request.since === 0 || request.until - request.since >= 30 * DAY_MS
+            const rowCount = longWindow
+              ? (yield* reader.get<{ count: number }>(sql`
+                  SELECT COUNT(*) AS count FROM usage_record
+                  WHERE completed_at >= ${request.since} AND completed_at < ${request.until}
+                `).pipe(Effect.orDie))?.count ?? 0
+              : 0
+            // At extreme scale, bound transient SQLite row hydration without
+            // imposing keyset overhead on ordinary datasets. The accumulator
+            // itself remains O(distinct dimensions), not O(settlements).
+            if (rowCount > 200_000) {
+              const limit = 65_536
+              let after: { completedAt: number; rowID: number } | null = null
+              for (;;) {
+                const page: Array<RawUsageRow & { cursor_id: number }> = yield* reader
+                  .all<RawUsageRow & { cursor_id: number }>(
+                    usageSummaryRawRowsQuery(request, { limit, after }, false),
+                  )
+                  .pipe(Effect.orDie)
+                if (!page.length) break
+                collector.addRows(page, dimensions)
+                const last = page[page.length - 1]!
+                after = { completedAt: last.completed_ms!, rowID: last.cursor_id }
+                if (page.length < limit) break
+              }
+            } else {
+              const raw = yield* reader
+                .all<RawUsageRow>(usageSummaryRawRowsQuery(request, undefined, false))
+                .pipe(Effect.orDie)
+              collector.addRows(raw, dimensions)
+            }
+          } else {
+            // Selective project reads already seek the compound
+            // (session_id,completed_at) index and return a small result.
+            const rows = yield* reader
+              .all<UsageRow>(usageSummaryRowsQuery(request, projectID, indexedProject))
+              .pipe(Effect.orDie)
+            collector.addRows(rows)
+          }
+          const maintenanceRows = yield* reader
             .all<MaintenanceUsageRow>(
-              sql`
-                SELECT
-                  agent,
-                  provider_id,
-                  model_id,
-                  variant,
-                  session_id,
-                  project_id,
-                  requests,
-                  cost_usd,
-                  cost_estimated,
-                  input_tokens,
-                  cache_read_tokens,
-                  cache_write_tokens,
-                  output_tokens,
-                  reasoning_tokens,
-                  total_tokens,
-                  time_started AS started_ms,
-                  time_completed AS completed_ms
-                FROM maintenance_usage
-                WHERE time_completed >= ${request.since}
-                  AND time_completed < ${request.until}
-                  AND (${projectID} IS NULL OR project_id = ${projectID})
-                ORDER BY time_completed ASC
-              `,
+              usageSummaryMaintenanceRowsQuery(request, projectID),
             )
             .pipe(Effect.orDie)
-          return aggregate(rows, maintenanceRows, rates, request)
+          return collector.finish(maintenanceRows)
+          })
+          // Both project plans read ordinary and maintenance usage separately.
+          // Always pin them to one WAL snapshot; even an indexed one-statement
+          // ordinary read could otherwise combine inconsistent revisions.
+          const value = yield* conn.transaction((tx) => collectSnapshot(tx), { behavior: "deferred" }).pipe(Effect.orDie)
+          // Never mark a result generated during a concurrent settlement as
+          // current under the *new* revision. Such a result must be recomputed.
+          if (UsageRecord.revision() === scanRevision) {
+            storeUsageSummary(key, scanRevision, value)
+          }
+          return value
         }),
       )
 
-      if (summaryCache.size > 100) summaryCache.clear()
-      summaryCache.set(key, { at: Date.now(), revision, value: result })
       return result
+    })
+
+    const inspect = Effect.fn("Usage.inspect")(function* (request: UsageInspectionRequest) {
+      const catalog = yield* modelsDev.get()
+      return yield* readLease((conn) =>
+        Effect.gen(function* () {
+          const rates = ratesFor(catalog)
+          const projectID = request.projectID ?? null
+          const indexedProject = projectID !== null && projectID !== "__historical__"
+            ? yield* shouldIndexUsageProject(conn, projectID)
+            : false
+          // Totals, breakdown and maintenance inspections execute multiple
+          // aggregate SELECTs; Session attribution and request counts must
+          // come from the same committed snapshot.
+          return yield* conn.transaction(
+            (tx) => runInspection(tx, rates, request, indexedProject),
+            { behavior: "deferred" },
+          ).pipe(Effect.orDie)
+        }),
+      )
+    })
+
+    const workload = Effect.fn("Usage.workload")(function* (request: WorkloadRequest) {
+      // Process-global scan lane, no catalog, history, Location or Instance.
+      return yield* readLease((conn) => conn.transaction(
+        (tx) => runWorkload(tx, request), { behavior: "deferred" },
+      ).pipe(Effect.orDie))
     })
 
     const modelProfile = Effect.fn("Usage.modelProfile")(function* () {
@@ -887,9 +983,8 @@ const layer = Layer.effect(
         Date.now() - hit.at < MODEL_PROFILE_CACHE_TTL_MS
       )
         return hit.value
-      const rows = yield* queryPermit.withPermits(1)(
+      const rows = yield* readLease((conn) =>
         Effect.gen(function* () {
-          const conn = yield* scanDb()
           return yield* conn
             .all<ModelProfileRow>(sql`
               WITH recent AS (
@@ -962,9 +1057,11 @@ const layer = Layer.effect(
     })
 
     const sessionContext = Effect.fn("Usage.sessionContext")(function* (sessionID: string) {
-      const catalog = yield* modelsDev.get()
-      const raw = yield* contextQueryPermit.withPermits(1)(
-        Effect.gen(function* () {
+       // A cold legacy transcript can hold the scan permit for much longer
+       // than a cached Context summary. Resolve the indexed watermark and
+       // cache hit before joining that cold queue, so a single long session
+       // cannot head-of-line block warm reads for other sessions.
+       const raw = yield* Effect.gen(function* () {
             const conn = readDb
             const sessionRows = yield* conn
               .all<SessionContextSessionRow>(sql`
@@ -988,22 +1085,18 @@ const layer = Layer.effect(
                     WHERE aggregate_id = session.id
                     LIMIT 1
                   ), 0) AS event_seq,
-                  (
-                    SELECT completed_at
-                    FROM usage_record
-                    WHERE session_id = session.id
-                    ORDER BY completed_at DESC, message_id DESC
-                    LIMIT 1
-                  ) AS latest_usage_completed_at,
-                  (
-                    SELECT message_id
-                    FROM usage_record
-                    WHERE session_id = session.id
-                    ORDER BY completed_at DESC, message_id DESC
-                    LIMIT 1
-                  ) AS latest_usage_message_id
-                FROM session
-                WHERE id = ${sessionID}
+                   latest_usage.completed_at AS latest_usage_completed_at,
+                   latest_usage.message_id AS latest_usage_message_id
+                 FROM session
+                 LEFT JOIN usage_record latest_usage
+                   ON latest_usage.message_id = (
+                     SELECT message_id
+                     FROM usage_record
+                     WHERE session_id = session.id
+                     ORDER BY completed_at DESC, message_id DESC
+                     LIMIT 1
+                   )
+                 WHERE id = ${sessionID}
                 LIMIT 1
                   `)
                   .pipe(Effect.orDie)
@@ -1011,17 +1104,17 @@ const layer = Layer.effect(
             if (!sessionRow) return undefined
 
             const cacheKey = `${filename}:${sessionID}`
-            const cached = sessionContextProjectionCache.get(cacheKey)
-            if (
-              cached &&
-              Date.now() - cached.at < SESSION_CONTEXT_CACHE_TTL_MS &&
-              cached.eventSeq === sessionRow.event_seq &&
-              cached.updatedAt === sessionRow.updated_ms &&
-              cached.latestUsageCompletedAt === sessionRow.latest_usage_completed_at &&
-              cached.latestUsageMessageID === sessionRow.latest_usage_message_id
-            ) {
-              return { sessionRow, ...cached.value }
-            }
+             const cached = cachedSessionContextProjection(cacheKey, sessionRow)
+             if (cached) return { sessionRow, ...cached }
+
+             return yield* contextQueryPermit.withPermits(1)(
+               Effect.gen(function* () {
+                 // A concurrent miss may have filled the cache while this
+                 // request waited for the cold scan permit. Avoid a duplicate
+                 // O(history) rebuild for the same exact durable watermarks.
+                 const filled = cachedSessionContextProjection(cacheKey, sessionRow)
+                 if (filled) return { sessionRow, ...filled }
+
 
             // Collapse the entire settled history inside SQLite. The wire/process
             // result is O(models), not O(turns), and the indexed session_id scan
@@ -1650,12 +1743,17 @@ const layer = Layer.effect(
               latestUsageMessageID: sessionRow.latest_usage_message_id,
               value,
             })
-            return { sessionRow, ...value }
-          }),
-      )
-      if (!raw) return undefined
+             return { sessionRow, ...value }
+               }),
+             )
+           })
+       if (!raw) return undefined
 
-      const { sessionRow, modelRows, latestRows, messageGroups, promptRows, partGroups } = raw
+       // Missing sessions should never trigger model-catalog work. Price/display
+       // metadata is independent of the SQLite projection and remains up to date
+       // even when its historical scalar row is served from the LRU.
+       const catalog = yield* modelsDev.get()
+       const { sessionRow, modelRows, latestRows, messageGroups, promptRows, partGroups } = raw
       let userMessages = 0
       let assistantMessages = 0
       let systemPrompt: string | null = null
@@ -1929,35 +2027,16 @@ const layer = Layer.effect(
         summaryCache.clear()
       }).pipe(Effect.catch(() => Effect.void))
 
-    return Service.of({ summary, modelProfile, pricingCatalog, sessionContext, recordMaintenance })
+    return Service.of({ summary, inspect, workload, modelProfile, pricingCatalog, sessionContext, recordMaintenance })
   }),
 )
 
-function buildRates(catalog: Record<string, ModelsDev.Provider>) {
-  const rates = new Map<string, ModelRates>()
-  for (const provider of Object.values(catalog)) {
-    for (const [modelID, model] of Object.entries(provider.models)) {
-      const cost = model.cost
-      if (!cost) continue
-      const cacheRead = cost.cache_read ?? cost.input
-      const cacheWrite = cost.cache_write ?? cost.input
-      rates.set(`${provider.id}/${modelID}`, {
-        input: cost.input,
-        output: cost.output,
-        cacheRead,
-        cacheWrite,
-      })
-    }
-  }
-  return rates
-}
-
-function aggregate(
-  rows: UsageRow[],
-  maintenanceRows: MaintenanceUsageRow[],
+/** Shared rich accounting accumulator for single-array and paged readers. */
+/** Shared pure accumulation algorithm; reusable by an isolated SQL worker. */
+export function createSummaryAccumulator(
   rates: Map<string, ModelRates>,
   request: UsageSummaryRequest,
-): UsageSummary {
+) {
   const totals: Mutable<UsageTotals> = {
     sessions: 0,
     messages: 0,
@@ -1987,7 +2066,10 @@ function aggregate(
   const daySessions = new Map<number, Set<string>>()
   const sessions = new Set<string>()
   const providerSessions = new Map<string, Set<string>>()
-  const projectSessions = new Map<string, Set<string>>()
+  // A new Date per generation dominates allocator traffic on multi-year
+  // ranges. Reuse one mutable Date within this synchronous accumulator;
+  // reset its timestamp before each civil-day/hour/weekday calculation.
+  const calendar = new Date(0)
   let cacheSavings = 0
   let cacheSavingsRecords = 0
   let estimatedRecords = 0
@@ -2096,7 +2178,7 @@ function aggregate(
     agentModelSet.add(modelIdentity)
     maintenanceAgentModels.set(record.agent, agentModelSet)
 
-    const modelKey = `${record.agent}\u0000${record.providerID}/${record.modelID}\u0000${record.variant ?? ""}`
+    const modelKey = `${record.agent}\u0000${record.providerID}/${record.modelID}\u0000${record.variant === null ? "\u0000" : "\u0001" + record.variant}`
     const model = maintenanceModels.get(modelKey) ?? {
       agent: record.agent,
       providerID: record.providerID,
@@ -2123,7 +2205,21 @@ function aggregate(
 
   const bucketPeriod = (ms: number) => (request.resolution === "hour" ? utcHourStart(ms) : utcDayStart(ms))
 
-  for (const row of rows) {
+  // Arrays work as before, while native SQLite's synchronous iterator can
+  // now stream rows directly through the identical fold, avoiding an O(turns)
+  // intermediate array in a dedicated aggregation worker.
+  const addRows = (rows: Iterable<UsageRow | RawUsageRow>, dimensions?: ReadonlyMap<string, UsageDimensionRow>) => {
+   for (const rawRow of rows) {
+    const dimension = dimensions?.get(rawRow.session_id)
+    if (dimensions) {
+      if (!dimension) throw new Error(`Usage dimension missing for session ${rawRow.session_id}`)
+      if (request.projectID != null && dimension.project_id !== request.projectID) continue
+    }
+    // Keep session metadata in the shared lookup instead of mutating every
+    // scalar row's object shape. That avoids four writes per settlement,
+    // including rows that the project filter immediately discards.
+    const row = rawRow as UsageRow
+    const projectID = dimension?.project_id ?? row.project_id
     const tokens: TokenTotals = {
       input: row.input_tokens,
       cacheRead: row.cache_read_tokens,
@@ -2159,12 +2255,22 @@ function aggregate(
       continue
     }
 
+    // Used by nine distribution accumulators per user-facing turn. Compute
+    // once rather than repeatedly summing the same five token counters.
+    const tokensUsed = totalTokens(tokens)
     totals.messages += 1
 
     const providerID = row.provider_id ?? "unknown"
     const modelID = row.model_id ?? "unknown"
-    const rate = rates.get(`${providerID}/${modelID}`)
+    // Reuse the same model identity for valuation, model variant bucketing,
+    // time series and per-session distinct-model membership.
+    const modelIdentity = `${providerID}/${modelID}`
+    const rate = rates.get(modelIdentity)
 
+    // Every settlement of a Session resolves to the same project within
+    // this pinned SQLite snapshot. The global Session set already tracks
+    // first sightings; a second per-project Session-set duplicates storage.
+    const firstSession = !sessions.has(row.session_id)
     sessions.add(row.session_id)
     let providerSessionSet = providerSessions.get(providerID)
     if (!providerSessionSet) {
@@ -2172,12 +2278,6 @@ function aggregate(
       providerSessions.set(providerID, providerSessionSet)
     }
     providerSessionSet.add(row.session_id)
-    let projectSessionSet = projectSessions.get(row.project_id)
-    if (!projectSessionSet) {
-      projectSessionSet = new Set()
-      projectSessions.set(row.project_id, projectSessionSet)
-    }
-    projectSessionSet.add(row.session_id)
 
     let source: "recorded" | "estimated" | "unpriced"
     let cost = 0
@@ -2210,7 +2310,7 @@ function aggregate(
     const generationMs = generationWindow(row, completed)
     if (generationMs !== undefined) throughputMs += generationMs
 
-    const saved = cacheSavingsFor(row, tokens, rate)
+    const saved = estimateCacheSavings(tokens, rate)
     cacheSavings += saved
     if (rate) cacheSavingsRecords += 1
 
@@ -2243,7 +2343,10 @@ function aggregate(
     }
     providers.set(providerID, provider)
 
-    const modelKey = `${providerID}/${modelID}\u0000${row.variant ?? ""}`
+    // Nullable variant is an actual dimension. Previously NULL and "" used
+    // the same model key; this silently merged two different API buckets.
+    // Prefix the variant with its type to distinguish every string from NULL.
+    const modelKey = `${modelIdentity}\u0000${row.variant == null ? "\u0000" : "\u0001" + row.variant}`
     const model = models.get(modelKey) ?? {
       providerID,
       modelID,
@@ -2282,23 +2385,24 @@ function aggregate(
     variantBucket.cost += cost
     variants.set(variant, variantBucket)
 
-    const project = projects.get(row.project_id) ?? {
-      projectID: row.project_id,
-      name: row.project_name ?? basename(row.directory),
+    const project = projects.get(projectID) ?? {
+      projectID,
+      name: dimension ? dimension.project_name ?? basename(dimension.directory) : row.project_name ?? basename(row.directory),
       sessions: 0,
       messages: 0,
       cost: 0,
       tokens: 0,
     }
     project.messages += 1
+    if (firstSession) project.sessions += 1
     project.cost += cost
-    project.tokens += totalTokens(tokens)
-    projects.set(row.project_id, project)
+    project.tokens += tokensUsed
+    projects.set(projectID, project)
 
     const periodStart = bucketPeriod(completed)
     const period = periods.get(periodStart) ?? { start: periodStart, cost: 0, tokens: 0, messages: 0 }
     period.cost += cost
-    period.tokens += totalTokens(tokens)
+    period.tokens += tokensUsed
     period.messages += 1
     periods.set(periodStart, period)
 
@@ -2309,12 +2413,12 @@ function aggregate(
     }
     let providerSlot = providerPeriod.get(periodStart) ?? { cost: 0, tokens: 0, messages: 0 }
     providerSlot.cost += cost
-    providerSlot.tokens += totalTokens(tokens)
+    providerSlot.tokens += tokensUsed
     providerSlot.messages += 1
     providerPeriod.set(periodStart, providerSlot)
 
     // Variants merged into one model series, matching how the client groups them.
-    const seriesModelKey = `${providerID}/${modelID}`
+    const seriesModelKey = modelIdentity
     let modelPeriod = modelSeriesData.get(seriesModelKey)
     if (!modelPeriod) {
       modelPeriod = new Map()
@@ -2322,14 +2426,20 @@ function aggregate(
     }
     let modelSlot = modelPeriod.get(periodStart) ?? { cost: 0, tokens: 0, messages: 0 }
     modelSlot.cost += cost
-    modelSlot.tokens += totalTokens(tokens)
+    modelSlot.tokens += tokensUsed
     modelSlot.messages += 1
     modelPeriod.set(periodStart, modelSlot)
 
-    const dayStart = localDayStart(completed)
+    // One Date supplies both the local weekday/hour and the local-midnight
+    // boundary, preserving 23h/25h daylight-saving-day behavior.
+    calendar.setTime(completed)
+    const dowIndex = calendar.getDay()
+    const hourIndex = calendar.getHours()
+    calendar.setHours(0, 0, 0, 0)
+    const dayStart = calendar.getTime()
     const day = days.get(dayStart) ?? { start: dayStart, cost: 0, tokens: 0, messages: 0, sessions: 0 }
     day.cost += cost
-    day.tokens += totalTokens(tokens)
+    day.tokens += tokensUsed
     day.messages += 1
     days.set(dayStart, day)
     let daySessionSet = daySessions.get(dayStart)
@@ -2339,27 +2449,24 @@ function aggregate(
     }
     daySessionSet.add(row.session_id)
 
-    const local = new Date(completed)
-    const dowIndex = local.getDay()
     dow[dowIndex].cost += cost
-    dow[dowIndex].tokens += totalTokens(tokens)
+    dow[dowIndex].tokens += tokensUsed
     dow[dowIndex].messages += 1
-    const hourIndex = local.getHours()
     hours[hourIndex].cost += cost
-    hours[hourIndex].tokens += totalTokens(tokens)
+    hours[hourIndex].tokens += tokensUsed
     hours[hourIndex].messages += 1
     const punchIndex = dowIndex * 24 + hourIndex
     punchcard[punchIndex].cost += cost
-    punchcard[punchIndex].tokens += totalTokens(tokens)
+    punchcard[punchIndex].tokens += tokensUsed
     punchcard[punchIndex].messages += 1
 
     // Rows arrive ordered by completion ascending, so `start` is set once on
     // first sight and `end` simply tracks the latest row for the session.
     const sessionBucket = sessionBuckets.get(row.session_id) ?? {
       sessionID: row.session_id,
-      title: row.session_title ?? "",
-      projectID: row.project_id,
-      projectName: row.project_name ?? basename(row.directory),
+      title: dimension ? dimension.session_title ?? "" : row.session_title ?? "",
+      projectID,
+      projectName: dimension ? dimension.project_name ?? basename(dimension.directory) : row.project_name ?? basename(row.directory),
       messages: 0,
       cost: 0,
       tokens: 0,
@@ -2369,7 +2476,7 @@ function aggregate(
     }
     sessionBucket.messages += 1
     sessionBucket.cost += cost
-    sessionBucket.tokens += totalTokens(tokens)
+    sessionBucket.tokens += tokensUsed
     sessionBucket.end = completed
     sessionBuckets.set(row.session_id, sessionBucket)
     let sessionModelSet = sessionModels.get(row.session_id)
@@ -2377,9 +2484,11 @@ function aggregate(
       sessionModelSet = new Set()
       sessionModels.set(row.session_id, sessionModelSet)
     }
-    sessionModelSet.add(`${providerID}/${modelID}`)
+    sessionModelSet.add(modelIdentity)
   }
 
+  }
+  const finish = (maintenanceRows: readonly MaintenanceUsageRow[]): UsageSummary => {
   for (const row of maintenanceRows) {
     const tokens: TokenTotals = {
       input: row.input_tokens,
@@ -2416,9 +2525,6 @@ function aggregate(
   }
   for (const variant of variants.values()) {
     variant.share = safeDiv(variant.messages, totals.messages)
-  }
-  for (const project of projects.values()) {
-    project.sessions = projectSessions.get(project.projectID)?.size ?? 0
   }
   for (const day of days.values()) {
     day.sessions = daySessions.get(day.start)?.size ?? 0
@@ -2458,7 +2564,7 @@ function aggregate(
 
   const mostUsedModel = findMostUsedModel(models.values(), totals.messages)
 
-    const finalPeriods = downsample([...periods.values()].sort((a, b) => a.start - b.start), MAX_PERIODS)
+    const finalPeriods = rollupUsagePeriods([...periods.values()].sort((a, b) => a.start - b.start), MAX_PERIODS, "messages")
     const alignSeries = (data: Iterable<[string, Map<number, { cost: number; tokens: number; messages: number }>]>): EntitySeries[] => {
       const out: EntitySeries[] = []
       for (const [key, perStart] of data) {
@@ -2466,9 +2572,8 @@ function aggregate(
         const tokens = new Array<number>(finalPeriods.length).fill(0)
         const messages = new Array<number>(finalPeriods.length).fill(0)
         for (const [start, bucket] of perStart) {
-          let fi = finalPeriods.length - 1
-          while (fi > 0 && finalPeriods[fi]!.start > start) fi--
-          if (finalPeriods.length > 0 && finalPeriods[fi]!.start <= start) {
+          const fi = usageBucketFloor(finalPeriods, start)
+          if (fi >= 0) {
             cost[fi]! += bucket.cost
             tokens[fi]! += bucket.tokens
             messages[fi]! += bucket.messages
@@ -2478,18 +2583,11 @@ function aggregate(
       }
       return out
     }
-    const modelBudget = Math.max(1, Math.floor(MAX_SERIES_VALUES / Math.max(1, finalPeriods.length)))
-    const modelSeries = alignSeries(
-      [...modelSeriesData.entries()]
-        .sort((a, b) => {
-          let am = 0
-          let bm = 0
-          for (const [, bucket] of a[1]) am += bucket.messages
-          for (const [, bucket] of b[1]) bm += bucket.messages
-          return bm - am
-        })
-        .slice(0, modelBudget),
-    )
+    const modelBudget = usageModelSeriesBudget(MAX_SERIES_VALUES, finalPeriods.length)
+    const modelSeries = alignSeries(topUsageSeries(modelSeriesData, modelBudget))
+    // Sorting is required once for both the bounded heatmap and the exact
+    // scalar activity statistics; never recompute over the historical map.
+    const sortedDays = [...days.values()].sort((a, b) => a.start - b.start)
 
   return {
     since: request.since,
@@ -2504,7 +2602,11 @@ function aggregate(
     variants: [...variants.values()].sort((a, b) => b.messages - a.messages),
     projects: [...projects.values()].sort((a, b) => b.cost - a.cost),
     periods: finalPeriods,
-    days: downsample([...days.values()].sort((a, b) => a.start - b.start), MAX_DAYS),
+    // Calendar-based activity must receive *recent contiguous chronology*.
+    // Uniform sampling of sparse active days would falsely compress
+    // non-consecutive dates into neighboring heatmap cells.
+    days: sortedDays.slice(-MAX_DAYS),
+    activity: summarizeUsageActivity(sortedDays),
     dow: dow as unknown as UsageSummary["dow"],
     hours: hours as unknown as UsageSummary["hours"],
     punchcard,
@@ -2512,7 +2614,7 @@ function aggregate(
     modelSeries,
     // Ranked by tokens rather than cost so a session run entirely on free or
     // unpriced models is not silently absent from "your heaviest work".
-    sessions: [...sessionBuckets.values()].sort((a, b) => b.tokens - a.tokens).slice(0, MAX_SESSIONS),
+    sessions: topUsageBy(sessionBuckets.values(), MAX_SESSIONS, (session) => session.tokens),
     pricing: {
       coverage: safeDiv(totals.pricedRecords, totals.messages),
       mode,
@@ -2523,23 +2625,11 @@ function aggregate(
       models: [...maintenanceModels.values()].sort(
         (a, b) => b.cost + b.estimatedCost - (a.cost + a.estimatedCost) || b.totalTokens - a.totalTokens,
       ),
-      periods: downsample([...maintenancePeriods.values()].sort((a, b) => a.start - b.start), MAX_PERIODS),
+      periods: rollupUsagePeriods([...maintenancePeriods.values()].sort((a, b) => a.start - b.start), MAX_PERIODS, "requests"),
     },
   }
-}
-
-function estimateCost(tokens: TokenTotals, rate: ModelRates) {
-  return (
-    (tokens.input / 1_000_000) * rate.input +
-    (tokens.cacheRead / 1_000_000) * rate.cacheRead +
-    (tokens.cacheWrite / 1_000_000) * rate.cacheWrite +
-    ((tokens.output + tokens.reasoning) / 1_000_000) * rate.output
-  )
-}
-
-function cacheSavingsFor(row: UsageRow, tokens: TokenTotals, rate: ModelRates | undefined) {
-  if (!rate || tokens.cacheRead <= 0) return 0
-  return (tokens.cacheRead / 1_000_000) * (rate.input - rate.cacheRead)
+  }
+  return { addRows, finish }
 }
 
 type ModelAggregate = { messages: number; cost: number; modelID: string; providerID: string; variant: string | null }

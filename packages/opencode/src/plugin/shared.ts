@@ -153,6 +153,66 @@ function resolvePackagePath(spec: string, raw: string, kind: PluginKind, pkg: Pl
   return pathToFileURL(resolvePackageFile(spec, raw, kind, pkg)).href
 }
 
+const TYPESCRIPT_PLUGIN_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts"])
+
+export function isTypeScriptPluginEntry(entry: string) {
+  const file = entry.startsWith("file://") ? fileURLToPath(entry) : entry
+  return TYPESCRIPT_PLUGIN_EXTENSIONS.has(path.extname(file).toLowerCase())
+}
+
+function compiledExtensions(sourceExtension: string, pkg: PluginPackage) {
+  if (sourceExtension === ".mts") return [".mjs", ".js"]
+  if (sourceExtension === ".cts") return [".cjs", ".js"]
+  return pkg.json.type === "module" ? [".js", ".mjs"] : [".js", ".cjs"]
+}
+
+/**
+ * Resolve the conventional compiled sibling for an npm plugin that publishes a
+ * TypeScript source entry. Node deliberately refuses TypeScript type stripping
+ * beneath node_modules, while Bun can execute the declared source directly.
+ *
+ * Keep this fallback narrow: only files inside the package are eligible, and
+ * only a same-path JavaScript sibling or the conventional src/* -> dist/*
+ * projection is considered. We never compile or execute a path outside the
+ * installed package and never reinterpret an unrelated package export.
+ */
+export async function resolveCompiledPluginEntry(entry: string, pkg: PluginPackage) {
+  const file = entry.startsWith("file://") ? fileURLToPath(entry) : entry
+  const root = Filesystem.resolve(pkg.dir)
+  const source = Filesystem.resolve(file)
+  if (!Filesystem.contains(root, source)) return
+
+  const extension = path.extname(source).toLowerCase()
+  if (!TYPESCRIPT_PLUGIN_EXTENSIONS.has(extension)) return
+
+  const relative = path.relative(root, source)
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return
+
+  const outputs = compiledExtensions(extension, pkg)
+  const candidates: string[] = []
+  const seen = new Set<string>()
+  const add = (candidate: string) => {
+    const resolved = Filesystem.resolve(path.join(root, candidate))
+    if (!Filesystem.contains(root, resolved) || seen.has(resolved)) return
+    seen.add(resolved)
+    candidates.push(resolved)
+  }
+
+  const sourcePrefix = `src${path.sep}`
+  if (relative.toLowerCase().startsWith(sourcePrefix)) {
+    const body = relative.slice(sourcePrefix.length, -extension.length)
+    for (const output of outputs) add(path.join("dist", `${body}${output}`))
+  }
+
+  const sibling = relative.slice(0, -extension.length)
+  for (const output of outputs) add(`${sibling}${output}`)
+
+  for (const candidate of candidates) {
+    const stat = await Filesystem.statAsync(candidate)
+    if (stat?.isFile()) return pathToFileURL(candidate).href
+  }
+}
+
 function resolvePackageEntrypoint(spec: string, kind: PluginKind, pkg: PluginPackage) {
   const exports = pkg.json.exports
   if (isRecord(exports)) {

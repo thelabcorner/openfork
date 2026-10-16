@@ -109,6 +109,7 @@ describe("quota reset agenda projection", () => {
     expect(account?.accountId).toBe("wb-stable")
     expect(account?.accountLabel).toBe("alpha@example.com")
     expect(account?.windows.map((item) => item.key)).toEqual(["Basic", "Combined"])
+    expect(account?.windows.every((item) => item.source === "observed")).toBe(true)
 
     const model = result.occurrences.find((item) => item.scope === "account-model")
     expect(model?.accountId).toBe("wb-stable")
@@ -191,6 +192,34 @@ describe("quota reset agenda projection", () => {
     expect(result.occurrences.find((item) => item.accountId === "zen-a")?.accountLabel).toBe("Primary")
     expect(result.occurrences.find((item) => item.accountId === "zen-b")?.accountLabel).toBe("Migrated Key")
     expect(result.occurrences.find((item) => item.accountId === "zen-b")?.windows[0]?.source).toBe("observed")
+  })
+
+  test("includes official Go rolling capacity even when its moving resetAt is outside a fixed agenda horizon", () => {
+    const past = from - 60_000
+    const goSnapshot: ForkUsageSnapshot = {
+      result: {
+        aggregate: [{
+          label: "5h", spentUSD: 0.1, limitUSD: 10, resetsAt: past,
+          clearsAt: past, callsInWindow: 3, source: "api",
+        }],
+        byCredential: [{
+          credentialID: "go-a", accountID: "stable-go-a",
+          windows: [{
+            label: "5h", spentUSD: 0.1, limitUSD: 10, resetsAt: past,
+            clearsAt: past, callsInWindow: 3, source: "api",
+          }],
+          official: { fetchedAt: from, ageMs: 0, status: "ok" },
+        }],
+      },
+      accountLabels: new Map([["stable-go-a", "Primary"]]),
+    }
+    const result = buildResetAgenda({ from, to, generatedAt: from, providerResults: [], goSnapshot })
+    // Project the actual account once, not again as a synthetic aggregate row.
+    expect(result.occurrences).toHaveLength(1)
+    expect(result.occurrences[0]?.scope).toBe("account")
+    expect(result.occurrences[0]?.accountId).toBe("stable-go-a")
+    expect(result.occurrences[0]?.resetAt).toBe(past)
+    expect(result.occurrences[0]?.windows[0]?.remainingPercent).toBeCloseTo(99)
   })
 
   test("preserves partial provider failures instead of failing the whole agenda", () => {

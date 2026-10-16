@@ -8,6 +8,7 @@ import type {
   WorkspaceAdapter as PluginWorkspaceAdapter,
 } from "@opencode-ai/plugin"
 import { Config } from "@/config/config"
+import { ConfigPlugin } from "@/config/plugin"
 import { createOpencodeClient } from "@opencode-ai/sdk"
 import { ServerAuth } from "@/server/auth"
 import { loadToolModule } from "@/tool/import"
@@ -26,7 +27,7 @@ import { ZenPlugin, ZenGoPlugin } from "./zen"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { ClaudeAuthPlugin } from "./claude"
 import { GensparkAuthPlugin } from "./genspark"
-import { Effect, Layer, Context } from "effect"
+import { Effect, Layer, Context, Fiber, Cause } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { errorMessage } from "@/util/error"
@@ -155,6 +156,25 @@ async function applyPlugin(load: PluginLoader.Loaded, input: PluginInput, hooks:
   }
 }
 
+function backgroundEventOnly(hook: Hooks) {
+  return Object.entries(hook).every(([name, value]) => value == null || name === "event" || name === "dispose")
+}
+
+function disposeHooks(hooks: Hooks[]) {
+  return Effect.forEach(
+    hooks,
+    (hook) =>
+      Effect.tryPromise({
+        try: () => Promise.resolve(hook.dispose?.()),
+        catch: errorMessage,
+      }).pipe(
+        Effect.tapError((error) => Effect.logError("plugin dispose hook failed", { error })),
+        Effect.ignore,
+      ),
+    { discard: true },
+  )
+}
+
 // Tool hot-reload P1 (plugin files): re-import a plugin entry from disk, bypassing Bun's
 // pathname-keyed module cache, and return the fresh module WITHOUT re-applying hooks. Callers
 // extract tool defs from the fresh `default` descriptor (readV1Plugin) and apply its server()
@@ -196,6 +216,7 @@ const layer = Layer.effect(
     const state = yield* InstanceState.make<State>(
       Effect.fn("Plugin.state")(function* (ctx) {
         const hooks: Hooks[] = []
+        const backgroundHooks: Hooks[] = []
         const bridge = yield* EffectBridge.make()
 
         function publishPluginError(message: string) {
@@ -249,67 +270,61 @@ const layer = Layer.effect(
         }
 
         const plugins = flags.pure ? [] : (cfg.plugin_origins ?? [])
-        if (flags.pure && cfg.plugin_origins?.length) {
-        }
-        if (plugins.length) yield* config.waitForDependencies()
+        const sessionPlugins = plugins.filter((item) => ConfigPlugin.pluginStartupLane(item.spec) === "session")
+        const backgroundPlugins = plugins.filter((item) => ConfigPlugin.pluginStartupLane(item.spec) === "background-events")
+        if (sessionPlugins.length) yield* config.waitForDependencies()
 
-        const loaded = yield* Effect.promise(() =>
-          PluginLoader.loadExternal({
-            items: plugins,
-            kind: "server",
-            report: {
-              start(candidate) {},
-              missing(candidate, _retry, message) {},
-              error(candidate, _retry, stage, error, resolved) {
-                const spec = candidate.plan.spec
-                const cause = error instanceof Error ? (error.cause ?? error) : error
-                const message = stage === "load" ? errorMessage(error) : errorMessage(cause)
+        const loadExternal = (items: typeof plugins) =>
+          Effect.promise(() =>
+            PluginLoader.loadExternal({
+              items,
+              kind: "server",
+              report: {
+                start(candidate) {},
+                missing(candidate, _retry, message) {},
+                error(candidate, _retry, stage, error, resolved) {
+                  const spec = candidate.plan.spec
+                  const cause = error instanceof Error ? (error.cause ?? error) : error
+                  const message = stage === "load" ? errorMessage(error) : errorMessage(cause)
 
-                if (stage === "install") {
-                  const parsed = parsePluginSpecifier(spec)
-                  publishPluginError(`Failed to install plugin ${parsed.pkg}@${parsed.version}: ${message}`)
-                  return
-                }
+                  if (stage === "install") {
+                    const parsed = parsePluginSpecifier(spec)
+                    publishPluginError(`Failed to install plugin ${parsed.pkg}@${parsed.version}: ${message}`)
+                    return
+                  }
 
-                if (stage === "compatibility") {
-                  publishPluginError(`Plugin ${spec} skipped: ${message}`)
-                  return
-                }
+                  if (stage === "compatibility") {
+                    publishPluginError(`Plugin ${spec} skipped: ${message}`)
+                    return
+                  }
 
-                if (stage === "entry") {
+                  if (stage === "entry") {
+                    publishPluginError(`Failed to load plugin ${spec}: ${message}`)
+                    return
+                  }
+
                   publishPluginError(`Failed to load plugin ${spec}: ${message}`)
-                  return
-                }
-
-                publishPluginError(`Failed to load plugin ${spec}: ${message}`)
+                },
               },
-            },
-          }),
-        )
-        for (const load of loaded) {
-          if (!load) continue
-
-          // Keep plugin execution sequential so hook registration and execution
-          // order remains deterministic across plugin runs.
-          yield* Effect.tryPromise({
-            try: () => applyPlugin(load, input, hooks),
-            catch: (err) => {
-              const message = errorMessage(err)
-              return message
-            },
-          }).pipe(
-            Effect.tapError((error) => Effect.logError("failed to load plugin", { path: load.spec, error })),
-            Effect.catch(() => {
-              // TODO: make proper events for this
-              // events.publish(Session.Event.Error, {
-              //   error: new NamedError.Unknown({
-              //     message: `Failed to load plugin ${load.spec}: ${message}`,
-              //   }).toObject(),
-              // })
-              return Effect.void
             }),
           )
-        }
+
+        const loadPluginHooks = (loaded: PluginLoader.Loaded[], target: Hooks[]) =>
+          Effect.forEach(
+            loaded,
+            (load) =>
+              Effect.tryPromise({
+                try: () => applyPlugin(load, input, target),
+                catch: errorMessage,
+              }).pipe(
+                Effect.tapError((error) => Effect.logError("failed to load plugin", { path: load.spec, error })),
+                Effect.ignore,
+              ),
+            { discard: true },
+          )
+
+        const loaded = yield* loadExternal(sessionPlugins)
+        yield* loadPluginHooks(loaded, hooks)
 
         // Notify plugins of current config
         for (const hook of hooks) {
@@ -322,9 +337,42 @@ const layer = Layer.effect(
           )
         }
 
+        let backgroundFiber: Fiber.Fiber<void> | undefined
+        if (backgroundPlugins.length) {
+          // Background plugins are explicit opt-ins and are restricted to
+          // event observation/disposal. Their dependency resolution, package
+          // installation, module loading, and server() callbacks must not hold
+          // the InstanceState barrier used by selected-model resolution.
+          backgroundFiber = yield* Effect.gen(function* () {
+            yield* config.waitForDependencies()
+            const loaded = yield* loadExternal(backgroundPlugins)
+            for (const plugin of loaded) {
+              const pluginHooks: Hooks[] = []
+              yield* loadPluginHooks([plugin], pluginHooks)
+              for (const hook of pluginHooks) {
+                if (backgroundEventOnly(hook)) {
+                  backgroundHooks.push(hook)
+                  continue
+                }
+                publishPluginError(`Background plugin ${plugin.spec} registered a session-critical hook; its hooks were rejected`)
+                yield* disposeHooks([hook])
+              }
+            }
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError("background plugin lane failed", { cause: Cause.pretty(cause) }).pipe(Effect.andThen(Effect.void)),
+            ),
+            Effect.asVoid,
+            Effect.forkScoped,
+          )
+        }
+
         const unsubscribe = yield* events.listenDirectoryAll(ctx.directory, (event) => {
           return Effect.sync(() => {
             for (const hook of hooks) {
+              void hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any })
+            }
+            for (const hook of backgroundHooks) {
               void hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any })
             }
           })
@@ -332,18 +380,10 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(() => unsubscribe)
 
         yield* Effect.addFinalizer(() =>
-          Effect.forEach(
-            hooks,
-            (hook) =>
-              Effect.tryPromise({
-                try: () => Promise.resolve(hook.dispose?.()),
-                catch: errorMessage,
-              }).pipe(
-                Effect.tapError((error) => Effect.logError("plugin dispose hook failed", { error })),
-                Effect.ignore,
-              ),
-            { discard: true },
-          ),
+          Effect.gen(function* () {
+            if (backgroundFiber) yield* Fiber.interrupt(backgroundFiber).pipe(Effect.asVoid)
+            yield* disposeHooks([...hooks, ...backgroundHooks])
+          }),
         )
 
         return { hooks }

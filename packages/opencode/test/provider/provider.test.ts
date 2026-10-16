@@ -1,8 +1,9 @@
 import { afterAll, afterEach, expect, spyOn, test } from "bun:test"
-import { mkdtempSync, rmSync } from "fs"
+import { mkdtempSync, rmSync, writeFileSync } from "fs"
 import { mkdir, unlink } from "fs/promises"
 import { tmpdir as osTmpdir } from "os"
 import path from "path"
+import { pathToFileURL } from "url"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Effect, Fiber, Layer } from "effect"
@@ -39,6 +40,34 @@ import { setTestAccountStore } from "@/plugin/workbuddy"
 
 const workBuddyTestRoot = mkdtempSync(path.join(osTmpdir(), "openfork-provider-workbuddy-"))
 setTestAccountStore(workBuddyTestRoot)
+const startupPluginRoot = mkdtempSync(path.join(osTmpdir(), "openfork-plugin-startup-lanes-"))
+const backgroundPluginPath = path.join(startupPluginRoot, "background-events.js")
+const sessionPluginPath = path.join(startupPluginRoot, "session-critical.js")
+writeFileSync(
+  backgroundPluginPath,
+  `export default async function plugin() {
+    globalThis.__openforkBackgroundPluginStarted?.()
+    await globalThis.__openforkBackgroundPluginGate
+    globalThis.__openforkBackgroundPluginLoaded = true
+    globalThis.__openforkBackgroundPluginCompleted?.()
+    return {
+      event() { globalThis.__openforkBackgroundEventCount = (globalThis.__openforkBackgroundEventCount ?? 0) + 1 },
+      config() { globalThis.__openforkBackgroundConfigHookRan = true },
+      dispose() {
+        globalThis.__openforkBackgroundDisposed = true
+        globalThis.__openforkBackgroundPluginDisposeComplete?.()
+      },
+    }
+  }`,
+)
+writeFileSync(
+  sessionPluginPath,
+  `export default async function plugin() {
+    globalThis.__openforkSessionPluginStarted?.()
+    await globalThis.__openforkSessionPluginGate
+    return { config(config) { config.provider["selected-a"].models["active-model"].name = "Config hook model" } }
+  }`,
+)
 
 const originalEnv = new Map<string, string | undefined>()
 
@@ -80,6 +109,7 @@ afterEach(async () => {
 
 afterAll(() => {
   rmSync(workBuddyTestRoot, { recursive: true, force: true })
+  rmSync(startupPluginRoot, { recursive: true, force: true })
 })
 
 const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
@@ -123,6 +153,80 @@ const languageBaseURL = (language: unknown) => (language as { config: { baseURL:
 const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node])))
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
 const fullProvider = testEffect(providerLayer())
+const providerWithoutBuiltins = testEffect(providerLayer({ disableDefaultPlugins: true }))
+
+for (const providerCount of [1, 3, 6]) {
+  providerWithoutBuiltins.instance(
+    `selected model avoids auth-file rereads across ${providerCount} plugin providers and 1/3/6 callers`,
+    Effect.gen(function* () {
+      const plugin = yield* Plugin.Service
+      const auth = yield* Auth.Service
+      const selectedProviderID = ProviderV2.ID.make("selected-a")
+      const selectedModelID = ModelV2.ID.make("active-model")
+      let selectedModelLoads = 0
+      let unrelatedModelLoads = 0
+      const pluginList = spyOn(plugin, "list").mockImplementation(() => Effect.succeed(
+        Array.from({ length: providerCount }, (_, index) => ({
+          provider: {
+            id: index === 0 ? selectedProviderID : ProviderV2.ID.make(`unrelated-${providerCount}-${index}`),
+            models: async () => {
+              if (index === 0) selectedModelLoads++
+              else unrelatedModelLoads++
+              return {}
+            },
+            ...(index > 0
+              ? {
+                  discoverModels: async () => {
+                    throw new Error("unrelated model discovery must stay uncalled")
+                  },
+                }
+              : {}),
+          },
+        })) as any,
+      ))
+      const authAll = spyOn(auth, "all")
+      const authGet = spyOn(auth, "get")
+
+      try {
+        for (const callerCount of [1, 3, 6]) {
+          const models = yield* Effect.all(
+            Array.from({ length: callerCount }, () => Provider.use.getModel(selectedProviderID, selectedModelID)),
+            { concurrency: "unbounded" },
+          )
+          expect(models).toHaveLength(callerCount)
+          expect(models.every((model) => model.id === selectedModelID)).toBe(true)
+        }
+        // Auth.get reads and decodes the whole auth file; unrelated provider
+        // hooks must consume the already-owned snapshot instead.
+        // ProviderCatalog and Provider.currentState each own one read; the
+        // count must not grow with unrelated plugin-provider count/callers.
+        expect(authAll).toHaveBeenCalledTimes(2)
+        expect(authGet).not.toHaveBeenCalled()
+        expect(pluginList).toHaveBeenCalledTimes(1)
+        expect(selectedModelLoads).toBe(1)
+        expect(unrelatedModelLoads).toBe(0)
+      } finally {
+        authAll.mockRestore()
+        authGet.mockRestore()
+        pluginList.mockRestore()
+      }
+    }),
+    {
+      config: {
+        provider: {
+          "selected-a": {
+            name: "Selected A",
+            npm: "@ai-sdk/openai-compatible",
+            api: "https://selected-a.example/v1",
+            options: { apiKey: "selected-a-key" },
+            models: { "active-model": { name: "Configured A model" } },
+          },
+        },
+      },
+    },
+    15_000,
+  )
+}
 
 fullProvider.instance(
   "TypeSafe metadata is demanded only by its selected decision provider",
@@ -589,6 +693,138 @@ fullProvider.instance(
   15_000,
 )
 
+providerWithoutBuiltins.instance(
+  "explicit background-events plugin activation is outside the selected-model barrier at 1/3/6 requests",
+  Effect.gen(function* () {
+    const plugin = yield* Plugin.Service
+    const providerID = ProviderV2.ID.make("selected-a")
+    const modelID = ModelV2.ID.make("active-model")
+    let release!: () => void
+    let started!: () => void
+    let loaded!: () => void
+    let disposed!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const start = new Promise<void>((resolve) => (started = resolve))
+    const completion = new Promise<void>((resolve) => (loaded = resolve))
+    const disposal = new Promise<void>((resolve) => (disposed = resolve))
+    ;(globalThis as any).__openforkBackgroundPluginGate = gate
+    ;(globalThis as any).__openforkBackgroundPluginStarted = started
+    ;(globalThis as any).__openforkBackgroundPluginCompleted = loaded
+    ;(globalThis as any).__openforkBackgroundPluginDisposeComplete = disposed
+
+    const initialization = yield* Effect.race(
+      plugin.init().pipe(Effect.as("ready" as const)),
+      Effect.promise(() => start).pipe(Effect.as("background-started" as const)),
+    )
+    expect(initialization).toBe("ready")
+    yield* Effect.promise(() => start)
+
+    const resolveSelected = (count: number) =>
+      Effect.all(
+        Array.from({ length: count }, () => Provider.use.getModel(providerID, modelID)),
+        { concurrency: "unbounded" },
+      )
+    const one = yield* resolveSelected(1)
+    const three = yield* resolveSelected(3)
+    const six = yield* resolveSelected(6)
+    expect([...one, ...three, ...six].every((model) => model.name === "Configured A model")).toBe(true)
+    expect((globalThis as any).__openforkBackgroundPluginLoaded).toBeUndefined()
+    expect((yield* plugin.list()).some((hook) => typeof hook.event === "function")).toBe(false)
+
+    release()
+    yield* Effect.promise(() => completion)
+    yield* Effect.promise(() => disposal)
+    expect((globalThis as any).__openforkBackgroundPluginLoaded).toBe(true)
+    expect((globalThis as any).__openforkBackgroundConfigHookRan).toBeUndefined()
+    expect((globalThis as any).__openforkBackgroundDisposed).toBe(true)
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        ;(globalThis as any).__openforkBackgroundPluginGate = undefined
+        ;(globalThis as any).__openforkBackgroundPluginStarted = undefined
+        ;(globalThis as any).__openforkBackgroundPluginCompleted = undefined
+        ;(globalThis as any).__openforkBackgroundPluginDisposeComplete = undefined
+        ;(globalThis as any).__openforkBackgroundPluginLoaded = undefined
+        ;(globalThis as any).__openforkBackgroundConfigHookRan = undefined
+        ;(globalThis as any).__openforkBackgroundDisposed = undefined
+        ;(globalThis as any).__openforkBackgroundEventCount = undefined
+      }),
+    ),
+  ),
+  {
+    config: {
+      plugin: [[pathToFileURL(backgroundPluginPath).href, { $openfork: { startup: "background-events" } }]],
+      provider: {
+        "selected-a": {
+          name: "Selected A",
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://selected-a.example/v1",
+          options: { apiKey: "selected-a-key" },
+          models: { "active-model": { name: "Configured A model" } },
+        },
+      },
+    },
+    init: (directory) => Effect.promise(() => markPluginDependenciesReady(directory)),
+  },
+  15_000,
+)
+
+providerWithoutBuiltins.instance(
+  "legacy plugin server and config hooks remain session-critical",
+  Effect.gen(function* () {
+    const providerID = ProviderV2.ID.make("selected-a")
+    const modelID = ModelV2.ID.make("active-model")
+    let release!: () => void
+    let started!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const start = new Promise<void>((resolve) => (started = resolve))
+    ;(globalThis as any).__openforkSessionPluginGate = gate
+    ;(globalThis as any).__openforkSessionPluginStarted = started
+
+    const pending = yield* Provider.use.getModel(providerID, modelID).pipe(Effect.exit, Effect.forkScoped)
+    const startedOrFailed = yield* Effect.race(
+      Effect.promise(() => start).pipe(Effect.as("started" as const)),
+      Effect.sleep("2 seconds").pipe(Effect.as("start-timeout" as const)),
+    )
+    expect(startedOrFailed).toBe("started")
+    const beforeRelease = yield* Effect.race(
+      Fiber.join(pending).pipe(Effect.as("ready" as const)),
+      Effect.sleep("50 millis").pipe(Effect.as("held" as const)),
+    )
+    expect(beforeRelease).toBe("held")
+    release()
+    const modelExit = yield* Fiber.join(pending)
+    if (modelExit._tag === "Failure") {
+      throw new Error("legacy selected model failed after releasing the plugin gate")
+    }
+    const model = modelExit.value
+    expect(model.name).toBe("Config hook model")
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        ;(globalThis as any).__openforkSessionPluginGate = undefined
+        ;(globalThis as any).__openforkSessionPluginStarted = undefined
+      }),
+    ),
+  ),
+  {
+    config: {
+      plugin: [pathToFileURL(sessionPluginPath).href],
+      provider: {
+        "selected-a": {
+          name: "Selected A",
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://selected-a.example/v1",
+          options: { apiKey: "selected-a-key" },
+          models: { "active-model": { name: "Configured A model" } },
+        },
+      },
+    },
+    init: (directory) => Effect.promise(() => markPluginDependenciesReady(directory)),
+  },
+  15_000,
+)
+
 it.instance(
   "discovers upstream-advertised free Jev during provider catalog assembly when models.dev lags Zen",
   Effect.gen(function* () {
@@ -697,6 +933,62 @@ it.instance(
     },
   },
   15_000,
+)
+
+it.instance(
+  "V1 getModel resolves proven neutral model metadata from a qualified-only hosted catalog",
+  Effect.gen(function* () {
+    const service = yield* Provider.Service
+    const providerID = ProviderV2.ID.make("opencode-go")
+    const modelID = ModelV2.ID.make("qualified-only-runtime-probe")
+    const selected = yield* service.getModel(providerID, modelID)
+    expect(selected.id).toBe(modelID)
+    expect(selected.api.id).toBe(modelID)
+    expect(selected.providerID).toBe(providerID)
+    const catalog = yield* service.getProvider(providerID)
+    expect(catalog.models[modelID]?.id).toBe(modelID)
+    expect(catalog.models["qualified-only-runtime-probe@zen-one"]).toBeDefined()
+    expect(catalog.models["qualified-only-runtime-probe@zen-two"]).toBeDefined()
+  }),
+  {
+    config: {
+      provider: {
+        "opencode-go": {
+          api: "https://opencode.ai/zen/go/v1",
+          models: {
+            "qualified-only-runtime-probe@zen-one": { id: "qualified-only-runtime-probe" },
+            "qualified-only-runtime-probe@zen-two": { id: "qualified-only-runtime-probe" },
+          },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "rejects qualified-only hosted aliases with an untrusted API origin before any route selection",
+  Effect.gen(function* () {
+    const provider = yield* Provider.Service
+    const providerID = ProviderV2.ID.make("opencode-go")
+    const modelID = ModelV2.ID.make("untrusted-qualified-probe")
+    const error = yield* provider.getModel(providerID, modelID).pipe(Effect.flip)
+    expect(error).toBeInstanceOf(Provider.ModelNotFoundError)
+    const metadata = yield* provider.getProvider(providerID)
+    expect(metadata.models["untrusted-qualified-probe"]).toBeUndefined()
+  }),
+  {
+    config: {
+      provider: {
+        "opencode-go": {
+          api: "https://unexpected-provider.invalid/v1",
+          models: {
+            "untrusted-qualified-probe@zen-first": { id: "untrusted-qualified-probe" },
+            "untrusted-qualified-probe@zen-second": { id: "untrusted-qualified-probe" },
+          },
+        },
+      },
+    },
+  },
 )
 
 it.instance(

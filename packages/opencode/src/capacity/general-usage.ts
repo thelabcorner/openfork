@@ -1,10 +1,8 @@
 import type { UsageYield } from "@opencode-ai/core/usage/yield"
 import {
   effectiveSamples,
-  meanVector,
   momentsFor,
   sessionMomentsFor,
-  snapshotYieldStatistic,
 } from "@opencode-ai/core/usage/yield-statistics"
 import { FALLBACK_WORKLOAD_CORPUS } from "@opencode-ai/schema/model-select/usage-yield"
 import { Schema } from "effect"
@@ -163,6 +161,47 @@ type RecentCandidate = {
 
 type WeightedCandidate = RecentCandidate & { readonly weight: number }
 
+type DirectCandidate = { updatedAt: number; estimate: ModelEstimate }
+
+function directOrder(a: DirectCandidate, b: DirectCandidate) {
+  return (
+    b.updatedAt - a.updatedAt ||
+    a.estimate.providerID.localeCompare(b.estimate.providerID) ||
+    a.estimate.modelID.localeCompare(b.estimate.modelID)
+  )
+}
+
+/** Retain the best 128 model scopes without sorting/allocating the full population. */
+function offerDirect(heap: DirectCandidate[], candidate: DirectCandidate) {
+  if (heap.length < MAX_DIRECT_MODELS) {
+    heap.push(candidate)
+    let index = heap.length - 1
+    while (index > 0) {
+      const parent = (index - 1) >> 1
+      if (directOrder(heap[index]!, heap[parent]!) <= 0) break
+      const value = heap[index]!
+      heap[index] = heap[parent]!
+      heap[parent] = value
+      index = parent
+    }
+    return
+  }
+  if (directOrder(candidate, heap[0]!) >= 0) return
+  heap[0] = candidate
+  let index = 0
+  for (;;) {
+    const left = index * 2 + 1
+    if (left >= heap.length) return
+    const right = left + 1
+    const child = right < heap.length && directOrder(heap[right]!, heap[left]!) > 0 ? right : left
+    if (directOrder(heap[child]!, heap[index]!) <= 0) return
+    const value = heap[index]!
+    heap[index] = heap[child]!
+    heap[child] = value
+    index = child
+  }
+}
+
 function candidateOrder(a: RecentCandidate, b: RecentCandidate) {
   return (
     a.providerID.localeCompare(b.providerID) ||
@@ -249,6 +288,22 @@ function recentEvidence(values: readonly WeightedCandidate[]): Evidence {
   }
 }
 
+/**
+ * This profile only needs session effective sample size. Finalizing an open
+ * session via snapshotYieldStatistic updates five full moment/cross-product
+ * matrices which are never read here. Project the scalar weights of the
+ * selected half-life instead: finalizeSessionBlock -> effectiveSamples uses
+ * exactly these same scalar recurrences.
+ */
+function snapshotSessionEffectiveSamples(state: UsageYield.Entry["state"]) {
+  const moments = sessionMomentsFor(state, HALF_LIFE)
+  if (!moments) return undefined
+  const active = state.sessions.activeCount > 0
+  const weight = active ? RHO * moments.weight + 1 : moments.weight
+  const squaredWeight = active ? RHO * RHO * moments.squaredWeight + 1 : moments.squaredWeight
+  return weight > 0 && squaredWeight > 0 ? (weight * weight) / squaredWeight : 0
+}
+
 function weightedQuantile(
   values: readonly WeightedCandidate[],
   select: (value: WeightedCandidate) => number,
@@ -270,6 +325,24 @@ function weightedQuantile(
   return select(sorted.at(-1)!)
 }
 
+/** Resolve both tails from one stable sort and one cumulative-weight scan. */
+function weightedBand(values: readonly WeightedCandidate[], select: (value: WeightedCandidate) => number) {
+  if (values.length === 0) return [undefined, undefined] as const
+  const sorted = [...values].sort((a, b) => select(a) - select(b) || candidateOrder(a, b))
+  const total = sorted.reduce((sum, value) => sum + value.weight, 0)
+  if (!(total > 0)) return [undefined, undefined] as const
+  const lowerTarget = 0.1 * total
+  const upperTarget = 0.9 * total
+  let lower: number | undefined
+  let cumulative = 0
+  for (const value of sorted) {
+    cumulative += value.weight
+    if (lower === undefined && cumulative >= lowerTarget) lower = select(value)
+    if (cumulative >= upperTarget) return [lower, select(value)] as const
+  }
+  return [lower, select(sorted[sorted.length - 1]!)] as const
+}
+
 function representativeCorpus(values: readonly WeightedCandidate[]): Workload[] {
   if (values.length === 0) return []
   const sorted = [...values].sort((a, b) => {
@@ -281,17 +354,15 @@ function representativeCorpus(values: readonly WeightedCandidate[]): Workload[] 
   const count = Math.min(CORPUS_SIZE, sorted.length)
   const total = sorted.reduce((sum, value) => sum + value.weight, 0)
   const result: Workload[] = []
+  let selectedIndex = 0
+  let cumulative = 0
   for (let index = 0; index < count; index++) {
     const target = ((index + 0.5) / count) * total
-    let cumulative = 0
-    let selected = sorted.at(-1)!
-    for (const value of sorted) {
-      cumulative += value.weight
-      if (cumulative < target) continue
-      selected = value
-      break
+    while (selectedIndex < sorted.length - 1 && cumulative + sorted[selectedIndex]!.weight < target) {
+      cumulative += sorted[selectedIndex]!.weight
+      selectedIndex++
     }
-    result.push(selected.workload)
+    result.push(sorted[selectedIndex]!.workload)
   }
   return result
 }
@@ -355,60 +426,52 @@ function fingerprint(source: Source, corpus: readonly Workload[], evidence: Evid
  * the standardized coding-agent corpus.
  */
 export function build(entries: readonly UsageYield.Entry[]): Snapshot {
-  const modelCandidates: Array<{ updatedAt: number; estimate: ModelEstimate }> = []
+  const modelCandidates: DirectCandidate[] = []
+  let observedModelScopes = 0
   const contexts: number[] = []
   const generations: number[] = []
   const recent: RecentCandidate[] = []
+  const recentScopes: Array<{ entry: UsageYield.Entry; latest: number }> = []
 
   for (const entry of entries) {
     // Account overlays repeat the same physical requests. They refine routing,
     // but are not independent model scopes and must never enter the global pool.
     if (entry.key.accountID) continue
 
-    const state = snapshotYieldStatistic(entry.state)
-    state.recent.forEach((value, index) => {
-      const current = workload({
-        input: value.tokens[0] ?? 0,
-        cacheRead: value.tokens[1] ?? 0,
-        cacheWrite: value.tokens[2] ?? 0,
-        output: value.tokens[3] ?? 0,
-        reasoning: value.tokens[4] ?? 0,
-      })
-      if (!(current.totalTokens > 0)) return
-      offerRecent(recent, {
-        providerID: entry.key.providerID,
-        modelID: entry.key.baseModelID,
-        sessionID: value.sessionID,
-        completedAt: value.completedAt,
-        index,
-        workload: current,
-      })
-    })
+    const state = entry.state
+    if (state.recent.length > 0) {
+      // Use the actual retained maximum, not lastCompletedAt/updatedAt: late
+      // observations may arrive out of order. The maximum is an upper bound
+      // even when that observation has an invalid/zero token vector.
+      let latest = Number.NEGATIVE_INFINITY
+      for (const value of state.recent) latest = Math.max(latest, value.completedAt)
+      recentScopes.push({ entry, latest })
+    }
 
+    // Sparse scopes contribute to the shared recent corpus, but cannot
+    // qualify as direct estimates regardless of their moment statistics.
+    if (state.observations < MIN_PERSONAL_REQUESTS) continue
     const request = momentsFor(state, HALF_LIFE)
-    const sessions = sessionMomentsFor(state, HALF_LIFE)
-    if (!request || !sessions) continue
-    const mean = meanVector(request)
-    if (!mean) continue
-
-    const current = workload({
-      input: mean[0] ?? 0,
-      cacheRead: mean[1] ?? 0,
-      cacheWrite: mean[2] ?? 0,
-      output: mean[3] ?? 0,
-      reasoning: mean[4] ?? 0,
-    })
+    if (!request || !(request.weight > 0)) continue
     const requestEffectiveSamples = effectiveSamples(request)
-    const sessionEffectiveSamples = effectiveSamples(sessions)
-    const independentEffectiveSamples = Math.min(requestEffectiveSamples, sessionEffectiveSamples)
-    if (
-      !(current.totalTokens > 0) ||
-      state.observations < MIN_PERSONAL_REQUESTS ||
-      independentEffectiveSamples < MIN_PERSONAL_EFFECTIVE_SAMPLES
-    )
+    if (requestEffectiveSamples < MIN_PERSONAL_EFFECTIVE_SAMPLES) continue
+    const sessionEffectiveSamples = snapshotSessionEffectiveSamples(state)
+    if (sessionEffectiveSamples === undefined || sessionEffectiveSamples < MIN_PERSONAL_EFFECTIVE_SAMPLES)
       continue
 
-    modelCandidates.push({
+    // Avoid allocating a five-element mean vector for every qualified model;
+    // direct division retains meanVector's operation order and rounding.
+    const current = workload({
+      input: (request.sum[0] ?? 0) / request.weight,
+      cacheRead: (request.sum[1] ?? 0) / request.weight,
+      cacheWrite: (request.sum[2] ?? 0) / request.weight,
+      output: (request.sum[3] ?? 0) / request.weight,
+      reasoning: (request.sum[4] ?? 0) / request.weight,
+    })
+    if (!(current.totalTokens > 0)) continue
+
+    observedModelScopes++
+    offerDirect(modelCandidates, {
       updatedAt: entry.updatedAt,
       estimate: {
         providerID: entry.key.providerID,
@@ -427,16 +490,39 @@ export function build(entries: readonly UsageYield.Entry[]): Snapshot {
     if (current.generationTokens > 0) generations.push(current.generationTokens)
   }
 
+  // Process newest scopes first, then stop as soon as every remaining scope's
+  // maximum timestamp is strictly older than the oldest retained request.
+  // This preserves the exact top-128 corpus but avoids converting thousands of
+  // stale request vectors into Workload objects on large materialized histories.
+  recentScopes.sort((a, b) => b.latest - a.latest)
+  for (const { entry, latest } of recentScopes) {
+    if (recent.length === RECENT_LIMIT && latest < recent[0]!.completedAt) break
+    const state = entry.state
+    for (let index = 0; index < state.recent.length; index++) {
+      const value = state.recent[index]!
+      if (recent.length === RECENT_LIMIT && value.completedAt < recent[0]!.completedAt) continue
+      const current = workload({
+        input: value.tokens[0] ?? 0,
+        cacheRead: value.tokens[1] ?? 0,
+        cacheWrite: value.tokens[2] ?? 0,
+        output: value.tokens[3] ?? 0,
+        reasoning: value.tokens[4] ?? 0,
+      })
+      if (!(current.totalTokens > 0)) continue
+      offerRecent(recent, {
+        providerID: entry.key.providerID,
+        modelID: entry.key.baseModelID,
+        sessionID: value.sessionID,
+        completedAt: value.completedAt,
+        index,
+        workload: current,
+      })
+    }
+  }
+
   // Stable wire order makes snapshots deterministic and cheaper to diff/test.
-  const observedModelScopes = modelCandidates.length
   const models = modelCandidates
-    .sort(
-      (a, b) =>
-        b.updatedAt - a.updatedAt ||
-        a.estimate.providerID.localeCompare(b.estimate.providerID) ||
-        a.estimate.modelID.localeCompare(b.estimate.modelID),
-    )
-    .slice(0, MAX_DIRECT_MODELS)
+    .sort(directOrder)
     .map((value) => value.estimate)
     .sort((a, b) => a.providerID.localeCompare(b.providerID) || a.modelID.localeCompare(b.modelID))
   contexts.sort((a, b) => a - b)
@@ -452,18 +538,12 @@ export function build(entries: readonly UsageYield.Entry[]): Snapshot {
   const corpus = personalCorpus.length > 0 ? personalCorpus : [...STANDARDIZED_CORPUS]
   const typical = source === "personal-general" ? typicalWorkload(weighted, STANDARDIZED_WORKLOAD) : STANDARDIZED_WORKLOAD
 
-  const lowerRequestContext = mature
-    ? weightedQuantile(weighted, (value) => value.workload.contextTokens, 0.1)
-    : undefined
-  const upperRequestContext = mature
-    ? weightedQuantile(weighted, (value) => value.workload.contextTokens, 0.9)
-    : undefined
-  const lowerRequestGeneration = mature
-    ? weightedQuantile(weighted, (value) => value.workload.generationTokens, 0.1)
-    : undefined
-  const upperRequestGeneration = mature
-    ? weightedQuantile(weighted, (value) => value.workload.generationTokens, 0.9)
-    : undefined
+  const [lowerRequestContext, upperRequestContext] = mature
+    ? weightedBand(weighted, (value) => value.workload.contextTokens)
+    : [undefined, undefined]
+  const [lowerRequestGeneration, upperRequestGeneration] = mature
+    ? weightedBand(weighted, (value) => value.workload.generationTokens)
+    : [undefined, undefined]
   const observedRequestBand =
     lowerRequestContext !== undefined &&
     upperRequestContext !== undefined &&

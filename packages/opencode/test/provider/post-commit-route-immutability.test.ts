@@ -69,6 +69,7 @@ const ZEN_ENV_KEYS = [
 
 const hostedProviderID = ProviderV2.ID.make("opencode")
 const hostedModelID = ModelV2.ID.make("big-pickle")
+const anthropicHostedModelID = ModelV2.ID.make("qwen3.6-plus")
 
 // The hosted catalog witness is the only network-shaped input Public eligibility
 // depends on. It advertises the model as hosted so the compat account path and the
@@ -133,7 +134,7 @@ const seedRouteSession = (sessionID: SessionSchema.ID) =>
       .pipe(Effect.orDie)
   })
 
-type Wire = { authorization: string | null; body: Record<string, unknown> }
+type Wire = { authorization: string | null; xApiKey: string | null; body: Record<string, unknown> }
 
 const installWireAndPool = (requests: Wire[]) =>
   Effect.gen(function* () {
@@ -150,14 +151,30 @@ const installWireAndPool = (requests: Wire[]) =>
         return new Response(
           JSON.stringify({
             object: "list",
-            data: [{ id: "big-pickle", object: "model", owned_by: "opencode" }],
+            data: [
+              { id: "big-pickle", object: "model", owned_by: "opencode" },
+              { id: "qwen3.6-plus", object: "model", owned_by: "opencode" },
+            ],
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         )
       }
       const request = new Request(input, init)
       const body = (await request.json()) as Record<string, unknown>
-      requests.push({ authorization: request.headers.get("authorization"), body })
+      const xApiKey = request.headers.get("x-api-key")
+      requests.push({ authorization: request.headers.get("authorization"), xApiKey, body })
+      if (xApiKey) {
+        return new Response(JSON.stringify({
+          id: "msg_qwen",
+          type: "message",
+          role: "assistant",
+          model: "qwen3.6-plus",
+          content: [{ type: "text", text: "ROUTE_OK" }],
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 2 },
+        }), { status: 200, headers: { "content-type": "application/json" } })
+      }
       return new Response(
         JSON.stringify({
           id: "chatcmpl-post-commit",
@@ -321,6 +338,42 @@ it.instance(
     expect(requests).toHaveLength(1)
     expect(requests[0]!.authorization).toBe(`Bearer ${COMPAT_KEY_B}`)
     expect(requests[0]!.authorization).not.toBe(`Bearer ${COMPAT_KEY_C}`)
+  }),
+  { timeout: 30_000 },
+)
+
+it.instance(
+  "real provider resolution and AI SDK send Anthropic Qwen with the selected committed account x-api-key",
+  Effect.gen(function* () {
+    const requests: Wire[] = []
+    yield* installWireAndPool(requests)
+    const provider = yield* Provider.Service
+    const accountB = stableZenIdentity(COMPAT_KEY_B)
+    const sessionID = SessionSchema.ID.make("ses_post_commit_anthropic_qwen")
+    yield* seedRouteSession(sessionID)
+    const routed = yield* provider.resolveRoutedModel({
+      sessionID,
+      providerID: hostedProviderID,
+      modelID: anthropicHostedModelID,
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "account", accountID: accountB, pin: "hard" }),
+    })
+    if (!routed) throw new Error("expected an Anthropic hosted account route")
+    expect(routed.model.api.npm).toBe("@ai-sdk/anthropic")
+    const language = yield* provider.getLanguage(routed.model)
+    const result = yield* Effect.promise(() =>
+      generateText({ model: language, prompt: "Reply with exactly ROUTE_OK", maxRetries: 0 }),
+    )
+    expect(result.text).toBe("ROUTE_OK")
+    expect(requests).toHaveLength(1)
+    expect(requests[0]!.xApiKey).toBe(COMPAT_KEY_B)
+    expect(requests[0]!.authorization).toBeNull()
+    expect(requests[0]!.body.model).toBe("qwen3.6-plus")
+    const persisted = yield* (yield* ProviderRoute.Service).get(
+      sessionID,
+      OpencodeProviderRoute.affinityDomain(hostedProviderID),
+    )
+    expect(persisted?.routeKind).toBe("account")
+    expect(persisted?.routeKind === "account" ? persisted.accountID : undefined).toBe(accountB)
   }),
   { timeout: 30_000 },
 )

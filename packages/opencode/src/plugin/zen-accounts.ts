@@ -61,6 +61,11 @@ export function zenEnvCredentials(env: Record<string, string | undefined> = proc
 
 type FailureState = { state: ZenAccountState; resetAt: number | undefined }
 
+const UNKNOWN_QUOTA_RECHECK_MS = 5 * 60 * 1000
+const UNKNOWN_COOLDOWN_RECHECK_MS = 30 * 1000
+
+type TrackedFailure = FailureState & { retryAt?: number }
+
 /**
  * Unified key pool for both "opencode" (Zen free) and "opencode-go" (Go paid)
  * providers, which share the same physical `OPENCODE_API_KEY` env keys plus
@@ -69,12 +74,13 @@ type FailureState = { state: ZenAccountState; resetAt: number | undefined }
  * "session" here is the model's account suffix,
  * resolved once per request by the caller.
  *
- * In-memory 402/429 tracking is best-effort and process-local; a restart
- * clears it, which is fine because upstream re-teaches it within one request.
+ * In-memory 402/429 tracking is best-effort and process-local. Known retry
+ * times are honored; unknown quota exhaustion is periodically re-probed so a
+ * missing reset header cannot strand an account until process restart.
  */
 export class ZenAccountPool {
   private accounts = new Map<string, ZenAccount>()
-  private failures = new Map<string, FailureState>()
+  private failures = new Map<string, TrackedFailure>()
 
   /** Rebuild the pool from current env + the vault credentials passed in. */
   sync(vaultCredentials: ZenVaultCredential[] = []): ZenAccount[] {
@@ -129,14 +135,16 @@ export class ZenAccountPool {
     return this.all().find((account) => account.isDefault) ?? this.all()[0]
   }
 
-  /** Record a non-ok response's status against the account for display purposes only. */
+  /** Track account-local quota and cooldown feedback for routing and display. */
   observe(accountId: string, status: number, resetAt: number | undefined) {
     if (status === 402) {
-      this.failures.set(accountId, { state: "QUOTA_EXHAUSTED", resetAt: undefined })
+      const retryAt = resetAt ?? Date.now() + UNKNOWN_QUOTA_RECHECK_MS
+      this.failures.set(accountId, { state: "QUOTA_EXHAUSTED", resetAt, retryAt })
       return
     }
     if (status === 429) {
-      this.failures.set(accountId, { state: "COOLING_DOWN", resetAt })
+      const retryAt = resetAt ?? Date.now() + UNKNOWN_COOLDOWN_RECHECK_MS
+      this.failures.set(accountId, { state: "COOLING_DOWN", resetAt, retryAt })
       return
     }
     if (status >= 200 && status < 300) {
@@ -147,11 +155,11 @@ export class ZenAccountPool {
   state(accountId: string, now = Date.now()): FailureState {
     const failure = this.failures.get(accountId)
     if (!failure) return { state: "READY", resetAt: undefined }
-    if (failure.state === "COOLING_DOWN" && failure.resetAt !== undefined && now >= failure.resetAt) {
+    if (failure.retryAt !== undefined && now >= failure.retryAt) {
       this.failures.delete(accountId)
       return { state: "READY", resetAt: undefined }
     }
-    return failure
+    return { state: failure.state, resetAt: failure.resetAt }
   }
 
   snapshot(now = Date.now()) {

@@ -14,6 +14,7 @@ import { projectT3CodeAccountModels } from "@/compat/t3code-provider"
 import { serviceRealmID } from "@/server/shared/instance-identity"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { makeConsoleAccountExecutionResolver } from "./console-account-execution"
+import { projectHostedNeutralModels } from "./hosted-neutral-model"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ServerEvent } from "@opencode-ai/schema/server-event"
@@ -223,6 +224,15 @@ const layer = Layer.effect(
 
         const cached = contributions.get(input.directory ?? "")
         if (cached) Object.assign(providers, cached.providers)
+        // Derive only safe account-neutral catalog metadata. The actual
+        // account-specific transport is always authorized later by ProviderRoute.
+        for (const [id, info] of Object.entries(providers)) {
+          const configured = providerConfig[id]
+          providers[id] = projectHostedNeutralModels(info, (base) =>
+            !configured?.blacklist?.includes(base) &&
+            (!configured?.whitelist || configured.whitelist.includes(base)),
+          )
+        }
 
         let accountSnapshot = accountSnapshots.get(directoryKey)
         if (isT3CodeCompatibilityProfile()) {
@@ -283,6 +293,18 @@ const layer = Layer.effect(
         if (isT3CodeCompatibilityProfile() && accountSnapshot?.rows.length) {
           const projection = projectT3CodeAccountModels(providers, accountSnapshot.rows)
           Object.assign(providers, projection.providers)
+          // Account capability projection may have introduced the only
+          // qualified rows after the baseline catalog normalization. Keep the
+          // final client-visible catalog subject to the exact same neutral
+          // witness and model restrictions. Non-hosted account aliases remain
+          // untouched; this does not modify the canonical provider store.
+          for (const [id, info] of Object.entries(providers)) {
+            const configured = providerConfig[id]
+            providers[id] = projectHostedNeutralModels(info, (base) =>
+              !configured?.blacklist?.includes(base) &&
+              (!configured?.whitelist || configured.whitelist.includes(base)),
+            )
+          }
           compatibilityConnected = projection.connected
         }
 

@@ -1,7 +1,7 @@
 export * as UsageCache from "./usage-cache"
 
 import { createHash } from "node:crypto"
-import { Effect } from "effect"
+import { Deferred, Effect, Exit } from "effect"
 
 /**
  * Fork-owned, process-global usage caches for the OpenCode Go usage arc.
@@ -172,15 +172,38 @@ export function createLocalUsageCache(options: { readonly now?: () => number; re
   const now = options.now ?? Date.now
   const ttlMs = options.ttlMs ?? LOCAL_TTL_MS
   let cached: { generation: number; at: number; value: unknown } | undefined
+  let inFlight: { deferred: Deferred.Deferred<unknown> } | undefined
 
   return {
     get: Effect.fn("LocalUsageCache.get")(function* (compute) {
       const gen = usageCacheGeneration()
       const at = now()
       if (cached && cached.generation === gen && at - cached.at < ttlMs) return cached.value as never
-      const value = yield* compute()
-      cached = { generation: gen, at, value }
-      return value
+      // A multi-minute SQLite history query must have exactly one process-global
+      // producer, even when 100 windows query usage at once. Credential/message
+      // generation invalidation must not fork a second scan while the previous
+      // scan is still running. A request abort must not cancel other readers.
+      const current = yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (inFlight) return inFlight
+          const flight = { deferred: yield* Deferred.make<unknown>() }
+          inFlight = flight
+          yield* Effect.suspend(compute).pipe(
+            Effect.exit,
+            Effect.flatMap((exit) =>
+              Effect.gen(function* () {
+                if (Exit.isSuccess(exit) && usageCacheGeneration() === gen) {
+                  cached = { generation: gen, at: now(), value: exit.value }
+                }
+                if (inFlight === flight) inFlight = undefined
+                yield* Deferred.done(flight.deferred, exit)
+              })),
+            Effect.forkDetach,
+          )
+          return flight
+        }),
+      )
+      return (yield* Deferred.await(current.deferred)) as never
     }),
   }
 }

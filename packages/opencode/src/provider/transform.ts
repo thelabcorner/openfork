@@ -465,6 +465,43 @@ function mapProviderOptions(
 export function message(msgs: ModelMessage[], model: Provider.Model, options: Record<string, unknown>) {
   msgs = unsupportedParts(msgs, model)
   msgs = normalizeMessages(msgs, model, options)
+  // Hosted Muse encrypted reasoning is bound to an upstream caller. The Zen/Go
+  // gateway can serve consecutive turns through different callers, and replay
+  // then fails with an opaque 400 (or a caller-mismatch validation error).
+  // Only omit prior provider-private reasoning on the outgoing hosted request;
+  // keep canonical history, visible replies, tool calls and results untouched.
+  if (options.store !== true && isMuseModel(model) && (model.providerID === "opencode" || model.providerID === "opencode-go")) {
+    msgs = msgs.flatMap((msg) => {
+      if (msg.role !== "assistant" || !Array.isArray(msg.content)) return [msg]
+      const content = msg.content.filter((part) => part.type !== "reasoning")
+      if (content.length === 0) return []
+      const firstCall = content.findIndex((part) => part.type === "tool-call")
+      if (firstCall < 0) return content.length === msg.content.length ? [msg] : [{ ...msg, content }]
+      const trailingText = content.slice(firstCall + 1).some((part) => part.type === "text")
+      const unphasedText = content.some((part) => part.type === "text" && part.providerOptions?.openai?.phase !== "commentary")
+      if (!trailingText && !unphasedText)
+        return content.length === msg.content.length ? [msg] : [{ ...msg, content }]
+      // Meta Responses rejects intermediate assistant text replayed as a final answer.
+      // Normalize the provider-visible order only: commentary comes before its calls.
+      const commentary = (part: (typeof content)[number]) => {
+        if (part.type !== "text") return part
+        const opts = part.providerOptions ?? {}
+        const openai = opts.openai ?? {}
+        if (openai.phase === "commentary") return part
+        return { ...part, providerOptions: { ...opts, openai: { ...openai, phase: "commentary" } } }
+      }
+      const before = content.slice(0, firstCall).map(commentary)
+      const after = content.slice(firstCall)
+      return [{
+        ...msg,
+        content: [
+          ...before,
+          ...after.filter((part) => part.type === "text").map(commentary),
+          ...after.filter((part) => part.type !== "text"),
+        ],
+      }]
+    })
+  }
   const usesAnthropicAutomaticCaching =
     options.cacheControl !== undefined &&
     (model.api.npm === "@ai-sdk/anthropic" || model.api.npm === "@ai-sdk/google-vertex/anthropic")
@@ -1419,15 +1456,41 @@ const SLUG_OVERRIDES: Record<string, string> = {
 }
 
 export function providerOptions(model: Provider.Model, options: { [x: string]: any }) {
+  // The hosted Go/Zen Muse Spark gateway advertises "max", but actually
+  // rejects reasoning.effort=max with a generic 400. Agent-level options may
+  // reintroduce max even after models.dev corrects advertised variants.
+  // xhigh is accepted by the same endpoint; guard only the affected route.
+  const museMaxBug =
+    (model.providerID === "opencode" || model.providerID === "opencode-go") &&
+    model.api.npm === "@ai-sdk/openai" &&
+    /(?:^|\/)muse-spark[-.][\w.-]*(?:contributor|free)/i.test(model.api.id) &&
+    options.reasoningEffort === "max"
+  const hostedStatelessMuse =
+    (model.providerID === "opencode" || model.providerID === "opencode-go") &&
+    model.api.npm === "@ai-sdk/openai" &&
+    isMuseModel(model) &&
+    options.store !== true
+  // Requesting private encrypted reasoning is unnecessary when the hosted
+  // gateway cannot replay it safely across workers. Avoid generating the
+  // caller-bound blobs in the first place while preserving unrelated includes.
+  const withoutEncryptedReasoning = hostedStatelessMuse && Array.isArray(options.include)
+    ? (() => {
+        const include = options.include.filter((value: unknown) => value !== "reasoning.encrypted_content")
+        if (include.length === options.include.length) return options
+        const { include: _include, ...rest } = options
+        return include.length ? { ...rest, include } : rest
+      })()
+    : options
+  const effective = museMaxBug ? { ...withoutEncryptedReasoning, reasoningEffort: "xhigh" } : withoutEncryptedReasoning
   const usesOpenAIReasoningGate =
     model.api.npm === "@ai-sdk/openai" ||
     model.api.npm === "@ai-sdk/azure" ||
     model.api.npm === "@ai-sdk/amazon-bedrock/mantle"
   const normalized =
     usesOpenAIReasoningGate &&
-    (model.capabilities.reasoning || options.reasoningEffort !== undefined || options.reasoningSummary !== undefined)
-      ? { ...options, forceReasoning: true }
-      : anthropicBlockBinding(model, options)
+    (model.capabilities.reasoning || effective.reasoningEffort !== undefined || effective.reasoningSummary !== undefined)
+      ? { ...effective, forceReasoning: true }
+      : anthropicBlockBinding(model, effective)
 
   if (model.api.npm === "@ai-sdk/gateway") {
     // Gateway providerOptions are split across two namespaces:
@@ -1486,6 +1549,93 @@ type JsonRecord = Record<string, unknown>
 
 function isPlainObject(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+export function isMuseModel(model: Pick<Provider.Model, "api">) {
+  return /(?:^|\/)muse-(?:spark|glimmer)/i.test(model.api.id)
+}
+
+/**
+ * Meta's Muse Responses endpoint rejects recursive $refs and JSON Schemas
+ * nested beyond ten levels. Lower ONLY the provider-visible schema: the
+ * original tool/Zod validator remains authoritative at execution time.
+ *
+ * Inlining local references preserves more information than simply deleting
+ * $defs. Once the wire budget is reached, a subtree is represented by an
+ * unconstrained node of the same type rather than by misleading required
+ * fields or an invalid dangling $ref.
+ */
+function sanitizeMuseSchema(schema: JSONSchema7): JSONSchema7 {
+  const MAX_DEPTH = 9 // Root is level 0; Meta accepts at most ten levels.
+  const structural = new Set(["properties", "patternProperties", "additionalProperties", "items", "contains", "not", "if", "then", "else"])
+  const combinations = new Set(["anyOf", "oneOf", "allOf", "prefixItems"])
+
+  function reference(ref: string): unknown {
+    if (!ref.startsWith("#/")) return undefined
+    let current: unknown = schema
+    for (const segment of ref.slice(2).split("/")) {
+      const key = segment.replaceAll("~1", "/").replaceAll("~0", "~")
+      if (!isPlainObject(current) || !Object.hasOwn(current, key)) return undefined
+      current = current[key]
+    }
+    return current
+  }
+
+  function relaxed(node: JsonRecord): JsonRecord {
+    const type = node.type
+    const result: JsonRecord = {}
+    if (typeof type === "string" || Array.isArray(type)) result.type = type
+    else if ("properties" in node || "required" in node) result.type = "object"
+    else if ("items" in node) result.type = "array"
+    if (result.type === "object") result.additionalProperties = true
+    if (typeof node.description === "string") result.description = node.description
+    return result
+  }
+
+  function lower(value: unknown, depth: number, active: ReadonlySet<string>): unknown {
+    if (typeof value === "boolean") return value ? {} : { not: {} }
+    if (!isPlainObject(value)) return value
+    let node = value
+    if (typeof node.$ref === "string") {
+      const target = reference(node.$ref)
+      if (!isPlainObject(target) || active.has(node.$ref)) return relaxed(node)
+      const next = new Set(active)
+      next.add(node.$ref)
+      const siblings = Object.fromEntries(Object.entries(node).filter(([key]) => key !== "$ref"))
+      return lower({ ...target, ...siblings }, depth, next)
+    }
+    if (depth >= MAX_DEPTH) {
+      // Preserve primitive constraints; relax only branches requiring children.
+      const result = Object.fromEntries(
+        Object.entries(node).filter(([key]) => !structural.has(key) && !combinations.has(key) && !["$defs", "definitions", "required"].includes(key)),
+      )
+      if (result.type === "object" || "properties" in node) result.additionalProperties = true
+      return result
+    }
+    const result: JsonRecord = {}
+    for (const [key, item] of Object.entries(node)) {
+      if (key === "$defs" || key === "definitions") continue
+      if (key === "required") {
+        if (Array.isArray(item)) result.required = item
+        continue
+      }
+      if ((key === "properties" || key === "patternProperties") && isPlainObject(item)) {
+        result[key] = Object.fromEntries(Object.entries(item).map(([name, child]) => [name, lower(child, depth + 1, active)]))
+      } else if (combinations.has(key) && Array.isArray(item)) {
+        result[key] = item.map((child) => lower(child, depth + 1, active))
+      } else if (structural.has(key) && (isPlainObject(item) || typeof item === "boolean")) {
+        result[key] = lower(item, depth + 1, active)
+      } else {
+        result[key] = item
+      }
+    }
+    if (Array.isArray(result.required)) {
+      const properties = isPlainObject(result.properties) ? result.properties : {}
+      result.required = result.required.filter((name) => typeof name === "string" && Object.hasOwn(properties, name))
+    }
+    return result
+  }
+  return lower(schema, 0, new Set()) as JSONSchema7
 }
 
 // Mirrors Codex's Rust JSON schema compatibility lowering for OpenAI tool schemas.
@@ -1595,6 +1745,8 @@ export function schema(model: Provider.Model, schema: JSONSchema7): JSONSchema7 
     schema = sanitizeOpenAISchema(schema) as JSONSchema7
     // Codex also applies lossy compaction above 4 KB; defer that until OpenCode needs the same schema budget.
   }
+
+  if (isMuseModel(model)) schema = sanitizeMuseSchema(schema)
 
   if (model.providerID === "moonshotai" || model.api.id.toLowerCase().includes("kimi")) {
     const sanitizeMoonshot = (obj: unknown): unknown => {
