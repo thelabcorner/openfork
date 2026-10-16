@@ -128,6 +128,7 @@ export class ToolRuntimeError extends Error {
       | "InvalidToolInput"
       | "InvalidToolOutput"
       | "InvalidDataValue"
+      | "LimitExceeded"
       | "ToolCallLimitExceeded",
     message: string,
     readonly suggestions: ReadonlyArray<string> = [],
@@ -178,6 +179,65 @@ const blockedMemberNames = new Set(["__proto__", "constructor", "prototype"])
 export const isBlockedMember = (name: string): boolean => blockedMemberNames.has(name)
 
 /**
+ * Mutable root-scoped admission budget for host tool results entering the sandbox.
+ *
+ * The runtime owns only the mechanism; hosts choose the numeric limits. Aggregate
+ * usage is monotonic and is charged only after a leaf value has been copied
+ * successfully.
+ */
+export type CodeExecutionBudget = {
+  readonly maxLeafBytes: number
+  remainingAggregateBytes: number
+}
+
+type LeafBudget = {
+  readonly root: CodeExecutionBudget
+  bytes: number
+}
+
+const jsonStringByteLength = (value: string): number => {
+  let bytes = 2
+  for (const char of value) {
+    const codePoint = char.codePointAt(0)!
+    if (codePoint === 0x22 || codePoint === 0x5c) {
+      bytes += 2
+      continue
+    }
+    if (codePoint <= 0x1f) {
+      bytes += 6
+      continue
+    }
+    bytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4
+  }
+  return bytes
+}
+
+const primitiveByteLength = (value: null | undefined | string | boolean | number): number => {
+  if (value === null || value === undefined) return 4
+  if (typeof value === "string") return jsonStringByteLength(value)
+  if (typeof value === "boolean") return value ? 4 : 5
+  return (JSON.stringify(value) ?? "null").length
+}
+
+const charge = (budget: LeafBudget | undefined, bytes: number, label: string) => {
+  if (!budget || bytes <= 0) return
+  const next = budget.bytes + bytes
+  if (next > budget.root.maxLeafBytes) {
+    throw new ToolRuntimeError(
+      "LimitExceeded",
+      `${label} exceeds the ${budget.root.maxLeafBytes}-byte intermediate leaf limit.`,
+    )
+  }
+  if (next > budget.root.remainingAggregateBytes) {
+    throw new ToolRuntimeError(
+      "LimitExceeded",
+      `${label} exceeds the remaining ${budget.root.remainingAggregateBytes}-byte intermediate aggregate budget.`,
+    )
+  }
+  budget.bytes = next
+}
+
+/**
  * Validates and copies a value against the plain-data contract (depth, circularity, plain
  * objects only, blocked properties, data-only leaves).
  *
@@ -192,8 +252,17 @@ export const isBlockedMember = (name: string): boolean => blockedMemberNames.has
  *
  * Both modes reject un-awaited promises with an await-hinting diagnostic.
  */
-export const copyIn = (value: unknown, label: string, preserveSandboxValues = false): unknown =>
-  copyBounded(value, label, 0, new Set(), preserveSandboxValues)
+export const copyIn = (
+  value: unknown,
+  label: string,
+  preserveSandboxValues = false,
+  rootBudget?: CodeExecutionBudget,
+): unknown => {
+  const budget = rootBudget ? { root: rootBudget, bytes: 0 } satisfies LeafBudget : undefined
+  const copied = copyBounded(value, label, 0, new Set(), preserveSandboxValues, budget)
+  if (budget) rootBudget!.remainingAggregateBytes -= budget.bytes
+  return copied
+}
 
 const copyBounded = (
   value: unknown,
@@ -201,6 +270,7 @@ const copyBounded = (
   depth: number,
   seen: Set<object>,
   preserveSandboxValues: boolean,
+  budget?: LeafBudget,
 ): unknown => {
   if (depth > MAX_VALUE_DEPTH) {
     throw new ToolRuntimeError("InvalidDataValue", `${label} exceeds the maximum value depth of ${MAX_VALUE_DEPTH}.`)
@@ -216,6 +286,7 @@ const copyBounded = (
     // JSON.stringify already does at any tool boundary.
     typeof value === "number"
   ) {
+    charge(budget, primitiveByteLength(value), label)
     return value
   }
 
@@ -253,13 +324,16 @@ const copyBounded = (
     if (value instanceof Map) {
       const wrapped = new SandboxMap()
       for (const [key, item] of value.entries()) {
-        wrapped.map.set(copyBounded(key, label, depth + 1, seen, true), copyBounded(item, label, depth + 1, seen, true))
+        wrapped.map.set(
+          copyBounded(key, label, depth + 1, seen, true, budget),
+          copyBounded(item, label, depth + 1, seen, true, budget),
+        )
       }
       return wrapped
     }
     if (value instanceof Set) {
       const wrapped = new SandboxSet()
-      for (const item of value.values()) wrapped.set.add(copyBounded(item, label, depth + 1, seen, true))
+      for (const item of value.values()) wrapped.set.add(copyBounded(item, label, depth + 1, seen, true, budget))
       return wrapped
     }
     if (value instanceof URL) return new SandboxURL(new URL(value.href))
@@ -270,13 +344,23 @@ const copyBounded = (
   // return) serialize exactly as JSON.stringify would at the data boundary: Date/URL use
   // toJSON(), while RegExp/Map/Set/URLSearchParams have no JSON form beyond {}.
   if (value instanceof SandboxDate) {
-    return Number.isFinite(value.time) ? new Date(value.time).toISOString() : null
+    const copied = Number.isFinite(value.time) ? new Date(value.time).toISOString() : null
+    charge(budget, primitiveByteLength(copied), label)
+    return copied
   }
   if (value instanceof Date) {
-    return Number.isFinite(value.getTime()) ? value.toISOString() : null
+    const copied = Number.isFinite(value.getTime()) ? value.toISOString() : null
+    charge(budget, primitiveByteLength(copied), label)
+    return copied
   }
-  if (value instanceof SandboxURL) return value.url.href
-  if (value instanceof URL) return value.href
+  if (value instanceof SandboxURL) {
+    charge(budget, primitiveByteLength(value.url.href), label)
+    return value.url.href
+  }
+  if (value instanceof URL) {
+    charge(budget, primitiveByteLength(value.href), label)
+    return value.href
+  }
   if (
     value instanceof SandboxRegExp ||
     value instanceof SandboxMap ||
@@ -287,6 +371,7 @@ const copyBounded = (
     value instanceof Set ||
     value instanceof URLSearchParams
   ) {
+    charge(budget, 2, label)
     return Object.create(null) as SafeObject
   }
 
@@ -297,7 +382,11 @@ const copyBounded = (
   seen.add(value)
 
   if (Array.isArray(value)) {
-    const copied = value.map((item) => copyBounded(item, label, depth + 1, seen, preserveSandboxValues))
+    charge(budget, 2, label)
+    const copied = value.map((item, index) => {
+      if (index > 0) charge(budget, 1, label)
+      return copyBounded(item, label, depth + 1, seen, preserveSandboxValues, budget)
+    })
     seen.delete(value)
     return copied
   }
@@ -308,11 +397,15 @@ const copyBounded = (
   }
 
   const copied: SafeObject = Object.create(null) as SafeObject
+  charge(budget, 2, label)
+  let index = 0
   for (const [key, item] of Object.entries(value)) {
     if (isBlockedMember(key)) {
       throw new ToolRuntimeError("InvalidDataValue", `${label} contains blocked property '${key}'.`)
     }
-    copied[key] = copyBounded(item, label, depth + 1, seen, preserveSandboxValues)
+    if (index++ > 0) charge(budget, 1, label)
+    charge(budget, jsonStringByteLength(key) + 1, label)
+    copied[key] = copyBounded(item, label, depth + 1, seen, preserveSandboxValues, budget)
   }
   seen.delete(value)
   return copied
@@ -721,10 +814,13 @@ const resolve = <R>(tools: HostTools<R>, path: ReadonlyArray<string>): HostTool<
   return value
 }
 
+export type HostCall<R = never> = (ref: string, input: unknown) => Effect.Effect<unknown, unknown, R>
+
 export type ToolRuntime<R = never> = {
   readonly root: ToolReference
   readonly calls: Array<ToolCall>
   readonly invoke: (path: ReadonlyArray<string>, args: Array<unknown>) => Effect.Effect<unknown, unknown, R>
+  readonly callHost?: (ref: string, input: unknown) => Effect.Effect<unknown, unknown, R>
   /** Enumerable namespace/tool names at one node of the callable tool tree; see `namespaceKeys`. */
   readonly keys: (path: ReadonlyArray<string>) => ReadonlyArray<string>
 }
@@ -735,6 +831,8 @@ export const make = <R>(
   maxToolCalls: number | undefined,
   searchIndex: ReadonlyArray<SearchEntry>,
   hooks?: ToolCallHooks<R>,
+  externalDataBudget?: CodeExecutionBudget,
+  hostCall?: HostCall<R>,
 ): ToolRuntime<R> => {
   const calls: Array<ToolCall> = []
   const callableTools = {
@@ -765,8 +863,11 @@ export const make = <R>(
 
   const decodeOutput = (value: unknown, name: string) =>
     Effect.try({
-      try: () => copyIn(value, `Result from tool '${name}'`),
-      catch: () => new ToolRuntimeError("InvalidToolOutput", `Invalid output from tool '${name}'.`),
+      try: () => copyIn(value, `Result from tool '${name}'`, false, externalDataBudget),
+      catch: (cause) =>
+        cause instanceof ToolRuntimeError && cause.kind === "LimitExceeded"
+          ? cause
+          : new ToolRuntimeError("InvalidToolOutput", `Invalid output from tool '${name}'.`),
     })
 
   const recordCall = (call: ToolCall): void => {
@@ -776,10 +877,30 @@ export const make = <R>(
     calls.push(call)
   }
 
+  const callHost = hostCall
+    ? (ref: string, input: unknown) =>
+        Effect.gen(function* () {
+          const externalInput = copyOut(copyIn(input, `Input for capability '${ref}'`))
+          const call = { name: ref }
+          const index = yield* Effect.sync(() => {
+            recordCall(call)
+            return calls.length - 1
+          }).pipe(Effect.tap((callIndex) => hooks?.onToolCallStart?.({ index: callIndex, name: ref, input: externalInput }) ?? Effect.void))
+          return yield* observeEnd(
+            Effect.gen(function* () {
+              const raw = yield* runHost(Effect.suspend(() => hostCall(ref, externalInput)))
+              return yield* decodeOutput(raw, ref)
+            }),
+            { index, name: ref, input: externalInput },
+          )
+        })
+    : undefined
+
   return {
     root: new ToolReference([]),
     calls,
     keys: (path) => namespaceKeys(callableTools, path),
+    ...(callHost ? { callHost } : {}),
     invoke: (path, args) =>
       Effect.gen(function* () {
         const name = path.join(".")

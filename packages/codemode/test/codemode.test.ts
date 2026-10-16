@@ -404,6 +404,205 @@ describe("CodeMode output budget", () => {
   })
 })
 
+describe("CodeMode intermediate data budget", () => {
+  const sized = Tool.make({
+    description: "Return a string of the requested size",
+    input: Schema.Struct({ size: Schema.Number }),
+    output: Schema.String,
+    run: ({ size }) => Effect.succeed("x".repeat(size)),
+  })
+
+  test("fails an oversized host result before it enters the sandbox", async () => {
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        tools: { host: { sized } },
+        code: `return await tools.host.sized({ size: 20 })`,
+        limits: { maxIntermediateLeafBytes: 10, maxIntermediateAggregateBytes: 100 },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe("LimitExceeded")
+    expect(result.error.message).toContain("10-byte intermediate leaf limit")
+  })
+
+  test("fails when individually valid leaves exhaust the root aggregate budget", async () => {
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        tools: { host: { sized } },
+        code: `
+          await tools.host.sized({ size: 4 })
+          return await tools.host.sized({ size: 4 })
+        `,
+        limits: { maxIntermediateLeafBytes: 10, maxIntermediateAggregateBytes: 11 },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe("LimitExceeded")
+    expect(result.error.message).toContain("remaining 5-byte intermediate aggregate budget")
+  })
+
+  test("does not charge aggregate budget for a rejected leaf copy", async () => {
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        tools: { host: { sized } },
+        code: `
+          try {
+            await tools.host.sized({ size: 20 })
+          } catch {}
+          return await tools.host.sized({ size: 4 })
+        `,
+        limits: { maxIntermediateLeafBytes: 10, maxIntermediateAggregateBytes: 6 },
+      }),
+    )
+
+    expect(result).toStrictEqual({
+      ok: true,
+      value: "xxxx",
+      toolCalls: [{ name: "host.sized" }, { name: "host.sized" }],
+    })
+  })
+})
+
+describe("CodeMode same-process safety limits", () => {
+  test("operation fuel stops a tight synchronous loop", async () => {
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        code: `
+          let i = 0
+          while (true) i++
+        `,
+        limits: { maxOperations: 50 },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe("LimitExceeded")
+    expect(result.error.message).toContain("operation budget")
+  })
+
+  test("String.repeat fails before materializing an oversized result", async () => {
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        code: `return "abcd".repeat(1000)`,
+        limits: { maxStringBytes: 32 },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.kind).toBe("LimitExceeded")
+    expect(result.error.message).toContain("String.repeat result")
+  })
+
+  test("binary and template concatenation respect the string budget", async () => {
+    for (const code of [`return "abcdefgh" + "ijklmnop"`, `return \`abcdefgh${"ijklmnop"}\``]) {
+      const result = await Effect.runPromise(CodeMode.execute({ code, limits: { maxStringBytes: 12 } }))
+      expect(result.ok).toBe(false)
+      if (result.ok) continue
+      expect(result.error.kind).toBe("LimitExceeded")
+    }
+  })
+
+  test("array growth and sparse assignment fail before exceeding the collection budget", async () => {
+    const programs = [
+      `const items = []; items.push(1, 2, 3); return items`,
+      `const items = []; items[100] = 1; return items.length`,
+      `return [1, 2, 3]`,
+    ]
+    for (const code of programs) {
+      const result = await Effect.runPromise(CodeMode.execute({ code, limits: { maxCollectionEntries: 2 } }))
+      expect(result.ok).toBe(false)
+      if (result.ok) continue
+      expect(result.error.kind).toBe("LimitExceeded")
+      expect(result.error.message).toContain("Array")
+    }
+  })
+
+  test("Map and Set growth count only new entries", async () => {
+    const map = await Effect.runPromise(
+      CodeMode.execute({
+        code: `
+          const m = new Map()
+          m.set("a", 1)
+          m.set("a", 2)
+          m.set("b", 3)
+          m.set("c", 4)
+          return m.size
+        `,
+        limits: { maxCollectionEntries: 2 },
+      }),
+    )
+    expect(map.ok).toBe(false)
+    if (!map.ok) expect(map.error.kind).toBe("LimitExceeded")
+
+    const set = await Effect.runPromise(
+      CodeMode.execute({
+        code: `
+          const s = new Set()
+          s.add("a")
+          s.add("a")
+          s.add("b")
+          return s.size
+        `,
+        limits: { maxCollectionEntries: 2 },
+      }),
+    )
+    expect(set.ok).toBe(true)
+    if (set.ok) expect(set.value).toBe(2)
+  })
+
+  test("maxConcurrency bounds eagerly running tool calls", async () => {
+    let active = 0
+    let peak = 0
+    const gate = Tool.make({
+      description: "Track concurrent calls",
+      input: Schema.Struct({ id: Schema.Number }),
+      output: Schema.Number,
+      run: ({ id }) =>
+        Effect.acquireUseRelease(
+          Effect.sync(() => {
+            active += 1
+            peak = Math.max(peak, active)
+          }),
+          () => Effect.sleep("10 millis").pipe(Effect.as(id)),
+          () =>
+            Effect.sync(() => {
+              active -= 1
+            }),
+        ),
+    })
+
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        tools: { gate },
+        code: `return await Promise.all([0,1,2,3,4,5].map((id) => tools.gate({ id })))`,
+        limits: { maxConcurrency: 2 },
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(peak).toBeLessThanOrEqual(2)
+  })
+
+  test("omitted same-process limits preserve existing behavior", async () => {
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        code: `
+          const values = []
+          for (let i = 0; i < 100; i++) values.push("x".repeat(100))
+          return values.length
+        `,
+      }),
+    )
+    expect(result).toStrictEqual({ ok: true, value: 100, toolCalls: [] })
+  })
+})
+
 describe("CodeMode schema flexibility", () => {
   test("accepts render-only JSON Schema input and omitted output", async () => {
     const observed: Array<unknown> = []
@@ -480,6 +679,95 @@ describe("CodeMode schema flexibility", () => {
     const result = await Effect.runPromise(runtime.execute(`return await tools.net.ping({ host: "example.test" })`))
     expect(result.ok).toBe(true)
     if (result.ok) expect(result.value).toBe("pong")
+  })
+})
+
+describe("CodeMode host globals", () => {
+  test("exposes immutable input and the host-mediated call(ref, input) bridge", async () => {
+    const seen: Array<[string, unknown]> = []
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        code: `
+          const value = await call("native:echo", { value: input.value })
+          return { input: input.value, value }
+        `,
+        input: { value: 42 },
+        call: (ref, input) =>
+          Effect.sync(() => {
+            seen.push([ref, input])
+            return { echoed: (input as { value: number }).value }
+          }),
+      }),
+    )
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { input: 42, value: { echoed: 42 } },
+      toolCalls: [{ name: "native:echo" }],
+    })
+    expect(seen).toEqual([["native:echo", { value: 42 }]])
+  })
+
+  test("host call shares the ordinary tool-call budget", async () => {
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        code: `
+          await call("native:one", {})
+          await call("native:two", {})
+          return "done"
+        `,
+        call: () => Effect.succeed("ok"),
+        limits: { maxToolCalls: 1 },
+      }),
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error.kind).toBe("ToolCallLimitExceeded")
+  })
+
+  test("host call failures remain catchable inside the program", async () => {
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        code: `
+          try {
+            await call("native:boom", {})
+          } catch (error) {
+            return error.message
+          }
+        `,
+        call: () => Effect.fail(toolError("denied by host")),
+      }),
+    )
+
+    expect(result).toMatchObject({ ok: true, value: "denied by host" })
+  })
+
+  test("host call obeys the same maxConcurrency semaphore as tools", async () => {
+    let active = 0
+    let peak = 0
+    const result = await Effect.runPromise(
+      CodeMode.execute({
+        code: `
+          return await Promise.all([
+            call("native:a", {}),
+            call("native:b", {}),
+            call("native:c", {}),
+          ])
+        `,
+        call: (ref) =>
+          Effect.gen(function* () {
+            active += 1
+            peak = Math.max(peak, active)
+            yield* Effect.sleep(10)
+            active -= 1
+            return ref
+          }),
+        limits: { maxConcurrency: 1 },
+      }),
+    )
+
+    expect(result.ok).toBe(true)
+    expect(peak).toBe(1)
   })
 })
 
@@ -1088,6 +1376,22 @@ describe("CodeMode public contract", () => {
     )
     expect(() => CodeMode.execute({ code: "return 1", limits: { maxToolCalls: -1 } })).toThrow(RangeError)
     expect(() => CodeMode.execute({ code: "return 1", limits: { maxOutputBytes: -1 } })).toThrow(RangeError)
+    expect(() =>
+      CodeMode.execute({ code: "return 1", limits: { maxIntermediateLeafBytes: 10 } }),
+    ).toThrow(RangeError)
+    expect(() =>
+      CodeMode.execute({ code: "return 1", limits: { maxIntermediateAggregateBytes: 10 } }),
+    ).toThrow(RangeError)
+    expect(() =>
+      CodeMode.execute({
+        code: "return 1",
+        limits: { maxIntermediateLeafBytes: -1, maxIntermediateAggregateBytes: 10 },
+      }),
+    ).toThrow(RangeError)
+    expect(() => CodeMode.execute({ code: "return 1", limits: { maxOperations: -1 } })).toThrow(RangeError)
+    expect(() => CodeMode.execute({ code: "return 1", limits: { maxStringBytes: -1 } })).toThrow(RangeError)
+    expect(() => CodeMode.execute({ code: "return 1", limits: { maxCollectionEntries: -1 } })).toThrow(RangeError)
+    expect(() => CodeMode.execute({ code: "return 1", limits: { maxConcurrency: 0 } })).toThrow(RangeError)
 
     expect(() => CodeMode.make({ tools, discovery: { catalogBudget: -1 } })).toThrow(RangeError)
 

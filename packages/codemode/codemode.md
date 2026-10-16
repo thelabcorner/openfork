@@ -1,176 +1,109 @@
-# CodeMode Design and Status
+# CodeMode Engine Design and Status
 
-This is the living design and status document for `@opencode-ai/codemode` and its existing V2 OpenCode adapter.
-It records current behavior, intentional boundaries, durable rationale, and material remaining work.
+`@opencode-ai/codemode` is OpenFork's host-neutral confined JavaScript/TypeScript orchestration engine. It is **not** the provider-visible OpenFork tool contract.
 
-Completed implementation history, branch names, test counts, and closed findings belong in git, not here. Remove
-completed work instead of preserving checked-off chronology.
+The OpenFork product integration is documented in [`docs/architecture/code-mode.md`](../../docs/architecture/code-mode.md). That host layer owns the static `code` tool with `search | describe | run | save | call`, durable ToolPart-backed runs, saved-tool revisions, permissions, tracing, replay, and capability discovery.
 
-Detailed package API documentation lives in [README.md](./README.md). OpenAPI-specific follow-ups live in
-[src/openapi/TODO.md](./src/openapi/TODO.md).
+Detailed package API documentation lives in [README.md](./README.md). OpenAPI-specific follow-ups live in [src/openapi/TODO.md](./src/openapi/TODO.md).
 
-## How CodeMode Works
+## Purpose
 
-### Purpose
+CodeMode executes a bounded orchestration program inside an owned tree-walking interpreter. A host may expose either an explicit schema-described tool tree, a host-mediated `call(ref, input)` bridge, or both. Programs can sequence dependent work, fan out independent calls, branch, filter, aggregate, and return only the data the model needs.
 
-CodeMode gives a model one `execute` tool backed by a confined JavaScript interpreter. Inside the program, the model
-can call an explicit tree of schema-described tools, sequence dependent work, run independent calls concurrently,
-and filter or aggregate results before returning them to the agent loop.
+The engine is designed to:
 
-The goals are:
+- keep large intermediate values out of model context;
+- avoid agent round-trips between every dependent call;
+- expose only host-supplied authority;
+- support deterministic resource budgets and cancellation;
+- permit reusable prepared programs without retaining host authority or warm runtime state.
 
-- Reduce model context consumed by large tool catalogs.
-- Avoid an agent round-trip between every dependent tool call.
-- Keep large intermediate results inside the program instead of sending them through model context.
-- Give generated code only the authority explicitly supplied by the host.
+CodeMode is an orchestration language, not a general JavaScript runtime or an authorization system.
 
-CodeMode is an orchestration language, not a general JavaScript runtime or an application authorization system.
+## Runtime
 
-### Runtime
+1. TypeScript syntax is transpiled away and Acorn parses the resulting JavaScript.
+2. An owned interpreter executes the supported subset without `eval` or ambient host globals.
+3. Program input, tool arguments, tool results, and final output cross bounded plain-data boundaries.
+4. Host calls return supervised sandbox promises; independent calls may run concurrently up to the configured budget.
+5. Expected parse/program/tool/limit failures return normalized `CodeMode.Result` diagnostics; host interruption remains Effect interruption.
+6. `CodeMode.prepare(source)` produces an authority-free `PreparedProgram`; `executePrepared(...)` reuses parse/transpile work with fresh input, host calls, limits, and runtime state.
+7. `PREPARED_PROGRAM_ABI` versions the prepared-program representation so host caches can invalidate safely when parser/runtime semantics change.
 
-The generic runtime lives in `packages/codemode` and is host-neutral:
+## Host call surfaces
 
-1. The host builds a tree of `Tool.make(...)` definitions and calls `CodeMode.make(...)` or `CodeMode.execute(...)`.
-2. CodeMode generates model instructions, a budgeted inline catalog, and the internal `$codemode.search` tool.
-3. TypeScript syntax is transpiled away, Acorn parses the resulting JavaScript, and an owned tree-walking interpreter
-   executes it without `eval`.
-4. Tool inputs and outputs cross schema and plain-data boundaries before they become visible on either side.
-5. Execution returns `CodeMode.Result`. Expected program and tool failures are diagnostic data; host interruption
-   remains Effect interruption.
+### Explicit tool tree
 
-Effect Schemas validate and transform tool inputs and outputs. JSON Schemas render model-facing signatures but do not
-validate values; adapter-provided values still cross the plain-data boundary. A tool without an output schema is
-advertised as `Promise<unknown>`.
+A host may pass `tools` built from `Tool.make(...)`. CodeMode can render a bounded inline catalog and internal search index for that generic engine API. This is useful for embedders that want the engine itself to own progressive disclosure.
 
-### Discovery and model workflow
+### Host-mediated capability bridge
 
-The model sees a token-budgeted catalog. Every namespace remains visible, and complete signatures are selected
-round-robin across namespaces so one large namespace cannot starve the others. `$codemode.search` is always callable
-and is advertised when the inline catalog is partial.
+A host may instead provide `call(ref, input)`. The generated program sees only the opaque host-issued ref plus structured input; resolution, authorization, mutation ownership, cancellation, tracing, and persistence remain host responsibilities.
 
-The intended workflow is:
+OpenFork's production `code` tool uses this bridge. Provider-level discovery happens through `code.search` and exact inspection through `code.describe`; the runtime surface stays intentionally smaller: `input` plus `call(ref, input)`.
 
-1. Pick an exact signature from the inline catalog, or return `$codemode.search(...)` results and use a selected path
-   in the next execution.
-2. Call the exact returned path without guessing or normalizing segments.
-3. Narrow `Promise<unknown>` results before reading fields.
-4. Start independent calls together and await them with `Promise.all`.
-5. Filter and aggregate inside the program, then return only the data needed by the model.
+## Execution budgets
 
-Search returns directly usable JavaScript paths, descriptions, and complete TypeScript signatures. It supports exact
-path lookup, namespace browsing, deterministic ranking, and pagination.
+Hosts choose limits. The engine supports bounded wall-clock time, tool-call count, model-facing output bytes, per-leaf and aggregate intermediate-data bytes, interpreter operations/fuel, string bytes, collection entries, and concurrent host calls.
 
-### Tool execution
+A host may pass one shared `ExecutionBudget` to multiple prepared executions. OpenFork uses this for nested saved-code frames so operation and intermediate-data limits remain root-scoped instead of resetting at every nested saved invocation.
 
-Calling a tool starts its Effect eagerly on a supervised fiber. The returned sandbox promise is run-once and can be
-awaited directly or through the supported `Promise` combinators. At most eight tool calls execute concurrently.
-Unfinished calls are drained before successful program completion, and an unhandled call failure becomes a diagnostic.
+## Data, files, and failures
 
-The public execution-policy knobs are `timeoutMs`, `maxToolCalls`, and `maxOutputBytes`. The package supplies no
-defaults because budgets are host policy. The interpreter also enforces fixed internal boundaries for tool-call
-concurrency and data nesting depth.
+Program-visible values are JSON-like bounded data. Runtime references and promises cannot escape. Unknown host defects are sanitized, while `ToolError` is the explicit safe-message channel.
 
-### Data, files, and failures
+Files and attachments remain outside sandbox value space. A host can collect them while leaves execute and project them once on the outer result.
 
-Program results and tool arguments are JSON-like data. Dates become ISO strings at host boundaries; RegExp, Map, and
-Set values become `{}` as they do under JSON serialization. Promise and runtime reference values cannot cross the
-boundary.
+## Authority boundary
 
-Unknown host failures and invalid outputs are sanitized. `ToolError` is the explicit channel for a safe message that a
-tool wants the model to see. Diagnostic categories distinguish parsing, unsupported syntax, unknown tools, invalid
-data, tool failures, limits, timeouts, and execution failures.
+CodeMode intentionally provides no ambient filesystem, process, environment, network, credential, module, package, or application access. There are no imports, dynamic imports, `eval`, npm packages, or host-process globals inside generated code.
 
-Files and other attachment content stay outside the interpreter. A host may collect them while child tools execute and
-attach them to the outer result, but the program receives only the structured tool output.
+Authorization is host-owned. The engine does not decide whether a capability may run, persist approval state, resolve credentials, or implement exactly-once external effects. OpenFork supplies those semantics through its capability inventory and invocation gateway.
 
-### V2 OpenCode adapter
+## OpenFork integration
 
-This section describes the `v2` branch integration. On `dev`, CodeMode is integrated through
-`packages/opencode/src/tool/code-mode.ts`, where nested MCP calls run the `tool.execute.before` and
-`tool.execute.after` plugin hooks.
+OpenFork's V1 production host owns the provider-visible `code` tool and uses CodeMode only as the confined compute engine. The host integration:
 
-CodeMode is integrated into V2 through `packages/core/src/tool/registry.ts` and
-`packages/core/src/tool/execute.ts`:
+- exposes one static cache-stable provider schema;
+- discovers native/lazy/MCP/MCP-resource/saved capabilities outside the sandbox;
+- executes every leaf through `CapabilityInvocationGateway`;
+- preserves permissions, plugin hooks, Snapshot ordering, cancellation, attachments, and root-scoped trace/budgets;
+- stores root state in the existing durable ToolPart;
+- supports fresh replay and revisioned filesystem-backed saved tools;
+- never treats the generic CodeMode inline catalog as provider authority.
 
-- Core has one canonical `Tool` representation. Location-scoped producers register direct or deferred tools through
-  `Tools.Service`.
-- Each model step snapshots effective registrations, applies catalog visibility filtering, and exposes direct tools
-  normally.
-- When visible deferred tools exist, Core reserves and materializes one `execute` tool. Grouped deferred tools become
-  CodeMode namespaces instead of flattened model-facing names.
-- Each nested call checks that its captured registration is still current before dispatching it.
-- Authorization and side-effect ordering remain responsibilities of the leaf tool. Catalog visibility is not execution
-  authorization.
-- Structured child output enters the interpreter. File parts are collected host-side and attached to the outer result.
-- Nested call statuses are returned as final `execute` metadata for the TUI.
-- `execute` is the one model-facing tool invocation. Nested calls reuse its invocation context and do not independently
-  run registry hooks or model-output bounding; this keeps complete intermediate structured values available for
-  in-program filtering. The outer `execute` settlement is the single model-output bounding boundary.
-- Core supplies no CodeMode timeout or tool-call limit. User cancellation interrupts the outer invocation and its
-  supervised children; the outer settlement applies Core's normal output-retention policy.
+See [`docs/architecture/code-mode.md`](../../docs/architecture/code-mode.md) for the product contract and [`docs/plans/code-tool-architecture.md`](../../docs/plans/code-tool-architecture.md) for detailed design history.
 
-MCP tools use this canonical path: they register as grouped tools and are deferred while CodeMode is enabled. Existing
-output schemas are preserved in generated signatures. Direct Core tools remain direct and are not ambient globals
-inside CodeMode.
+## Intentional boundaries
 
-## Intentionally Unsupported
+- no ambient filesystem/process/network/credential access;
+- no modules/imports/eval/arbitrary host globals;
+- no heuristic parsing of text results as JSON;
+- no generic authorization or permission policy inside the engine;
+- no claim that arbitrary external side effects are rollbackable;
+- no durable runtime/kernel state between executions.
 
-These are product boundaries rather than DSL backlog:
+## Decisions and rationale
 
-- Ambient filesystem, process, environment, network, credential, or application access. External work must go through
-  supplied tools.
-- Modules, imports, dynamic imports, `eval`, arbitrary host globals, npm packages, and prototype mutation.
-- Generic permission prompts, authorization policy, durable pause/resume, replay, storage, or exactly-once external
-  side effects. Hosts and tools own those concerns.
-- Heuristic parsing of text tool results as JSON. A result should not silently change type based on its contents.
+| Decision | Rationale |
+| --- | --- |
+| Own the interpreter | The requirement is bounded orchestration, not arbitrary JavaScript. |
+| Keep authority host-owned | The engine can only confine execution to host-supplied capabilities; leaf policy belongs to the host. |
+| Support explicit tools and `call(ref,input)` | Embedders need both self-contained engine catalogs and host-owned capability resolution. |
+| Prepare source separately from execution | Repeated replay/saved calls should avoid redundant transpile/parse without retaining authority or mutable runtime state. |
+| Share execution budgets explicitly | Nested programs must not reset root operation/intermediate limits. |
+| Keep files outside sandbox values | Binary/file payloads should not flow through generated code or model context. |
+| Return expected failures as data | Agents need actionable diagnostics while interruption/defects keep host semantics. |
+| Leave limit values to hosts | Appropriate budgets depend on surrounding product policy. |
 
-The OpenAPI adapter may gain more transports and encodings, but it must continue skipping operations it cannot
-represent accurately rather than guessing semantics.
+## Remaining engine work
 
-## Decisions and Rationale
+Keep this section limited to generic engine work; OpenFork host/product work belongs in the architecture and implementation ledger.
 
-| Decision                                                 | Rationale                                                                                                                                                                                                                |
-| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Keep an owned tree-walking interpreter.                  | The product need is bounded tool orchestration, not arbitrary JavaScript. Owning the language surface keeps authority and behavior explicit.                                                                             |
-| Treat schemas as the model-facing interface.             | Signatures drive correct calls; Effect Schema also provides the runtime validation boundary, while JSON Schema supports adapter interoperability.                                                                        |
-| Keep authority host-owned.                               | CodeMode can only confine programs to supplied tools. The host chooses those tools, and each tool enforces its own authorization and side-effect policy.                                                                 |
-| Use progressive catalog disclosure plus search.          | Large tool sets should not consume the prompt, but every namespace must remain discoverable and speculative search calls should remain valid.                                                                            |
-| Start tool promises eagerly and supervise them.          | This preserves normal call-time parallelism while giving each call run-once settlement and interruption safety.                                                                                                          |
-| Keep files outside the sandbox value space.              | Models should compose structured data without routing binary payloads through generated code or context.                                                                                                                 |
-| Treat `execute` as the model-facing invocation boundary. | Nested calls are implementation details of one orchestration program. Reusing the outer context and bounding only the final result preserves complete intermediate data without inventing durable child-call identities. |
-| Return expected failures as data.                        | Models need actionable diagnostics without exposing private host causes; host interruption and defects must still propagate correctly.                                                                                   |
-| Leave execution-limit defaults to hosts.                 | Appropriate budgets depend on the surrounding product and its own cancellation, retention, and output-bounding policies.                                                                                                 |
-| Skip unsupported OpenAPI operations.                     | Incorrect parameter encoding, authentication, or transport behavior is worse than a precise `skipped` reason.                                                                                                            |
-
-## Remaining Work
-
-Keep only material unresolved work here. Small isolated defects should be GitHub issues; adapter-only work belongs in
-the adapter TODO. Delete entries when completed.
-
-### DSL expansion
-
-The supported JavaScript subset should grow when common model-generated code improves tool orchestration. These are
-current omissions to implement, not intentional product boundaries.
-
-- [ ] Design proper multi-stage promise pipelines. Supporting `.then`, `.catch`, and `.finally` should preserve promise
-      assimilation, cancellation, failure handling, and concurrent per-item pipelines rather than adding syntax-only
-      shims. Consider `Promise.any` in the same pass.
-- [ ] Support async iteration and `for await...of`. Define behavior first for the runtime's supported promise and
-      collection values, then extend it to bounded host streams when a stream boundary exists.
-- [ ] Support callback-bearing standard-library variants that models commonly generate: the mapper argument to
-      `Array.from(...)` and replacers for `JSON.stringify(...)`, including Effect-aware callbacks where needed.
-- [ ] Close basic `Object` parity gaps: let `Object.values`/`Object.entries` accept arrays, make `Object.assign` validate
-      and mutate its target, add `Object.is`, and let `Object.fromEntries` consume every supported iterable.
-- [ ] Add deterministic modern collection conveniences where they improve orchestration: `Object.groupBy`, Set
-      composition methods, and `Array.prototype.toSpliced`.
-- [ ] Complete the deterministic `Math` surface beyond the current arithmetic, rounding, root, power, and logarithm
-      helpers. Decide separately whether nondeterministic `Math.random` belongs in the runtime.
-- [ ] Refine diagnostics so user throws, expected tool failures, unexpected host/tool defects, and genuine interpreter
-      defects are distinguishable without leaking private causes.
-
-### Tool and result contracts
-
-- [ ] Design explicit tagged representations and size rules before allowing Blob, File, ArrayBuffer, typed arrays, or
-      host streams to cross the sandbox boundary.
-- [ ] Define one consistent policy for tool path segments named `__proto__`, `constructor`, or `prototype`. They must
-      either be safely callable, rejected before catalog generation, or use one documented escaping rule.
+- Design multi-stage promise pipelines (`then`, `catch`, `finally`) without weakening cancellation or failure semantics.
+- Support async iteration / `for await...of` once a bounded stream boundary exists.
+- Expand deterministic callback-bearing standard-library variants where common generated code benefits.
+- Close remaining deterministic `Object`, collection, and `Math` parity gaps.
+- Continue refining diagnostics so user throws, safe tool failures, host defects, and interpreter defects remain distinguishable without leaking private causes.
+- Define tagged bounded representations before adding Blob/File/ArrayBuffer/typed-array/stream values.
+- Keep OpenAPI adaptation fail-closed for operations/transports it cannot represent accurately.
