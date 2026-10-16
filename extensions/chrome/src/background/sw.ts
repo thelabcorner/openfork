@@ -9,7 +9,8 @@ import { NativePortV2 } from "./native-port.js"
 import { ActiveTabIconController } from "./active-tab-icon.js"
 import { waitForTabComplete, waitForUrl } from "./tab-waits.js"
 import { operationNeedsDebugger } from "./dispatch-policy.js"
-import { interactiveElementsScanScript, resolveElementScript } from "@opencode-ai/browser-targeting"
+import { interactiveElementsScanScript, reactInspectScript, resolveElementScript } from "@opencode-ai/browser-targeting"
+import { profilerStartScript, profilerStopScript, reactDevtoolsStatusScript, reactPresentScript } from "@opencode-ai/browser-profiler"
 import { SnapshotRefRegistry } from "./snapshot-refs.js"
 import { VisualRuntimeLoader } from "./visual-runtime-loader.js"
 import { VisualRequestTracker, abortVisualRequestsForTab } from "./visual-lifecycle.js"
@@ -479,6 +480,60 @@ async function dispatchOperation(request) {
       const result = res.result?.value ?? res.result ?? null
       const type = typeof result
       return { evaluated: { result, type, truncated: false } }
+    }
+    case "react_inspect": {
+      const coords = await resolveTargetToCoords(dm, tabId, input.target)
+      const find = `() => document.elementFromPoint(${JSON.stringify(coords.x)}, ${JSON.stringify(coords.y)})`
+      const result = await evaluatePage(dm, tabId, reactInspectScript(find))
+      if (result && typeof result === "object" && typeof result.error === "string") {
+        throw Object.assign(new Error(result.error), { tag: "BrowserTargetNotFound", retryable: true })
+      }
+      if (!result) throw browserTargetNotFound()
+      return {
+        inspected: {
+          tabId: String(tabId),
+          hasReact: !!result.hasReact,
+          component: result.component,
+          ancestors: Array.isArray(result.ancestors) ? result.ancestors : [],
+        },
+      }
+    }
+    case "profiler_start": {
+      const present = await evaluatePage(dm, tabId, reactPresentScript())
+      if (!present) {
+        throw Object.assign(new Error("The page is not a React application"), { tag: "BrowserNotAReactAppError", retryable: false })
+      }
+      const devtools = await evaluatePage(dm, tabId, reactDevtoolsStatusScript())
+      if (!devtools?.connected) {
+        throw Object.assign(
+          new Error("No React DevTools renderer is connected to this page. Enable the React Developer Tools extension for this site and reload the page before profiling."),
+          { tag: "BrowserOperationFailed", retryable: false, details: { reactDevtools: devtools } },
+        )
+      }
+      const started = await evaluatePage(dm, tabId, profilerStartScript(input.component))
+      if (started?.noDevtools) {
+        throw Object.assign(new Error("React DevTools disconnected before profiling could start. Reload the page and retry."), { tag: "BrowserOperationFailed", retryable: false })
+      }
+      const snapshot = await snapshotRefs.get(tabId)
+      return { started: { snapshotVersion: snapshot?.version ?? 0 } }
+    }
+    case "profiler_stop": {
+      const result = await evaluatePage(dm, tabId, profilerStopScript())
+      if (result?.noReact) {
+        const present = await evaluatePage(dm, tabId, reactPresentScript()).catch(() => false)
+        if (!present) throw Object.assign(new Error("The page is not a React application"), { tag: "BrowserNotAReactAppError", retryable: false })
+        return { profiled: { commits: 0, windowMs: 0, topRenders: [], truncated: false } }
+      }
+      const topRenders = Array.isArray(result?.topRenders) ? result.topRenders.slice(0, 100) : []
+      return {
+        profiled: {
+          commits: Number.isFinite(result?.commits) ? result.commits : 0,
+          windowMs: Number.isFinite(result?.windowMs) ? result.windowMs : 0,
+          topRenders,
+          propsDiff: result?.propsDiff,
+          truncated: result?.truncated === true,
+        },
+      }
     }
     case "wait_for": {
       const timeout = input.timeoutMs ?? 5000

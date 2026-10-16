@@ -8,6 +8,7 @@ const root = import.meta.dir
 process.chdir(root)
 const browserVisual = resolve(root, "../../packages/browser-visual/src/index.ts")
 const browserTargeting = resolve(root, "../../packages/desktop/src/main/browser/scripts-resolve.ts")
+const browserProfiler = resolve(root, "../../packages/desktop/src/main/browser/scripts-profiler.ts")
 const safeGifenc = resolve(root, "../../packages/browser-visual/src/gifenc-safe.ts")
 const visualNotices = resolve(root, "../../packages/browser-visual/THIRD_PARTY_NOTICES.txt")
 const extensionNotices = resolve(root, "THIRD_PARTY_NOTICES.snapeye.txt")
@@ -18,6 +19,7 @@ const workspaceAlias = {
   setup(build: { onResolve: (options: { filter: RegExp }, callback: () => { path: string }) => void }) {
     build.onResolve({ filter: /^@opencode-ai\/browser-visual$/ }, () => ({ path: browserVisual }))
     build.onResolve({ filter: /^@opencode-ai\/browser-targeting$/ }, () => ({ path: browserTargeting }))
+    build.onResolve({ filter: /^@opencode-ai\/browser-profiler$/ }, () => ({ path: browserProfiler }))
     build.onResolve({ filter: /^gifenc$/ }, () => ({ path: safeGifenc }))
   },
 }

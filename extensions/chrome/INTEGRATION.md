@@ -40,6 +40,24 @@ Single responder: InFlight {request,timer,respond} — one writer, as host.ts:87
 Health when Chrome is paired: GET /health → {ok,connected,chrome:true,lanes:["extension","webview"]}
 ```
 
+## React DevTools on Chrome tabs
+
+- The Chrome companion does not bundle React DevTools and does not request the
+  broad `management` permission to enumerate installed Chrome extensions.
+- React inspection reads Fiber data from the selected page and works without
+  React DevTools. React profiling checks that the page already exposes a
+  DevTools-compatible hook with a connected renderer and event-listener API.
+  That is a live capability check, not proof of a particular extension ID.
+- The official React DevTools extension normally supplies this hook before the
+  page's React renderer initializes. If the hook or renderer is missing, enable
+  the extension for that site and reload the page; OpenFork reports the missing
+  capability instead of installing a late synthetic hook that cannot observe
+  commits.
+- Chrome's DevTools UI can be opened by the user and will show the React panels
+  when the official extension is active. The Chrome companion's `chrome.debugger`
+  session conflicts with an open DevTools window, so close that window before
+  asking the agent to profile the same tab.
+
 ## Overlay contract (overlay-ops track)
 
 - Closed shadow `host.attachShadow({mode:"closed"})` at `z-index:2147483646`, `position:fixed inset:0 pointerEvents:none`, `MutationObserver` re-append — transplant from `packages/desktop/src/guest/annotation-overlay.ts:291-330`.
