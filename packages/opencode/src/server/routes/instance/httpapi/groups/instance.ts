@@ -14,14 +14,6 @@ import {
 } from "../middleware/workspace-routing"
 import { described } from "./metadata"
 
-const PathInfo = Schema.Struct({
-  home: Schema.String,
-  state: Schema.String,
-  config: Schema.String,
-  worktree: Schema.String,
-  directory: Schema.String,
-}).annotate({ identifier: "Path" })
-
 export const VcsDiffQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   mode: Vcs.Mode,
@@ -66,28 +58,6 @@ export const InstanceApi = HttpApi.make("instance")
             identifier: "instance.dispose",
             summary: "Dispose instance",
             description: "Clean up and dispose the current OpenFork instance, releasing all resources.",
-          }),
-        ),
-        HttpApiEndpoint.get("path", InstancePaths.path, {
-          query: WorkspaceRoutingQuery,
-          success: PathInfo,
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "path.get",
-            summary: "Get paths",
-            description:
-              "Retrieve the current working directory and related path information for the OpenFork instance.",
-          }),
-        ),
-        HttpApiEndpoint.get("vcs", InstancePaths.vcs, {
-          query: WorkspaceRoutingQuery,
-          success: described(Vcs.Info, "VCS info"),
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "vcs.get",
-            summary: "Get VCS info",
-            description:
-              "Retrieve version control system (VCS) information for the current project, such as git branch.",
           }),
         ),
         HttpApiEndpoint.get("vcsStatus", InstancePaths.vcsStatus, {
@@ -191,5 +161,33 @@ export const InstanceApi = HttpApi.make("instance")
       title: "OpenFork experimental HttpApi",
       version: "0.0.1",
       description: "Experimental HttpApi surface for selected instance routes.",
+    }),
+  )
+
+// Branch metadata is a Tier-1 read: it needs the explicit workspace location
+// and Git identity only, not VCS watchers or a runtime Instance.
+export const VcsBranchApi = HttpApi.make("vcs-branch")
+  .add(
+    HttpApiGroup.make("vcs-branch")
+      .add(
+        HttpApiEndpoint.get("vcs", InstancePaths.vcs, {
+          query: WorkspaceRoutingQuery,
+          success: described(Vcs.Info, "VCS info"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "vcs.get",
+            summary: "Get VCS info",
+            description: "Retrieve version control branch metadata for the explicitly routed workspace.",
+          }),
+        ),
+      )
+      .middleware(WorkspaceRoutingMiddleware)
+      .middleware(Authorization),
+  )
+  .annotateMerge(
+    OpenApi.annotations({
+      title: "OpenFork VCS branch metadata",
+      version: "0.0.1",
+      description: "Explicit-location branch metadata without execution instance bootstrap.",
     }),
   )

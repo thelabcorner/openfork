@@ -41,7 +41,7 @@ import { and, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm"
 import { Effect } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
-import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { ModelPreferences } from "@/preference/model-preferences"
 import { Session } from "@/session/session"
@@ -50,9 +50,11 @@ import { NotFoundError } from "@/storage/storage"
 import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
 import { SessionStatus } from "@/session/status"
+import { projectSessionStatus } from "./session-status-projection"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
 import { OxpAttribution } from "@opencode-ai/core/oxp-attribution/attribution"
+import { OxpWorkload } from "@opencode-ai/core/oxp-attribution/workload"
 import { Project } from "@/project/project"
 import { bumpUsageCache } from "@/fork/usage-cache"
 import { resetUsageSummaryCache } from "@/usage/usage"
@@ -781,7 +783,29 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       payload: typeof GlobalSessionTelemetryInput.Type
     }) {
       const telemetry = yield* SessionTelemetry.Service
-      return yield* telemetry.snapshot(ctx.payload.sessions)
+      const [snapshot, working] = yield* Effect.all([
+        telemetry.snapshot(ctx.payload.sessions),
+        execution.listWorkingForSessionIDs(ctx.payload.sessions),
+      ])
+      // A same-process runner defect can leave a live telemetry overlay after
+      // its exact local activation has disappeared. The owner projection is
+      // authoritative for whether that phase is still live; keep settled
+      // counters/context while removing stale turn/phase clocks.
+      for (const [sessionID, state] of working) {
+        const current = snapshot[sessionID]
+        if (state.type !== "interrupted" || !current || current.phase === "idle") continue
+        snapshot[sessionID] = {
+          ...current,
+          phase: "idle",
+          phaseStartedAt: undefined,
+          phaseElapsedMs: undefined,
+          turnStartedAt: undefined,
+          turnElapsedMs: undefined,
+          isCompaction: undefined,
+          step: undefined,
+        }
+      }
+      return snapshot
     })
 
     const sessionStatus = Effect.fn("GlobalHttpApi.sessionStatus")(function* (ctx: {
@@ -794,17 +818,11 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
         const candidates = [...current.keys()]
         const sessionIDs = yield* execution.listSessionIDsByDirectory(resolved, candidates)
         const currentByDirectory = yield* statuses.listForSessionIDs(sessionIDs)
-        const result = Object.fromEntries(currentByDirectory)
-        for (const [sessionID] of yield* execution.listWorkingByDirectory(resolved)) {
-          result[sessionID] ??= { type: "busy" }
-        }
-        return result
+        const working = yield* execution.listWorkingByDirectory(resolved)
+        return projectSessionStatus(Object.fromEntries(currentByDirectory), working)
       }
-      const result = Object.fromEntries(yield* statuses.list())
-      for (const [sessionID] of yield* execution.listWorking()) {
-        result[sessionID] ??= { type: "busy" }
-      }
-      return result
+      const [current, working] = yield* Effect.all([statuses.list(), execution.listWorking()])
+      return projectSessionStatus(Object.fromEntries(current), working)
     })
 
     const oxpActivities = Effect.fn("GlobalHttpApi.oxpActivities")(function* (ctx: {
@@ -835,7 +853,13 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const oxpAttributionSnapshot = Effect.fn("GlobalHttpApi.oxpAttribution")(function* (ctx: {
       query: typeof GlobalOxpAttributionQuery.Type
     }) {
-      return yield* oxpAttribution.snapshot(ctx.query)
+      if (ctx.query.includeWorkload && (
+        ctx.query.since === undefined || ctx.query.until === undefined ||
+        !Number.isSafeInteger(ctx.query.since) || !Number.isSafeInteger(ctx.query.until) ||
+        ctx.query.since < 0 || ctx.query.until < ctx.query.since ||
+        ctx.query.until - ctx.query.since > OxpWorkload.MAX_RANGE_MS
+      )) return yield* new HttpApiError.BadRequest({})
+      return yield* oxpAttribution.snapshot({ ...ctx.query, includeWorkload: ctx.query.includeWorkload === "true" })
     })
 
     const oxpInvocations = Effect.fn("GlobalHttpApi.oxpInvocations")(function* (ctx: {
@@ -894,6 +918,9 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       payload: typeof GlobalOxpActivityPatch.Type
     }) {
       let changed = false
+      if (ctx.payload.regenerateTitle === true) {
+        changed = (yield* oxpActivity.regenerateTitle(ctx.params.activityID)) || changed
+      }
       if (ctx.payload.title !== undefined || ctx.payload.clearTitle === true) {
         const title =
           ctx.payload.clearTitle === true || !ctx.payload.title?.trim() ? undefined : ctx.payload.title.trim()

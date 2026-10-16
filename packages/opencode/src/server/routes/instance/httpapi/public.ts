@@ -67,7 +67,11 @@ const QueryParameterSchemas: Record<string, OpenApiSchema> = {
   "GET /session limit": { type: "number" },
   "GET /usage/summary since": { type: "number" },
   "GET /usage/summary until": { type: "number" },
+  "GET /usage/workload since": { type: "number" },
+  "GET /usage/workload until": { type: "number" },
+  "GET /usage/workload limit": { type: "number", minimum: 1, maximum: 50 },
   "GET /session/{sessionID}/message limit": { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  "GET /session/{sessionID}/context/ledger/page limit": { type: "integer", minimum: 1, maximum: 200 },
   "GET /vcs/diff context": { type: "integer", minimum: 0 },
   "GET /api/session limit": { type: "number" },
   "GET /api/session start": { type: "number" },
@@ -298,6 +302,10 @@ function applyLegacySchemaOverrides(spec: OpenApiSpec) {
     schemas.GlobalSession.properties.project = nullable(schemas.GlobalSession.properties.project)
   const providerOptions = schemas.ProviderConfig?.properties?.options
   if (providerOptions) providerOptions.additionalProperties = {}
+  for (const name of ["ToolStateRunning", "ToolStateCompleted", "ToolStateError", "ToolPart"] as const) {
+    const metadata = schemas[name]?.properties?.metadata
+    if (metadata) metadata.additionalProperties = {}
+  }
   const model = schemas.ProviderConfig?.properties?.models?.additionalProperties
   const variants = typeof model === "object" ? model.properties?.variants?.additionalProperties : undefined
   if (variants && typeof variants === "object") variants.additionalProperties = {}

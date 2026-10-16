@@ -94,6 +94,8 @@ function harness(kind: "public" | "account" | "direct") {
 
   const usage: Usage.Interface = {
     summary: () => Effect.die("unused"),
+    inspect: () => Effect.die("unused"),
+    workload: () => Effect.die("unused"),
     modelProfile: () => Effect.die("unused"),
     pricingCatalog: () => Effect.die("unused"),
     sessionContext: () => Effect.die("unused"),
@@ -107,7 +109,7 @@ function harness(kind: "public" | "account" | "direct") {
 }
 
 describe("Project Copy standalone provider route authority", () => {
-  it.effect("uses one transient Public route for transport and maintenance settlement", () =>
+  it.effect("degrades to a local name rather than execute hosted Public maintenance", () =>
     Effect.gen(function* () {
       const h = harness("public")
       const name = yield* generateProjectCopyName({
@@ -118,25 +120,17 @@ describe("Project Copy standalone provider route authority", () => {
         usage: h.usage,
       })
 
-      expect(name).toBe("routed-project-name")
+      expect(name).not.toBe("routed-project-name")
+      expect(name.length).toBeGreaterThan(0)
       expect(h.routeInputs).toHaveLength(1)
       expect(h.routeInputs[0]).toMatchObject({
         providerID: "opencode",
         modelID: "copy-model",
         routeIntent: { kind: "auto" },
+        executionPurpose: "special-agent",
       })
-      expect(h.streamInputs).toHaveLength(1)
-      expect(h.streamInputs[0]?.model).toBe(h.routedModel)
-      expect(h.streamInputs[0]?.route).toEqual({ routeKind: "public" })
-      expect(h.maintenance).toHaveLength(1)
-      expect(h.maintenance[0]).toMatchObject({
-        agent: "project-copy-name",
-        providerID: "opencode",
-        modelID: "copy-model",
-        route: { routeKind: "public" },
-        projectID: "project-copy-public",
-      })
-      expect(JSON.stringify(h.maintenance[0])).not.toContain("accountID")
+      expect(h.streamInputs).toHaveLength(0)
+      expect(h.maintenance).toHaveLength(0)
     }),
   )
 

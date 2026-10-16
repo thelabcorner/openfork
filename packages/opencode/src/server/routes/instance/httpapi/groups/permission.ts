@@ -16,6 +16,10 @@ const ReplyPayload = Schema.Struct({
 })
 
 export const PermissionResponsePayload = Schema.Struct({ response: PermissionV1.Reply })
+const AutoAcceptPolicyPayload = Schema.Struct({
+  autoAccept: Schema.Record(Schema.String, Schema.Boolean),
+  mode: Schema.Literals(["hydrate", "patch"]),
+})
 
 export const PermissionApi = HttpApi.make("permission")
   .add(
@@ -78,6 +82,16 @@ export const PermissionControlApi = HttpApi.make("permission-control").add(
           description: "Approve or deny a permission request without loading a workspace Instance.",
         }),
       ),
+      HttpApiEndpoint.put("autoAcceptPolicy", `${root}/auto-accept`, {
+        query: WorkspaceRoutingQuery,
+        payload: AutoAcceptPolicyPayload,
+        success: described(Schema.Boolean, "Auto-accept policy synchronized"),
+        error: [HttpApiError.BadRequest],
+      }).annotateMerge(OpenApi.annotations({
+        identifier: "permission.autoAcceptPolicy",
+        summary: "Synchronize permission auto-accept policy",
+        description: "Merge missing startup preferences or patch explicit session/directory choices for an explicit workspace location.",
+      })),
     )
     .middleware(WorkspaceRoutingMiddleware)
     .middleware(Authorization),

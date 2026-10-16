@@ -14,6 +14,7 @@ export const PromptRevisorPayload = Schema.Struct({
   prompt: Schema.String,
   purpose: Schema.optional(PromptRevisor.Purpose),
   target: Schema.optional(RevisionDraft.Target),
+  operationID: Schema.optional(Schema.String),
   draft: Schema.optional(PromptRevisor.DraftContext),
   sessionID: Schema.optional(SessionSchema.ID),
   includeSessionContext: Schema.optional(Schema.Boolean),

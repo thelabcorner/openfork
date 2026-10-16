@@ -4,8 +4,10 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
+import { ProjectCurrentApi } from "../groups/project"
 import { ProjectNotFoundError } from "../errors"
 import { markInstanceForReload } from "../lifecycle"
+import { WorkspaceRouteContext } from "../middleware/workspace-routing"
 
 export const projectHandlers = HttpApiBuilder.group(InstanceHttpApi, "project", (handlers) =>
   Effect.gen(function* () {
@@ -14,10 +16,6 @@ export const projectHandlers = HttpApiBuilder.group(InstanceHttpApi, "project", 
 
     const list = Effect.fn("ProjectHttpApi.list")(function* () {
       return yield* svc.list()
-    })
-
-    const current = Effect.fn("ProjectHttpApi.current")(function* () {
-      return (yield* InstanceState.context).project
     })
 
     const initGit = Effect.fn("ProjectHttpApi.initGit")(function* () {
@@ -55,9 +53,20 @@ export const projectHandlers = HttpApiBuilder.group(InstanceHttpApi, "project", 
 
     return handlers
       .handle("list", list)
-      .handle("current", current)
       .handle("initGit", initGit)
       .handle("update", update)
       .handle("directories", directories)
+  }),
+)
+
+export const projectCurrentHandlers = HttpApiBuilder.group(ProjectCurrentApi, "project-current", (handlers) =>
+  Effect.gen(function* () {
+    const svc = yield* Project.Service
+    return handlers.handle("current", () =>
+      Effect.gen(function* () {
+        const location = yield* WorkspaceRouteContext
+        return yield* svc.currentForDirectory(location.directory)
+      }),
+    )
   }),
 )

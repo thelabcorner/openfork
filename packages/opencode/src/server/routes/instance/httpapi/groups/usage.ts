@@ -1,12 +1,14 @@
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import { Usage } from "@/usage/usage"
+import { WorkloadRequest, WorkloadSnapshot } from "@/usage/workload"
 import { described } from "./metadata"
 import { Authorization } from "../middleware/authorization"
-import { ApiNotFoundError } from "../errors"
+import { ApiNotFoundError, InvalidRequestError } from "../errors"
 
 export const UsagePaths = {
   summary: "/usage/summary",
+  workload: "/usage/workload",
   modelProfile: "/usage/model-profile",
   pricingCatalog: "/usage/pricing-catalog",
   sessionContext: "/usage/session/:sessionID/context",
@@ -33,6 +35,17 @@ export const UsageApi = HttpApi.make("usage").add(
             "Aggregate token and cost usage across every session in the database, bucketed by provider, model, variant, project, and time.",
         }),
       ),
+    )
+    .add(
+      HttpApiEndpoint.get("workload", UsagePaths.workload, {
+        query: WorkloadRequest,
+        success: described(WorkloadSnapshot, "Settled native tool and generation workload"),
+        error: [InvalidRequestError],
+      }).annotateMerge(OpenApi.annotations({
+        identifier: "usage.workload",
+        summary: "Get native tool and latency workload",
+        description: "Tier-0 scalar-only, time-windowed tool outcomes/durations and distinct host-observed first-token/generation clocks. Historical tool coverage is explicitly partial.",
+      })),
     )
     .add(
       HttpApiEndpoint.get("modelProfile", UsagePaths.modelProfile, {

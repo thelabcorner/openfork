@@ -191,6 +191,15 @@ function setupMdns(opts: ListenOptions, port: number, scope: Scope.Scope) {
 }
 
 function makeStop(state: ListenerState, unpublishMdns: Effect.Effect<void>, listenerUrl: URL) {
+  // Explicit diagnostic only. This is the process-owner shutdown boundary:
+  // distinguish socket force-close from Scope.close, which can hold thousands
+  // of service finalizers. Never enable in ordinary server operation.
+  const mark = (phase: string) => {
+    if (process.env.OPENFORK_ACP_MEMORY_PROFILE !== "1") return
+    const m = process.memoryUsage()
+    const scopeState = state.scope.state
+    console.error(`[server-stop-profile] ${phase} rssMiB=${Math.round(m.rss / 1048576)} heapMiB=${Math.round(m.heapUsed / 1048576)} heapTotalMiB=${Math.round(m.heapTotal / 1048576)} finalizers=${scopeState._tag === "Open" ? scopeState.finalizers.size : 0} scope=${scopeState._tag}`)
+  }
   return Effect.gen(function* () {
     const forceCloseOnce = yield* Effect.cached(forceClose(state).pipe(Effect.ignore))
     const closeScopeOnce = yield* Effect.cached(
@@ -206,9 +215,13 @@ function makeStop(state: ListenerState, unpublishMdns: Effect.Effect<void>, list
 
     return (close?: boolean) =>
       Effect.gen(function* () {
+        mark("start")
         yield* unpublishMdns
+        mark("mdns")
         if (close) yield* forceCloseOnce
+        mark("transport-close")
         yield* closeScopeOnce
+        mark("scope-close")
       })
   })
 }
@@ -280,7 +293,11 @@ function serverLayer(opts: { port: number; hostname: string }) {
       ListenerServerService.of({
         closeAll: Effect.sync(() => {
           serverRef.forceStop = true
-          if (serverRef.closeStarted) server.closeAllConnections()
+          // Request fibers can hold service finalizers open. Begin transport
+          // shutdown before Scope.close drains those services, rather than
+          // waiting for the server's finalizer to eventually call close().
+          if (!serverRef.closeStarted) server.close(() => undefined)
+          server.closeAllConnections()
         }),
       }),
     ),

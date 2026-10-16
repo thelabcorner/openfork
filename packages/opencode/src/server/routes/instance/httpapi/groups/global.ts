@@ -271,7 +271,47 @@ export const GlobalOxpAttributionQuery = Schema.Struct({
   activityID: Schema.optional(OxpActivitySchema.ActivityID),
   since: Schema.optional(Schema.NumberFromString),
   until: Schema.optional(Schema.NumberFromString),
+  includeWorkload: Schema.optional(Schema.Literal("true")),
 })
+
+const OxpWorkloadMetrics = Schema.Struct({
+  calls: Schema.Number,
+  successes: Schema.Number,
+  failures: Schema.Number,
+  denied: Schema.Number,
+  cancelled: Schema.Number,
+  interrupted: Schema.Number,
+  running: Schema.Number,
+  unknown: Schema.Number,
+  failureRate: Schema.NullOr(Schema.Finite),
+  measuredDurations: Schema.Number,
+  missingDurations: Schema.Number,
+  toolWallMs: Schema.Finite,
+  p50Ms: Schema.NullOr(Schema.Finite),
+  p95Ms: Schema.NullOr(Schema.Finite),
+})
+
+const OxpWorkloadProfile = Schema.Struct({
+  scope: Schema.Struct({
+    since: Schema.Finite,
+    until: Schema.Finite,
+    activityID: Schema.optional(OxpActivitySchema.ActivityID),
+  }),
+  bucketWidthMs: Schema.Finite,
+  totals: OxpWorkloadMetrics,
+  tools: Schema.Array(Schema.Struct({ ...OxpWorkloadMetrics.fields, tool: Schema.String })),
+  topFailures: Schema.Array(Schema.Struct({ ...OxpWorkloadMetrics.fields, tool: Schema.String })),
+  topTime: Schema.Array(Schema.Struct({ ...OxpWorkloadMetrics.fields, tool: Schema.String })),
+  otherTools: Schema.Number,
+  otherCalls: Schema.Number,
+  buckets: Schema.Array(Schema.Struct({ start: Schema.Finite, calls: Schema.Number, successes: Schema.Number, failures: Schema.Number })),
+  coverage: Schema.Struct({
+    historicalCompleteness: Schema.Literal("unknown"),
+    quantileSampleLimit: Schema.Number,
+    p50MinimumSamples: Schema.Literal(5),
+    p95MinimumSamples: Schema.Literal(20),
+  }),
+}).annotate({ identifier: "OxpWorkloadProfile" })
 
 const OxpAttributionSource = Schema.Literals([
   "observed_boundary",
@@ -283,10 +323,6 @@ const OxpAttributionSource = Schema.Literals([
 const OxpAttributionTool = Schema.Struct({
   tool: Schema.String,
   calls: Schema.Number,
-  uniqueRequestChars: Schema.Finite,
-  uniqueResultChars: Schema.Finite,
-  uniqueChars: Schema.Finite,
-  uniqueTokens: Schema.Finite,
   requestChars: Schema.Finite,
   resultChars: Schema.Finite,
   chars: Schema.Finite,
@@ -299,7 +335,6 @@ const OxpAttributionSourceBreakdown = Schema.Struct({
   source: OxpAttributionSource,
   requestCalls: Schema.Number,
   resultCalls: Schema.Number,
-  uniqueChars: Schema.Finite,
   requestChars: Schema.Finite,
   resultChars: Schema.Finite,
   chars: Schema.Finite,
@@ -311,12 +346,9 @@ const OxpAttributionSourceBreakdown = Schema.Struct({
 const OxpAttributionTotals = Schema.Struct({
   calls: Schema.Number,
   activities: Schema.Number,
-  inferredRounds: Schema.Number,
-  uniqueRequestChars: Schema.Finite,
-  uniqueResultChars: Schema.Finite,
-  uniqueChars: Schema.Finite,
-  uniqueTokens: Schema.Finite,
-  amplification: Schema.NullOr(Schema.Finite),
+  inferredTurns: Schema.Number,
+  estimatedSurroundingTokens: Schema.Finite,
+  estimatedTotalTokens: Schema.Finite,
   requestChars: Schema.Finite,
   resultChars: Schema.Finite,
   chars: Schema.Finite,
@@ -349,24 +381,29 @@ const OxpAttributionCoverage = Schema.Struct({
 
 const OxpAttributionCalibration = Schema.Struct({
   productionDigest: Schema.String,
+  payloadDigest: Schema.String,
   sourceDigest: Schema.String,
   calibratedAt: Schema.String,
   observations: Schema.Number,
   corpus: Schema.Struct({
-    observations: Schema.Number,
-    activities: Schema.Number,
-    tools: Schema.Number,
-    toolStatusGroups: Schema.Number,
-    minStartedAt: Schema.Finite,
+    pairedMessages: Schema.Number,
+    sessions: Schema.Number,
+    usageRows: Schema.Number,
+    toolRows: Schema.Number,
     maxStartedAt: Schema.Finite,
-    maxCompletedAt: Schema.Finite,
+  }),
+  tokenizer: Schema.Struct({
+    encoding: Schema.String,
+    sampledInvocations: Schema.Number,
   }),
   validation: Schema.Struct({
-    toolPriorChars: Schema.Finite,
-    statusPriorChars: Schema.Finite,
-    statusSpecialization: Schema.String,
-    exposureAggregateBiasRMSE: Schema.Finite,
-    exposureWAPE: Schema.Finite,
+    cvSessionWAPE: Schema.Finite,
+    cvSessionMedianAPE: Schema.Finite,
+    cvSessionP90APE: Schema.Finite,
+    maxAbsFoldBias: Schema.Finite,
+    labeledGaps: Schema.Number,
+    boundaryRawError: Schema.Finite,
+    boundaryBalancedError: Schema.Finite,
   }),
 }).annotate({ identifier: "OxpAttributionCalibration" })
 
@@ -378,38 +415,21 @@ const OxpAttributionSnapshot = Schema.Struct({
     activityID: Schema.optional(OxpActivitySchema.ActivityID),
   }),
   totals: OxpAttributionTotals,
-  sensitivity: Schema.Struct({
-    low: Schema.Struct({
-      rho: Schema.Literal(0.75),
-      tokens: Schema.Finite,
-    }),
-    calibrated: Schema.Struct({
-      rho: Schema.Finite,
-      tokens: Schema.Finite,
-    }),
-    high: Schema.Struct({
-      rho: Schema.Literal(0.99),
-      tokens: Schema.Finite,
-    }),
-  }),
   coverage: OxpAttributionCoverage,
+  workload: Schema.optional(OxpWorkloadProfile),
   model: Schema.Struct({
-    kind: Schema.Literal("geometric-context-residency"),
-    rho: Schema.Finite,
-    gapThresholdMs: Schema.Finite,
+    kind: Schema.Literal("empirical-tool-usage"),
     requestCharsPerToken: Schema.Finite,
     resultCharsPerToken: Schema.Finite,
+    turnGapThresholdMs: Schema.Finite,
     components: Schema.Struct({
-      callTranscript: Schema.Literal(true),
-      returnedContent: Schema.Literal(true),
-      repeatedContextExposure: Schema.Literal(true),
+      observedToolPayload: Schema.Literal(true),
+      estimatedOxpTokens: Schema.Literal(true),
+      empiricallyEstimatedUpstream: Schema.Literal(true),
+      geometricResidency: Schema.Literal(false),
       availabilitySchema: Schema.Literal(false),
     }),
     calibration: OxpAttributionCalibration,
-  }),
-  causalAttribution: Schema.Struct({
-    available: Schema.Literal(false),
-    reason: Schema.Literal("trace-chain-unavailable"),
   }),
 }).annotate({ identifier: "OxpAttributionSnapshot" })
 
@@ -445,6 +465,7 @@ const OxpInvocationDetailInfo = Schema.Struct({
 export const GlobalOxpActivityPatch = Schema.Struct({
   title: Schema.optional(Schema.String.check(Schema.isMaxLength(256))),
   clearTitle: Schema.optional(Schema.Boolean),
+  regenerateTitle: Schema.optional(Schema.Boolean),
   archived: Schema.optional(Schema.Boolean),
 }).annotate({ identifier: "GlobalOxpActivityPatch" })
 
@@ -729,12 +750,13 @@ export const GlobalApi = HttpApi.make("global").add(
       HttpApiEndpoint.get("oxpAttribution", GlobalPaths.oxpAttribution, {
         query: GlobalOxpAttributionQuery,
         success: described(OxpAttributionSnapshot, "Modeled OXP context footprint and exposure"),
+        error: HttpApiError.BadRequest,
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.oxpAttribution",
-          summary: "Estimate OXP context exposure without workspace bootstrap",
+          summary: "Estimate OXP tool and surrounding model token usage without workspace bootstrap",
           description:
-            "Read a compact Core-owned OXP context-footprint projection. Exact boundary and retained historical observations remain provenance-labelled; missing historical mass may use calibrated donors. Repeated exposure is a geometric context-residency sensitivity model, not provider-reported usage or trace-conserved causal attribution.",
+            "Read a compact Core-owned OXP usage projection. OXP request/result payloads are measured at the tool boundary and converted to estimated tokens with a calibrated tokenizer ratio; missing historical payloads may use calibrated donors. A separate empirical model estimates surrounding model usage from OXP-visible activity. Neither estimate is provider-reported ChatGPT usage. Opt in to includeWorkload=true with since and until (inclusive milliseconds, at most 90 days) for a bounded scalar-only tool/failure/duration/time-bucket profile.",
         }),
       ),
       HttpApiEndpoint.patch("oxpActivityUpdate", GlobalPaths.oxpActivity, {
@@ -744,9 +766,9 @@ export const GlobalApi = HttpApi.make("global").add(
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.oxpActivityUpdate",
-          summary: "Rename or archive OXP activity history",
+          summary: "Rename, regenerate the title, or archive OXP activity history",
           description:
-            "Update local presentation/history state only. This never mutates resources referenced by the activity.",
+            "Update local presentation/history state only. Title regeneration derives a compact label from bounded, redacted OXP tool-call evidence. This never mutates resources referenced by the activity.",
         }),
       ),
       HttpApiEndpoint.delete("oxpActivityDelete", GlobalPaths.oxpActivity, {

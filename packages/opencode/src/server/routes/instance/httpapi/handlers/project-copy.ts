@@ -48,7 +48,15 @@ export const generateProjectCopyName = Effect.fn("ProjectCopyHttpApi.generateNam
         providerID: candidate.providerID,
         modelID: candidate.id,
         routeIntent: { kind: "auto" },
-      })
+        executionPurpose: "special-agent",
+      }).pipe(Effect.catch((error) =>
+        Provider.isHostedZenProvider(candidate.providerID) ? Effect.succeed(undefined) : Effect.fail(error),
+      ))
+      // Project-copy naming is optional maintenance. If a hosted provider has no
+      // authoritative transient route, degrade to a local slug rather than
+      // streaming through ambient auth.
+      if (Provider.isHostedZenProvider(candidate.providerID) && (!routed || routed.route.route.kind !== "account"))
+        return Slug.create()
       const model = routed?.model ?? candidate
       const route = routeAttribution(routed)
       const sessionID = SessionID.descending()

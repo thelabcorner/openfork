@@ -56,6 +56,21 @@ function percentile(values: number[], q: number) {
   return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] ?? 0
 }
 
+function traceCounterSampler(names: string[]) {
+  const seen = new Map(names.map((name) => [name, 0]))
+  const total = new Map(names.map((name) => [name, 0]))
+  return () => {
+    const counters = EventTrace.state().counters
+    for (const name of names) {
+      const value = counters[name] ?? 0
+      const previous = seen.get(name) ?? 0
+      total.set(name, (total.get(name) ?? 0) + (value >= previous ? value - previous : value))
+      seen.set(name, value)
+    }
+    return Object.fromEntries(total)
+  }
+}
+
 afterEach(async () => {
   EventTrace.configure({ enabled: false })
   await disposeAllInstances()
@@ -94,6 +109,18 @@ describe("native SSE fanout fairness", () => {
           expect((yield* readFrame(reader)).type).toBe("server.connected")
         }
 
+        // The opt-in trace intentionally rolls its in-memory counter window
+        // every 15 seconds. The request path below is much slower than that on
+        // cold workstations, so sample cumulative deltas instead of asserting
+        // against only whichever partial window happens to be current at end.
+        EventTrace.reset()
+        const sampleCounters = traceCounterSampler([
+          "native.subscriberOffered",
+          "native.subscriberFailed",
+          "bridge.legacySkipped",
+          "bridge.legacyEnvelopes",
+        ])
+
         // The response streams are already continuously pulled into the test
         // queues above, so this measures server fanout rather than a deliberately
         // stalled client. Three subscribers model PWAs; the fourth models the
@@ -104,9 +131,11 @@ describe("native SSE fanout fairness", () => {
           const response = yield* requestInDirectory("/session", directory, { method: "POST" })
           fanout.push(performance.now() - started)
           expect(response.status).toBe(200)
+          sampleCounters()
         }
 
         yield* Effect.sleep("100 millis")
+        const sampled = sampleCounters()
         const trace = EventTrace.state()
         const metrics = {
           subscribers: subscribers.length,
@@ -114,10 +143,10 @@ describe("native SSE fanout fairness", () => {
           baselineP95Ms: percentile(baseline, 0.95),
           fanoutMedianMs: percentile(fanout, 0.5),
           fanoutP95Ms: percentile(fanout, 0.95),
-          offered: trace.counters["native.subscriberOffered"] ?? 0,
-          failed: trace.counters["native.subscriberFailed"] ?? 0,
-          legacySkipped: trace.counters["bridge.legacySkipped"] ?? 0,
-          legacyEnvelopes: trace.counters["bridge.legacyEnvelopes"] ?? 0,
+          offered: sampled["native.subscriberOffered"] ?? 0,
+          failed: sampled["native.subscriberFailed"] ?? 0,
+          legacySkipped: sampled["bridge.legacySkipped"] ?? 0,
+          legacyEnvelopes: sampled["bridge.legacyEnvelopes"] ?? 0,
           serialize: trace.timings["native.serializeMs"],
         }
         console.log(`EVENT_FAIRNESS_METRICS=${JSON.stringify(metrics)}`)
@@ -127,10 +156,12 @@ describe("native SSE fanout fairness", () => {
         expect(metrics.offered).toBeGreaterThanOrEqual(48 * 4)
         expect(metrics.legacySkipped).toBeGreaterThan(0)
         expect(metrics.legacyEnvelopes).toBe(0)
-        // This is intentionally a generous regression ceiling: it catches a
-        // reintroduced blocking subscriber path without encoding workstation
-        // microbenchmark noise into CI.
-        expect(metrics.fanoutP95Ms).toBeLessThan(250)
+        // Compare fanout with the same session-admission operation before the
+        // subscribers were added. An absolute sub-250ms ceiling failed even
+        // with zero subscribers on cold Windows workstations, so it measured
+        // fixture/bootstrap cost instead of event fanout overhead.
+        expect(metrics.fanoutMedianMs).toBeLessThan(metrics.baselineMedianMs + 150)
+        expect(metrics.fanoutP95Ms).toBeLessThan(Math.max(250, metrics.baselineP95Ms * 1.35))
       }).pipe(Effect.timeout("120 seconds")),
     { git: true, config: { formatter: false, lsp: false } },
     { timeout: 180_000 },

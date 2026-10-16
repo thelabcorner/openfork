@@ -29,18 +29,23 @@ import * as HttpSessionError from "../../src/server/routes/instance/httpapi/hand
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
 import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/global"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
+import { SessionReadPaths } from "../../src/server/routes/instance/httpapi/groups/session-read"
 import { Session } from "@/session/session"
 import { SessionRunState } from "@/session/run-state"
+import { SessionOperatorRecovery } from "@/session/operator-stop"
 import { PendingResponseRegistry } from "@/server/pending-response-registry"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Question } from "@/question"
+import { Permission } from "@/permission"
+import * as AutoAcceptPolicy from "@/permission/auto-accept-policy"
 import { QuestionID } from "@/question/schema"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionHistory } from "@opencode-ai/core/session/history"
 import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import { SessionLimitRecovery as Recovery } from "@opencode-ai/core/session/limit-recovery"
 import * as CurrentParts from "@opencode-ai/core/session/current-parts"
 import { SessionTurnProvenance as CurrentSessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 import { SessionTurnProvenance as V1SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
@@ -52,7 +57,7 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
-import { TestLLMServer, reply } from "../lib/llm-server"
+import { TestLLMServer, reply, httpError } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { pollWithTimeout, awaitWithTimeout, testEffect } from "../lib/effect"
 
@@ -72,7 +77,9 @@ const appLayer = AppNodeBuilder.build(
     SessionExecutionOwner.node,
     GoalAutomation.node,
     SessionRunState.node,
+    SessionOperatorRecovery.node,
     PendingResponseRegistry.node,
+    Permission.node,
     EventV2Bridge.node,
     AppBackgroundJob.node,
     CurrentParts.node,
@@ -268,37 +275,116 @@ afterEach(async () => {
 })
 
 describe("session HttpApi", () => {
-  it.live(
-    "admits V1 sessions for 1, 3, and 6 concurrent creates without loading an Instance",
+  it.instance(
+    "serves bootstrap-free generation-fenced limit recovery and publishes fork events",
     () =>
       Effect.gen(function* () {
-        const directory = yield* tmpdirScoped({ config: { share: "disabled" } })
+        const test = yield* TestInstance
+        const session = yield* createSession({ title: "limit recovery API" })
         const store = yield* InstanceStore.Service
         const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
-        let start = 0
-        const created: Session.Info[] = []
-        for (const count of [1, 3, 6]) {
-          const results = yield* Effect.forEach(
-            Array.from({ length: count }, (_, index) => index),
-            (index) =>
-              requestJson<Session.Info>(SessionPaths.create, {
-                method: "POST",
-                headers: {
-                  "x-opencode-directory": directory,
-                  "content-type": "application/json",
-                },
-                body: JSON.stringify({ title: `parallel admission ${start + index}` }),
-              }),
-            { concurrency: count },
-          )
-          expect(results.every((session) => session.id)).toBe(true)
-          created.push(...results)
-          start += count
-        }
-        expect(new Set(created.map((session) => session.id)).size).toBe(10)
+        const { db } = yield* Database.Service
+        const recovery = yield* Recovery.observeFailure(db, {
+          sessionID: session.id,
+          sourceAssistantMessageID: "msg_limit_api",
+          providerID: "provider-test",
+          modelID: "model-test",
+          failureClass: "account-quota",
+          resetAt: Date.now() + 60_000,
+          resetSource: "retry-after",
+          now: Date.now(),
+        })
+        const seen: string[] = []
+        const events = yield* EventV2Bridge.Service
+        const unsubscribe = yield* events.listen((event) =>
+          Effect.sync(() => {
+            seen.push(event.type)
+          }),
+        )
+        yield* Effect.addFinalizer(() => unsubscribe)
+        const path = `/session/${session.id}/limit-recovery`
+        const snapshot = yield* requestJson<{ generation: number; autoResume: boolean }>(path)
+        expect(snapshot).toMatchObject({ generation: recovery!.generation, autoResume: false })
+
+        const auto = yield* request(`${path}/auto-resume`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation: recovery!.generation, enabled: true }),
+        })
+        expect(auto.status).toBe(200)
+        expect(yield* responseJson(auto)).toMatchObject({ autoResume: true })
+
+        const stale = yield* request(`${path}/wake`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation: recovery!.generation + 1 }),
+        })
+        expect(stale.status).toBe(409)
+
+        const snooze = yield* request(`${path}/snooze-until-reset`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation: recovery!.generation }),
+        })
+        expect(snooze.status).toBe(200)
+        const wake = yield* request(`${path}/wake`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation: recovery!.generation }),
+        })
+        expect(wake.status).toBe(200)
+        const resume = yield* request(`${path}/resume`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation: recovery!.generation }),
+        })
+        expect(resume.status).toBe(200)
+        expect(yield* responseJson(resume)).toMatchObject({ manualResume: true, autoResume: false })
+        const cancel = yield* request(path, {
+          method: "DELETE",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation: recovery!.generation }),
+        })
+        expect(cancel.status).toBe(204)
+        expect(yield* Recovery.get(db, session.id)).toBeUndefined()
+        expect(seen).toContain("session.limit_recovery.updated")
+        expect(seen).toContain("session.limit_recovery.cleared")
         expect(load).not.toHaveBeenCalled()
         load.mockRestore()
       }),
+    { git: true, config: { formatter: false, lsp: false } },
+    15_000,
+  )
+
+  it.live("admits V1 sessions for 1, 3, and 6 concurrent creates without loading an Instance", () =>
+    Effect.gen(function* () {
+      const directory = yield* tmpdirScoped({ config: { share: "disabled" } })
+      const store = yield* InstanceStore.Service
+      const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+      let start = 0
+      const created: Session.Info[] = []
+      for (const count of [1, 3, 6]) {
+        const results = yield* Effect.forEach(
+          Array.from({ length: count }, (_, index) => index),
+          (index) =>
+            requestJson<Session.Info>(SessionPaths.create, {
+              method: "POST",
+              headers: {
+                "x-opencode-directory": directory,
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({ title: `parallel admission ${start + index}` }),
+            }),
+          { concurrency: count },
+        )
+        expect(results.every((session) => session.id)).toBe(true)
+        created.push(...results)
+        start += count
+      }
+      expect(new Set(created.map((session) => session.id)).size).toBe(10)
+      expect(load).not.toHaveBeenCalled()
+      load.mockRestore()
+    }),
   )
 
   it.live(
@@ -587,7 +673,9 @@ describe("session HttpApi", () => {
       })
 
       // Selection is session state, not a synthetic conversation turn.
-      expect(yield* Session.use.messages({ sessionID: session.id }).pipe(provideInstanceEffect(directory), Effect.orDie)).toHaveLength(0)
+      expect(
+        yield* Session.use.messages({ sessionID: session.id }).pipe(provideInstanceEffect(directory), Effect.orDie),
+      ).toHaveLength(0)
 
       const invalid = yield* request(path, {
         method: "PATCH",
@@ -927,7 +1015,12 @@ describe("session HttpApi", () => {
           pausedAt: null,
         })
         expect(
-          yield* readDb.select().from(SessionInputTable).where(eq(SessionInputTable.session_id, owned.id)).all().pipe(Effect.orDie),
+          yield* readDb
+            .select()
+            .from(SessionInputTable)
+            .where(eq(SessionInputTable.session_id, owned.id))
+            .all()
+            .pipe(Effect.orDie),
         ).toHaveLength(0)
         const stored = (yield* Session.Service.use((svc) => svc.messages({ sessionID: owned.id }))).find(
           (message) => message.info.id === seeded.info.id,
@@ -946,6 +1039,111 @@ describe("session HttpApi", () => {
       }),
     { git: true, config: { formatter: false, lsp: false } },
     20_000,
+  )
+
+  it.live(
+    "model-switch rejects unsupported reasoning variants but accepts a valid model up to the live-attempt fence",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const base = testProviderConfig(llm.url)
+        const config = {
+          ...base,
+          provider: {
+            test: {
+              ...base.provider.test,
+              models: {
+                "test-model": {
+                  ...base.provider.test.models["test-model"],
+                  variants: { high: {} },
+                },
+              },
+            },
+          },
+        }
+        const directory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "switch variant validation" }).pipe(
+          provideInstanceEffect(directory),
+        )
+        const route = `${pathFor(SessionPaths.switchModel, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        const payload = {
+          assistantMessageID: MessageID.ascending(),
+          requestSentAt: Date.now(),
+          providerID: "test",
+          modelID: "test-model",
+        }
+        const unsupported = yield* request(route, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...payload, variant: "ultra" }),
+        })
+        expect(unsupported.status).toBe(400)
+        expect(yield* responseJson(unsupported)).toMatchObject({
+          _tag: "InvalidRequestError",
+          kind: "model",
+          field: "variant",
+        })
+
+        const defaultVariant = yield* request(route, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...payload, variant: "default" }),
+        })
+        // No provider attempt is active. This must pass model validation, then
+        // fail the exact-attempt conflict fence without queuing any continuation.
+        expect(defaultVariant.status).toBe(409)
+        const { db } = yield* Database.Service
+        const queued = yield* db.select().from(SessionInputTable).where(eq(SessionInputTable.session_id, session.id)).all()
+        expect(queued).toHaveLength(0)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    40_000,
+  )
+
+  it.instance(
+    "model-switch validates conversational ownership before model selection with actionable errors",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const parent = yield* createSession({ title: "model switch parent" })
+        const scheduled = yield* createSession({
+          title: "model switch scheduled run",
+          metadata: { scheduledTaskID: "stk_model_switch", scheduledTaskRunID: "str_model_switch" },
+        })
+        const child = yield* createSession({ title: "model switch child", parentID: parent.id })
+        const call = (sessionID: SessionIDType) =>
+          request(pathFor(SessionPaths.switchModel, { sessionID }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              assistantMessageID: MessageID.ascending(),
+              requestSentAt: Date.now(),
+              providerID: "missing-provider",
+              modelID: "missing-model",
+            }),
+          })
+
+        for (const sessionID of [parent.id, scheduled.id]) {
+          const response = yield* call(sessionID)
+          expect(response.status).toBe(400)
+          expect(yield* responseJson(response)).toMatchObject({
+            _tag: "InvalidRequestError",
+            kind: "model",
+            field: "modelID",
+          })
+        }
+
+        const blocked = yield* call(child.id)
+        expect(blocked.status).toBe(400)
+        expect(yield* responseJson(blocked)).toMatchObject({
+          _tag: "InvalidRequestError",
+          kind: "child",
+          message: "This worker's model selection is managed by its owning controller and cannot be switched here.",
+        })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
   )
 
   it.instance(
@@ -1014,116 +1212,237 @@ describe("session HttpApi", () => {
     15_000,
   )
 
-  it.instance("answers active pending-response handles over HTTP without loading an Instance", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      const store = yield* InstanceStore.Service
-      const registry = yield* PendingResponseRegistry.Service
-      const settled = new Set<string>()
-      const unregister = [] as Array<Effect.Effect<void>>
-      const ids = Array.from({ length: 10 }, (_, index) => `question_control_${index + 1}`)
-      for (const id of ids) {
-        unregister.push(yield* registry.register({
-          kind: "question",
-          requestID: id,
-          sessionID: SessionID.make(`ses_${id}`),
-          directory: FSUtil.resolve(test.directory),
-          snapshot: { id, sessionID: SessionID.make(`ses_${id}`), questions: [] },
-          settle: () => Effect.sync(() => { settled.add(id) }),
-        }))
-      }
-      yield* Effect.addFinalizer(() => Effect.forEach(unregister, (remove) => remove, { discard: true }))
-      const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
-      try {
-        let start = 0
-        for (const count of [1, 3, 6]) {
-          const group = ids.slice(start, start + count)
-          const responses = yield* Effect.forEach(group, (requestID) => request(
-            `/question/${requestID}/reject`,
-            { method: "POST", headers: { "x-opencode-directory": test.directory } },
-          ), { concurrency: count })
-          expect(responses.map((response) => response.status)).toEqual(Array.from({ length: count }, () => 200))
-          expect(yield* Effect.forEach(responses, responseJson)).toEqual(Array.from({ length: count }, () => true))
-          start += count
-        }
-        expect(settled.size).toBe(10)
-        expect(load).not.toHaveBeenCalled()
+  it.instance(
+    "surfaces and stops an orphaned same-process generation with an unresolved tool effect",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const owner = yield* SessionExecutionOwner.Service
+        const sessions = yield* Session.Service
+        const { db } = yield* Database.Service
+        const session = yield* createSession({ title: "orphaned tool recovery" })
+        const user = yield* createTextMessage(session.id, "run the tool")
+        const assistant = yield* sessions.updateMessage({
+          id: MessageID.ascending(),
+          sessionID: session.id,
+          role: "assistant",
+          parentID: user.info.id,
+          modelID: ModelV2.ID.make("test"),
+          providerID: ProviderV2.ID.make("test"),
+          mode: "build",
+          agent: "build",
+          path: { cwd: test.directory, root: test.directory },
+          time: { created: Date.now() },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
+        const part = yield* sessions.updatePart({
+          id: PartID.ascending(),
+          sessionID: session.id,
+          messageID: assistant.id,
+          type: "tool",
+          callID: "call_interrupted_tool",
+          tool: "bash",
+          state: { status: "running", input: { command: "unknown external effect" }, time: { start: Date.now() } },
+        })
 
-        const literalPercentDirectory = `${test.directory}_literal%2Fdirectory`
-        const removePercent = yield* registry.register({
-          kind: "question",
-          requestID: "question_control_percent",
-          sessionID: SessionID.make("ses_question_control_percent"),
-          directory: FSUtil.resolve(literalPercentDirectory),
-          snapshot: { id: "question_control_percent", sessionID: SessionID.make("ses_question_control_percent"), questions: [] },
-          settle: () => Effect.sync(() => { settled.add("question_control_percent") }),
-        })
-        yield* Effect.addFinalizer(() => removePercent)
-        const percentResponse = yield* request("/question/question_control_percent/reject", {
+        // Acquire through the durable owner API without registering a local
+        // Runner activation, reproducing a same-process orphaned generation.
+        const acquired = yield* owner.tryAcquire(session.id)
+        expect(acquired.state).toBe("acquired")
+        if (acquired.state !== "acquired") return
+
+        const headers = { "x-opencode-directory": test.directory }
+        const status = yield* request(`/session/status?directory=${encodeURIComponent(test.directory)}`)
+        expect(status.status).toBe(200)
+        expect(yield* responseJson(status)).toMatchObject({ [session.id]: { type: "interrupted" } })
+
+        const stopped = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
           method: "POST",
-          headers: { "x-opencode-directory": literalPercentDirectory },
+          headers,
         })
-        expect(percentResponse.status).toBe(200)
-        expect(yield* responseJson(percentResponse)).toBe(true)
-      } finally {
-        load.mockRestore()
-      }
-    }),
+        expect(stopped.status).toBe(200)
+        expect(yield* responseJson(stopped)).toBe(true)
+        expect((yield* owner.snapshot(session.id)).ownerID).toBeUndefined()
+        expect((yield* sessions.get(session.id)).pausedAt).toBeDefined()
+        const repaired = yield* db.select().from(PartTable).where(eq(PartTable.id, part.id)).get().pipe(Effect.orDie)
+        expect(repaired?.data.state).toMatchObject({ status: "error", metadata: { interrupted: true } })
+      }),
     { git: true, config: { formatter: false, lsp: false } },
     15_000,
   )
 
-  it.instance("overflowed transient notifications publish an invalidation and the active snapshot repairs state", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      const registry = yield* PendingResponseRegistry.Service
-      const events = yield* EventV2Bridge.Service
-      const store = yield* InstanceStore.Service
-      const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
-      const entered = yield* Deferred.make<void>()
-      const release = yield* Deferred.make<void>()
-      const invalidated = yield* Deferred.make<void>()
-      let blockOnce = true
-      const unsubscribe = yield* events.listen((event) => {
-        if (event.type === Question.Event.Rejected.type && blockOnce) {
-          blockOnce = false
-          return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+  it.instance(
+    "returns false instead of reporting successful abort when the observed live owner cannot be quiesced",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const owner = yield* SessionExecutionOwner.Service
+        const recovery = yield* SessionOperatorRecovery.Service
+        const session = yield* createSession({ title: "live-owner abort refuses false success" })
+        const acquired = yield* owner.tryAcquire(session.id)
+        expect(acquired.state).toBe("acquired")
+        if (acquired.state !== "acquired") return
+        yield* Effect.addFinalizer(() => owner.release(acquired.token).pipe(Effect.asVoid))
+
+        const restore = spyOn(recovery, "recover").mockImplementation(() => Effect.succeed("live"))
+        yield* Effect.addFinalizer(() => Effect.sync(() => restore.mockRestore()))
+        const stopped = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": test.directory },
+        })
+        expect(stopped.status).toBe(200)
+        expect(yield* responseJson(stopped)).toBe(false)
+        const after = yield* owner.snapshot(session.id)
+        expect(after.ownerID).toBe(acquired.token.ownerID)
+        expect(after.generation).toBe(acquired.token.generation)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    15_000,
+  )
+
+  it.instance(
+    "answers active pending-response handles over HTTP without loading an Instance",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const store = yield* InstanceStore.Service
+        const registry = yield* PendingResponseRegistry.Service
+        const settled = new Set<string>()
+        const unregister = [] as Array<Effect.Effect<void>>
+        const ids = Array.from({ length: 10 }, (_, index) => `question_control_${index + 1}`)
+        for (const id of ids) {
+          unregister.push(
+            yield* registry.register({
+              kind: "question",
+              requestID: id,
+              sessionID: SessionID.make(`ses_${id}`),
+              directory: FSUtil.resolve(test.directory),
+              snapshot: { id, sessionID: SessionID.make(`ses_${id}`), questions: [] },
+              settle: () =>
+                Effect.sync(() => {
+                  settled.add(id)
+                }),
+            }),
+          )
         }
-        if (event.type === "server.pending-response-state-invalidated")
-          return Deferred.succeed(invalidated, undefined)
-        return Effect.void
-      })
-      yield* Effect.addFinalizer(() => unsubscribe)
+        yield* Effect.addFinalizer(() => Effect.forEach(unregister, (remove) => remove, { discard: true }))
+        const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+        try {
+          let start = 0
+          for (const count of [1, 3, 6]) {
+            const group = ids.slice(start, start + count)
+            const responses = yield* Effect.forEach(
+              group,
+              (requestID) =>
+                request(`/question/${requestID}/reject`, {
+                  method: "POST",
+                  headers: { "x-opencode-directory": test.directory },
+                }),
+              { concurrency: count },
+            )
+            expect(responses.map((response) => response.status)).toEqual(Array.from({ length: count }, () => 200))
+            expect(yield* Effect.forEach(responses, responseJson)).toEqual(Array.from({ length: count }, () => true))
+            start += count
+          }
+          expect(settled.size).toBe(10)
+          expect(load).not.toHaveBeenCalled()
 
-      const id = "question_overflow_active"
-      const sessionID = SessionID.make("ses_question_overflow_active")
-      const unregister = yield* registry.register({
-        kind: "question",
-        requestID: id,
-        sessionID,
-        directory: FSUtil.resolve(test.directory),
-        snapshot: { id, sessionID, questions: [{ question: "Continue?", header: "Action", options: [] }] },
-        settle: () => Effect.void,
-      })
-      yield* Effect.addFinalizer(() => unregister)
+          const literalPercentDirectory = `${test.directory}_literal%2Fdirectory`
+          const removePercent = yield* registry.register({
+            kind: "question",
+            requestID: "question_control_percent",
+            sessionID: SessionID.make("ses_question_control_percent"),
+            directory: FSUtil.resolve(literalPercentDirectory),
+            snapshot: {
+              id: "question_control_percent",
+              sessionID: SessionID.make("ses_question_control_percent"),
+              questions: [],
+            },
+            settle: () =>
+              Effect.sync(() => {
+                settled.add("question_control_percent")
+              }),
+          })
+          yield* Effect.addFinalizer(() => removePercent)
+          const wrongPercentResponse = yield* request("/question/question_control_percent/reject", {
+            method: "POST",
+            headers: { "x-opencode-directory": `${test.directory}_wrong` },
+          })
+          expect(wrongPercentResponse.status).toBe(404)
+          const queryFenceResponse = yield* request(
+            `/question/question_control_percent/reject?directory=${encodeURIComponent(test.directory)}`,
+            { method: "POST", headers: { "x-opencode-directory": literalPercentDirectory } },
+          )
+          expect(queryFenceResponse.status).toBe(404)
+          const percentResponse = yield* request("/question/question_control_percent/reject", {
+            method: "POST",
+            headers: { "x-opencode-directory": literalPercentDirectory },
+          })
+          expect(percentResponse.status).toBe(200)
+          expect(yield* responseJson(percentResponse)).toBe(true)
+          expect(load).not.toHaveBeenCalled()
+        } finally {
+          load.mockRestore()
+        }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    15_000,
+  )
 
-      yield* registry.notify(
-        events.publish(Question.Event.Rejected, { sessionID, requestID: QuestionID.make("que_worker_blocker") }),
-        FSUtil.resolve(test.directory),
-      )
-      yield* Deferred.await(entered).pipe(Effect.timeout("2 seconds"))
-      for (let index = 0; index < 129; index++) yield* registry.notify(Effect.void, FSUtil.resolve(test.directory))
-      yield* Deferred.succeed(release, undefined)
-      yield* Deferred.await(invalidated).pipe(Effect.timeout("5 seconds"))
+  it.instance(
+    "overflowed transient notifications publish an invalidation and the active snapshot repairs state",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const registry = yield* PendingResponseRegistry.Service
+        const events = yield* EventV2Bridge.Service
+        const store = yield* InstanceStore.Service
+        const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const invalidated = yield* Deferred.make<void>()
+        let blockOnce = true
+        const unsubscribe = yield* events.listen((event) => {
+          if (event.type === Question.Event.Rejected.type && blockOnce) {
+            blockOnce = false
+            return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          }
+          if (event.type === "server.pending-response-state-invalidated")
+            return Deferred.succeed(invalidated, undefined)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => unsubscribe)
 
-      const response = yield* request("/question", { headers: { "x-opencode-directory": test.directory } })
-      expect(response.status).toBe(200)
-      expect(yield* responseJson(response)).toEqual([
-        { id, sessionID, questions: [{ question: "Continue?", header: "Action", options: [] }] },
-      ])
-      expect(load).not.toHaveBeenCalled()
-      load.mockRestore()
-    }),
+        const id = "question_overflow_active"
+        const sessionID = SessionID.make("ses_question_overflow_active")
+        const unregister = yield* registry.register({
+          kind: "question",
+          requestID: id,
+          sessionID,
+          directory: FSUtil.resolve(test.directory),
+          snapshot: { id, sessionID, questions: [{ question: "Continue?", header: "Action", options: [] }] },
+          settle: () => Effect.void,
+        })
+        yield* Effect.addFinalizer(() => unregister)
+
+        yield* registry.notify(
+          events.publish(Question.Event.Rejected, { sessionID, requestID: QuestionID.make("que_worker_blocker") }),
+          FSUtil.resolve(test.directory),
+        )
+        yield* Deferred.await(entered).pipe(Effect.timeout("2 seconds"))
+        for (let index = 0; index < 129; index++) yield* registry.notify(Effect.void, FSUtil.resolve(test.directory))
+        yield* Deferred.succeed(release, undefined)
+        yield* Deferred.await(invalidated).pipe(Effect.timeout("5 seconds"))
+
+        const response = yield* request("/question", { headers: { "x-opencode-directory": test.directory } })
+        expect(response.status).toBe(200)
+        expect(yield* responseJson(response)).toEqual([
+          { id, sessionID, questions: [{ question: "Continue?", header: "Action", options: [] }] },
+        ])
+        expect(load).not.toHaveBeenCalled()
+        load.mockRestore()
+      }),
     { git: true, config: { formatter: false, lsp: false } },
     15_000,
   )
@@ -1177,120 +1496,143 @@ describe("session HttpApi", () => {
     15_000,
   )
 
-  it.instance("aborts an orphaned session-owned BackgroundJob without loading an Instance", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      const store = yield* InstanceStore.Service
-      const session = yield* createSession({ title: "orphaned background task" })
-      const job = yield* AppBackgroundJob.Service.use((jobs) =>
-        jobs.start({
-          id: `job_${session.id}`,
-          type: "test-orphan",
-          metadata: { sessionId: session.id },
-          run: Effect.never,
-        }),
-      ).pipe(provideInstanceEffect(test.directory))
-      const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+  it.instance(
+    "aborts an orphaned session-owned BackgroundJob without loading an Instance",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const store = yield* InstanceStore.Service
+        const session = yield* createSession({ title: "orphaned background task" })
+        const job = yield* AppBackgroundJob.Service.use((jobs) =>
+          jobs.start({
+            id: `job_${session.id}`,
+            type: "test-orphan",
+            metadata: { sessionId: session.id },
+            run: Effect.never,
+          }),
+        ).pipe(provideInstanceEffect(test.directory))
+        const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
 
-      const response = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
-        method: "POST",
-        headers: { "x-opencode-directory": test.directory },
-      })
+        const response = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": test.directory },
+        })
 
-      expect(response.status).toBe(200)
-      expect(yield* responseJson(response)).toBe(true)
-      expect(load).not.toHaveBeenCalled()
-      load.mockRestore()
-      expect(
-        yield* AppBackgroundJob.Service.use((jobs) => jobs.get(job.id)).pipe(provideInstanceEffect(test.directory)),
-      ).toMatchObject({ status: "cancelled" })
-    }),
+        expect(response.status).toBe(200)
+        expect(yield* responseJson(response)).toBe(true)
+        expect(load).not.toHaveBeenCalled()
+        load.mockRestore()
+        expect(
+          yield* AppBackgroundJob.Service.use((jobs) => jobs.get(job.id)).pipe(provideInstanceEffect(test.directory)),
+        ).toMatchObject({ status: "cancelled" })
+      }),
     { git: true, config: { formatter: false, lsp: false } },
   )
 
-  it.instance("does not let a delayed stale abort cancel a newer session generation", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      const runState = yield* SessionRunState.Service
-      const owner = yield* SessionExecutionOwner.Service
-      const automation = yield* GoalAutomation.Service
-      const session = yield* createSession({ title: "stale abort fence" })
-      const running = yield* runState
-        .ensureRunning(session.id, Effect.succeed({} as SessionV1.WithParts), Effect.never)
-        .pipe(Effect.forkChild)
-      yield* Effect.sleep("30 millis")
-      const previous = yield* owner.snapshot(session.id)
-      expect(previous.ownerID).toBeTruthy()
+  it.instance(
+    "does not let a delayed stale abort cancel a newer session generation",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const runState = yield* SessionRunState.Service
+        const owner = yield* SessionExecutionOwner.Service
+        const automation = yield* GoalAutomation.Service
+        const session = yield* createSession({ title: "stale abort fence" })
+        const running = yield* runState
+          .ensureRunning(session.id, Effect.succeed({} as SessionV1.WithParts), Effect.never)
+          .pipe(Effect.forkChild)
+        yield* Effect.sleep("30 millis")
+        const previous = yield* owner.snapshot(session.id)
+        expect(previous.ownerID).toBeTruthy()
 
-      const entered = yield* Deferred.make<void>()
-      const resume = yield* Deferred.make<void>()
-      const cancelAutomation = spyOn(automation, "cancel")
-      const requestInterrupt = owner.requestInterrupt
-      const delayed = spyOn(owner, "requestInterrupt").mockImplementation((id, reason, generation) =>
-        Deferred.succeed(entered, undefined).pipe(
-          Effect.andThen(Deferred.await(resume)),
-          Effect.andThen(requestInterrupt(id, reason, generation)),
-        ),
-      )
-      const abort = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
-        method: "POST",
-        headers: { "x-opencode-directory": test.directory },
-      }).pipe(Effect.forkChild)
-      yield* Deferred.await(entered).pipe(Effect.timeout("2 seconds"))
+        const entered = yield* Deferred.make<void>()
+        const resume = yield* Deferred.make<void>()
+        const cancelAutomation = spyOn(automation, "cancel")
+        const requestInterrupt = owner.requestInterrupt
+        const delayed = spyOn(owner, "requestInterrupt").mockImplementation((id, reason, generation) =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(resume)),
+            Effect.andThen(requestInterrupt(id, reason, generation)),
+          ),
+        )
+        const abort = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": test.directory },
+        }).pipe(Effect.forkChild)
+        yield* Deferred.await(entered).pipe(Effect.timeout("2 seconds"))
 
-      yield* owner.release({
-        sessionID: session.id,
-        ownerID: previous.ownerID!,
-        generation: previous.generation,
-      })
-      const acquired = yield* owner.tryAcquireLocal(session.id)
-      expect(acquired.state).toBe("acquired")
-      if (acquired.state !== "acquired") return
+        yield* owner.release({
+          sessionID: session.id,
+          ownerID: previous.ownerID!,
+          generation: previous.generation,
+        })
+        const acquired = yield* owner.tryAcquireLocal(session.id)
+        expect(acquired.state).toBe("acquired")
+        if (acquired.state !== "acquired") return
 
-      yield* Deferred.succeed(resume, undefined)
-      const response = yield* Fiber.join(abort).pipe(Effect.timeout("2 seconds"))
-      delayed.mockRestore()
-      expect(response.status).toBe(200)
-      expect(yield* responseJson(response)).toBe(false)
-      const current = yield* owner.snapshot(session.id)
-      expect(current.ownerID).toBe(acquired.token.ownerID)
-      expect(current.generation).toBe(acquired.token.generation)
-      expect(cancelAutomation).not.toHaveBeenCalled()
-      cancelAutomation.mockRestore()
+        const { db } = yield* Database.Service
+        const newerRecovery = yield* Recovery.observeFailure(db, {
+          sessionID: session.id,
+          sourceAssistantMessageID: "msg_newer_generation_recovery",
+          providerID: "test",
+          modelID: "test-model",
+          failureClass: "account-quota",
+          resetAt: Date.now() + 60000,
+          resetSource: "retry-after",
+          now: Date.now(),
+        })
 
-      yield* owner.release(acquired.token)
-      yield* runState.cancel(session.id)
-      yield* Fiber.await(running)
-    }),
+        yield* Deferred.succeed(resume, undefined)
+        const response = yield* Fiber.join(abort).pipe(Effect.timeout("2 seconds"))
+        delayed.mockRestore()
+        expect(response.status).toBe(200)
+        expect(yield* responseJson(response)).toBe(false)
+        const current = yield* owner.snapshot(session.id)
+        expect(current.ownerID).toBe(acquired.token.ownerID)
+        expect(current.generation).toBe(acquired.token.generation)
+        expect(cancelAutomation).not.toHaveBeenCalled()
+        expect((yield* Recovery.get(db, session.id))?.generation).toBe(newerRecovery.generation)
+        cancelAutomation.mockRestore()
+
+        yield* owner.release(acquired.token)
+        yield* runState.cancel(session.id)
+        yield* Fiber.await(running)
+      }),
     { git: true, config: { formatter: false, lsp: false } },
     15_000,
   )
 
-  it.instance("rejects abort for producer-owned sessions without canceling their active owner", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      const runState = yield* SessionRunState.Service
-      const owner = yield* SessionExecutionOwner.Service
-      const session = yield* createSession({ title: "producer-owned abort" })
-      const metadata = SessionMetadataOwnership.specialAgent({ agent: "test-owner", ownerKind: "goal", ownerID: "goal_test" })
-      const { db } = yield* Database.Service
-      yield* db.update(SessionTable).set({ metadata }).where(eq(SessionTable.id, session.id)).run().pipe(Effect.orDie)
-      expect(SessionMetadataOwnership.isProducerOwned(metadata)).toBe(true)
-      const running = yield* runState
-        .ensureRunning(session.id, Effect.succeed({} as SessionV1.WithParts), Effect.never)
-        .pipe(Effect.forkChild)
-      yield* Effect.sleep("30 millis")
-      const before = yield* owner.snapshot(session.id)
-      const response = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
-        method: "POST",
-        headers: { "x-opencode-directory": test.directory },
-      })
-      expect(response.status).toBe(400)
-      expect((yield* owner.snapshot(session.id)).generation).toBe(before.generation)
-      expect((yield* owner.snapshot(session.id)).ownerID).toBe(before.ownerID)
-      yield* runState.cancel(session.id)
-      yield* Fiber.await(running)
-    }),
+  it.instance(
+    "rejects abort for producer-owned sessions without canceling their active owner",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const runState = yield* SessionRunState.Service
+        const owner = yield* SessionExecutionOwner.Service
+        const session = yield* createSession({ title: "producer-owned abort" })
+        const metadata = SessionMetadataOwnership.specialAgent({
+          agent: "test-owner",
+          ownerKind: "goal",
+          ownerID: "goal_test",
+        })
+        const { db } = yield* Database.Service
+        yield* db.update(SessionTable).set({ metadata }).where(eq(SessionTable.id, session.id)).run().pipe(Effect.orDie)
+        expect(SessionMetadataOwnership.isProducerOwned(metadata)).toBe(true)
+        const running = yield* runState
+          .ensureRunning(session.id, Effect.succeed({} as SessionV1.WithParts), Effect.never)
+          .pipe(Effect.forkChild)
+        yield* Effect.sleep("30 millis")
+        const before = yield* owner.snapshot(session.id)
+        const response = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": test.directory },
+        })
+        expect(response.status).toBe(400)
+        expect((yield* owner.snapshot(session.id)).generation).toBe(before.generation)
+        expect((yield* owner.snapshot(session.id)).ownerID).toBe(before.ownerID)
+        yield* runState.cancel(session.id)
+        yield* Fiber.await(running)
+      }),
     { git: true, config: { formatter: false, lsp: false } },
   )
 
@@ -1476,7 +1818,8 @@ describe("session HttpApi", () => {
         })
         expect(forked.status).toBe(400)
         expect(
-          (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: trusted.id }), { headers })).metadata,
+          (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: trusted.id }), { headers }))
+            .metadata,
         ).toEqual({
           ordinaryOld: true,
           scheduledTaskID: "stk_real",
@@ -1494,35 +1837,30 @@ describe("session HttpApi", () => {
             ordinaryOld: true,
           },
         })
-        const specialUpdated = yield* request(
-          pathFor(SessionPaths.update, { sessionID: specialAgent.id }),
-          {
-            method: "PATCH",
-            headers,
-            body: JSON.stringify({
-              metadata: {
-                specialAgent: "prompt_revisor",
-                specialAgentOwnerKind: "session",
-                specialAgentOwnerID: "spoof-owner",
-                goalID: "goal_spoof",
-                parentSessionID: "ses_spoof",
-                ordinaryNew: true,
-              },
-            }),
-          },
-        )
+        const specialUpdated = yield* request(pathFor(SessionPaths.update, { sessionID: specialAgent.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({
+            metadata: {
+              specialAgent: "prompt_revisor",
+              specialAgentOwnerKind: "session",
+              specialAgentOwnerID: "spoof-owner",
+              goalID: "goal_spoof",
+              parentSessionID: "ses_spoof",
+              ordinaryNew: true,
+            },
+          }),
+        })
         expect(specialUpdated.status).toBe(400)
 
-        const specialFork = yield* request(
-          pathFor(SessionPaths.fork, { sessionID: specialAgent.id }),
-          {
-            method: "POST",
-            headers,
-          },
-        )
+        const specialFork = yield* request(pathFor(SessionPaths.fork, { sessionID: specialAgent.id }), {
+          method: "POST",
+          headers,
+        })
         expect(specialFork.status).toBe(400)
         expect(
-          (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: specialAgent.id }), { headers })).metadata,
+          (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: specialAgent.id }), { headers }))
+            .metadata,
         ).toEqual({
           specialAgent: "goal_auditor",
           specialAgentOwnerKind: "goal",
@@ -1659,7 +1997,9 @@ describe("session HttpApi", () => {
         expect(missingBootstrapFree).toBeNull()
 
         const projects = yield* requestJson<Project.Info[]>(GlobalPaths.projects)
-        expect(projects.some((project) => FSUtil.resolve(project.worktree) === FSUtil.resolve(test.directory))).toBe(true)
+        expect(projects.some((project) => FSUtil.resolve(project.worktree) === FSUtil.resolve(test.directory))).toBe(
+          true,
+        )
       }),
     { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
   )
@@ -1769,27 +2109,170 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "serves progressive timeline parts for a persisted owner and 404s only a missing message",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory }
+        const session = yield* createSession({ title: "timeline parts route" })
+        const message = yield* createTextMessage(session.id, "timeline route content")
+        const route = pathFor(`${SessionReadPaths.message}/timeline-parts`, {
+          sessionID: session.id,
+          messageID: message.info.id,
+        })
+
+        const page = yield* requestJson<{ data: { id: string }[]; nextCursor?: string }>(route, { headers })
+        expect(page.data.map((part) => part.id)).toContain(message.part.id)
+
+        const missing = pathFor(`${SessionReadPaths.message}/timeline-parts`, {
+          sessionID: session.id,
+          messageID: "msg_missing_timeline_route",
+        })
+        const response = yield* request(missing, { headers })
+        expect(response.status).toBe(404)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 30000 },
+  )
+
+  it.instance(
+    "pages session timeline parts once across owners with a stable lossless cursor",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory }
+        const session = yield* createSession({ title: "batch timeline recovery" })
+        const first = yield* createTextMessage(session.id, "first")
+        const second = yield* createTextMessage(session.id, "second")
+        const expected = new Set([first.part.id, second.part.id])
+        const sessionService = yield* Session.Service
+        for (let index = 0; index < 511; index++) {
+          const part = yield* sessionService.updatePart({
+            id: PartID.ascending(),
+            sessionID: session.id,
+            messageID: index % 2 === 0 ? first.info.id : second.info.id,
+            type: "text",
+            text: `part ${index}`,
+          })
+          expected.add(part.id)
+        }
+
+        const route = pathFor(SessionReadPaths.timelineParts, { sessionID: session.id })
+        const query = new URLSearchParams()
+        query.append("messageIDs", first.info.id)
+        query.append("messageIDs", second.info.id)
+        let cursor: string | undefined
+        const recovered = new Map<string, string>()
+        const pageSizes: number[] = []
+        do {
+          const page = yield* requestJson<{
+            data: { messageID: string; part: { id: string; messageID: string } }[]
+            nextCursor?: string
+            completeMessageIDs: string[]
+          }>(`${route}?${query.toString()}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`, { headers })
+          pageSizes.push(page.data.length)
+          for (const entry of page.data) {
+            expect(entry.part.messageID).toBe(entry.messageID)
+            expect([first.info.id, second.info.id]).toContain(entry.messageID)
+            expect(recovered.has(entry.part.id)).toBe(false)
+            recovered.set(entry.part.id, entry.messageID)
+          }
+          if (page.nextCursor) expect(page.nextCursor).not.toBe(cursor)
+          if (!page.nextCursor)
+            expect(page.completeMessageIDs.toSorted()).toEqual([first.info.id, second.info.id].toSorted())
+          cursor = page.nextCursor
+        } while (cursor)
+
+        expect(pageSizes).toEqual([512, 1])
+        expect(new Set(recovered.keys())).toEqual(expected)
+        expect([...recovered.values()].filter((messageID) => messageID === first.info.id)).toHaveLength(257)
+        expect([...recovered.values()].filter((messageID) => messageID === second.info.id)).toHaveLength(256)
+
+        const foreignSession = yield* createSession({ title: "foreign timeline owner" })
+        const foreign = yield* createTextMessage(foreignSession.id, "foreign")
+        const invalidQuery = new URLSearchParams()
+        invalidQuery.append("messageIDs", first.info.id)
+        invalidQuery.append("messageIDs", foreign.info.id)
+        const invalid = yield* request(`${route}?${invalidQuery.toString()}`, { headers })
+        expect(invalid.status).toBe(404)
+
+        const cursorMismatch = yield* request(
+          `${route}?${invalidQuery.toString()}&cursor=${encodeURIComponent(
+            Buffer.from(
+              JSON.stringify({ partID: "prt_invalid", messageIDs: [first.info.id, second.info.id] }),
+            ).toString("base64url"),
+          )}`,
+          { headers },
+        )
+        expect(cursorMismatch.status).toBe(400)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 30000 },
+  )
+
+  it.instance(
+    "serves bounded progressive V1 part detail without a keyed full-message read",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory }
+        const session = yield* createSession({ title: "part detail" })
+        const message = yield* createTextMessage(session.id, "inspect-" + "🙂".repeat(2_500))
+        const route = pathFor(`${SessionReadPaths.message}/parts`, {
+          sessionID: session.id,
+          messageID: message.info.id,
+        })
+        const serialized = JSON.stringify({ type: "text", text: message.part.text })
+        let cursor: string | undefined
+        let inspected = ""
+        let pages = 0
+        do {
+          const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""
+          const page = yield* requestJson<{
+            data: { partID: string; type: string; offset: number; totalChars: number; text: string }[]
+            nextCursor?: string
+          }>(`${route}${query}`, { headers })
+          pages++
+          expect(page.data).toHaveLength(1)
+          expect(page.data[0]?.partID).toBe(message.part.id)
+          expect(page.data[0]?.offset).toBe(Array.from(inspected).length)
+          expect(page.data[0]?.totalChars).toBe(Array.from(serialized).length)
+          expect(Array.from(page.data[0]!.text).length).toBeLessThanOrEqual(1_024)
+          inspected += page.data[0]!.text
+          cursor = page.nextCursor
+        } while (cursor)
+
+        expect(pages).toBeGreaterThan(1)
+        expect(inspected).toBe(serialized)
+        expect(inspected.length).toBe(serialized.length)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 30000 },
+  )
+
+  it.instance(
     "detail recovery reads the live producer prefix without changing durable history",
-    () => Effect.gen(function* () {
-      const test = yield* TestInstance
-      const headers = { "x-opencode-directory": test.directory }
-      const session = yield* createSession({ title: "live recovery" })
-      const stored = yield* createTextMessage(session.id, "")
-      const currentParts = yield* CurrentParts.Service
-      const live = { ...stored.part, text: "prefix while provider is silent" }
-      const key = { sessionID: session.id, messageID: stored.info.id, partID: stored.part.id }
-      const token = currentParts.register({ ...key, snapshot: () => live })
-      yield* Effect.addFinalizer(() => Effect.sync(() => currentParts.release(key, token)))
-      const route = `${pathFor(SessionPaths.messages, { sessionID: session.id })}?limit=1`
-      const recovered = yield* requestJson<SessionV1.WithParts[]>(route, { headers })
-      expect(recovered[0]?.parts).toContainEqual(live)
-      const durable = yield* Session.Service.use((svc) => svc.messages({ sessionID: session.id }))
-      expect(durable[0]?.parts).toContainEqual(stored.part)
-      currentParts.release(key, token)
-      const after = yield* requestJson<SessionV1.WithParts[]>(route, { headers })
-      expect(after[0]?.parts).toContainEqual(stored.part)
-      expect(currentParts.snapshot(session.id, [stored.info.id])).toEqual([])
-    }),
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory }
+        const session = yield* createSession({ title: "live recovery" })
+        const stored = yield* createTextMessage(session.id, "")
+        const currentParts = yield* CurrentParts.Service
+        const live = { ...stored.part, text: "prefix while provider is silent" }
+        const key = { sessionID: session.id, messageID: stored.info.id, partID: stored.part.id }
+        const token = currentParts.register({ ...key, snapshot: () => live })
+        yield* Effect.addFinalizer(() => Effect.sync(() => currentParts.release(key, token)))
+        const route = `${pathFor(SessionPaths.messages, { sessionID: session.id })}?limit=1`
+        const recovered = yield* requestJson<SessionV1.WithParts[]>(route, { headers })
+        expect(recovered[0]?.parts).toContainEqual(live)
+        const durable = yield* Session.Service.use((svc) => svc.messages({ sessionID: session.id }))
+        expect(durable[0]?.parts).toContainEqual(stored.part)
+        currentParts.release(key, token)
+        const after = yield* requestJson<SessionV1.WithParts[]>(route, { headers })
+        expect(after[0]?.parts).toContainEqual(stored.part)
+        expect(currentParts.snapshot(session.id, [stored.info.id])).toEqual([])
+      }),
     { git: true, config: { formatter: false, lsp: false } },
     { timeout: 30000 },
   )
@@ -1818,9 +2301,9 @@ describe("session HttpApi", () => {
         )
         expect(updated).toMatchObject({ id: first.part.id, type: "text", text: "updated" })
         const stabilized = yield* Session.Service.use((svc) =>
-          svc.messages({ sessionID: session.id }).pipe(
-            Effect.map((messages) => messages.find((message) => message.info.id === first.info.id)),
-          ),
+          svc
+            .messages({ sessionID: session.id })
+            .pipe(Effect.map((messages) => messages.find((message) => message.info.id === first.info.id))),
         )
         expect(stabilized?.info).toMatchObject({
           role: "user",
@@ -1916,6 +2399,332 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "human Stop/Pause/Resume reach root and nested delegated workers without granting aggregate mutation",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const svc = yield* Session.Service
+        const runState = yield* SessionRunState.Service
+        const owner = yield* SessionExecutionOwner.Service
+        const store = yield* InstanceStore.Service
+        const parent = yield* createSession({ title: "Nested worker parent" })
+        const headers = { "x-opencode-directory": test.directory }
+        for (const nested of [false, true]) {
+          const metadata = SessionMetadataOwnership.delegatedWorker({
+            producer: "oxp",
+            principalRef: "principal",
+            invocationRef: "invocation",
+            rootRef: "root",
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            nestedDelegation: false,
+            ...(nested ? { parentWorkerID: parent.id } : {}),
+          })
+          const chat = yield* createSession({
+            agent: "build",
+            model: { providerID: ProviderV2.ID.make("test"), id: ModelV2.ID.make("test-model") },
+            metadata,
+            ...(nested ? { parentID: parent.id } : {}),
+          })
+          const { db } = yield* Database.Service
+          yield* Recovery.observeFailure(db, {
+            sessionID: chat.id,
+            sourceAssistantMessageID: "msg_human_stop_recovery",
+            providerID: "test",
+            modelID: "test-model",
+            failureClass: "account-quota",
+            resetAt: Date.now() + 60000,
+            resetSource: "retry-after",
+            now: Date.now(),
+          })
+          const entered = yield* Deferred.make<void>()
+          const running = yield* runState
+            .ensureRunning(
+              chat.id,
+              Effect.succeed({} as SessionV1.WithParts),
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+            )
+            .pipe(Effect.forkChild)
+          yield* awaitWithTimeout(Deferred.await(entered), "worker did not acquire execution")
+          const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+          try {
+            const stopped = yield* awaitWithTimeout(
+              request(pathFor(SessionPaths.abort, { sessionID: chat.id }), { method: "POST", headers }),
+              "human Stop waited for bootstrap",
+            )
+            expect(stopped.status).toBe(200)
+            expect(yield* stopped.json).toBe(true)
+            expect(load).not.toHaveBeenCalled()
+            expect(yield* Recovery.get(db, chat.id)).toBeUndefined()
+            const registry = yield* PendingResponseRegistry.Service
+            for (const kind of ["permission", "question"] as const) {
+              const requestID = `${kind}_human_${nested ? "nested" : "root"}`
+              const settled = yield* Deferred.make<void>()
+              const unregister = yield* registry.register({
+                kind,
+                requestID,
+                sessionID: chat.id,
+                directory: FSUtil.resolve(test.directory),
+                snapshot: { id: requestID, sessionID: chat.id },
+                settle: () => Deferred.succeed(settled, undefined).pipe(Effect.asVoid),
+              })
+              yield* Effect.addFinalizer(() => unregister)
+              const response = yield* awaitWithTimeout(
+                request(kind === "permission" ? `/permission/${requestID}/reply` : `/question/${requestID}/reject`, {
+                  method: "POST",
+                  headers: { ...headers, "content-type": "application/json" },
+                  ...(kind === "permission" ? { body: JSON.stringify({ reply: "once" }) } : {}),
+                }),
+                "human blocker response waited for bootstrap",
+              )
+              expect(response.status).toBe(200)
+              yield* awaitWithTimeout(Deferred.await(settled), "human blocker response never settled")
+            }
+            expect(load).not.toHaveBeenCalled()
+          } finally {
+            load.mockRestore()
+          }
+          yield* Fiber.await(running)
+          expect((yield* owner.snapshot(chat.id)).ownerID).toBeUndefined()
+          const paused = yield* request(pathFor(SessionPaths.pause, { sessionID: chat.id }), {
+            method: "POST",
+            headers,
+          })
+          expect(paused.status).toBe(204)
+          expect((yield* svc.get(chat.id)).pausedAt).toBeDefined()
+          const resumed = yield* request(pathFor(SessionPaths.resume, { sessionID: chat.id }), {
+            method: "POST",
+            headers,
+          })
+          expect(resumed.status).toBe(204)
+          expect((yield* svc.get(chat.id)).pausedAt).toBeUndefined()
+          expect((yield* svc.get(chat.id)).metadata).toEqual(metadata)
+          const mutation = yield* request(pathFor(SessionPaths.update, { sessionID: chat.id }), {
+            method: "PATCH",
+            headers: { ...headers, "content-type": "application/json" },
+            body: JSON.stringify({ title: "takeover" }),
+          })
+          expect(mutation.status).toBe(400)
+        }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 30000 },
+  )
+
+  it.live(
+    "delegated prompt_async admits a follow-up while the provider is occupied and completes execution",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        let release!: () => void
+        const held = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(release))
+        yield* llm.push(
+          reply().wait(held).text("first completion").stop().item(),
+          reply().text("follow-up completion").stop().item(),
+        )
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const origin = {
+          producer: "oxp",
+          principalRef: "oxp:busy-http",
+          invocationRef: "oxp-inv:busy-http",
+          rootRef: "root-busy-http",
+          agent: "build",
+          model: { providerID: "test", modelID: "test-model" },
+          nestedDelegation: false,
+        }
+        const chat = yield* createSession({
+          title: "Busy worker follow-up",
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), id: ModelV2.ID.make("test-model") },
+          metadata: SessionMetadataOwnership.delegatedWorker(origin),
+        }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+        for (const text of ["follow-up one", "follow-up two"]) {
+          const response = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: chat.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ parts: [{ type: "text", text }] }),
+          }).pipe((operation) =>
+            awaitWithTimeout(operation, `${text}: HTTP admission exceeded five seconds`, "5 seconds"),
+          )
+          expect(response.status).toBe(204)
+          if (text === "follow-up one")
+            yield* awaitWithTimeout(llm.wait(1), "First prompt did not reach the held provider", "10 seconds")
+        }
+        const stored = yield* Session.use.messages({ sessionID: chat.id }).pipe(provideInstanceEffect(directory))
+        expect(stored.filter((message) => message.info.role === "user")).toHaveLength(2)
+        release()
+        yield* pollWithTimeout(
+          Session.use.messages({ sessionID: chat.id }).pipe(
+            provideInstanceEffect(directory),
+            Effect.map((messages) =>
+              messages.some(
+                (message) =>
+                  message.info.role === "assistant" &&
+                  !!message.info.time.completed &&
+                  message.parts.some((part) => part.type === "text" && part.text.includes("follow-up completion")),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+          "follow-up never reached a completed provider response",
+        )
+        expect((yield* Session.use.get(chat.id).pipe(provideInstanceEffect(directory))).metadata).toEqual(chat.metadata)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    { timeout: 45000 },
+  )
+
+  it.instance(
+    "admits interactive delegated-worker follow-ups at 1/3/6 concurrency without changing protected ownership",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const svc = yield* Session.Service
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        for (const count of [1, 3, 6]) {
+          const chats = yield* Effect.forEach(
+            Array.from({ length: count }, (_, index) => index),
+            (index) => {
+              const origin = {
+                producer: "oxp",
+                principalRef: `oxp:interactive-${count}-${index}`,
+                invocationRef: `oxp-inv:interactive-${count}-${index}`,
+                rootRef: "root-interactive",
+                agent: "build",
+                model: { providerID: "test", modelID: "test-model", accountID: "assigned-account", variant: "max" },
+                nestedDelegation: false,
+              }
+              return createSession({
+                title: "Interactive worker",
+                agent: origin.agent,
+                model: {
+                  providerID: ProviderV2.ID.make("test"),
+                  id: ModelV2.ID.make("test-model"),
+                  accountID: "assigned-account",
+                  variant: "max",
+                },
+                metadata: SessionMetadataOwnership.delegatedWorker(origin),
+              })
+            },
+          )
+          const responses = yield* Effect.forEach(
+            chats,
+            (chat) =>
+              request(pathFor(SessionPaths.promptAsync, { sessionID: chat.id }), {
+                method: "POST",
+                headers,
+                // The composer can omit accountID; admission binds the durable account.
+                body: JSON.stringify({
+                  noReply: true,
+                  agent: "build",
+                  model: { providerID: "test", modelID: "test-model" },
+                  variant: "max",
+                  parts: [{ type: "text", text: "human follow-up" }],
+                }),
+              }).pipe(Effect.timeout("5 seconds")),
+            { concurrency: "unbounded" },
+          )
+          expect(responses.map((response) => response.status)).toEqual(Array(count).fill(204))
+          for (const chat of chats) {
+            const current = yield* svc.get(chat.id)
+            expect(current.metadata).toEqual(chat.metadata)
+            expect(current.model).toEqual(chat.model)
+            expect(current.agent).toBe(chat.agent)
+            const messages = yield* svc.messages({ sessionID: chat.id })
+            expect(messages).toHaveLength(1)
+            expect(messages[0]!.info).toMatchObject({
+              role: "user",
+              provenance: { owner: "user", source: "prompt" },
+              model: { providerID: "test", modelID: "test-model", accountID: "assigned-account", variant: "max" },
+            })
+            expect(messages[0]!.parts).toMatchObject([{ type: "text", text: "human follow-up" }])
+            expect(messages[0]!.parts[0]).toMatchObject({
+              metadata: { workerDelegationPolicy: { version: 1, nestedDelegation: false } },
+            })
+            // Conversational admission does not grant aggregate mutation authority.
+            const takeover = yield* request(pathFor(SessionPaths.update, { sessionID: chat.id }), {
+              method: "PATCH",
+              headers,
+              body: JSON.stringify({ title: "takeover" }),
+            })
+            expect(takeover.status).toBe(400)
+          }
+        }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 30000 },
+  )
+
+  it.instance(
+    "rejects delegated selection/permission overrides and malformed origins before acknowledgement or persistence",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const svc = yield* Session.Service
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const origin = {
+          producer: "oxp",
+          principalRef: "oxp:protected",
+          invocationRef: "oxp-inv:protected",
+          rootRef: "root-protected",
+          agent: "build",
+          model: { providerID: "test", modelID: "test-model" },
+          nestedDelegation: false,
+        }
+        const chat = yield* createSession({
+          title: "Protected worker",
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), id: ModelV2.ID.make("test-model") },
+          metadata: SessionMetadataOwnership.delegatedWorker(origin),
+        })
+        for (const override of [
+          { model: { providerID: "other", modelID: "other" } },
+          { model: { providerID: "test", modelID: "test-model", accountID: "other" } },
+          { variant: "max" },
+          { tools: { shell: true } },
+          { subProvider: "other" },
+          { agent: "plan" },
+        ]) {
+          const response = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: chat.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ noReply: true, parts: [{ type: "text", text: "must not persist" }], ...override }),
+          })
+          expect(response.status).toBe(400)
+          expect(yield* response.json).toMatchObject({
+            _tag: "InvalidRequestError",
+            kind: "delegated_worker",
+            message: expect.stringContaining("assigned"),
+          })
+          expect(yield* svc.messages({ sessionID: chat.id })).toHaveLength(0)
+          expect((yield* svc.get(chat.id)).metadata).toEqual(chat.metadata)
+        }
+        const malformed = yield* createSession({ metadata: { workerDelegation: { producer: "oxp" } } })
+        const response = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: malformed.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ noReply: true, parts: [{ type: "text", text: "must not persist" }] }),
+        })
+        expect(response.status).toBe(400)
+        expect(yield* svc.messages({ sessionID: malformed.id })).toHaveLength(0)
+        // The synchronous prompt endpoint shares the same service-owned binding.
+        const admitted = yield* request(pathFor(SessionPaths.prompt, { sessionID: chat.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ noReply: true, parts: [{ type: "text", text: "synchronous follow-up" }] }),
+        })
+        expect(admitted.status).toBe(200)
+        expect(yield* svc.messages({ sessionID: chat.id })).toHaveLength(1)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 30000 },
+  )
+
+  it.instance(
     "keeps scheduled-task aggregate mutation fenced while allowing ordinary Session prompting",
     () =>
       Effect.gen(function* () {
@@ -1927,19 +2736,16 @@ describe("session HttpApi", () => {
         })
         const seeded = yield* createTextMessage(session.id, "producer-owned transcript")
 
-        const prompt = yield* request(
-          pathFor(SessionPaths.promptAsync, { sessionID: session.id }),
-          {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              noReply: true,
-              agent: "build",
-              model: { providerID: "test", modelID: "test-model" },
-              parts: [{ type: "text", text: "human follow-up" }],
-            }),
-          },
-        )
+        const prompt = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            noReply: true,
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "human follow-up" }],
+          }),
+        })
         expect(prompt.status).toBe(204)
         yield* pollWithTimeout(
           Session.Service.use((svc) => svc.messages({ sessionID: session.id })).pipe(
@@ -1963,19 +2769,16 @@ describe("session HttpApi", () => {
           // A run id without its owning task is the malformed protected origin.
           metadata: { scheduledTaskRunID: "str_http_malformed" },
         })
-        const malformedPrompt = yield* request(
-          pathFor(SessionPaths.promptAsync, { sessionID: malformed.id }),
-          {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              noReply: true,
-              agent: "build",
-              model: { providerID: "test", modelID: "test-model" },
-              parts: [{ type: "text", text: "must fail before async acknowledgement" }],
-            }),
-          },
-        )
+        const malformedPrompt = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: malformed.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            noReply: true,
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "must fail before async acknowledgement" }],
+          }),
+        })
         expect(malformedPrompt.status).toBe(400)
 
         const blockedAggregateOperations = [
@@ -2080,7 +2883,9 @@ describe("session HttpApi", () => {
         )
         expect(stored?.parts).toMatchObject([{ id: seeded.part.id, text: "producer-owned transcript" }])
 
-        const aggregate = yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), { headers })
+        const aggregate = yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), {
+          headers,
+        })
         expect(aggregate).toMatchObject({
           id: session.id,
           title: "scheduled run",
@@ -2093,9 +2898,9 @@ describe("session HttpApi", () => {
           headers,
         })
         expect(removeSession.status).toBe(400)
-        expect((yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), { headers })).id).toBe(
-          session.id,
-        )
+        expect(
+          (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), { headers })).id,
+        ).toBe(session.id)
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )
@@ -2240,7 +3045,7 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
-    "paused sessions admit prompts without running them, then drain on resume",
+    "submitting a prompt automatically resumes a paused session and drains the new input",
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
@@ -2253,8 +3058,8 @@ describe("session HttpApi", () => {
 
         yield* request(pathFor(SessionPaths.pause, { sessionID: session.id }), { method: "POST", headers })
 
-        // A prompt while paused is admitted (user message created) but never
-        // reaches the provider — no assistant message, no LLM hit.
+        // Sending a human prompt is an explicit Resume action: no separate
+        // /resume request is needed, and the new message is admitted first.
         const admitted = yield* request(
           `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`,
           {
@@ -2268,14 +3073,7 @@ describe("session HttpApi", () => {
           },
         )
         expect(admitted.status).toBe(200)
-        expect(yield* llm.calls).toBe(0)
-        expect(
-          (yield* Session.use.messages({ sessionID: session.id }).pipe(provideInstanceEffect(directory), Effect.orDie))
-            .filter((message) => message.info.role === "assistant"),
-        ).toHaveLength(0)
-
-        // Resume wakes the drain: the admitted message gets answered.
-        yield* request(pathFor(SessionPaths.resume, { sessionID: session.id }), { method: "POST", headers })
+        expect((yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), { headers })).pausedAt).toBeUndefined()
 
         const assistant = yield* pollWithTimeout(
           Effect.gen(function* () {
@@ -2284,12 +3082,64 @@ describe("session HttpApi", () => {
               .pipe(provideInstanceEffect(directory), Effect.orDie)
             return messages.find((message) => message.info.role === "assistant")
           }),
-          "resume did not drain the admitted prompt",
+          "user submission did not resume and drain the admitted prompt",
           "10 seconds",
         )
         expect(assistant?.info.role).toBe("assistant")
+        expect(yield* llm.calls).toBe(1)
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 60000 },
+  )
+
+  it.instance(
+    "prompt_async including a Poke continue message automatically unpauses the session",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.text("continued", { usage: { input: 1, output: 1 } })
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "paused poke" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory }
+        const paused = yield* request(pathFor(SessionPaths.pause, { sessionID: session.id }), { method: "POST", headers })
+        expect(paused.status).toBe(204)
+
+        const sent = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+          method: "POST",
+          headers: { ...headers, "content-type": "application/json" },
+          body: JSON.stringify({
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "continue" }],
+          }),
+        })
+        expect(sent.status).toBe(204)
+        expect((yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), { headers })).pausedAt).toBeUndefined()
+
+        const assistant = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const messages = yield* Session.use.messages({ sessionID: session.id })
+              .pipe(provideInstanceEffect(directory), Effect.orDie)
+            return messages.find((message) => message.info.role === "assistant")
+          }),
+          "Poke did not wake the paused session",
+          "10 seconds",
+        )
+        expect(assistant?.info.role).toBe("assistant")
+        // An async wake creates the assistant row before provider startup.
+        // Verify the request actually reached the model, not merely the DB.
+        const calls = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const count = yield* llm.calls
+            return count > 0 ? count : undefined
+          }),
+          "Poke did not reach the provider",
+          "30 seconds",
+        )
+        expect(calls).toBe(1)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 120000 },
   )
 
   it.live("pause stops an in-flight V1 run", () =>
@@ -2338,248 +3188,324 @@ describe("session HttpApi", () => {
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 
-  it.live("regenerates a session title in the background", () =>
-    Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      yield* llm.tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Generated Title" })
+  it.live(
+    "regenerates a session title in the background",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Generated Title" })
 
-      const config = testProviderConfig(llm.url)
-      const directory = yield* tmpdirScoped({ git: true, config })
-      const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
-      const svc = yield* Session.Service
-      const message = yield* svc.updateMessage({
-        id: MessageID.ascending(),
-        role: "user",
-        sessionID: session.id,
-        agent: "build",
-        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
-        time: { created: Date.now() },
-      })
-      yield* svc.updatePart({
-        id: PartID.ascending(),
-        sessionID: session.id,
-        messageID: message.id,
-        type: "text",
-        text: "hello",
-      })
+        const config = testProviderConfig(llm.url)
+        const directory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
+        const svc = yield* Session.Service
+        const message = yield* svc.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: session.id,
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+          time: { created: Date.now() },
+        })
+        yield* svc.updatePart({
+          id: PartID.ascending(),
+          sessionID: session.id,
+          messageID: message.id,
+          type: "text",
+          text: "hello",
+        })
 
-      const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
-        method: "POST",
-        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
-        body: JSON.stringify({}),
-      })
-      expect(response.status).toBe(204)
+        const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+          body: JSON.stringify({}),
+        })
+        expect(response.status).toBe(204)
 
-      const titled = yield* pollWithTimeout(
-        Effect.gen(function* () {
-          const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
-          return current.title === "Old Title" ? undefined : current.title
-        }),
-        "title was not regenerated",
-        "10 seconds",
-      )
-      expect(titled).toBe("Generated Title")
+        const titled = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
+            return current.title === "Old Title" ? undefined : current.title
+          }),
+          "title was not regenerated",
+          "10 seconds",
+        )
+        expect(titled).toBe("Generated Title")
 
-      const transcriptID = SpecialAgentSession.sessionIDFor({
-        ownerKind: SpecialAgentSession.OWNER_SESSION,
-        ownerID: session.id,
-        agent: "session_title",
-      })
-      const { readDb } = yield* Database.Service
-      const history = yield* SessionHistory.load(readDb, transcriptID)
-      const prompts = history.filter(
-        (item) =>
-          item.type === "synthetic" &&
-          item.provenance?.owner === "host" &&
-          item.provenance.source === CurrentSessionTurnProvenance.Source.SessionTitle,
-      )
-      expect(prompts).toHaveLength(1)
-      expect(prompts[0] && CurrentSessionTurnProvenance.isWorkerPromptTurn(prompts[0])).toBe(false)
-      const assistants = history.filter((item) => item.type === "assistant")
-      expect(assistants).toHaveLength(1)
-      expect(
-        assistants.flatMap((assistant) =>
-          assistant.type === "assistant"
-            ? assistant.content
-                .filter((part) => part.type === "tool")
-                .map((part) => ({ name: part.name, status: part.state.status }))
-            : [],
-        ),
-      ).toContainEqual({ name: SessionTitle.GENERATED_TITLE_TOOL, status: "completed" })
-
-      // The desktop's production local-protocol path hydrates detail Sessions
-      // through the mature V1 message endpoint. Special-agent Sessions own a
-      // current transcript, so that endpoint must expose the same durable
-      // conversation instead of rendering an empty child after navigation.
-      const compat = yield* requestJson<SessionV1.WithParts[]>(
-        `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=50`,
-        { headers: { "x-opencode-directory": directory } },
-      )
-      expect(
-        compat.some(
+        const transcriptID = SpecialAgentSession.sessionIDFor({
+          ownerKind: SpecialAgentSession.OWNER_SESSION,
+          ownerID: session.id,
+          agent: "session_title",
+        })
+        const { readDb } = yield* Database.Service
+        const history = yield* SessionHistory.load(readDb, transcriptID)
+        const prompts = history.filter(
           (item) =>
-            item.info.role === "user" &&
-            item.info.provenance?.source === CurrentSessionTurnProvenance.Source.SessionTitle,
-        ),
-      ).toBe(true)
-      expect(
-        compat.some(
-          (item) =>
-            item.info.role === "assistant" &&
-            item.parts.some((part) => part.type === "tool" && part.tool === SessionTitle.GENERATED_TITLE_TOOL),
-        ),
-      ).toBe(true)
+            item.type === "synthetic" &&
+            item.provenance?.owner === "host" &&
+            item.provenance.source === CurrentSessionTurnProvenance.Source.SessionTitle,
+        )
+        expect(prompts).toHaveLength(1)
+        expect(prompts[0] && CurrentSessionTurnProvenance.isWorkerPromptTurn(prompts[0])).toBe(false)
+        const assistants = history.filter((item) => item.type === "assistant")
+        expect(assistants).toHaveLength(1)
+        expect(
+          assistants.flatMap((assistant) =>
+            assistant.type === "assistant"
+              ? assistant.content
+                  .filter((part) => part.type === "tool")
+                  .map((part) => ({ name: part.name, status: part.state.status }))
+              : [],
+          ),
+        ).toContainEqual({ name: SessionTitle.GENERATED_TITLE_TOOL, status: "completed" })
 
-      const assistant = compat.find((item) => item.info.role === "assistant")
-      const prompt = compat.find((item) => item.info.role === "user")
-      expect(assistant?.info.role).toBe("assistant")
-      expect(prompt?.info.role).toBe("user")
-      if (!assistant || assistant.info.role !== "assistant" || !prompt || prompt.info.role !== "user") {
-        return yield* Effect.die("special-agent V1 projection did not expose the expected turn pair")
-      }
-      expect(assistant.info.parentID).toBe(prompt.info.id)
+        // The desktop's production local-protocol path hydrates detail Sessions
+        // through the mature V1 message endpoint. Special-agent Sessions own a
+        // current transcript, so that endpoint must expose the same durable
+        // conversation instead of rendering an empty child after navigation.
+        const compat = yield* requestJson<SessionV1.WithParts[]>(
+          `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=50`,
+          { headers: { "x-opencode-directory": directory } },
+        )
+        expect(
+          compat.some(
+            (item) =>
+              item.info.role === "user" &&
+              item.info.provenance?.source === CurrentSessionTurnProvenance.Source.SessionTitle,
+          ),
+        ).toBe(true)
+        expect(
+          compat.some(
+            (item) =>
+              item.info.role === "assistant" &&
+              item.parts.some((part) => part.type === "tool" && part.tool === SessionTitle.GENERATED_TITLE_TOOL),
+          ),
+        ).toBe(true)
 
-      const firstPageResponse = yield* request(
-        `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=1`,
-        { headers: { "x-opencode-directory": directory } },
-      )
-      const firstPage = yield* json<SessionV1.WithParts[]>(firstPageResponse)
-      expect(firstPage).toHaveLength(1)
-      expect(firstPage[0]?.info.role).toBe("assistant")
-      const nextCursor = firstPageResponse.headers["x-next-cursor"]
-      expect(nextCursor).toBeTruthy()
+        const assistant = compat.find((item) => item.info.role === "assistant")
+        const prompt = compat.find((item) => item.info.role === "user")
+        expect(assistant?.info.role).toBe("assistant")
+        expect(prompt?.info.role).toBe("user")
+        if (!assistant || assistant.info.role !== "assistant" || !prompt || prompt.info.role !== "user") {
+          return yield* Effect.die("special-agent V1 projection did not expose the expected turn pair")
+        }
+        expect(assistant.info.parentID).toBe(prompt.info.id)
 
-      const secondPage = yield* requestJson<SessionV1.WithParts[]>(
-        `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=1&before=${encodeURIComponent(String(nextCursor))}`,
-        { headers: { "x-opencode-directory": directory } },
-      )
-      expect(secondPage).toHaveLength(1)
-      expect(secondPage[0]?.info.role).toBe("user")
-      expect(firstPage[0]?.info.role === "assistant" ? firstPage[0].info.parentID : undefined).toBe(
-        secondPage[0]?.info.id,
-      )
+        const firstPageResponse = yield* request(
+          `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=1`,
+          { headers: { "x-opencode-directory": directory } },
+        )
+        const firstPage = yield* json<SessionV1.WithParts[]>(firstPageResponse)
+        expect(firstPage).toHaveLength(1)
+        expect(firstPage[0]?.info.role).toBe("assistant")
+        const nextCursor = firstPageResponse.headers["x-next-cursor"]
+        expect(nextCursor).toBeTruthy()
 
-      const byID = yield* requestJson<SessionV1.WithParts>(
-        pathFor(SessionPaths.message, {
-          sessionID: transcriptID,
-          messageID: assistant.info.id,
-        }),
-        { headers: { "x-opencode-directory": directory } },
-      )
-      expect(byID.info.id).toBe(assistant.info.id)
-      expect(byID.info.role === "assistant" ? byID.info.parentID : undefined).toBe(prompt.info.id)
-      expect(
-        byID.parts.some((part) => part.type === "tool" && part.tool === SessionTitle.GENERATED_TITLE_TOOL),
-      ).toBe(true)
-    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+        const secondPage = yield* requestJson<SessionV1.WithParts[]>(
+          `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=1&before=${encodeURIComponent(String(nextCursor))}`,
+          { headers: { "x-opencode-directory": directory } },
+        )
+        expect(secondPage).toHaveLength(1)
+        expect(secondPage[0]?.info.role).toBe("user")
+        expect(firstPage[0]?.info.role === "assistant" ? firstPage[0].info.parentID : undefined).toBe(
+          secondPage[0]?.info.id,
+        )
+
+        const byID = yield* requestJson<SessionV1.WithParts>(
+          pathFor(SessionPaths.message, {
+            sessionID: transcriptID,
+            messageID: assistant.info.id,
+          }),
+          { headers: { "x-opencode-directory": directory } },
+        )
+        expect(byID.info.id).toBe(assistant.info.id)
+        expect(byID.info.role === "assistant" ? byID.info.parentID : undefined).toBe(prompt.info.id)
+        expect(byID.parts.some((part) => part.type === "tool" && part.tool === SessionTitle.GENERATED_TITLE_TOOL)).toBe(
+          true,
+        )
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     20_000,
   )
 
-  it.live("regenerateTitle repairs prose in the same title-agent conversation", () =>
-    Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      yield* llm.push(
-        reply().text("This looks like a title, but I forgot the completion tool.").stop().item(),
-        reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Recovered Title" }).item(),
-      )
+  it.live(
+    "regenerateTitle leaves the title untouched until user explicitly chooses a different model",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.push(
+          httpError(400, { error: { message: "Upstream rejected the first title model" } }),
+          reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Recovered After 400" }).item(),
+        )
 
-      const config = testProviderConfig(llm.url)
-      const directory = yield* tmpdirScoped({ git: true, config })
-      const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
-      const svc = yield* Session.Service
-      const message = yield* svc.updateMessage({
-        id: MessageID.ascending(),
-        role: "user",
-        sessionID: session.id,
-        agent: "build",
-        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
-        time: { created: Date.now() },
-      })
-      yield* svc.updatePart({
-        id: PartID.ascending(),
-        sessionID: session.id,
-        messageID: message.id,
-        type: "text",
-        text: "repair title generation",
-      })
+        const base = testProviderConfig(llm.url)
+        const config = {
+          ...base,
+          provider: {
+            test: {
+              ...base.provider.test,
+              models: {
+                ...base.provider.test.models,
+                "title-backup-model": {
+                  ...base.provider.test.models["test-model"],
+                  id: "title-backup-model",
+                  name: "Title Backup",
+                },
+              },
+            },
+          },
+        }
+        const directory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
+        const svc = yield* Session.Service
+        const message = yield* svc.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: session.id,
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+          time: { created: Date.now() },
+        })
+        yield* svc.updatePart({
+          id: PartID.ascending(),
+          sessionID: session.id,
+          messageID: message.id,
+          type: "text",
+          text: "HTTP 400 recovery test",
+        })
 
-      const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
-        method: "POST",
-        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
-        body: JSON.stringify({}),
-      })
-      expect(response.status).toBe(204)
+        const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+          body: JSON.stringify({}),
+        })
+        expect(response.status).toBe(503)
+        expect((yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)).title).toBe("Old Title")
+        expect((yield* llm.inputs).map((item) => item.model)).toEqual(["test-model"])
 
-      const titled = yield* pollWithTimeout(
-        Effect.gen(function* () {
-          const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
-          return current.title === "Old Title" ? undefined : current.title
-        }),
-        "repaired title was not regenerated",
-        "10 seconds",
-      )
-      expect(titled).toBe("Recovered Title")
-
-      const inputs = yield* llm.inputs
-      expect(inputs).toHaveLength(2)
-      expect(JSON.stringify(inputs[1])).toContain("Protocol correction")
-      expect(JSON.stringify(inputs[1])).toContain(SessionTitle.GENERATED_TITLE_TOOL)
-    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+        // UI prompts the human to choose another model. No backend fallback
+        // happens before the explicit second request carrying that choice.
+        const retry = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+          body: JSON.stringify({ model: { providerID: "test", id: "title-backup-model" } }),
+        })
+        expect(retry.status).toBe(204)
+        expect((yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)).title)
+          .toBe("Recovered After 400")
+        expect((yield* llm.inputs).map((item) => item.model)).toEqual(["test-model", "title-backup-model"])
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     20_000,
   )
 
-  it.live("regenerateTitle repairs an invalid generated_title payload before succeeding", () =>
-    Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      yield* llm.push(
-        reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { wrong: "field" }).item(),
-        reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Validated Title" }).item(),
-      )
+  it.live(
+    "regenerateTitle repairs prose in the same title-agent conversation",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.push(
+          reply().text("This looks like a title, but I forgot the completion tool.").stop().item(),
+          reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Recovered Title" }).item(),
+        )
 
-      const config = testProviderConfig(llm.url)
-      const directory = yield* tmpdirScoped({ git: true, config })
-      const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
-      const svc = yield* Session.Service
-      const message = yield* svc.updateMessage({
-        id: MessageID.ascending(),
-        role: "user",
-        sessionID: session.id,
-        agent: "build",
-        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
-        time: { created: Date.now() },
-      })
-      yield* svc.updatePart({
-        id: PartID.ascending(),
-        sessionID: session.id,
-        messageID: message.id,
-        type: "text",
-        text: "validate title payload",
-      })
+        const config = testProviderConfig(llm.url)
+        const directory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
+        const svc = yield* Session.Service
+        const message = yield* svc.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: session.id,
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+          time: { created: Date.now() },
+        })
+        yield* svc.updatePart({
+          id: PartID.ascending(),
+          sessionID: session.id,
+          messageID: message.id,
+          type: "text",
+          text: "repair title generation",
+        })
 
-      const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
-        method: "POST",
-        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
-        body: JSON.stringify({}),
-      })
-      expect(response.status).toBe(204)
+        const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+          body: JSON.stringify({}),
+        })
+        expect(response.status).toBe(204)
 
-      const titled = yield* pollWithTimeout(
-        Effect.gen(function* () {
-          const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
-          return current.title === "Old Title" ? undefined : current.title
-        }),
-        "payload-repaired title was not regenerated",
-        "10 seconds",
-      )
-      expect(titled).toBe("Validated Title")
+        const titled = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
+            return current.title === "Old Title" ? undefined : current.title
+          }),
+          "repaired title was not regenerated",
+          "10 seconds",
+        )
+        expect(titled).toBe("Recovered Title")
 
-      const inputs = yield* llm.inputs
-      expect(inputs).toHaveLength(2)
-      const repair = JSON.stringify(inputs[1])
-      expect(repair).toContain("Protocol error")
-      expect(repair).toContain("Protocol correction")
-      expect(repair).toContain("host rejected the previous completion")
-    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+        const inputs = yield* llm.inputs
+        expect(inputs).toHaveLength(2)
+        expect(JSON.stringify(inputs[1])).toContain("Protocol correction")
+        expect(JSON.stringify(inputs[1])).toContain(SessionTitle.GENERATED_TITLE_TOOL)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    20_000,
+  )
+
+  it.live(
+    "regenerateTitle repairs an invalid generated_title payload before succeeding",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.push(
+          reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { wrong: "field" }).item(),
+          reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Validated Title" }).item(),
+        )
+
+        const config = testProviderConfig(llm.url)
+        const directory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
+        const svc = yield* Session.Service
+        const message = yield* svc.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: session.id,
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+          time: { created: Date.now() },
+        })
+        yield* svc.updatePart({
+          id: PartID.ascending(),
+          sessionID: session.id,
+          messageID: message.id,
+          type: "text",
+          text: "validate title payload",
+        })
+
+        const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+          body: JSON.stringify({}),
+        })
+        expect(response.status).toBe(204)
+
+        const titled = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
+            return current.title === "Old Title" ? undefined : current.title
+          }),
+          "payload-repaired title was not regenerated",
+          "10 seconds",
+        )
+        expect(titled).toBe("Validated Title")
+
+        const inputs = yield* llm.inputs
+        expect(inputs).toHaveLength(2)
+        const repair = JSON.stringify(inputs[1])
+        expect(repair).toContain("Protocol error")
+        expect(repair).toContain("Protocol correction")
+        expect(repair).toContain("host rejected the previous completion")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     20_000,
   )
 
@@ -2624,4 +3550,56 @@ describe("session HttpApi", () => {
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 
+  it.instance(
+    "permission auto-accept policy route settles a pending ask without renderer delivery",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* Effect.addFinalizer(() => Effect.promise(() => AutoAcceptPolicy.remove(test.directory)))
+        const permission = yield* Permission.Service
+        const sessionID = SessionID.descending()
+        const ask = yield* permission
+          .ask({
+            sessionID,
+            permission: "bash",
+            patterns: ["echo hidden"],
+            always: [],
+            metadata: {},
+            ruleset: [],
+          })
+          .pipe(Effect.forkScoped)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const pending = yield* permission.list()
+            return pending.length === 1 ? pending : undefined
+          }),
+          "permission did not become pending",
+        )
+
+        const query = new URLSearchParams({ directory: test.directory })
+        const response = yield* request(`/permission/auto-accept?${query}`, {
+          method: "PUT",
+          headers: { "x-opencode-directory": test.directory, "content-type": "application/json" },
+          body: JSON.stringify({ autoAccept: { "*": true }, mode: "patch" }),
+        })
+        expect(response.status).toBe(200)
+        expect(yield* responseJson(response)).toBe(true)
+        yield* awaitWithTimeout(Fiber.await(ask), "sidecar did not settle the permission")
+        expect(yield* permission.list()).toHaveLength(0)
+
+        // A second renderer may hydrate an older full preference snapshot. Hydration
+        // only fills absent keys and cannot overwrite the sidecar's explicit choice.
+        const hydrate = yield* request(`/permission/auto-accept?${query}`, {
+          method: "PUT",
+          headers: { "x-opencode-directory": test.directory, "content-type": "application/json" },
+          body: JSON.stringify({ autoAccept: { "*": false, stale_window_session: false }, mode: "hydrate" }),
+        })
+        expect(hydrate.status).toBe(200)
+        const durable = yield* Effect.promise(() => AutoAcceptPolicy.get(test.directory))
+        expect(durable.current.autoAccept["*"]).toBe(true)
+        expect(durable.current.autoAccept.stale_window_session).toBe(false)
+      }),
+    { git: true },
+    15_000,
+  )
 })

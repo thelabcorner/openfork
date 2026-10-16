@@ -44,8 +44,12 @@ const handlers = HttpApiBuilder.group(Api, "test", (handlers) =>
     .handle("missing", () => Effect.fail(new HttpApiError.NotFound({}))),
 )
 
+let v2ProbeExecutions = 0
 const serverHandlers = HttpApiBuilder.group(ServerApi, "test.v2", (handlers) =>
-  handlers.handle("probe", () => Effect.succeed("ok")),
+  handlers.handle("probe", () => {
+    v2ProbeExecutions++
+    return Effect.succeed("ok")
+  }),
 )
 
 const apiLayer = HttpRouter.serve(
@@ -89,6 +93,12 @@ const getProbe = (headers?: Record<string, string>) =>
     HttpClient.execute,
   )
 
+const getV2Probe = (headers?: Record<string, string>) =>
+  HttpClientRequest.get("/api/probe").pipe(
+    headers ? HttpClientRequest.setHeaders(headers) : (request) => request,
+    HttpClient.execute,
+  )
+
 describe("HttpApi authorization middleware", () => {
   it.live("allows requests when server password is not configured", () =>
     Effect.gen(function* () {
@@ -125,10 +135,44 @@ describe("HttpApi authorization middleware", () => {
       )
 
       expect(missing.status).toBe(401)
-      expect(missing.headers["www-authenticate"] ?? "").toContain("Basic")
+      expect(missing.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
       expect(badPassword.status).toBe(401)
-      expect(badPassword.headers["www-authenticate"] ?? "").toContain("Basic")
+      expect(badPassword.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
       expect(good.status).toBe(200)
+    }),
+  )
+
+  itSecret.live("uses a browser-safe Bearer challenge on cross-origin V1 requests", () =>
+    Effect.gen(function* () {
+      const response = yield* getProbe({ origin: "https://mobile.example.test" })
+
+      expect(response.status).toBe(401)
+      expect(response.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
+    }),
+  )
+
+  itSecret.live("uses Bearer for a same-origin desktop API fetch", () =>
+    Effect.gen(function* () {
+      const response = yield* getProbe({ origin: "http://localhost" })
+
+      expect(response.status).toBe(401)
+      expect(response.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
+    }),
+  )
+
+  itSecret.live("uses Bearer for missing, invalid, or legacy renderer Origins on API routes", () =>
+    Effect.gen(function* () {
+      const [missing, invalid, renderer] = yield* Effect.all(
+        [getProbe(), getProbe({ origin: "not an origin" }), getProbe({ origin: "oc://renderer" })],
+        { concurrency: "unbounded" },
+      )
+
+      expect(missing.status).toBe(401)
+      expect(missing.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
+      expect(invalid.status).toBe(401)
+      expect(invalid.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
+      expect(renderer.status).toBe(401)
+      expect(renderer.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
     }),
   )
 
@@ -195,8 +239,38 @@ describe("HttpApi authorization middleware", () => {
       const body = yield* response.json
 
       expect(response.status).toBe(401)
-      expect(response.headers["www-authenticate"] ?? "").toContain("Basic")
+      expect(response.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
       expect(body).toEqual({ _tag: "UnauthorizedError", message: "Authentication required" })
+    }),
+  )
+
+  itV2Secret.live("uses the same Bearer challenge on cross-origin V2 requests", () =>
+    Effect.gen(function* () {
+      const response = yield* getV2Probe({
+        origin: "https://mobile.example.test",
+        authorization: "Bearer invalid-device-token",
+      })
+      const body = yield* response.json
+
+      expect(response.status).toBe(401)
+      expect(response.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
+      expect(body).toEqual({ _tag: "UnauthorizedError", message: "Authentication required" })
+    }),
+  )
+
+  itV2Secret.live("uses Bearer for missing, invalid, or same-origin metadata", () =>
+    Effect.gen(function* () {
+      const [missing, invalid, sameOrigin] = yield* Effect.all(
+        [getV2Probe(), getV2Probe({ origin: "not an origin" }), getV2Probe({ origin: "http://localhost" })],
+        { concurrency: "unbounded" },
+      )
+
+      expect(missing.status).toBe(401)
+      expect(missing.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
+      expect(invalid.status).toBe(401)
+      expect(invalid.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
+      expect(sameOrigin.status).toBe(401)
+      expect(sameOrigin.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
     }),
   )
 
@@ -249,6 +323,35 @@ describe("HttpApi authorization middleware", () => {
       expect(bearer.status).toBe(401)
       expect(basicAuth.status).toBe(401)
       expect(query.status).toBe(401)
+
+      const crossOriginV1 = yield* getProbe({
+        authorization: `Bearer ${created.token}`,
+        origin: "https://mobile.example.test",
+      })
+      expect(crossOriginV1.status).toBe(401)
+      expect(crossOriginV1.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
+    }),
+  )
+
+  // Keep this on the V2-only test router: issuing /api/probe through itSecret
+  // instead is an unmatched path (404) before either auth or the probe runs.
+  itV2Secret.live("rejects a revoked device before executing the V2 probe handler", () =>
+    Effect.gen(function* () {
+      const devices = yield* Device.Service
+      const created = yield* devices.create()
+      const authorized = yield* getV2Probe({ authorization: `Bearer ${created.token}` })
+      expect(authorized.status).toBe(200)
+
+      yield* devices.revoke(created.device.id)
+      const executionsBeforeRejectedRequest = v2ProbeExecutions
+      const rejected = yield* getV2Probe({
+        authorization: `Bearer ${created.token}`,
+        origin: "https://mobile.example.test",
+      })
+
+      expect(rejected.status).toBe(401)
+      expect(rejected.headers["www-authenticate"]).toBe('Bearer realm="OpenFork"')
+      expect(v2ProbeExecutions).toBe(executionsBeforeRejectedRequest)
     }),
   )
 

@@ -1,5 +1,6 @@
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { GlobalBus } from "@/bus/global"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { estimateEventBytes, parseEventSequence } from "@opencode-ai/core/event-replay"
 import { EventV2 } from "@opencode-ai/core/event"
 import {
@@ -87,21 +88,15 @@ function eventID() {
   return EventV2.ID.create()
 }
 
-function routeDirectory(input: string) {
-  try {
-    // Preserve the directory decoding that InstanceContextMiddleware applied
-    // before this transport switched to the explicit routing context.
-    return decodeURIComponent(input)
-  } catch {
-    return input
-  }
-}
-
 function eventResponse(events: EventV2Bridge.Interface) {
   return Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
     const route = yield* WorkspaceRouteContext
-    const directory = routeDirectory(route.directory)
+    // WorkspaceRoutingMiddleware owns SDK directory-header decoding. Resolve
+    // the routed path to the same filesystem identity used by instance events;
+    // Windows short/long names and symlinked workspaces otherwise make a valid
+    // subscriber silently miss every directory-scoped event.
+    const directory = FSUtil.resolve(route.directory)
     const workspaceID = route.workspaceID
     const lastEventID = request.headers["last-event-id"]
     // Request-derived context must be read here, not inside the stream: the

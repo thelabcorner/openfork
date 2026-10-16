@@ -13,16 +13,6 @@ export const ConfigApi = HttpApi.make("config")
   .add(
     HttpApiGroup.make("config")
       .add(
-        HttpApiEndpoint.get("get", root, {
-          query: WorkspaceRoutingQuery,
-          success: described(ConfigV1.Info, "Get config info"),
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "config.get",
-            summary: "Get configuration",
-            description: "Retrieve the current OpenFork configuration settings and preferences.",
-          }),
-        ),
         HttpApiEndpoint.patch("update", root, {
           query: WorkspaceRoutingQuery,
           payload: ConfigV1.Info,
@@ -61,5 +51,34 @@ export const ConfigApi = HttpApi.make("config")
       title: "OpenFork experimental HttpApi",
       version: "0.0.1",
       description: "Experimental HttpApi surface for selected instance routes.",
+    }),
+  )
+
+// Configuration projection is Tier 2: it belongs to an explicit workspace but
+// does not need the execution Instance that owns config mutation and provider
+// catalog operations below.
+export const ConfigReadApi = HttpApi.make("config-read")
+  .add(
+    HttpApiGroup.make("config-read")
+      .add(
+        HttpApiEndpoint.get("get", root, {
+          query: WorkspaceRoutingQuery,
+          success: described(ConfigV1.Info, "Get config info"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "config.get",
+            summary: "Get configuration",
+            description: "Retrieve the effective OpenFork configuration for an explicit workspace.",
+          }),
+        ),
+      )
+      .middleware(WorkspaceRoutingMiddleware)
+      .middleware(Authorization),
+  )
+  .annotateMerge(
+    OpenApi.annotations({
+      title: "OpenFork workspace config read",
+      version: "0.0.1",
+      description: "Explicit-location configuration projection without execution instance bootstrap.",
     }),
   )
