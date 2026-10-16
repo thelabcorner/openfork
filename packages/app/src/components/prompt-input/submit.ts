@@ -11,6 +11,7 @@ import { useLayout } from "@/context/layout"
 import { useLocal, type ModelSelection } from "@/context/local"
 import { usePermission } from "@/context/permission"
 import { type ContextItem, type ImageAttachmentPart, type Prompt, type usePrompt } from "@/context/prompt"
+import { snapshotPrompt } from "@/context/prompt-snapshot"
 import { useSDK, type DirectorySDK } from "@/context/sdk"
 import { useSync, type DirectorySync } from "@/context/sync"
 import { Identifier } from "@/utils/id"
@@ -19,7 +20,9 @@ import { buildRequestParts } from "./build-request-parts"
 import { setCursorPosition } from "./editor-dom"
 import { formatServerError } from "@/utils/server-errors"
 import { ScopedKey } from "@/utils/server-scope"
+import { stopSession } from "@/utils/session-stop"
 import { createPromptSubmissionState } from "./submission-state"
+import { correctPromptParts, shouldCorrectPromptSubmission } from "./correction"
 import { normalizeSessionInfo } from "@/utils/session"
 import { Event } from "@opencode-ai/schema/event"
 import { blobDataUrl } from "@/utils/draft-store"
@@ -37,7 +40,7 @@ export type FollowupDraft = {
   prompt: Prompt
   context: (ContextItem & { key: string })[]
   agent: string
-  model: { providerID: string; modelID: string }
+  model: { providerID: string; modelID: string; routeIntent?: import("@opencode-ai/schema/model-select/provider-route-intent").Info }
   variant?: string
   subProvider?: string
   goal?: {
@@ -57,6 +60,7 @@ type FollowupSendInput = {
   optimisticBusy?: boolean
   before?: () => Promise<boolean> | boolean
   prepare?: (draft: FollowupDraft) => Promise<void>
+  isCurrent?: () => boolean
 }
 
 const draftText = (prompt: Prompt) => prompt.map((part) => ("content" in part ? part.content : "")).join("")
@@ -64,6 +68,7 @@ const draftText = (prompt: Prompt) => prompt.map((part) => ("content" in part ? 
 const draftImages = (prompt: Prompt) => prompt.filter((part): part is ImageAttachmentPart => part.type === "image")
 
 export async function sendFollowupDraft(input: FollowupSendInput) {
+  const humanInterjection = input.sync.session.get(input.draft.sessionID)?.humanInterjection === true
   const text = draftText(input.draft.prompt)
   const images = draftImages(input.draft.prompt)
   const setBusy = () => {
@@ -83,8 +88,12 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
   }
 
   const [head, ...tail] = text.split(" ")
-  const cmd = head?.startsWith("/") ? head.slice(1) : undefined
-  if (cmd && input.sync.data.command.find((item) => item.name === cmd)) {
+  const cmd = !humanInterjection && head?.startsWith("/") ? head.slice(1) : undefined
+  const commands = cmd
+    ? await input.serverSync.commands.ensure(input.draft.sessionDirectory, { isCurrent: input.isCurrent })
+    : input.sync.data.command
+  if (input.isCurrent && !input.isCurrent()) return false
+  if (cmd && commands.find((item) => item.name === cmd)) {
     setBusy()
     try {
       if (!(await wait())) {
@@ -105,6 +114,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
           providerID: input.draft.model.providerID,
           variant: input.draft.variant,
         },
+        routeIntent: input.draft.model.routeIntent,
         files: await Promise.all(
           images.map(async (attachment) => ({
             uri: await blobDataUrl(attachment.blob, attachment.mime),
@@ -178,7 +188,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
     await input.api.prompt({
       sessionID: input.draft.sessionID,
       id: messageID,
-      agent: input.draft.agent,
+      agent: humanInterjection ? undefined : input.draft.agent,
       model: input.draft.model,
       variant: input.draft.variant,
       subProvider: input.draft.subProvider,
@@ -221,9 +231,12 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
 type PromptSubmitInput = {
   prompt: ReturnType<typeof usePrompt>
   info: Accessor<{ id: string } | undefined>
-  imageAttachments: Accessor<ImageAttachmentPart[]>
   commentCount: Accessor<number>
   autoAccept: Accessor<boolean>
+  /** Only explicit first-party human composers may opt into normalization. */
+  correctBeforeSubmit?: Accessor<boolean>
+  correctionIgnoredWords?: Accessor<readonly string[]>
+  correctionUserReplacements?: Accessor<Readonly<Record<string, string>>>
   mode: Accessor<"normal" | "shell">
   working: Accessor<boolean>
   editor: () => HTMLDivElement | undefined
@@ -273,8 +286,9 @@ export function createPromptSubmit(input: PromptSubmitInput) {
   const errorMessage = (err: unknown) => {
     if (err && typeof err === "object" && "message" in err && typeof err.message === "string") return err.message
     if (err && typeof err === "object" && "data" in err) {
-      const data = (err as { data?: { message?: string } }).data
-      if (data?.message) return data.message
+      const data = err.data
+      if (data && typeof data === "object" && "message" in data && typeof data.message === "string")
+        return data.message
     }
     if (err instanceof Error) return err.message
     return language.t("common.requestFailed")
@@ -284,8 +298,6 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     const sessionID = params.id
     if (!sessionID) return Promise.resolve()
 
-    serverSync().session.set("todo", sessionID, [])
-
     input.onAbort?.()
 
     const key = pendingKey(sessionID)
@@ -294,11 +306,18 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       queued.abort.abort()
       queued.cleanup()
       pending.delete(key)
-      return Promise.resolve()
     }
-    return sdk()
-      .api.session.interrupt({ sessionID })
-      .catch(() => {})
+    // Cancelling a locally queued prompt is not the same as stopping an
+    // already-admitted turn. Always run the server's exact-generation Stop as
+    // well: another worker may already own this Session. Do not optimistically
+    // erase durable TODO state or silently present a failed stop as success.
+    return stopSession(sdk().api.session, sessionID).catch((error) => {
+      showToast({
+        variant: "error",
+        title: language.t("common.requestFailed"),
+        description: errorMessage(error),
+      })
+    })
   }
 
   const restoreCommentItems = (
@@ -339,20 +358,57 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     })
   }
 
-  const handleSubmit = async (event: Event): Promise<boolean> => {
+  const handleSubmit = async (event: Event, options?: {
+    skipCorrection?: boolean
+    selectedPatchStarts?: readonly number[]
+  }): Promise<boolean> => {
     event.preventDefault()
 
     const target = prompt.capture()
     const submission = createPromptSubmissionState({
       target,
-      prompt: target.current(),
-      context: target.context.items().slice(),
+      prompt: snapshotPrompt(target.current()),
+      context: target.context.items().map((item) => ({
+        ...item,
+        selection: item.selection ? { ...item.selection } : undefined,
+      })),
     })
-    const currentPrompt = submission.prompt
+    const mode = input.mode()
+    const worker = params.id ? sync().session.get(params.id) : undefined
+    const humanInterjection = worker?.humanInterjection === true
+    const correction = correctPromptParts(
+      submission.prompt,
+      shouldCorrectPromptSubmission({
+        mode,
+        enabled: input.correctBeforeSubmit?.() === true,
+        skip: options?.skipCorrection,
+        humanInterjection,
+      }),
+      {
+        excludedWords: input.correctionIgnoredWords?.(),
+        userReplacements: input.correctionUserReplacements?.(),
+        locale: language.locale(),
+        selectedPatchStarts: options?.selectedPatchStarts ? new Set(options.selectedPatchStarts) : undefined,
+      },
+    )
+    const currentPrompt = correction.effective
     const context = submission.context
     const text = currentPrompt.map((part) => ("content" in part ? part.content : "")).join("")
-    const images = input.imageAttachments().slice()
-    const mode = input.mode()
+    // Read image descriptors from the same immutable admission snapshot as text.
+    // A live composer accessor can change while session/worktree setup awaits.
+    const images = draftImages(submission.prompt)
+    const notifyCorrection = () => {
+      if (!correction.patches.length) return
+      showToast({
+        title: language.t(correction.patches.length === 1
+          ? "prompt.autocorrection.toast.one"
+          : "prompt.autocorrection.toast.many"),
+        description: language.t("prompt.autocorrection.toast.description", {
+          changes: correction.patches.slice(0, 3).map((patch) => `${patch.original} → ${patch.replacement}`).join(", ") +
+            (correction.patches.length > 3 ? "…" : ""),
+        }),
+      })
+    }
 
     if (text.trim().length === 0 && images.length === 0 && input.commentCount() === 0) {
       if (input.working()) void abort()
@@ -360,10 +416,20 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     }
 
     const modelSelection = input.model ?? local.model
-    const currentModel = modelSelection.current()
-    const currentAgent = local.agent.current()
-    const variant = modelSelection.variant.current()
-    const subProvider = currentModel?.provider.id === "openrouter" ? modelSelection.subProvider.current() : undefined
+    // The composer selector is the execution choice for this prompt, including
+    // when a human is steering a delegated worker. Keep the worker assignment
+    // only as a fallback for older/temporarily unavailable selector state.
+    const selectedModel = modelSelection.current()
+    const currentModel = selectedModel ?? (humanInterjection && worker.model
+      ? { id: worker.model.id, provider: { id: worker.model.providerID } }
+      : undefined)
+    const currentAgent = humanInterjection && worker.agent ? { name: worker.agent } : local.agent.current()
+    const variant = selectedModel ? modelSelection.variant.current() : worker?.model?.variant ?? modelSelection.variant.current()
+    const routeIntent = selectedModel ? modelSelection.routeIntent.current() : worker?.model?.routeIntent
+    const subProvider =
+      currentModel?.provider.id === "openrouter"
+        ? modelSelection.subProvider.current()
+        : undefined
     if (!currentModel || !currentAgent) {
       showToast({
         title: language.t("prompt.toast.modelAgentRequired.title"),
@@ -379,7 +445,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       input.goal?.restore(armKey, goalArm)
     }
 
-    input.addToHistory(currentPrompt, mode)
+    // Preserve exactly what was in the editor at send time for history/undo.
+    input.addToHistory(submission.prompt, mode)
     input.resetHistoryNavigation()
 
     const projectDirectory = sdk().directory
@@ -431,12 +498,40 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       input.onNewSessionWorktreeReset?.()
     }
 
+    const submittedSessionID = params.id
     let session = input.info()
+    if (!session && submittedSessionID) {
+      try {
+        // The selected session may not have reached the renderer's in-memory
+        // projection yet (for example, while the directory session list is
+        // still loading). Resolve only this explicitly addressed session from
+        // the global durable metadata owner; never turn a cache miss into a
+        // new session or hydrate its message history.
+        const resolved = await serverSync().session.resolve(submittedSessionID, { priority: "control" })
+        if (params.id !== submittedSessionID || sdk().directory !== projectDirectory) return false
+        sessionDirectory = resolved.directory || sessionDirectory
+        seed(sessionDirectory, resolved)
+        session = resolved
+      } catch (err) {
+        if (params.id !== submittedSessionID || sdk().directory !== projectDirectory) return false
+        restoreGoalArm()
+        showToast({
+          title: language.t("prompt.toast.promptSendFailed.title"),
+          description: errorMessage(err),
+        })
+        return false
+      }
+    }
     if (!session && isNewSession) {
       const created = await sdk()
         .api.session.create({
           agent: currentAgent.name,
-          model: { id: currentModel.id, providerID: currentModel.provider.id, variant },
+          model: {
+            id: currentModel.id,
+            providerID: currentModel.provider.id,
+            variant,
+            ...(routeIntent ? { routeIntent } : {}),
+          },
           location: { directory: sessionDirectory },
         })
         .then(normalizeSessionInfo)
@@ -467,11 +562,14 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           // per-session choice. Stamping both ON and OFF means later default or
           // directory changes cannot silently rewrite this session, and an
           // explicit OFF is never overwritten by the ON default.
-          if (isNewSession)
-            permissionState.initializeAutoAccept(session.id, sessionDirectory, shouldAutoAccept)
+          if (isNewSession) permissionState.initializeAutoAccept(session.id, sessionDirectory, shouldAutoAccept)
           local.session.promote(sessionDirectory, session.id, {
             agent: currentAgent.name,
-            model: { providerID: currentModel.provider.id, modelID: currentModel.id },
+            model: {
+              providerID: currentModel.provider.id,
+              modelID: currentModel.id,
+              ...(routeIntent ? { routeIntent } : {}),
+            },
             variant: variant ?? null,
           })
           layout.handoff.setTabs(base64Encode(sessionDirectory), session.id)
@@ -491,6 +589,15 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return false
     }
 
+    if (!humanInterjection && !(await permissionState.synchronizeAutoAccept(session.id, sessionDirectory))) {
+      restoreGoalArm()
+      showToast({
+        title: language.t("prompt.toast.promptSendFailed.title"),
+        description: language.t("common.requestFailed"),
+      })
+      return false
+    }
+
     const authoritativeSession = sync().session.get(session.id)
     if (goalArm && !authoritativeSession) {
       restoreGoalArm()
@@ -504,6 +611,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     const model = {
       modelID: currentModel.id,
       providerID: currentModel.provider.id,
+      ...(routeIntent ? { routeIntent } : {}),
     }
     const agent = currentAgent.name
     const draft: FollowupDraft = {
@@ -542,7 +650,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         const editor = input.editor()
         if (!editor) return
         editor.focus()
-        setCursorPosition(editor, input.promptLength(currentPrompt))
+        setCursorPosition(editor, input.promptLength(submission.prompt))
         input.queueScroll()
       })
       return true
@@ -550,6 +658,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
     if (!isNewSession && mode === "normal" && input.shouldQueue?.()) {
       input.onQueue?.(draft)
+      notifyCorrection()
       clearContext(submission.target())
       clearInput()
       return true
@@ -578,10 +687,16 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return true
     }
 
-    if (text.startsWith("/")) {
+    if (!humanInterjection && text.startsWith("/")) {
       const [cmdName, ...args] = text.split(" ")
       const commandName = cmdName.slice(1)
-      const customCommand = sync().data.command.find((c) => c.name === commandName)
+      const commands = commandName
+        ? await serverSync().commands.ensure(sessionDirectory, {
+            isCurrent: () => sdk().directory === projectDirectory && (!params.id || params.id === session.id),
+          })
+        : sync().data.command
+      if (params.id && params.id !== session.id) return false
+      const customCommand = commands.find((c) => c.name === commandName)
       if (customCommand) {
         clearInput()
         const messageID = Identifier.ascending("message")
@@ -594,6 +709,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             arguments: args.join(" "),
             agent,
             model: { id: model.modelID, providerID: model.providerID, variant },
+            routeIntent: model.routeIntent,
             files: await Promise.all(
               images.map(async (attachment) => ({
                 uri: await blobDataUrl(attachment.blob, attachment.mime),
@@ -690,6 +806,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       sync: sync(),
       serverSync: serverSync(),
       draft,
+      isCurrent: () => sdk().directory === projectDirectory && (!params.id || params.id === draft.sessionID),
       messageID,
       optimisticBusy: sessionDirectory === projectDirectory,
       before: waitForWorktree,
@@ -700,7 +817,10 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         })
       },
     })
-      .then((sent) => sent)
+      .then((sent) => {
+        if (sent) notifyCorrection()
+        return sent
+      })
       .catch(async (err) => {
         pending.delete(pendingKey(session.id))
         if (sessionDirectory === projectDirectory) {

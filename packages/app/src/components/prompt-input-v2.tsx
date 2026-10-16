@@ -11,6 +11,7 @@ import { Popover } from "@opencode-ai/ui/popover"
 import { ScrollViewOverlayScrollbar } from "@opencode-ai/ui/scroll-view"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 import { getFilename } from "@opencode-ai/core/util/path"
+import type { SessionTelemetry } from "@opencode-ai/schema/session-telemetry"
 import {
   createEffect,
   createMemo,
@@ -36,6 +37,12 @@ import { promptDesignPlaceholder, promptPlaceholder } from "@/components/prompt-
 import type { QuestionDetailsBinding } from "@/pages/session/composer/question-controller"
 import { questionDetailsText } from "@/pages/session/composer/question-details"
 import { createPromptSubmit } from "@/components/prompt-input/submit"
+import { createPromptHarper } from "@/components/prompt-input/harper-controller"
+import { snapshotPrompt } from "@/context/prompt-snapshot"
+import { correctPromptParts } from "@/components/prompt-input/correction"
+import { promptCorrectionReviewFingerprint } from "@/components/prompt-input/correction-review"
+import { DialogPromptCorrectionReview } from "@/components/dialog-prompt-correction-review"
+import { formatServerError } from "@/utils/server-errors"
 import {
   createLiveGenerationRate,
   type LiveGenerationRateState,
@@ -62,7 +69,11 @@ import {
   promptRevisionPrefix,
   promptRevisionRevealBoundaries,
   promptRevisionText,
+  pollRevisionProgress,
   revisedPromptParts,
+  cancelRevisionRun,
+  resumeRevisionRun,
+  type RevisionFailedStatus,
 } from "@/components/prompt-input/prompt-revision"
 import { selectionFromLines, type SelectedLineRange, useFile } from "@/context/file"
 import { useComments } from "@/context/comments"
@@ -83,11 +94,14 @@ import { createSessionTabs } from "@/pages/session/helpers"
 import { focusLimitsProvider } from "@/pages/session/limits-panel-state"
 import { useLimits } from "@/hooks/use-limits"
 import { splitModelIDForProvider } from "@/utils/model-account-identity"
+import { providerModelID } from "@opencode-ai/schema/model-select/account-identity"
 import { useNow } from "@/hooks/use-now"
 import { buildArcModel, type ArcModel } from "@/components/prompt-input/limit-arc"
 import { LimitArcCard, LimitArcGlyph } from "@/components/prompt-input/limit-arc-view"
 import { showToast } from "@/utils/toast"
-import type { CompatibleRevisionDraftArtifact } from "@/utils/server-compat"
+import { activeGenerationMismatch, modelIdentityKey, shouldFollowActiveModel, type ModelIdentity } from "@/components/prompt-input/model-mismatch"
+import { modelSwitchSelection } from "@/components/prompt-input/model-switch-selection"
+import type { CompatibleRevisionDraftArtifact, CompatibleRevisionProgress } from "@/utils/server-compat"
 import {
   promptRevisionTargetKey,
   promptRevisionSourceFingerprint,
@@ -135,7 +149,9 @@ type PromptRevisionSendRegistration = {
   run: (intent: PromptRevisionFlow["intent"]) => void
   busy: () => boolean
   readyForSend: () => boolean
-  cancel: () => void
+  cancel: (options?: { notify?: boolean }) => void
+  /** Latest advisory progress for the in-flight revision; undefined while idle. */
+  progress: () => CompatibleRevisionProgress | undefined
 }
 
 export type PromptInputV2ComposerController = PromptInputV2Interaction & {
@@ -143,6 +159,19 @@ export type PromptInputV2ComposerController = PromptInputV2Interaction & {
   readonly autoAccept: { active: () => boolean; toggle: () => void }
   readonly liveRate: () => LiveGenerationRateState
   readonly sessionID: () => string | undefined
+  readonly grammar: {
+    enabled: () => boolean
+    issues: () => readonly import("@/components/prompt-input/harper-projection").PromptGrammarIssue[]
+    state: () => "off" | "idle" | "loading" | "ready" | "unavailable"
+    undo: () => boolean
+    undoAvailable: () => boolean
+    apply: (id: string, replacement: string) => boolean
+    ignore: (word: string) => void
+    onCompositionChange: (active: boolean) => void
+    autoChanges: () => readonly import("@/components/prompt-input/harper-autofix").AutoHarperChange[]
+    rejectAuto: (id: string) => boolean
+    dismiss: (id: string) => boolean
+  }
   readonly revisionSend: {
     autoBeforeSend: () => boolean
     setAutoBeforeSend: (value: boolean) => void
@@ -151,9 +180,12 @@ export type PromptInputV2ComposerController = PromptInputV2Interaction & {
     available: () => boolean
     busy: () => boolean
     readyForSend: () => boolean
+    progress: () => CompatibleRevisionProgress | undefined
     register: (registration: PromptRevisionSendRegistration) => () => void
     sendWithRevision: () => void
-    sendWithoutRevision: () => Promise<boolean>
+    sendWithoutRevision: (options?: { skipCorrection?: boolean; selectedPatchStarts?: readonly number[] }) => Promise<boolean>
+    sendExact: () => Promise<boolean>
+    reviewCorrections: () => void
   }
   readonly questionActive: () => boolean
   readonly awaitDraftReady: () => Promise<void>
@@ -165,9 +197,30 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
   const command = useCommand()
   const language = useLanguage()
   const sdk = useSDK()
+  const serverSync = useServerSync()
   const params = useParams<{ id?: string }>()
   const [search] = useSearchParams<{ draftId?: string }>()
   const sessionID = () => params.id
+  const telemetry = () => {
+    const id = sessionID()
+    return id ? serverSync().telemetry.get(id) : undefined
+  }
+  const switchModel = async (
+    target: ModelIdentity,
+    attempt: { assistantMessageID: string; requestSentAt: number },
+  ) => {
+    const id = sessionID()
+    if (!id) return
+    await sdk().client.session.switchModel({
+      sessionID: id,
+      assistantMessageID: attempt.assistantMessageID,
+      requestSentAt: attempt.requestSentAt,
+      providerID: target.providerID,
+      modelID: target.modelID,
+      ...(target.accountID ? { accountID: target.accountID } : {}),
+      ...(target.variant ? { variant: target.variant } : {}),
+    })
+  }
   const armKey = () => goalArmKey({ sessionID: sessionID(), draftID: search.draftId, directory: sdk().directory })
 
   return (
@@ -175,6 +228,19 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
       <SessionUsageWarningBanner providerID={props.controller.model.selection.current()?.provider?.id} />
       <PromptInputV2
         controller={props.controller}
+        writingAssistance={{
+          enabled: props.controller.grammar.enabled(),
+          status: props.controller.grammar.state(),
+          issues: props.controller.grammar.issues(),
+          onApply: props.controller.grammar.apply,
+          onIgnore: props.controller.grammar.ignore,
+          onCompositionChange: props.controller.grammar.onCompositionChange,
+          undoAvailable: props.controller.grammar.undoAvailable(),
+          onUndo: props.controller.grammar.undo,
+          autoChanges: props.controller.grammar.autoChanges(),
+          onRejectAuto: props.controller.grammar.rejectAuto,
+          onDismiss: props.controller.grammar.dismiss,
+        }}
         borderUnderlay={props.borderUnderlay}
         class={props.class}
         variantControlVisible={!props.controller.model.loading}
@@ -187,9 +253,7 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
             onToggle={props.controller.autoAccept.toggle}
           />
         }
-        goalControl={
-          <GoalComposerLauncher sessionID={sessionID()} armKey={armKey()} promptText={() => props.controller.value()} />
-        }
+        goalControl={<GoalComposerLauncher sessionID={sessionID()} armKey={armKey()} promptText={() => props.controller.value()} />}
         revisionControl={
           <PromptInputV2RevisionControl
             controller={props.controller}
@@ -206,6 +270,9 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
             title={language.t("command.model.choose")}
             keybind={command.keybindParts("model.choose")}
             model={props.controller.model.selection}
+            sessionID={sessionID()}
+            telemetry={telemetry}
+            onSwitch={switchModel}
             providerID={props.controller.model.selection.current()?.provider?.id}
             modelName={props.controller.model.selection.current()?.name ?? language.t("dialog.model.select.title")}
             onClose={props.controller.restoreFocus}
@@ -243,6 +310,37 @@ function promptRevisionModelRef(providerID: string, qualifiedModelID: string, va
     ...(split.accountID ? { accountID: split.accountID } : {}),
     ...(variant ? { variant } : {}),
   }
+}
+
+/**
+ * Correlation id for one revision operation. The host keys its advisory
+ * latest-value progress projection by exactly this id, and the composer polls
+ * it only while the matching revise request is in flight.
+ */
+function createRevisionOperationID() {
+  try {
+    return crypto.randomUUID()
+  } catch {
+    return `rev_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
+  }
+}
+
+/**
+ * Failures already surfaced by a returning composer, keyed by locator + the
+ * registry's failure timestamp. The registry retains failures for a bounded
+ * TTL; this only keeps a remount (tab switch back and forth) from repeating
+ * the same toast.
+ */
+const surfacedRevisionFailures = new Set<string>()
+const markRevisionFailureSurfaced = (key: string, at: number) => {
+  const id = `${key}\0${at}`
+  if (surfacedRevisionFailures.has(id)) return false
+  if (surfacedRevisionFailures.size >= 64) {
+    const oldest = surfacedRevisionFailures.values().next().value
+    if (oldest !== undefined) surfacedRevisionFailures.delete(oldest)
+  }
+  surfacedRevisionFailures.add(id)
+  return true
 }
 
 function PromptRevisionBusyIcon() {
@@ -326,6 +424,7 @@ function PromptInputV2RevisionControl(props: {
   const language = useLanguage()
   const settings = useSettings()
   const [busy, setBusy] = createSignal(false)
+  const [progress, setProgress] = createSignal<CompatibleRevisionProgress | undefined>()
   const [open, setOpen] = createSignal(false)
   const [guidance, setGuidance] = createSignal("")
   const [modelOverride, setModelOverride] = createSignal<SettingsModelRef | undefined>()
@@ -341,6 +440,9 @@ function PromptInputV2RevisionControl(props: {
   let guidanceEditorArea: HTMLDivElement | undefined
   let request = 0
   let abort: AbortController | undefined
+  let progressPoll: AbortController | undefined
+  let resumePoll: AbortController | undefined
+  let activeRun: { key: string; operationID?: string } | undefined
   const questionReleaseWaiters = new Set<() => void>()
   const releaseQuestionWaiters = () => {
     for (const resolve of questionReleaseWaiters) resolve()
@@ -350,9 +452,14 @@ function PromptInputV2RevisionControl(props: {
     if (props.controller.questionActive()) return
     releaseQuestionWaiters()
   })
+  // Component teardown abandons local waiters only. With a durable target the
+  // run is owned by the server-side registry; explicit cancellation goes
+  // through `cancelRevision` and the cancel endpoint instead.
   onCleanup(() => {
     request += 1
     abort?.abort()
+    progressPoll?.abort()
+    resumePoll?.abort()
     releaseQuestionWaiters()
   })
 
@@ -418,54 +525,132 @@ function PromptInputV2RevisionControl(props: {
     })
   }
 
+  /**
+   * Recover one durable revision artifact for this composer target and report
+   * whether it was handled. Shared by the mount effect and the resumed-run
+   * supervisor, so both paths use the same fingerprint fences and conflict UI.
+   */
+  const recoverPendingArtifact = async (input: {
+    directory: string
+    key: string
+    signal?: AbortSignal
+  }): Promise<boolean> => {
+    const { directory, key } = input
+    const artifact = await sdk()
+      .api.revisionDraft.recover({ kind: "prompt", key })
+      .catch(() => null)
+    if (input.signal?.aborted) return false
+    if (!artifact || artifact.kind !== "prompt" || artifact.key !== key || sdk().directory !== directory) return false
+    const current = props.controller.parts()
+    const currentText = props.controller.value()
+    const structurallyApplied = promptRevisionArtifactIsApplied(current, artifact.prompt, artifact.references)
+    const currentFingerprint = await promptRevisionSourceFingerprint({
+      directory,
+      promptFingerprint: promptRevisionFingerprint(current),
+    })
+    if (input.signal?.aborted) return false
+    if (targetKey() !== key || sdk().directory !== directory) return false
+    if (structurallyApplied) {
+      await props.controller.flushDraft()
+      await consumeArtifact(artifact.id)
+      return true
+    }
+    const decision = revisionRecoveryDecision({
+      sourceFingerprint: artifact.sourceFingerprint,
+      currentFingerprint,
+      currentText,
+      revisedText: artifact.prompt,
+      consumeIfEqual: false,
+    })
+    if (decision === "apply") {
+      await applyRecovered(artifact, artifact.sourceFingerprint)
+      return true
+    }
+    showToast({
+      title: language.t("prompt.revision.recovery.title"),
+      description: language.t("prompt.revision.recovery.description"),
+      actions: [
+        {
+          label: language.t("prompt.revision.recovery.apply"),
+          onClick: () => void applyRecovered(artifact, currentFingerprint),
+        },
+        { label: language.t("common.dismiss"), onClick: () => void consumeArtifact(artifact.id) },
+      ],
+    })
+    return true
+  }
+
+  /**
+   * A failed run that outlived its composer is surfaced once, and only while
+   * the visible draft is still the source that was being revised.
+   */
+  const surfaceRunFailure = async (failed: RevisionFailedStatus, directory: string, key: string) => {
+    if (!markRevisionFailureSurfaced(key, failed.at)) return
+    const currentFingerprint = await promptRevisionSourceFingerprint({
+      directory,
+      promptFingerprint: promptRevisionFingerprint(props.controller.parts()),
+    })
+    if (targetKey() !== key || sdk().directory !== directory) return
+    if (currentFingerprint !== failed.sourceFingerprint) return
+    showToast({
+      variant: "error",
+      title: language.t("prompt.revision.error.title"),
+      description: failed.message,
+    })
+  }
+
   createEffect(() => {
     const directory = sdk().directory
     const key = targetKey()
     const scope = `${directory}\0${key}`
     if (scope === recoveredScope) return
     recoveredScope = scope
+    const controller = new AbortController()
+    resumePoll?.abort()
+    resumePoll = controller
     void (async () => {
-      const [artifact] = await Promise.all([
-        sdk().api.revisionDraft.recover({ kind: "prompt", key }).catch(() => null),
-        props.controller.awaitDraftReady(),
-      ])
-      if (!artifact || artifact.kind !== "prompt" || artifact.key !== key || sdk().directory !== directory) return
-      const current = props.controller.parts()
-      const currentText = props.controller.value()
-      const structurallyApplied = promptRevisionArtifactIsApplied(current, artifact.prompt, artifact.references)
-      const currentFingerprint = await promptRevisionSourceFingerprint({
-        directory,
-        promptFingerprint: promptRevisionFingerprint(current),
-      })
-      if (targetKey() !== key || sdk().directory !== directory) return
-      if (structurallyApplied) {
-        await props.controller.flushDraft()
-        await consumeArtifact(artifact.id)
+      await props.controller.awaitDraftReady()
+      if (controller.signal.aborted) return
+      if (await recoverPendingArtifact({ directory, key, signal: controller.signal })) return
+      if (controller.signal.aborted || targetKey() !== key || sdk().directory !== directory) return
+      const status = await sdk()
+        .api.promptRevisor.runStatus({ kind: "prompt", key, signal: controller.signal })
+        .catch(() => null)
+      if (controller.signal.aborted || targetKey() !== key || sdk().directory !== directory) return
+      if (status?.state === "failed") {
+        await surfaceRunFailure(status, directory, key)
         return
       }
-      const decision = revisionRecoveryDecision({
-        sourceFingerprint: artifact.sourceFingerprint,
-        currentFingerprint,
-        currentText,
-        revisedText: artifact.prompt,
-        consumeIfEqual: false,
+      if (!status || status.state !== "running") return
+      // The composer that started this run is gone (tab switch, reload), but
+      // the process-global registry still owns it. Show the in-flight state
+      // and keep the existing bounded progress poll under the correlation id
+      // the registry reports, then recover the committed artifact on settle.
+      setBusy(true)
+      activeRun = { key, operationID: status.operationID }
+      const run = resumeRevisionRun({
+        readStatus: (signal) => sdk().api.promptRevisor.runStatus({ kind: "prompt", key, signal }),
+        ...(status.operationID === undefined
+          ? {}
+          : {
+              readProgress: (operationID: string, signal: AbortSignal) =>
+                sdk().api.promptRevisor.progress({ operationID, signal }),
+            }),
+        recover: (signal) => recoverPendingArtifact({ directory, key, signal }),
+        onRunning: () => {},
+        onProgress: (next) => {
+          if (!controller.signal.aborted && targetKey() === key) setProgress(next)
+        },
+        onFailed: (failed) => void surfaceRunFailure(failed, directory, key),
+        isCurrent: () => !controller.signal.aborted && targetKey() === key && sdk().directory === directory,
       })
-      if (decision === "apply") {
-        await applyRecovered(artifact, artifact.sourceFingerprint)
-        return
-      }
-      showToast({
-        title: language.t("prompt.revision.recovery.title"),
-        description: language.t("prompt.revision.recovery.description"),
-        actions: [
-          {
-            label: language.t("prompt.revision.recovery.apply"),
-            onClick: () => void applyRecovered(artifact, currentFingerprint),
-          },
-          { label: language.t("common.dismiss"), onClick: () => void consumeArtifact(artifact.id) },
-        ],
-      })
+      await run.done
+      if (controller.signal.aborted) return
+      setProgress(undefined)
+      setBusy(false)
+      if (activeRun?.key === key) activeRun = undefined
     })()
+    onCleanup(() => controller.abort())
   })
 
   const targetChanged = (flow: PromptRevisionFlow) =>
@@ -620,6 +805,24 @@ function PromptInputV2RevisionControl(props: {
     const controller = new AbortController()
     abort?.abort()
     abort = controller
+    // One client-generated correlation id per revision: the host reports live
+    // advisory progress under exactly this id and clears it when the operation
+    // settles, so a superseded or finished flow never shows a stale number.
+    const operationID = createRevisionOperationID()
+    activeRun = { key: flow.target.key, operationID }
+    progressPoll?.abort()
+    const progressController = new AbortController()
+    progressPoll = progressController
+    setProgress(undefined)
+    void pollRevisionProgress({
+      operationID,
+      read: (id, signal) => sdk().api.promptRevisor.progress({ operationID: id, signal }),
+      isCurrent: () => flow.token === request,
+      onUpdate: (next) => {
+        if (flow.token === request) setProgress(next)
+      },
+      signal: progressController.signal,
+    })
     try {
       const result = await sdk().api.promptRevisor.revise({
         prompt: flow.draft,
@@ -629,6 +832,7 @@ function PromptInputV2RevisionControl(props: {
         guidance: flow.guidance,
         model: flow.model,
         fallbackModel: flow.fallbackModel,
+        operationID,
         location: { directory: flow.directory },
         signal: controller.signal,
       })
@@ -640,14 +844,20 @@ function PromptInputV2RevisionControl(props: {
         setOpen(false)
         return
       }
-      if (result.type === "cancelled") return
+      if (result.type === "cancelled") {
+        showToast({
+          title: language.t("prompt.revision.cancelled.title"),
+          description: language.t("prompt.revision.cancelled.description"),
+        })
+        return
+      }
       const applied = await apply(flow, result.prompt, result.references ?? [], result.artifactID)
       if (!applied) return
       await props.controller.flushDraft()
       if (flow.intent === "send") {
         // Revise-and-send remains recoverable while the optimistic composer clear
         // is in flight. Acknowledgement happens only after server admission.
-        const sent = await props.controller.revisionSend.sendWithoutRevision()
+        const sent = await props.controller.revisionSend.sendWithoutRevision({ skipCorrection: true })
         if (sent) await consumeArtifact(result.artifactID)
         return
       }
@@ -661,8 +871,14 @@ function PromptInputV2RevisionControl(props: {
         description: error instanceof Error ? error.message : String(error),
       })
     } finally {
+      progressController.abort()
+      if (progressPoll === progressController) progressPoll = undefined
       if (abort === controller) abort = undefined
-      if (flow.token === request) setBusy(false)
+      if (activeRun?.operationID === operationID) activeRun = undefined
+      if (flow.token === request) {
+        setBusy(false)
+        setProgress(undefined)
+      }
     }
   }
 
@@ -716,22 +932,50 @@ function PromptInputV2RevisionControl(props: {
     })
   }
 
-  const cancelRevision = () => {
+  /**
+   * Explicit cancellation. A raw client abort no longer stops the detached
+   * run, so the server cancel endpoint is the only thing that actually ends
+   * it; the local waiters are torn down either way. `notify` is false when the
+   * cancellation is a side effect of sending without the Revisor.
+   */
+  const cancelRevision = async (notify: boolean) => {
+    const active = activeRun
     request += 1
     abort?.abort()
     abort = undefined
+    progressPoll?.abort()
+    progressPoll = undefined
+    resumePoll?.abort()
+    resumePoll = undefined
+    activeRun = undefined
+    setProgress(undefined)
     releaseQuestionWaiters()
     setBusy(false)
     setOpen(false)
     setModelOverride(undefined)
     props.controller.restoreFocus()
+    if (!active) return false
+    const cancelled = await cancelRevisionRun({
+      kind: "prompt",
+      key: active.key,
+      operationID: active.operationID,
+      cancel: (input) => sdk().api.promptRevisor.cancel(input),
+    })
+    if (notify) {
+      showToast({
+        title: language.t("prompt.revision.cancelled.title"),
+        description: language.t("prompt.revision.cancelled.description"),
+      })
+    }
+    return cancelled
   }
 
   const unregisterRevisionSend = props.controller.revisionSend.register({
     run: (intent) => void run(undefined, intent),
     busy,
     readyForSend: () => !!restorable(),
-    cancel: cancelRevision,
+    cancel: (options) => void cancelRevision(options?.notify !== false),
+    progress,
   })
   onCleanup(unregisterRevisionSend)
 
@@ -750,20 +994,24 @@ function PromptInputV2RevisionControl(props: {
 
   return (
     <div data-prompt-revision-split-control="" class="flex shrink-0 items-center">
-      <TooltipV2 placement="top" gutter={4} value={language.t("prompt.revision.description")}>
+      <TooltipV2
+        placement="top"
+        gutter={4}
+        value={busy() ? language.t("prompt.revision.cancel") : language.t("prompt.revision.description")}
+      >
         <IconButtonV2
           type="button"
           size="large"
           variant="ghost-muted"
           class={`shrink-0 !rounded-r-[3px] ${busy() ? "!text-v2-icon-icon-accent !opacity-100" : ""}`}
-          disabled={busy() || !hasDraft()}
-          aria-label={language.t("prompt.revision.title")}
+          disabled={!busy() && !hasDraft()}
+          aria-label={busy() ? language.t("prompt.revision.cancel") : language.t("prompt.revision.title")}
           icon={
             <Show when={busy()} fallback={<Icon name="pencil-sparkles" size="small" />}>
               <PromptRevisionBusyIcon />
             </Show>
           }
-          onClick={() => void run()}
+          onClick={() => (busy() ? void cancelRevision(true) : void run())}
         />
       </TooltipV2>
       <Show when={restorable()}>
@@ -886,9 +1134,11 @@ function PromptStoppingGlyph() {
 
 function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerController }) {
   const language = useLanguage()
+  const settings = useSettings()
   const serverSync = useServerSync()
   const mode = () => props.controller.state.mode
   const working = () => props.controller.view.submit.working?.() ?? false
+  const recoveryRequired = () => !working() && props.controller.view.submit.stopping()
   const canSubmit = () => props.controller.canSubmit()
   const autoRevise = () => props.controller.revisionSend.autoBeforeSend()
   const autoSend = () => props.controller.revisionSend.autoSendAfterRevision()
@@ -908,6 +1158,7 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
       autoReviseBeforeSending: autoRevise(),
       revisionBusy: revisionBusy(),
       revisionReadyForSend: revisionReadyForSend(),
+      recoveryRequired: recoveryRequired(),
       questionActive: questionActive(),
     }),
   )
@@ -915,12 +1166,22 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
   const menuAvailable = () => working() || mode() === "normal"
   const revisionUnavailable = () => action() === "revise" && !revisionAvailable()
   const primaryDisabled = () =>
-    action() === "blocked" || action() === "stop" || !canSubmit() || revisionUnavailable()
+    action() === "blocked" || (action() === "stop" && !recoveryRequired()) || (!recoveryRequired() && !canSubmit()) || revisionUnavailable()
   const unavailable = () => mode() === "normal" && !canSubmit() && !props.controller.model.selection.current()
   const primaryLabel = () => {
+    if (action() === "stop") return language.t("prompt.action.stop")
     if (questionActive()) return language.t("prompt.action.send")
     if (revisionUnavailable()) return language.t("prompt.revision.send.unavailableAction")
-    if (revisorOwnsPrimary()) return language.t("prompt.revision.send.revising")
+    if (revisorOwnsPrimary()) {
+      const state = props.controller.revisionSend.progress()
+      if (state) {
+        const detail = state.note?.trim() || state.phase?.trim()
+        return detail
+          ? language.t("prompt.revision.send.revisingProgressDetail", { percent: state.percent, detail })
+          : language.t("prompt.revision.send.revisingProgress", { percent: state.percent })
+      }
+      return language.t("prompt.revision.send.revising")
+    }
     if (action() === "revise")
       return autoSend()
         ? language.t("prompt.revision.send.reviseAndSend")
@@ -940,7 +1201,7 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
       : language.t("prompt.revision.send.options.autoRevise")
   }
   const sendOneShot = () => {
-    if (questionActive()) return
+    if (questionActive() || recoveryRequired()) return
     if (oneShot() === "send-without-revisor") {
       props.controller.revisionSend.sendWithoutRevision()
       return
@@ -1119,6 +1380,7 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
     return language.t("prompt.action.stop")
   }
   const sendGlyph = () => {
+    if (action() === "stop") return "stop"
     if (questionActive()) return "send"
     if (revisorOwnsPrimary() || action() === "revise") return "revise"
     if (mode() === "shell") return "shell"
@@ -1215,7 +1477,8 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
         }}
       >
         <div data-slot="prompt-send-group">
-          <TooltipV2 placement="top" gutter={6} inactive={!menuAvailable()} value={optionsLabel()}>
+          <TooltipV2 placement="top" gutter={6} inactive={!menuAvailable()} value={optionsLabel()}
+            contentStyle={{ "pointer-events": "none" }}>
             <MenuV2.Trigger
               as="button"
               type="button"
@@ -1232,11 +1495,12 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
               <Icon name="chevron-down" size="small" class="!size-[7px]" />
             </MenuV2.Trigger>
           </TooltipV2>
-          <TooltipV2
-            placement="top"
-            gutter={6}
-            inactive={primaryDisabled() && !revisorOwnsPrimary() && !revisionUnavailable()}
-            value={
+            <TooltipV2
+              placement="top"
+              gutter={6}
+              contentStyle={{ "pointer-events": "none" }}
+              inactive={primaryDisabled() && !revisorOwnsPrimary() && !revisionUnavailable()}
+              value={
               <span class="flex items-center gap-1.5">
                 <span>{primaryLabel()}</span>
                 <KeybindV2 keys={["Enter"]} variant="ghost" />
@@ -1278,6 +1542,9 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
                       data-slot={revisorOwnsPrimary() ? "prompt-send-revising" : undefined}
                     />
                   </span>
+                  <span data-active={sendGlyph() === "stop" ? "true" : "false"}>
+                    <Icon name="stop" size="small" />
+                  </span>
                 </span>
               </span>
               <Show when={revisionReadyForSend() && !questionActive() && !revisorOwnsPrimary()}>
@@ -1299,6 +1566,7 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
             <Show when={mode() === "normal"}>
               <MenuV2.Item
                 disabled={
+                  recoveryRequired() ||
                   questionActive() ||
                   !canSubmit() ||
                   revisionBusy() ||
@@ -1310,6 +1578,21 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
                   ? language.t("prompt.revision.send.withoutRevisor")
                   : language.t("prompt.revision.send.withRevisor")}
               </MenuV2.Item>
+              <Show when={settings.general.promptAutocorrection()}>
+                <MenuV2.Item
+                  disabled={recoveryRequired() || questionActive() || !canSubmit() || revisionBusy() || autoRevise()}
+                  onSelect={() => props.controller.revisionSend.reviewCorrections()}
+                >
+                  {language.t("prompt.autocorrection.review.open")}
+                </MenuV2.Item>
+                <MenuV2.Item
+                  disabled={recoveryRequired() || questionActive() || !canSubmit() || revisionBusy()}
+                  onSelect={() => void props.controller.revisionSend.sendExact()}
+                >
+                  {language.t("prompt.autocorrection.sendExact")}
+                </MenuV2.Item>
+                <MenuV2.Separator />
+              </Show>
               <MenuV2.Separator />
               <MenuV2.CheckboxItem
                 checked={autoRevise()}
@@ -1590,6 +1873,7 @@ function PromptInputV2UsageArc(props: { model: PromptInputV2ComposerController["
 
 export function usePromptInputV2Controller(props: PromptInputV2ControllerProps): PromptInputV2ComposerController {
   const sdk = useSDK()
+  const serverSync = useServerSync()
   const sync = useSync()
   const files = useFile()
   const layout = useLayout()
@@ -1625,6 +1909,10 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   })
   const info = createMemo(() => (props.controls.session.id ? sync().session.get(props.controls.session.id) : undefined))
   const working = createMemo(() => sync().data.session_working(props.controls.session.id ?? ""))
+  const interrupted = createMemo(() => {
+    const id = props.controls.session.id
+    return !!id && sync().data.session_status[id]?.type === "interrupted"
+  })
   const sessionID = () => props.controls.session.id
   const liveRate = createLiveGenerationRate({ sessionID, working })
   const attachments = createMemo(() =>
@@ -1649,6 +1937,42 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     }),
   )
   const questionActive = () => props.question?.active() === true
+  const [grammarComposing, setGrammarComposing] = createSignal(false)
+  const harper = createPromptHarper({
+    enabled: () => settings.general.promptGrammarHarper() && mode() === "normal" && !questionActive() &&
+      !info()?.humanInterjection && !grammarComposing(),
+    parts: () => prompt.current(),
+    locale: () => language.locale(),
+    ignoredWords: () => settings.general.promptGrammarIgnoredWords(),
+    autoApply: () => settings.general.promptGrammarAutoApply(),
+    cursor: () => prompt.cursor(),
+    replace: (parts, cursor, source) => {
+      prompt.set(parts, cursor)
+      // Automatic edits must NEVER steal focus from whichever input is active.
+      // Explicit suggestion/rejection clicks intentionally return editor focus.
+      if (source !== "auto") controller.restoreFocus(cursor)
+    },
+  })
+  const grammar = {
+    enabled: () => settings.general.promptGrammarHarper() && mode() === "normal" && !questionActive() &&
+      !grammarComposing(),
+    onCompositionChange: setGrammarComposing,
+    issues: harper.issues,
+    state: harper.state,
+    undo: harper.undo,
+    undoAvailable: harper.undoAvailable,
+    autoChanges: harper.autoChanges,
+    rejectAuto: harper.reject,
+    dismiss: harper.dismiss,
+    apply: (id: string, replacement: string) => {
+      const issue = harper.issues().find((item) => item.id === id)
+      return issue ? harper.apply(issue, replacement) : false
+    },
+    ignore: (word: string) => {
+      if (!/^[a-z]{2,40}$/i.test(word)) return
+      settings.general.setPromptGrammarIgnoredWords([...settings.general.promptGrammarIgnoredWords(), word])
+    },
+  }
   const designPlaceholder = () => {
     if (questionActive() && mode() === "normal") return props.question!.placeholder()
     return promptDesignPlaceholder(mode(), placeholder(), (key, params) =>
@@ -1729,9 +2053,14 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   const submission = createPromptSubmit({
     prompt,
     info,
-    imageAttachments: attachments,
     commentCount,
     autoAccept: accepting,
+    correctBeforeSubmit: () => settings.general.promptAutocorrection() && !settings.general.promptRevision()?.autoBeforeSend,
+    correctionIgnoredWords: () => [
+      ...settings.general.promptAutocorrectionIgnore(),
+      ...harper.rejectedWords(),
+    ],
+    correctionUserReplacements: () => settings.general.promptAutocorrectionCustom(),
     mode,
     working,
     editor: () => editor,
@@ -1782,10 +2111,77 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       autoSendAfterRevision: current.autoBeforeSend === true && value ? true : undefined,
     })
   }
-  const directSubmit = () => {
-    revisionSendRegistration()?.cancel()
-    return submission.handleSubmit(new Event("submit"))
+  const directSubmit = (options?: { skipCorrection?: boolean; selectedPatchStarts?: readonly number[] }) => {
+    if (interrupted()) {
+      void submission.abort()
+      return Promise.resolve(false)
+    }
+    revisionSendRegistration()?.cancel({ notify: false })
+    return submission.handleSubmit(new Event("submit"), options)
   }
+  const reviewCorrections = () => {
+    // Preview is strictly on demand: no correction scanner runs on keystrokes.
+    // Revisor auto-send and delegated human-interjection paths own their own
+    // send semantics; this optional inspection must never intercept them.
+    if (!settings.general.promptAutocorrection() || settings.general.promptRevision()?.autoBeforeSend ||
+      mode() !== "normal" || props.question?.active() || interrupted() || !controller.canSubmit() ||
+      (sessionID() && sync().session.get(sessionID()!)?.humanInterjection === true)) return
+
+    const configuration = () => ({
+      excludedWords: settings.general.promptAutocorrectionIgnore(),
+      userReplacements: settings.general.promptAutocorrectionCustom(),
+      locale: language.locale(),
+    })
+    const preview = correctPromptParts(snapshotPrompt(prompt.current()), true, configuration())
+
+    // Include the effective submission scope, not just visible characters.
+    // An image, mention, context comment, model or personal dictionary can
+    // change asynchronously while a modal is open. Never send on stale review.
+    const fingerprint = () => promptCorrectionReviewFingerprint({
+      prompt: prompt.current(),
+      context: prompt.context.items(),
+      sessionID: sessionID(),
+      directory: sdk().directory,
+      modelID: props.controls.model.selection.current()?.id,
+      providerID: props.controls.model.selection.current()?.provider.id,
+      variant: props.controls.model.selection.variant.current(),
+      locale: language.locale(),
+      ignored: settings.general.promptAutocorrectionIgnore(),
+      custom: settings.general.promptAutocorrectionCustom(),
+    })
+    const original = fingerprint()
+    if (original === undefined) {
+      showToast({
+        title: language.t("prompt.autocorrection.review.title"),
+        description: language.t("prompt.autocorrection.review.changed"),
+      })
+      return
+    }
+    dialog.show(() => (
+      <DialogPromptCorrectionReview
+        patches={preview.patches}
+        bypassed={preview.status === "bypassed"}
+        onSend={(selectedPatchStarts) => {
+          if (fingerprint() !== original || !controller.canSubmit() ||
+            !settings.general.promptAutocorrection() || settings.general.promptRevision()?.autoBeforeSend ||
+            mode() !== "normal" || interrupted() || props.question?.active() ||
+            (sessionID() && sync().session.get(sessionID()!)?.humanInterjection === true)) {
+            dialog.close()
+            showToast({
+              title: language.t("prompt.autocorrection.review.title"),
+              description: language.t("prompt.autocorrection.review.changed"),
+            })
+            return false
+          }
+          void directSubmit(selectedPatchStarts === undefined
+            ? { skipCorrection: true }
+            : { selectedPatchStarts })
+          return true
+        }}
+      />
+    ))
+  }
+
   const revisionUnavailable = () =>
     showToast({
       variant: "error",
@@ -1793,6 +2189,10 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       description: language.t("prompt.revision.send.unavailable"),
     })
   const runRevision = (intent: PromptRevisionFlow["intent"]) => {
+    if (interrupted()) {
+      void submission.abort()
+      return
+    }
     if (mode() !== "normal" || questionActive() || !controller.canSubmit()) return
     if (!isPromptTextRevisable(controller.value())) {
       void directSubmit()
@@ -1815,6 +2215,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     available: () => revisionSendRegistration() !== undefined,
     busy: () => revisionSendRegistration()?.busy() ?? false,
     readyForSend: () => revisionSendRegistration()?.readyForSend() ?? false,
+    progress: () => revisionSendRegistration()?.progress(),
     register(registration: PromptRevisionSendRegistration) {
       setRevisionSendRegistration(() => registration)
       return () => {
@@ -1823,12 +2224,14 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     },
     sendWithRevision,
     sendWithoutRevision: directSubmit,
+    sendExact: () => directSubmit({ skipCorrection: true }),
+    reviewCorrections,
   }
   const submitFromPrimary = () => {
     // A pending question owns the composer: Enter (and the send button) answer
     // it rather than starting a new turn. Revision/queue/goal paths are
     // deliberately skipped — none of them apply to an answer.
-    if (questionActive() && mode() === "normal") {
+    if (questionActive() && mode() === "normal" && !interrupted()) {
       if (!props.question!.canSubmit()) return
       props.question!.submit()
       return
@@ -1841,6 +2244,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       autoReviseBeforeSending: autoReviseBeforeSending(),
       revisionBusy: revisionSend.busy(),
       revisionReadyForSend: revisionSend.readyForSend(),
+      recoveryRequired: interrupted(),
       questionActive: questionActive(),
     })
     if (action === "blocked") return
@@ -1914,32 +2318,34 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     })),
   )
   const sdkClient = useSDK()
-  const [skillsResource] = createResource(async () => {
-    try {
-      const result: any = await sdkClient().client.v2.skill.list({})
-      if (Array.isArray(result)) return result
-      if (Array.isArray(result?.data)) {
-        // Unified SDK wrapper vs Location.response shape: data may be the array or { location, data: [...] }
-        const inner = result.data
-        if (Array.isArray(inner)) return inner
+  const [skillItems, setSkillItems] = createSignal<any[]>([])
+  let skillListLoaded = false
+  let skillListLoading: Promise<void> | undefined
+  const skillListAbort = new AbortController()
+  onCleanup(() => skillListAbort.abort())
+  const refreshSkills = () => {
+    if (skillListLoaded || skillListLoading) return skillListLoading
+    skillListLoading = (async () => {
+      try {
+        const result: any = await sdkClient().client.v2.skill.list({}, { signal: skillListAbort.signal })
+        const list = Array.isArray(result) ? result
+          : Array.isArray(result?.data) ? result.data
+            : Array.isArray(result?.data?.data) ? result.data.data
+              : Array.isArray(result?.data?.data?.data) ? result.data.data.data
+                : []
+        setSkillItems(list)
+        skillListLoaded = true
+      } catch {
+        // Context autocomplete can still offer other suggestions. A skill
+        // lookup failure must not block route rendering.
+      } finally {
+        skillListLoading = undefined
       }
-      if (Array.isArray(result?.data?.data)) return result.data.data
-      if (Array.isArray(result?.data?.data?.data)) return result.data.data.data
-      return []
-    } catch {
-      return []
-    }
-  })
+    })()
+    return skillListLoading
+  }
   const skills = createMemo<PromptInputV2Suggestion[]>(() => {
-    // Context suggestions are rendered beneath the session route Suspense
-    // boundary. Never call a pending resource accessor from this path: doing
-    // so parks the whole route and presents as a full-tab black flash when the
-    // user types `@`. `latest` is explicitly non-suspending and is sufficient
-    // for autocomplete, where an empty list while the first fetch resolves is
-    // preferable to blanking the session UI.
-    const raw = skillsResource.latest as unknown
-    const list: any[] = Array.isArray(raw) ? raw : []
-    return list.map((skill: any) => ({
+    return skillItems().map((skill: any) => ({
       id: `skill:${skill.name}`,
       kind: "skill" as const,
       label: `@${skill.name}`,
@@ -2010,7 +2416,6 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       // Drop data from another model/session immediately. The catalog is
       // permission-aware, so stale cross-target suggestions are not acceptable.
       if (toolCatalog()?.key !== target.key) setToolCatalog(undefined)
-      void refreshToolCatalog(target)
     }),
   )
   const tools = createMemo<PromptInputV2Suggestion[]>(() => {
@@ -2109,10 +2514,14 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     commands,
     context,
     onContextOpen() {
-      // Initial loading is started by the target effect. This is a no-op while
-      // that request is in flight; later opens refresh so MCP/tool reloads show
-      // up without turning autocomplete into a route-level loading state.
+      // Tool catalogs initialize the execution instance. Fetch only after the
+      // user opens context autocomplete, never while a session route mounts.
+      // Reopening refreshes the permission-aware catalog after MCP/tool changes.
+      sync().mcp.ensure()
       void refreshToolCatalog()
+      // Skill suggestions are likewise loaded on explicit autocomplete
+      // demand, never while a session route mounts.
+      void refreshSkills()
     },
     searchContextFiles: async (query, options) =>
       (await files.searchMentions(query, { ...options, symbols: false })).results.flatMap((entry) => {
@@ -2158,6 +2567,21 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     onEditor(element) {
       editor = element as HTMLDivElement
       props.ref?.(editor)
+    },
+    onCommandOpen() {
+      const directory = sdk().directory
+      const sessionID = props.controls.session.id
+      void serverSync()
+        .commands.ensure(directory, {
+          isCurrent: () => sdk().directory === directory && (!sessionID || props.controls.session.id === sessionID),
+        })
+        .catch((err: unknown) => {
+          showToast({
+            variant: "error",
+            title: language.t("toast.project.reloadFailed.title", { project: getFilename(directory) }),
+            description: formatServerError(err, language.t),
+          })
+        })
     },
     onSuggestionSelect(item) {
       if (item.kind !== "command") return
@@ -2210,7 +2634,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
         keybind: () => command.keybindParts("model.variant.cycle"),
       },
       submit: {
-        stopping,
+        stopping: () => interrupted() || stopping(),
         working,
         onSubmit: submitFromPrimary,
         onStop: () => void submission.abort(),
@@ -2222,6 +2646,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     get: () => ({ active: accepting, toggle: toggleAutoAccept }),
   })
   Object.defineProperty(controller, "liveRate", { get: () => liveRate })
+  Object.defineProperty(controller, "grammar", { get: () => grammar })
   Object.defineProperty(controller, "sessionID", { get: () => sessionID })
   Object.defineProperty(controller, "revisionSend", { get: () => revisionSend })
   Object.defineProperty(controller, "questionActive", { get: () => questionActive })
@@ -2351,11 +2776,108 @@ function PromptInputV2ModelControl(props: {
   title: string
   keybind: string[]
   model: PromptInputV2ComposerController["model"]["selection"]
+  sessionID?: string
+  telemetry: () => SessionTelemetry.Info | undefined
+  onSwitch: (target: ModelIdentity, attempt: { assistantMessageID: string; requestSentAt: number }) => Promise<void>
   providerID?: string
   modelName: string
   onClose: () => void
   onUnpaidClick: () => void
 }) {
+  const language = useLanguage()
+  const settings = useSettings()
+  const selectorIdentity = () => modelSwitchSelection(props.model.current(), props.model.variant.current())
+  const telemetry = () => props.telemetry()
+  const mismatch = () =>
+    activeGenerationMismatch({ selected: selectorIdentity(), telemetry: telemetry(), sessionID: props.sessionID })
+  const attempt = () => {
+    const info = telemetry()
+    if (!info || info.sessionID !== props.sessionID || info.isCompaction) return
+    if (info.phase !== "requesting" && info.phase !== "reasoning" && info.phase !== "generating") return
+    const assistantMessageID = info.step?.assistantMessageID
+    const requestSentAt = info.step?.requestSentAt
+    if (!assistantMessageID || requestSentAt === undefined) return
+    return { assistantMessageID, requestSentAt }
+  }
+  let previousAttemptKey: string | undefined
+  let previousSelectionKey: string | undefined
+  let previousActiveKey: string | undefined
+  createEffect(() => {
+    const info = telemetry()
+    const selected = selectorIdentity()
+    const attemptKey =
+      info && info.sessionID === props.sessionID && !info.isCompaction &&
+      (info.phase === "requesting" || info.phase === "reasoning" || info.phase === "generating") &&
+      info.step?.assistantMessageID && info.step.requestSentAt !== undefined
+        ? `${info.step.assistantMessageID}:${info.step.requestSentAt}`
+        : undefined
+    const selectedKey = modelIdentityKey(selected)
+    const activeKey = attemptKey ? modelIdentityKey(info?.model) : undefined
+    const shouldFollow = shouldFollowActiveModel({
+      enabled: settings.general.autoUpdateModelSelectorOnGeneratingMismatch(),
+      nextAttemptKey: attemptKey,
+      previousAttemptKey,
+      selectedKey,
+      previousSelectedKey: previousSelectionKey,
+      activeKeyBefore: previousActiveKey,
+      activeKey,
+    })
+    previousAttemptKey = attemptKey
+    if (activeKey) previousActiveKey = activeKey
+    if (shouldFollow && info?.model) {
+      props.model.set({
+        providerID: info.model.providerID,
+        modelID: providerModelID(info.model.modelID, info.model.providerID, info.model.accountID),
+        ...(info.model.variant ? { variant: info.model.variant } : {}),
+      })
+    }
+    previousSelectionKey = shouldFollow && info?.model ? modelIdentityKey(info.model) : selectedKey
+  })
+  const selectRunningModel = () => {
+    const model = mismatch()?.model
+    if (!model) return
+    props.model.set({
+      providerID: model.providerID,
+      modelID: providerModelID(model.modelID, model.providerID, model.accountID),
+      ...(model.variant ? { variant: model.variant } : {}),
+    })
+  }
+  const autoInterruptFor = (target: ModelIdentity | undefined) => {
+    if (!target || !settings.general.autoInterruptOnModelSelectorChange()) return
+    const currentMismatch = activeGenerationMismatch({
+      selected: target,
+      telemetry: telemetry(),
+      sessionID: props.sessionID,
+    })
+    const currentAttempt = attempt()
+    if (!currentMismatch || !currentAttempt) return
+    void props.onSwitch(target, currentAttempt).catch((error) =>
+      showToast({
+        title: language.t("prompt.modelSwitch.failed"),
+        description: error instanceof Error ? error.message : String(error),
+        variant: "error",
+      }),
+    )
+  }
+  const modelSelection = {
+    ...props.model,
+    set(item: Parameters<typeof props.model.set>[0], options?: Parameters<typeof props.model.set>[1]) {
+      const previous = selectorIdentity()
+      props.model.set(item, options)
+      const next = selectorIdentity()
+      if (item && modelIdentityKey(previous) !== modelIdentityKey(next)) autoInterruptFor(next)
+    },
+    variant: {
+      ...props.model.variant,
+      set(value: Parameters<typeof props.model.variant.set>[0]) {
+        const current = selectorIdentity()
+        props.model.variant.set(value)
+        if (!current) return
+        const next = { ...current, ...(value ? { variant: value } : { variant: undefined }) }
+        if (modelIdentityKey(current) !== modelIdentityKey(next)) autoInterruptFor(next)
+      },
+    },
+  } as typeof props.model
   const shouldAnimate = createMemo<boolean>((previous) => previous ?? props.loading)
   const content = () => (
     <>
@@ -2382,6 +2904,65 @@ function PromptInputV2ModelControl(props: {
   // the localized placeholder, so the last-known selection stays visible through
   // refetches instead of vanishing.
   return (
+    <div data-slot="prompt-model-group" data-mismatch={mismatch() ? "true" : undefined}>
+    <MenuV2
+      gutter={6}
+      modal={false}
+      placement="top"
+      onOpenChange={(open) => {
+        if (!open) requestAnimationFrame(() => props.onClose())
+      }}
+    >
+      <Show when={mismatch()}>
+        <TooltipV2 placement="top" gutter={6} value={language.t("prompt.modelSwitch.options")}>
+          <MenuV2.Trigger
+            as="button"
+            type="button"
+            data-slot="prompt-model-tab"
+            data-action="prompt-model-mismatch-options"
+            aria-label={language.t("prompt.modelSwitch.options")}
+          >
+            <Icon name="chevron-down" size="small" class="!size-[7px]" />
+          </MenuV2.Trigger>
+        </TooltipV2>
+      </Show>
+      <MenuV2.Portal>
+        <MenuV2.Content>
+          <MenuV2.Item
+            disabled={!mismatch() || !attempt()}
+            onSelect={() => {
+              const selected = selectorIdentity()
+              const currentMismatch = mismatch()
+              const currentAttempt = attempt()
+              if (!selected || !currentMismatch || !currentAttempt) return
+              void props.onSwitch(selected, currentAttempt).catch((error) =>
+                showToast({
+                  title: language.t("prompt.modelSwitch.failed"),
+                  description: error instanceof Error ? error.message : String(error),
+                  variant: "error",
+                }),
+              )
+            }}
+          >
+            <span class="flex min-w-0 flex-col gap-0.5">
+              <span>{language.t("prompt.modelSwitch.resumeSelected")}</span>
+              <span class="truncate text-xs opacity-65">
+                {language.t("prompt.modelSwitch.selectedModel")}: {props.modelName}
+              </span>
+            </span>
+          </MenuV2.Item>
+          <MenuV2.Separator />
+          <MenuV2.Item onSelect={selectRunningModel}>
+            <span class="flex min-w-0 flex-col gap-0.5">
+              <span>{language.t("prompt.modelSwitch.useRunning")}</span>
+              <span class="truncate text-xs opacity-65">
+                {language.t("prompt.modelSwitch.runningModel")}: {mismatch()?.model.name ?? mismatch()?.model.modelID}
+              </span>
+            </span>
+          </MenuV2.Item>
+        </MenuV2.Content>
+      </MenuV2.Portal>
+    </MenuV2>
     <TooltipV2
       placement="top"
       gutter={4}
@@ -2425,7 +3006,7 @@ function PromptInputV2ModelControl(props: {
           }
         >
           <ModelSelectorPopoverV2
-            model={props.model}
+            model={modelSelection}
             trigger={(triggerProps) => (
               <ButtonV2
                 {...triggerProps}
@@ -2445,6 +3026,7 @@ function PromptInputV2ModelControl(props: {
         </Suspense>
       </Show>
     </TooltipV2>
+    </div>
   )
 }
 

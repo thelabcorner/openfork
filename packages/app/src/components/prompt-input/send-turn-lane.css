@@ -132,9 +132,80 @@
 
 [data-slot="prompt-send-group"] {
   position: relative;
+  /* The rising menu tab extends above the footer into the editor's z-10
+   * stacking context. Keep this entire control (not just its inner tab)
+   * above the contenteditable and adjacent footer hit surfaces. */
+  z-index: 20;
   display: flex;
   flex: none;
   isolation: isolate;
+}
+
+[data-slot="prompt-model-group"] {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+}
+
+/* The mismatch affordance floats over a ghost (transparent) trigger, so unlike
+ * the send tab it cannot tuck its lower half behind an opaque surface: any part
+ * meant to be culled stays visible. It is a self-contained bubble instead —
+ * fully rounded, muted neutral material — resting on the trigger's bottom edge
+ * with a small overlap so the two controls share one uninterrupted hover region. */
+[data-slot="prompt-model-tab"] {
+  position: absolute;
+  bottom: -5px;
+  left: 50%;
+  translate: -50% 0;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+  color: var(--v2-icon-icon-muted);
+  background-color: var(--v2-background-bg-button-neutral);
+  box-shadow: var(--v2-elevation-button-neutral);
+  opacity: 0;
+  transform: translateY(-3px) scale(0.78);
+  transform-origin: 50% 0%;
+  pointer-events: none;
+  transition:
+    opacity var(--prompt-turn-swap) ease,
+    transform var(--prompt-turn-swap) var(--prompt-turn-ease-out),
+    color var(--prompt-turn-swap) ease;
+}
+
+[data-slot="prompt-model-tab"]:hover {
+  color: var(--v2-icon-icon-base);
+  background-image:
+    linear-gradient(90deg, var(--v2-overlay-simple-overlay-hover) 0%, var(--v2-overlay-simple-overlay-hover) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-button-neutral) 0%, var(--v2-background-bg-button-neutral) 100%);
+}
+
+[data-slot="prompt-model-tab"]:active,
+[data-slot="prompt-model-tab"][data-expanded] {
+  color: var(--v2-icon-icon-base);
+  background-image:
+    linear-gradient(90deg, var(--v2-overlay-simple-overlay-pressed) 0%, var(--v2-overlay-simple-overlay-pressed) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-button-neutral) 0%, var(--v2-background-bg-button-neutral) 100%);
+}
+
+[data-slot="prompt-model-group"][data-mismatch="true"] [data-slot="prompt-model-tab"],
+[data-slot="prompt-model-group"]:hover [data-slot="prompt-model-tab"],
+[data-slot="prompt-model-group"]:focus-within [data-slot="prompt-model-tab"] {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+
+[data-slot="prompt-model-tab"]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 1px;
 }
 
 [data-slot="prompt-send-tab"] {
@@ -351,6 +422,7 @@
   [data-slot="prompt-turn-group"],
   [data-slot="prompt-send-tab"],
   [data-slot="prompt-send-tab"]::after,
+  [data-slot="prompt-model-tab"],
   [data-slot="prompt-send-glyph-stack"] > span,
   [data-slot="prompt-turn-glyph-stack"] > span {
     transition-duration: 0ms !important;

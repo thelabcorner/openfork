@@ -25,6 +25,14 @@ export type AtSymbolKind = "fn" | "method" | "class" | "interface" | "type" | "e
 export type AtOption =
   | { type: "agent"; name: string; display: string }
   | {
+      type: "tool"
+      name: string
+      display: string
+      description?: string
+      exposure?: "default" | "lazy"
+      source?: "registry" | "mcp" | "mcp-resource"
+    }
+  | {
       type: "resource"
       name: string
       uri: string
@@ -180,6 +188,26 @@ function AtResourceContent(props: { option: Extract<AtOption, { type: "resource"
   return (
     <>
       <FileIcon node={{ path: props.option.uri, type: "file" }} class="shrink-0 size-4" />
+      <div class="flex items-center min-w-0">
+        <span class="text-text-strong whitespace-nowrap" classList={primaryTextClass(props.v2)}>
+          @{props.option.name}
+        </span>
+        <Show when={props.option.description}>
+          {(description) => (
+            <span class="whitespace-nowrap truncate min-w-0 ms-2" classList={mutedTextClass(props.v2)}>
+              {description()}
+            </span>
+          )}
+        </Show>
+      </div>
+    </>
+  )
+}
+
+function AtToolContent(props: { option: Extract<AtOption, { type: "tool" }>; v2: boolean }) {
+  return (
+    <>
+      <Icon name="code" size="small" class="text-icon-info-active shrink-0" />
       <div class="flex items-center min-w-0">
         <span class="text-text-strong whitespace-nowrap" classList={primaryTextClass(props.v2)}>
           @{props.option.name}
@@ -394,6 +422,7 @@ function AtExternalContent(props: {
 function AtItemContent(props: { option: AtOption; v2: boolean; statusLabel?: string }): JSX.Element {
   const option = props.option
   if (option.type === "agent") return <AtAgentContent option={option} v2={props.v2} />
+  if (option.type === "tool") return <AtToolContent option={option} v2={props.v2} />
   if (option.type === "resource") return <AtResourceContent option={option} v2={props.v2} />
   if (option.type === "reference") return <AtReferenceContent option={option} v2={props.v2} />
   if (option.type === "symbol") return <AtSymbolContent option={option} v2={props.v2} />

@@ -8,6 +8,7 @@ import { useSync } from "@/context/sync"
 import { useProviders } from "@/hooks/use-providers"
 import { resolveDefaultModel } from "@/hooks/provider-catalog"
 import { Model as ModelContract } from "@opencode-ai/schema/model"
+import { splitModelIDForProvider } from "@/utils/model-account-identity"
 
 export function createPromptModelSelection(input: { agent: () => { model?: ModelKey; variant?: string } | undefined }) {
   const sdk = useSDK()
@@ -19,13 +20,12 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
 
   const valid = (model: ModelKey) => {
     const provider = providers.all().get(model.providerID)
-    const info = provider?.models[model.modelID]
-    return (
-      !!provider &&
-      !!info &&
-      connected().has(model.providerID) &&
-      ModelContract.isLanguageModel(provider.id, info)
-    )
+    if (!provider || !connected().has(model.providerID)) return false
+    const exact = provider.models[model.modelID]
+    if (exact) return ModelContract.isLanguageModel(provider.id, exact)
+    const base = splitModelIDForProvider(model.modelID, model.providerID).baseModelID
+    const resolved = provider.models[base]
+    return base !== model.modelID && !!resolved && ModelContract.isLanguageModel(provider.id, resolved)
   }
 
   const configured = () => {
@@ -50,10 +50,12 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
     })[0]
   }
 
-  const current = () => {
-    const key = [prompt.model.current(), input.agent()?.model, configured(), recent(), fallback()].find(
+  const currentKey = () =>
+    [prompt.model.current(), input.agent()?.model, configured(), recent(), fallback()].find(
       (item): item is ModelKey => !!item && valid(item),
     )
+  const current = () => {
+    const key = currentKey()
     if (!key) return
     return models.find(key)
   }
@@ -67,6 +69,9 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
   const selection = {
     ready: models.ready,
     current,
+    routeIntent: {
+      current: () => currentKey()?.routeIntent,
+    },
     recent: recentModels,
     list: models.list,
     cycle(direction: 1 | -1) {
@@ -79,14 +84,27 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
       if (next) selection.set({ providerID: next.provider.id, modelID: next.id })
     },
     set(item: ModelKey | undefined, options?: { recent?: boolean }) {
-      startTransition(() =>
-        batch(() => {
-          prompt.model.set(item ? { ...item, variant: prompt.model.current()?.variant } : undefined)
-          if (!item) return
-          models.setVisibility(item, true)
-          if (options?.recent) models.recent.push(item)
-        }),
-      )
+      // A model choice is the next prompt's execution input. Do not defer it
+      // behind a transition: submit may run immediately after the picker closes.
+      batch(() => {
+        const previous = prompt.model.current()
+        if (
+          item &&
+          !item.routeIntent &&
+          previous?.providerID === item.providerID &&
+          previous.routeIntent?.kind === "auto" &&
+          !splitModelIDForProvider(item.modelID, item.providerID).accountID
+        ) {
+          item = { ...item, routeIntent: previous.routeIntent }
+        }
+        // A caller that explicitly supplies a variant (for example, adopting
+        // the currently running model) wins. Ordinary model-picker changes
+        // keep the user's current variant when the new model supports it.
+        prompt.model.set(item ? { ...item, variant: item.variant ?? prompt.model.current()?.variant } : undefined)
+        if (!item) return
+        models.setVisibility(item, true)
+        if (options?.recent) models.recent.push(item)
+      })
     },
     visible: models.visible,
     setVisibility: models.setVisibility,
@@ -145,7 +163,12 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
           batch(() => {
             const model = current()
             if (!model) return
-            prompt.model.set({ providerID: model.provider.id, modelID: model.id, variant: value ?? null })
+            prompt.model.set({
+              providerID: model.provider.id,
+              modelID: model.id,
+              variant: value ?? null,
+              routeIntent: prompt.model.current()?.routeIntent,
+            })
             models.variant.set({ providerID: model.provider.id, modelID: model.id }, value)
           }),
         )

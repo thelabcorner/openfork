@@ -27,6 +27,7 @@ export {
   isCommentItem,
   isPromptEqual,
 } from "./prompt-state"
+export { snapshotPrompt } from "./prompt-snapshot"
 export type {
   AgentPart,
   ContentPart,

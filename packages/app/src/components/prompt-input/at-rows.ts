@@ -8,6 +8,8 @@ export const groupTitleKey = (category: string) => {
   switch (category) {
     case "agent":
       return "prompt.popover.group.agents"
+    case "tool":
+      return "prompt.popover.group.tools"
     case "reference":
     case "resource":
       return "prompt.popover.group.context"

@@ -4,6 +4,7 @@ import { Persist, persisted } from "@/utils/persist"
 import {
   clonePromptHistoryComments,
   clonePromptParts,
+  migratePromptHistory,
   prependHistoryEntry,
   type PromptHistoryComment,
   type PromptHistoryStoredEntry,
@@ -41,14 +42,48 @@ export function createPromptInputHistory(): PromptInputHistory {
 }
 
 export function createPersistedPromptInputHistory() {
+  let normalHistoryCompacted = false
+  const migrateNormalHistory = (value: unknown) => {
+    const next = migratePromptHistory(value)
+    normalHistoryCompacted ||= next !== value
+    return next
+  }
   const [normal, setNormal, normalInit] = persisted(
-    Persist.prompt(Persist.global("prompt-history", ["prompt-history.v1"])),
+    Persist.prompt({ ...Persist.global("prompt-history", ["prompt-history.v1"]), migrate: migrateNormalHistory }),
     createStore<PromptHistoryState>({ entries: [] }),
   )
+  let shellHistoryCompacted = false
+  const migrateShellHistory = (value: unknown) => {
+    const next = migratePromptHistory(value)
+    shellHistoryCompacted ||= next !== value
+    return next
+  }
   const [shell, setShell, shellInit] = persisted(
-    { ...Persist.prompt(Persist.global("prompt-history-shell", ["prompt-history-shell.v1"])), defer: true },
+    {
+      ...Persist.prompt(Persist.global("prompt-history-shell", ["prompt-history-shell.v1"])),
+      defer: true,
+      migrate: migrateShellHistory,
+    },
     createStore<PromptHistoryState>({ entries: [] }),
   )
+  const persistCompaction = (
+    init: string | null | Promise<string | null>,
+    compacted: () => boolean,
+    entries: () => PromptHistoryStoredEntry[],
+    setEntries: SetStoreFunction<PromptHistoryState>,
+  ) => {
+    const persist = () => {
+      if (compacted()) setEntries("entries", entries().slice())
+    }
+    if (init instanceof Promise) void init.then(persist)
+    else persist()
+  }
+  // `migrate` bounds the in-memory value before it reaches the UI. Persist the
+  // compacted representation once so an old oversized value does not get
+  // parsed again on every launch. The normal history remains after-paint and
+  // shell history remains deferred by its Persist target.
+  persistCompaction(normalInit, () => normalHistoryCompacted, () => normal.entries, setNormal)
+  persistCompaction(shellInit, () => shellHistoryCompacted, () => shell.entries, setShell)
   const history = createPromptInputHistoryStore(normal, setNormal, shell, setShell)
   return {
     ...history,

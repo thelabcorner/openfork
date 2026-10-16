@@ -20,6 +20,13 @@ function sessionTreeRequest<T>(
   if (!sessionID) return
   const children = Array.isArray(session) ? indexSessionChildren(session) : session
 
+  // Pending requests are commonly on the tab's own session. Resolve that case
+  // without traversing its delegated-worker tree, but retain the original
+  // two-phase traversal for sparse/absent descendant requests. Fusing the
+  // checks into the BFS was slower in the measured no-request case.
+  const own = request[sessionID]
+  if (own?.some(include)) return own.find(include)
+
   const seen = new Set([sessionID])
   const ids = [sessionID]
   for (const id of ids) {
@@ -31,8 +38,7 @@ function sessionTreeRequest<T>(
       ids.push(child)
     }
   }
-
-  const id = ids.find((id) => request[id]?.some(include))
+  const id = ids.find((id) => id !== sessionID && request[id]?.some(include))
   if (!id) return
   return request[id]?.find(include)
 }

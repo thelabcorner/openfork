@@ -1,5 +1,6 @@
 import { Show, type JSX } from "solid-js"
 import { GoalComposerShelf } from "@/components/goal-composer-shelf"
+import { LimitRecoveryComposerShelf } from "@/components/limit-recovery-composer-shelf"
 import { useLanguage } from "@/context/language"
 import { useSettings } from "@/context/settings"
 import { SessionPermissionDock } from "@/pages/session/composer/session-permission-dock"
@@ -57,7 +58,12 @@ export function SessionComposerRegion(props: {
               it generates, and shares that dock's full width so the two read as
               one column instead of a floating pill over a bar. */}
           <Show when={controller.sessionID()}>
-            {(id) => <GoalComposerShelf sessionID={id()} promptText={controller.draftText} />}
+            {(id) => (
+              <>
+                <LimitRecoveryComposerShelf sessionID={id()} />
+                <GoalComposerShelf sessionID={id()} promptText={controller.draftText} />
+              </>
+            )}
           </Show>
           <Show when={controller.dock()}>
             <div
@@ -144,10 +150,7 @@ export function SessionComposerRegion(props: {
                   onEdit={controller.followup()!.onEdit}
                 />
               </Show>
-              <Show
-                when={controller.child()}
-                fallback={<Show when={!controller.state.permissionRequest()}>{props.promptInput}</Show>}
-              >
+              <Show when={controller.child()} fallback={props.promptInput}>
                 <div
                   ref={controller.setPromptRef}
                   class="w-full rounded-[12px] border border-border-weak-base bg-background-base p-3 text-16-regular text-text-weak"
