@@ -15,6 +15,10 @@ type SessionCache = {
   todo: Record<string, Todo[] | undefined>
   message: Record<string, Message[] | undefined>
   session_message: Record<string, SessionMessageInfo[] | undefined>
+  message_window?: Record<
+    string,
+    { omittedContentItems: number; truncatedStrings: number; error?: string } | undefined
+  >
   part: Record<string, Part[] | undefined>
   permission: Record<string, PermissionRequest[] | undefined>
   question: Record<string, QuestionRequest[] | undefined>
@@ -62,6 +66,7 @@ export function estimateSessionCacheBytes(store: SessionCache, sessionID: string
   for (const message of store.message[sessionID] ?? []) messageIDs.add(message.id)
   for (const message of store.session_message[sessionID] ?? []) messageIDs.add(message.id)
   if (messageIDs.size > 0) {
+    for (const messageID of messageIDs) bytes += roughValueBytes(store.message_window?.[messageID], seen)
     // The part cache is keyed by message ID. Walk this session's known messages
     // instead of scanning every cached part array and checking its owner. This
     // estimator runs at timeline release and background-prefetch boundaries,
@@ -102,18 +107,22 @@ export function dropSessionCaches(store: SessionCache, sessionIDs: Iterable<stri
   // the common trim keeps its cheap message-walk.
   const orphan = new Set<string>()
   for (const sessionID of stale) {
-    const messages = store.message[sessionID]
-    if (!messages || messages.length === 0) {
+    const messageIDs = new Set([
+      ...(store.message[sessionID] ?? []).map((message) => message.id),
+      ...(store.session_message[sessionID] ?? []).map((message) => message.id),
+    ])
+    if (messageIDs.size === 0) {
       orphan.add(sessionID)
       continue
     }
-    for (const message of messages) {
-      const parts = store.part[message.id]
+    for (const messageID of messageIDs) {
+      delete store.message_window?.[messageID]
+      const parts = store.part[messageID]
       if (!parts) continue
       for (const part of parts) {
         delete store.part_text_accum_delta[part.id]
       }
-      delete store.part[message.id]
+      delete store.part[messageID]
     }
   }
 
@@ -125,6 +134,7 @@ export function dropSessionCaches(store: SessionCache, sessionIDs: Iterable<stri
       // message list still being present.
       const owner = parts.find((part) => !!part?.sessionID)?.sessionID
       if (!owner || !orphan.has(owner)) continue
+      delete store.message_window?.[messageID]
       for (const part of parts) {
         delete store.part_text_accum_delta[part.id]
       }

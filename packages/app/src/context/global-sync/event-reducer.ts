@@ -16,7 +16,7 @@ import { trimSessions } from "./session-trim"
 import { dropSessionCaches } from "./session-cache"
 import { diffs as list, message as clean } from "@/utils/diffs"
 import { messageKey } from "@/utils/session-message"
-import { appendRunningToolOutputPreview, runningToolPartPreview } from "@/utils/tool-output-preview"
+import { appendRunningToolOutput } from "@/utils/tool-output-preview"
 import { applyPartDelta } from "../session-part-delta"
 
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
@@ -120,7 +120,7 @@ export function applyDirectoryEvent(input: {
   setStore: SetStoreFunction<State>
   push: (directory: string) => void
   directory: string
-  loadLsp: () => void
+  loadLsp: (servers: State["lsp"]) => void
   loadReferences?: () => void
   vcsCache?: VcsCache
   setSessionTodo?: (sessionID: string, todos: Todo[] | undefined) => void
@@ -319,7 +319,7 @@ export function applyDirectoryEvent(input: {
       break
     }
     case "message.part.updated": {
-      const part = runningToolPartPreview((event.properties as { part: Part }).part)
+      const part = (event.properties as { part: Part }).part
       if (SKIP_PARTS.has(part.type)) break
       input.setStore(
         produce((draft) => {
@@ -389,7 +389,7 @@ export function applyDirectoryEvent(input: {
           if (props.field === "state.metadata.output" && part.type === "tool" && part.state.status === "running") {
             part.state.metadata ??= {}
             const existing = part.state.metadata.output
-            part.state.metadata.output = appendRunningToolOutputPreview(existing, props.delta)
+            part.state.metadata.output = appendRunningToolOutput(existing, props.delta)
             return
           }
           const field = props.field as keyof typeof part
@@ -482,7 +482,7 @@ export function applyDirectoryEvent(input: {
       break
     }
     case "lsp.updated": {
-      input.loadLsp()
+      input.loadLsp((event.properties as { servers: State["lsp"] }).servers)
       break
     }
     case "reference.updated": {

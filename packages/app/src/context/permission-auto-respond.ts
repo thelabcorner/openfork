@@ -9,6 +9,37 @@ export function directoryAcceptKey(directory: string) {
   return `${base64Encode(directory)}/*`
 }
 
+export function projectAutoAcceptPolicy(autoAccept: Record<string, boolean>, directory: string) {
+  const prefix = `${base64Encode(directory)}/`
+  const result: Record<string, boolean> = {}
+  const directoryValue = autoAccept[directoryAcceptKey(directory)]
+  if (directoryValue !== undefined) result["*"] = directoryValue
+  for (const [key, value] of Object.entries(autoAccept)) {
+    if (!key.startsWith(prefix)) continue
+    const sessionID = key.slice(prefix.length)
+    if (sessionID && sessionID !== "*") result[sessionID] = value
+  }
+  return result
+}
+
+export function enqueuePolicyUpdate(
+  queue: Map<string, Promise<boolean>>,
+  directory: string,
+  update: () => Promise<boolean>,
+  maxLocations = 2048,
+) {
+  const existing = queue.get(directory)
+  if (!existing && queue.size >= maxLocations) return Promise.resolve(false)
+  const previous = existing ?? Promise.resolve(true)
+  let request!: Promise<boolean>
+  request = previous.catch(() => false).then(update).finally(() => {
+    if (queue.get(directory) === request) queue.delete(directory)
+  })
+  queue.delete(directory)
+  queue.set(directory, request)
+  return request
+}
+
 function accepted(autoAccept: Record<string, boolean>, sessionID: string, directory?: string) {
   const key = acceptKey(sessionID, directory)
   return autoAccept[key] ?? autoAccept[sessionID]

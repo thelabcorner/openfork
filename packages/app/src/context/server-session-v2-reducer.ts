@@ -32,6 +32,11 @@ const MAX_STREAM_INDEXES = 256
 
 type IncrementalReduction =
   | {
+      kind: "append"
+      index: number
+      message: SessionMessageInfo
+    }
+  | {
       kind: "assistant-content"
       index: number
       messageID: string
@@ -66,12 +71,27 @@ export type V2SessionReduction =
 export function createV2SessionReducer() {
   const pending = new Map<string, SessionPendingMessage>()
   const indexes = new Map<string, StreamIndex>()
+  // Structural appends are common during history creation. Keep the ID lookup
+  // alongside the positional stream index so duplicate detection does not scan
+  // the full transcript for every appended record. Like the stream index, this
+  // is only trusted until an authoritative snapshot invalidates it.
+  const positions = new Map<string, Map<string, number>>()
   // The compatibility HTTP history model predates explicit textID/reasoningID
   // fields, while the current native stream is keyed by those IDs. Keep the
   // tiny ID -> legacy ordinal bridge out-of-band instead of inflating every
   // historical content entry. It is bounded with the same session policy as
   // the stream indexes and rebuilt lazily after hydration/reconnect.
   const streamIDs = new Map<string, Map<string, StreamContentIDs>>()
+
+  const rememberPositions = (sessionID: string, byID: Map<string, number>) => {
+    positions.delete(sessionID)
+    positions.set(sessionID, byID)
+    while (positions.size > MAX_STREAM_INDEXES) {
+      const oldest = positions.keys().next().value
+      if (oldest === undefined) break
+      positions.delete(oldest)
+    }
+  }
 
   const rememberIndex = (sessionID: string, index: StreamIndex) => {
     indexes.delete(sessionID)
@@ -176,8 +196,35 @@ export function createV2SessionReducer() {
       touched: [],
       ...(missing === undefined ? {} : { missing }),
     })
-    const append = (message: SessionMessageInfo) =>
-      result(source.some((item) => item.id === message.id) ? [...source] : [...source, message], [message.id])
+    const append = (message: SessionMessageInfo): V2SessionReduction => {
+      let byID = positions.get(sessionID)
+      if (byID) rememberPositions(sessionID, byID)
+      if (!byID || byID.size !== source.length) {
+        byID = new Map(source.map((item, index) => [item.id, index] as const))
+        rememberPositions(sessionID, byID)
+      }
+      const existing = byID.get(message.id)
+      if (existing !== undefined) return unchanged()
+
+      const index = source.length
+      byID.set(message.id, index)
+      const incremental = { kind: "append" as const, index, message }
+      let materialized: SessionMessageInfo[] | undefined
+      return {
+        kind: "messages",
+        sessionID,
+        get messages() {
+          // Compatibility for callers/tests that still request a materialized
+          // reduction. The production projector can consume `incremental`
+          // without copying the complete source array.
+          if (materialized) return materialized
+          materialized = [...source, message]
+          return materialized
+        },
+        touched: [message.id],
+        incremental,
+      }
+    }
 
     const reduction = (() => {
       switch (event.type) {
@@ -1067,7 +1114,10 @@ export function createV2SessionReducer() {
     // so both retain the index. Every other message reduction is treated as
     // structural and invalidates conservatively after its semantic result is
     // known. This avoids lifecycle/control invalidation without a skip list.
-    if (reduction?.kind === "messages" && !reduction.incremental) indexes.delete(sessionID)
+    if (reduction?.kind === "messages" && !reduction.incremental) {
+      indexes.delete(sessionID)
+      positions.delete(sessionID)
+    }
     return reduction
   }
 
@@ -1078,10 +1128,12 @@ export function createV2SessionReducer() {
         if (id.startsWith(`${sessionID}:`)) pending.delete(id)
       }
       indexes.delete(sessionID)
+      positions.delete(sessionID)
       streamIDs.delete(sessionID)
     },
     invalidate(sessionID: string) {
       indexes.delete(sessionID)
+      positions.delete(sessionID)
       streamIDs.delete(sessionID)
     },
   }
@@ -1345,6 +1397,11 @@ function materializeIncremental(
   source: readonly SessionMessageInfo[],
   incremental: NonNullable<V2SessionReduction["incremental"]>,
 ) {
+  if (incremental.kind === "append") {
+    if (source[incremental.index]?.id === incremental.message.id) return source.slice()
+    if (incremental.index !== source.length) return source.slice()
+    return [...source, incremental.message]
+  }
   const next = source.slice()
   if (incremental.kind === "message") {
     const at =

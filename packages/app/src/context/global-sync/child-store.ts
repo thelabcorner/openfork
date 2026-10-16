@@ -15,11 +15,12 @@ import {
 } from "./types"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./eviction"
 import { useQuery } from "@tanstack/solid-query"
-import { QueryOptionsApi } from "../server-sync"
-import { directoryKey, type DirectoryKey } from "./utils"
-import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
+import type { QueryOptionsApi } from "../server-sync"
+import { pathKey as directoryKey, type PathKey as DirectoryKey } from "@/utils/path-key"
+import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import type { ServerScope } from "@/utils/server-scope"
 import { safeQueryData } from "@/utils/safe-query-data"
+import { sessionStatusIsWorking } from "@/utils/session-status"
 
 export function createChildStoreManager(input: {
   owner: Owner
@@ -28,7 +29,6 @@ export function createChildStoreManager(input: {
   isBooting: (directory: string) => boolean
   isLoadingSessions: (directory: string) => boolean
   onBootstrap: (directory: string) => void
-  onMcp: (directory: string, setStore: SetStoreFunction<State>) => void
   onDispose: (directory: string) => void
   translate: (key: string, vars?: Record<string, string | number>) => string
   queryOptions: QueryOptionsApi
@@ -44,12 +44,28 @@ export function createChildStoreManager(input: {
   const pins = new Map<string, number>()
   const ownerPins = new WeakMap<object, Set<string>>()
   const disposers = new Map<string, () => void>()
+  // Persisted VCS/project/icon stores register onCleanup and write-flush
+  // callbacks. They must have the same eviction lifetime as this directory,
+  // not the global provider owner that may survive thousands of directory
+  // switches. Keep their own root separate from the query child root.
+  const cacheDisposers = new Map<string, () => void>()
   const mcpDirectories = new Set<string>()
   const mcpRequestToggles = new Map<string, (requested: boolean) => void>()
   const mcpQueryToggles = new Map<string, (enabled: boolean) => void>()
   const activeDirectories = new Set<string>()
   const activationToggles = new Map<string, (enabled: boolean) => void>()
   const catalogToggles = new Map<string, (enabled: boolean) => void>()
+
+  // Solid createRoot returns an independent disposer: unloading the parent
+  // does not automatically invoke the per-directory disposal callbacks.
+  // Attach one finalizer to the supplied global owner, so shutdown releases
+  // any still-pinned/active query and persistence roots as well as eviction.
+  runWithOwner(input.owner, () => onCleanup(() => {
+    for (const dispose of disposers.values()) dispose()
+    for (const dispose of cacheDisposers.values()) dispose()
+    disposers.clear()
+    cacheDisposers.clear()
+  }))
 
   const markKey = (key: DirectoryKey) => {
     if (!key) return
@@ -132,6 +148,11 @@ export function createChildStoreManager(input: {
       dispose()
       disposers.delete(key)
     }
+    const disposeCache = cacheDisposers.get(key)
+    if (disposeCache) {
+      disposeCache()
+      cacheDisposers.delete(key)
+    }
     delete children[key]
     input.onDispose(key)
     return true
@@ -158,32 +179,47 @@ export function createChildStoreManager(input: {
     const key = directoryKey(directory)
     if (!key) console.error("No directory provided")
     if (!children[key]) {
-      const vcs = runWithOwner(input.owner, () =>
-        input.persist(
-          { ...Persist.serverWorkspace(input.scope, directory, "vcs", ["vcs.v1"]), defer: true },
-          createStore({ value: undefined as VcsInfo | undefined }),
-        ),
-      )
-      if (!vcs) throw new Error(input.translate("error.childStore.persistedCacheCreateFailed"))
+      // The original runWithOwner(global, persisted(...)) attached every
+      // onCleanup/flush observer to the application's global root. Eviction
+      // disposed the query root but NEVER detached these observers. One
+      // dedicated cache root per directory makes all three persist callbacks
+      // independently reclaimable by disposeDirectory.
+      const cacheStores = (() => {
+        try {
+          return runWithOwner(input.owner, () => createRoot((dispose) => {
+            cacheDisposers.set(key, dispose)
+            return {
+              vcs: input.persist(
+                { ...Persist.serverWorkspace(input.scope, directory, "vcs", ["vcs.v1"]), defer: true },
+                createStore({ value: undefined as VcsInfo | undefined }),
+              ),
+              meta: input.persist(
+                { ...Persist.serverWorkspace(input.scope, directory, "project", ["project.v1"]), defer: true },
+                createStore({ value: undefined as ProjectMeta | undefined }),
+              ),
+              icon: input.persist(
+                { ...Persist.serverWorkspace(input.scope, directory, "icon", ["icon.v1"]), defer: true },
+                createStore({ value: undefined as string | undefined }),
+              ),
+            }
+          }))
+        } catch (error) {
+          // A storage/provider failure midway through creating three caches
+          // must not strand the first already-registered persistence observer.
+          cacheDisposers.get(key)?.()
+          cacheDisposers.delete(key)
+          throw error
+        }
+      })()
+      if (!cacheStores?.vcs || !cacheStores?.meta || !cacheStores?.icon) {
+        cacheDisposers.get(key)?.()
+        cacheDisposers.delete(key)
+        throw new Error(input.translate("error.childStore.persistedCacheCreateFailed"))
+      }
+      const { vcs, meta, icon } = cacheStores
       const vcsStore = vcs[0]
       vcsCache.set(key, { store: vcsStore, setStore: vcs[1], ready: vcs[3] })
-
-      const meta = runWithOwner(input.owner, () =>
-        input.persist(
-          { ...Persist.serverWorkspace(input.scope, directory, "project", ["project.v1"]), defer: true },
-          createStore({ value: undefined as ProjectMeta | undefined }),
-        ),
-      )
-      if (!meta) throw new Error(input.translate("error.childStore.persistedProjectMetadataCreateFailed"))
       metaCache.set(key, { store: meta[0], setStore: meta[1], ready: meta[3] })
-
-      const icon = runWithOwner(input.owner, () =>
-        input.persist(
-          { ...Persist.serverWorkspace(input.scope, directory, "icon", ["icon.v1"]), defer: true },
-          createStore({ value: undefined as string | undefined }),
-        ),
-      )
-      if (!icon) throw new Error(input.translate("error.childStore.persistedProjectIconCreateFailed"))
       iconCache.set(key, { store: icon[0], setStore: icon[1], ready: icon[3] })
 
       const init = () =>
@@ -194,7 +230,7 @@ export function createChildStoreManager(input: {
           const [mcpEnabled, setMcpEnabled] = createSignal(false)
           const [instanceQueriesEnabled, setInstanceQueriesEnabled] = createSignal(false)
           const [catalogQueriesEnabled, setCatalogQueriesEnabled] = createSignal(false)
-          // Deferred tier: lsp + references are not on critical paint and can
+          // Deferred tier: references are not on critical paint and can
           // idle-delay to avoid the 36-request burst. They auto-enable after
           // instanceQueriesEnabled has been true for one idle callback.
           const [deferredQueriesEnabled, setDeferredQueriesEnabled] = createSignal(false)
@@ -207,7 +243,6 @@ export function createChildStoreManager(input: {
           const pathQuery = useQuery(() => ({ ...input.queryOptions.path(key), enabled: instanceQueriesEnabled() }))
           const mcpQuery = useQuery(() => ({ ...input.queryOptions.mcp(key), enabled: mcpEnabled() }))
           const mcpResourceQuery = useQuery(() => ({ ...input.queryOptions.mcpResources(key), enabled: mcpEnabled() }))
-          const lspQuery = useQuery(() => ({ ...input.queryOptions.lsp(key), enabled: deferredQueriesEnabled() }))
           const providerQuery = useQuery(() => ({
             ...input.queryOptions.providers(key),
             enabled: catalogQueriesEnabled(),
@@ -247,7 +282,7 @@ export function createChildStoreManager(input: {
             session_status: {},
             session_working(id: string) {
               const type = this.session_status[id]?.type
-              return (type ?? "idle") !== "idle"
+              return sessionStatusIsWorking(type)
             },
             session_diff: {},
             todo: {},
@@ -262,12 +297,11 @@ export function createChildStoreManager(input: {
             get mcp_resource() {
               return mcpResourceQuery.isLoading ? {} : (mcpResourceQuery.data ?? {})
             },
-            get lsp_ready() {
-              return deferredQueriesEnabled() && !lspQuery.isLoading
-            },
-            get lsp() {
-              return lspQuery.isLoading ? [] : (lspQuery.data ?? [])
-            },
+            // LSP status is an event-owned snapshot. An empty initial value is
+            // already a complete answer; lsp.updated replaces it when the
+            // server reports active language servers.
+            lsp_ready: true,
+            lsp: [],
             vcs: vcsStore.value,
             limit: 5,
             message: {},
@@ -296,9 +330,9 @@ export function createChildStoreManager(input: {
               setDeferredQueriesEnabled(false)
               return
             }
-            // Burst control: first two active directories get lsp/references
+            // Burst control: first two active directories get references
             // immediately (tests + critical path); beyond that idle-defer so
-            // startup goes from 24 parallel lsp+ref+path+provider requests to
+            // startup goes from 24 parallel auxiliary requests to
             // 4-8 + deferred 16, cutting 705ms thundering herd.
             const immediate = activeDirectories.size < 2
             if (immediate) {
@@ -381,7 +415,6 @@ export function createChildStoreManager(input: {
     // already-complete child remains immediate.
     if (childStore[0].status !== "complete") return
     mcpQueryToggles.get(key)?.(true)
-    input.onMcp(directory, childStore[1])
   }
 
   function enableMcpQueries(directory: string) {

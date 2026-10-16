@@ -15,10 +15,11 @@ import type {
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import type { SessionMessageInfo } from "@/utils/session-message-info"
 import { hasSessionMessageStateSemantics } from "@/utils/session-message-info"
-import { batch } from "solid-js"
+import { batch, createSignal } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { message as cleanMessage } from "@/utils/diffs"
 import { sessionNotFoundError } from "@/utils/server-errors"
+import { sessionStatusIsWorking } from "@/utils/session-status"
 import { rootSession } from "@/utils/session-route"
 import { normalizeSessionInfo } from "@/utils/session"
 import {
@@ -31,6 +32,7 @@ import {
   isConversationParentMessage,
   userTurnPresentation,
   messageKey,
+  createSessionMessageNormalizer,
   normalizeSessionAssistantContentPart,
   normalizeSessionMessages,
 } from "@/utils/session-message"
@@ -44,11 +46,15 @@ import {
 import { createV2SessionReducer, type V2SessionReduction } from "./server-session-v2-reducer"
 import type { ServerApi } from "@/utils/server"
 import { isSessionStreamContentEvent } from "@/utils/session-stream-content"
-import { appendRunningToolOutputPreview, runningToolPartPreview } from "@/utils/tool-output-preview"
+import { appendRunningToolOutput } from "@/utils/tool-output-preview"
 import { applyPartDelta } from "./session-part-delta"
 
 type MessageApi = ServerApi["message"]
 type SessionStreamEvent = OpenCodeEvent | typeof SessionEvent.All.Encoded
+export type SessionStructureOperation =
+  | { kind: "append"; message: SessionMessageInfo; messages?: Message[] }
+  | { kind: "reset" }
+export type SessionStructureChange = { revision: number; operation: SessionStructureOperation }
 
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
@@ -97,6 +103,7 @@ type OptimisticItem = {
 type MessagePage = {
   session: Message[]
   part: { id: string; part: Part[] }[]
+  windowed?: { messageID: string; omittedContentItems: number; truncatedStrings: number }[]
   source?: SessionMessageInfo[]
   sourceMode?: "latest" | "older"
   projectSource?: boolean
@@ -139,6 +146,25 @@ function legacyMessageSource(items: { info: Message; parts: Part[] }[]): Session
     })
 }
 
+function readWindowedMessages(headers: Headers) {
+  const value = headers.get("x-windowed-messages")
+  if (!value) return []
+  try {
+    const parsed = JSON.parse(value)
+    if (!Array.isArray(parsed)) return []
+    return parsed.flatMap((item): NonNullable<MessagePage["windowed"]> =>
+      item &&
+      typeof item.messageID === "string" &&
+      typeof item.omittedParts === "number" &&
+      item.omittedParts > 0
+        ? [{ messageID: item.messageID, omittedContentItems: item.omittedParts, truncatedStrings: 0 }]
+        : [],
+    )
+  } catch {
+    return []
+  }
+}
+
 // Most markers describe the current HTTP attempt; deltaParts persists non-durable stream state across retries.
 type MessageLoadState = {
   touchedMessages: Set<string>
@@ -153,6 +179,8 @@ type MessageLoadState = {
   clearedMessageParts: Set<string>
   touchedSource: Set<string>
 }
+
+const MAX_ONE_SHOT_MESSAGE_RECOVERY_ITEMS = 8
 
 type MessageLoadBaseline = Pick<
   MessageLoadState,
@@ -274,6 +302,10 @@ export function createServerSession(
     question: {} as Record<string, QuestionRequest[]>,
     message: {} as Record<string, Message[]>,
     session_message: {} as Record<string, SessionMessageInfo[]>,
+    message_window: {} as Record<
+      string,
+      { omittedContentItems: number; truncatedStrings: number; error?: string } | undefined
+    >,
     part: {} as Record<string, Part[]>,
     part_text_accum_delta: {} as Record<string, string>,
     // Durable paused sidecar: derived from session.next.paused/resumed events (V2),
@@ -282,7 +314,8 @@ export function createServerSession(
     // flip through a spinner state.
     paused: {} as Record<string, boolean>,
     session_working(id: string) {
-      return ((this.session_status[id]?.type ?? "idle") !== "idle" && this.paused[id] !== true)
+      const type = this.session_status[id]?.type
+      return sessionStatusIsWorking(type) && this.paused[id] !== true
     },
     session_paused(id: string) {
       return this.paused[id] === true
@@ -293,8 +326,36 @@ export function createServerSession(
   const inflightTodo = new Map<string, Promise<void>>()
   const optimistic = new Map<string, Map<string, OptimisticItem>>()
   const v2 = createV2SessionReducer()
+  const v2Normalizers = new Map<string, ReturnType<typeof createSessionMessageNormalizer>>()
+  const legacySourceIDs = new Map<string, Set<string>>()
+  const structureSignals = new Map<
+    string,
+    { get: () => SessionStructureChange; set: (next: SessionStructureChange) => SessionStructureChange }
+  >()
+  const publishStructureChange = (sessionID: string, operation: SessionStructureOperation) => {
+    const signal = structureSignals.get(sessionID)
+    if (!signal) return
+    signal.set({ revision: signal.get().revision + 1, operation })
+  }
+  const structureChange = (sessionID: string) => {
+    let signal = structureSignals.get(sessionID)
+    if (!signal) {
+      const [get, set] = createSignal<SessionStructureChange>({ revision: 0, operation: { kind: "reset" } })
+      signal = { get, set }
+      while (structureSignals.size >= SESSION_CACHE_LIMIT) {
+        const oldest = structureSignals.keys().next().value
+        if (oldest === undefined) break
+        structureSignals.delete(oldest)
+      }
+    }
+    structureSignals.delete(sessionID)
+    structureSignals.set(sessionID, signal)
+    return signal.get
+  }
   const messageLoads = new Map<string, MessageLoadState>()
   const pendingParts = new Map<string, Map<string, Set<string>>>()
+  const timelineContentLoads = new Map<string, Promise<void>>()
+  const timelineRecoveryChanges = new Map<string, { owners: Set<string>; parts: Set<string>; removedMessages: Set<string> }>()
   const orphanParts = new Map<string, Set<string>>()
   const removedMessages = new Map<string, Set<string>>()
   const deltaBases = new Map<string, { base: string; sessionID: string }>()
@@ -319,7 +380,14 @@ export function createServerSession(
   }
   const publishStreamInterest = () => options?.onStreamInterestChanged?.([...activated].sort())
   const deleteMessageParts = (
-    cache: { part: Record<string, Part[] | undefined>; part_text_accum_delta: Record<string, string | undefined> },
+    cache: {
+      part: Record<string, Part[] | undefined>
+      part_text_accum_delta: Record<string, string | undefined>
+      message_window: Record<
+        string,
+        { omittedContentItems: number; truncatedStrings: number; error?: string } | undefined
+      >
+    },
     messageID: string,
   ) => {
     for (const part of cache.part[messageID] ?? []) {
@@ -327,6 +395,7 @@ export function createServerSession(
       deltaBases.delete(part.id)
     }
     delete cache.part[messageID]
+    delete cache.message_window[messageID]
   }
   const seen = new Set<string>()
   const infoSeen = new Set<string>()
@@ -353,12 +422,60 @@ export function createServerSession(
 
   const indexLegacyMessage = (message: Message) => {
     const current = data.session_message[message.sessionID] ?? []
-    if (current.some((item) => item.id === message.id)) return
-    setData(
-      "session_message",
-      message.sessionID,
-      reconcile([...current, ...legacyMessageSource([{ info: message, parts: [] }])]),
-    )
+    let known = legacySourceIDs.get(message.sessionID)
+    if (!known || known.size !== current.length) {
+      known = new Set(current.map((item) => item.id))
+      legacySourceIDs.set(message.sessionID, known)
+    }
+    if (known.has(message.id)) return
+    const item = legacyMessageSource([{ info: message, parts: [] }])[0]
+    if (!item) return
+
+    if (current.length === 0) {
+      setData("session_message", message.sessionID, [item])
+    } else if (compareMessages(current.at(-1)!, item) <= 0) {
+      setData("session_message", message.sessionID, current.length, item)
+    } else {
+      // Time-key regressions, imports and repair events do not satisfy the
+      // strict-tail proof. Preserve canonical chronological ordering and emit
+      // a reset so timeline consumers rebuild their indexed projections.
+      setData("session_message", message.sessionID, reconcile([...current, item]))
+      known.add(message.id)
+      v2Normalizers.set(
+        message.sessionID,
+        createSessionMessageNormalizer(
+          message.sessionID,
+          data.session_message[message.sessionID] ?? [],
+          (messageID) => data.message[message.sessionID]?.find((entry) => entry?.id === messageID),
+        ),
+      )
+      publishStructureChange(message.sessionID, { kind: "reset" })
+      return
+    }
+    known.add(message.id)
+    let normalizer = v2Normalizers.get(message.sessionID)
+    if (!normalizer) {
+      normalizer = createSessionMessageNormalizer(
+        message.sessionID,
+        current,
+        (messageID) => data.message[message.sessionID]?.find((entry) => entry?.id === messageID),
+      )
+      v2Normalizers.set(message.sessionID, normalizer)
+    }
+    const projected = normalizer.append(item, (messageID) => data.part[messageID] ?? [])
+    if (!projected) {
+      v2Normalizers.set(
+        message.sessionID,
+        createSessionMessageNormalizer(
+          message.sessionID,
+          data.session_message[message.sessionID] ?? [],
+          (messageID) => data.message[message.sessionID]?.find((entry) => entry?.id === messageID),
+        ),
+      )
+      publishStructureChange(message.sessionID, { kind: "reset" })
+      return
+    }
+    return item
   }
 
   const remember = (session: Session) => {
@@ -524,6 +641,8 @@ export function createServerSession(
   }
 
   const trackPartChange = (sessionID: string, messageID: string, partID: string) => {
+    const recovery = timelineRecoveryChanges.get(sessionID)
+    if (recovery?.owners.has(messageID)) recovery.parts.add(partID)
     const load = messageLoads.get(sessionID)
     if (!load) return
     // A part event keeps an existing parent when the fetched page omits it without overriding fetched metadata.
@@ -596,6 +715,8 @@ export function createServerSession(
       if (evicted.has(item.sessionID)) deltaBases.delete(partID)
     }
     sessionIDs.forEach((sessionID) => {
+      timelineContentLoads.delete(sessionID)
+      timelineRecoveryChanges.delete(sessionID)
       cacheBytes.delete(sessionID)
       generations.delete(sessionID)
       clearOptimistic(sessionID)
@@ -604,6 +725,9 @@ export function createServerSession(
       inflightTodo.delete(sessionID)
       messageLoads.delete(sessionID)
       v2.clear(sessionID)
+      v2Normalizers.delete(sessionID)
+      legacySourceIDs.delete(sessionID)
+      structureSignals.delete(sessionID)
       pendingParts.delete(sessionID)
       orphanParts.delete(sessionID)
       removedMessages.delete(sessionID)
@@ -802,6 +926,12 @@ export function createServerSession(
         source,
         sourceMode: before ? ("older" as const) : ("latest" as const),
         projectSource: true,
+        windowed: pages.flatMap(
+          (page) =>
+            (page as unknown as {
+              windowed?: { messageID: string; omittedContentItems: number; truncatedStrings: number }[]
+            }).windowed ?? [],
+        ),
         cursor: response.cursor.next ?? undefined,
         complete: response.data.length === 0,
       }
@@ -820,6 +950,7 @@ export function createServerSession(
         part: item.parts.filter((part) => !!part?.id).sort((a, b) => cmp(a.id, b.id)),
       })),
       source: legacyMessageSource(items),
+      windowed: readWindowedMessages(response.response.headers),
       sourceMode: before ? ("older" as const) : ("latest" as const),
       cursor: response.response.headers.get("x-next-cursor") ?? undefined,
       complete: !response.response.headers.get("x-next-cursor"),
@@ -837,10 +968,12 @@ export function createServerSession(
         onAttempt?.()
         return scheduleRequest(sessionID, priority, "session-message", () => sessionApi.message({ sessionID, messageID }))
       })
-      const normalized = normalizeSessionMessages(sessionID, [response])
+      const source = [...(data.session_message[sessionID] ?? []).filter((message) => message.id !== response.id), response]
+        .sort(compareMessages)
+      const normalized = normalizeSessionMessages(sessionID, source)
       const message = normalized.messages[0]
       if (!message) throw new Error(`Message not found: ${messageID}`)
-      return { message, parts: normalized.parts.get(messageID) ?? [] }
+      return { message, parts: normalized.parts.get(messageID) ?? [], source: response }
     }
     const response = await (options?.retry ?? retry)(() => {
       onAttempt?.()
@@ -850,7 +983,161 @@ export function createServerSession(
     return {
       message: cleanMessage(response.data.info),
       parts: response.data.parts.filter((part) => !!part?.id).sort((a, b) => cmp(a.id, b.id)),
+      source: legacyMessageSource([response.data])[0],
     }
+  }
+
+  const inspectMessageParts = async (sessionID: string, messageID: string, cursor?: string) => {
+    touch(sessionID)
+    // This request is deliberately demand-driven and returns directly to the
+    // opened detail surface. Its bounded slices never enter the shared session
+    // or part store and cannot invalidate/rebuild the live timeline.
+    return scheduleRequest(sessionID, "interactive", "session-message-detail", async () => {
+      const response = await (options?.retry ?? retry)(() =>
+        client.sessionRead.parts({ sessionID, messageID, ...(cursor ? { cursor } : {}) }),
+      )
+      if (!response.data) throw response.error ?? new Error("Message detail is unavailable")
+      return response.data as {
+        data: { partID: string; type: string; offset: number; totalChars: number; text: string }[]
+        nextCursor?: string
+      }
+    })
+  }
+
+  const timelineContentStatus = (sessionID: string) => {
+    const windows = (data.message[sessionID] ?? [])
+      .map((message) => data.message_window[message.id])
+      .filter((window): window is NonNullable<typeof window> => !!window)
+    return {
+      pendingCount: windows.filter((window) => !window.error).length,
+      error: windows.find((window) => window.error)?.error,
+    }
+  }
+
+  const hydrateWindowedTimelineContent = (sessionID: string) => {
+    if (!activated.has(sessionID) || timelineContentLoads.has(sessionID)) return timelineContentLoads.get(sessionID)
+    const active = generation(sessionID)
+    const messageIDs = (data.message[sessionID] ?? [])
+      .filter((message) => !!message && !!data.message_window[message.id] && !data.message_window[message.id]?.error)
+      .map((message) => message.id)
+      .slice(0, 200)
+    if (!messageIDs.length) return Promise.resolve()
+    const owners = new Set(messageIDs)
+    const windows = new Map(messageIDs.map((messageID) => [messageID, data.message_window[messageID]]))
+    const changes = { owners, parts: new Set<string>(), removedMessages: new Set<string>() }
+    timelineRecoveryChanges.set(sessionID, changes)
+    const run = async () => {
+      let cursor: string | undefined
+      const seen = new Set<string>()
+      while (activated.has(sessionID) && generations.get(sessionID) === active) {
+        const response = await (options?.retry ?? retry)(() =>
+          scheduleRequest(sessionID, "background", "session-timeline-content", () =>
+            client.sessionRead.timelinePartsBatch({ sessionID, messageIDs, ...(cursor ? { cursor } : {}) }),
+          ),
+        )
+        if (generations.get(sessionID) !== active || !activated.has(sessionID)) return
+        if (!response.data) throw response.error ?? new Error("Session timeline recovery is unavailable")
+        const page = response.data
+        const grouped = new Map<string, Part[]>()
+        for (const entry of page.data) {
+          if (!owners.has(entry.messageID) || entry.part.messageID !== entry.messageID || entry.part.sessionID !== sessionID)
+            throw new Error("Session timeline recovery returned a part with invalid ownership")
+          if (seen.has(entry.part.id)) throw new Error("Session timeline recovery returned a duplicate part")
+          seen.add(entry.part.id)
+          if (SKIP_PARTS.has(entry.part.type)) continue
+          const parts = grouped.get(entry.messageID) ?? []
+          parts.push(entry.part as Part)
+          grouped.set(entry.messageID, parts)
+        }
+        if (generations.get(sessionID) !== active || !activated.has(sessionID)) return
+        for (const [messageID, recovered] of grouped) {
+          if (changes.removedMessages.has(messageID) || data.message_window[messageID] !== windows.get(messageID)) continue
+          const current = data.part[messageID] ?? []
+          const mergedByID = new Map(current.map((part) => [part.id, part]))
+          for (const part of recovered) {
+            // Events received after this snapshot request own the newer fact.
+            // Their mutations/removals must survive older recovery replies.
+            if (changes.parts.has(part.id) || pendingParts.get(sessionID)?.get(messageID)?.has(part.id)) continue
+            mergedByID.set(part.id, part)
+          }
+          const merged = [...mergedByID.values()].sort((a, b) => cmp(a.id, b.id))
+          setData("part", messageID, reconcile(merged, { key: "id" }))
+        }
+        const next = page.nextCursor
+        if (next && next === cursor) throw new Error("Session timeline recovery cursor did not advance")
+        if (next) {
+          if (page.completeMessageIDs.length) throw new Error("Session timeline recovery completed owners before the page set")
+          cursor = next
+          continue
+        }
+        if (
+          page.completeMessageIDs.length !== messageIDs.length ||
+          messageIDs.some((messageID) => !page.completeMessageIDs.includes(messageID))
+        ) throw new Error("Session timeline recovery ended without proving every message complete")
+        setData(produce((draft) => {
+          for (const messageID of messageIDs)
+            if (data.message_window[messageID] === windows.get(messageID)) delete draft.message_window[messageID]
+        }))
+        return
+      }
+    }
+    const pending = run()
+      .catch((error) => {
+        if (generations.get(sessionID) !== active) return
+        const message = error instanceof Error ? error.message : String(error)
+        setData(produce((draft) => {
+          for (const messageID of messageIDs) {
+            const window = draft.message_window[messageID]
+            if (window && data.message_window[messageID] === windows.get(messageID)) draft.message_window[messageID] = { ...window, error: message }
+          }
+        }))
+        console.warn("[session-timeline] complete content hydration failed", { sessionID, messageIDs, error })
+      })
+      .finally(() => {
+        if (timelineRecoveryChanges.get(sessionID) === changes) timelineRecoveryChanges.delete(sessionID)
+        if (timelineContentLoads.get(sessionID) === pending) timelineContentLoads.delete(sessionID)
+        if (activated.has(sessionID) && generations.get(sessionID) === active) {
+          const unstarted = (data.message[sessionID] ?? []).some((message) => {
+            const window = data.message_window[message.id]
+            return !!window && !window.error && window !== windows.get(message.id)
+          })
+          if (unstarted) queueMicrotask(() => hydrateWindowedTimelineContent(sessionID))
+        }
+      })
+    timelineContentLoads.set(sessionID, pending)
+    return pending
+  }
+
+  const retryTimelineContent = (sessionID: string) => {
+    setData(produce((draft) => {
+      for (const message of draft.message[sessionID] ?? []) {
+        const window = draft.message_window[message.id]
+        if (window?.error) draft.message_window[message.id] = { ...window, error: undefined }
+      }
+    }))
+    return hydrateWindowedTimelineContent(sessionID)
+  }
+
+  const loadFullMessage = async (sessionID: string, messageID: string) => {
+    const window = data.message_window[messageID]
+    if (!window) return
+    // A keyed full-message read is still a one-shot allocation. Keep it for
+    // small omissions only; a huge history must never be rehydrated into the
+    // renderer by a recovery button.
+    if (window.truncatedStrings > 0 || window.omittedContentItems > MAX_ONE_SHOT_MESSAGE_RECOVERY_ITEMS)
+      throw new Error("This message is too large for one-shot timeline recovery")
+    const active = generation(sessionID)
+    const full = await fetchMessage(sessionID, messageID, undefined, "interactive")
+    if (generations.get(sessionID) !== active) return
+    const message = full.message
+    const parts = full.parts
+    setData(
+      "message",
+      sessionID,
+      (messages = []) => reconcileFetched([message], messages, { preserveUnfetched: true, compare: compareMessages }),
+    )
+    replaceParts(sessionID, [{ id: messageID, part: parts }], new Set([messageID]), messageLoads.get(sessionID))
+    setData(produce((draft) => delete draft.message_window[messageID]))
   }
 
   const replaceMessages = (sessionID: string, messages: Message[]) => {
@@ -859,7 +1146,10 @@ export function createServerSession(
     setData("message", sessionID, reconcile(messages, { key: "id" }))
     setData(
       produce((draft) => {
-        for (const message of dropped) deleteMessageParts(draft, message.id)
+        for (const message of dropped) {
+          deleteMessageParts(draft, message.id)
+          delete draft.message_window[message.id]
+        }
       }),
     )
     return messageIDs
@@ -873,9 +1163,7 @@ export function createServerSession(
   ) => {
     for (const item of items) {
       if (!messageIDs.has(item.id)) continue
-      const fetched = load?.clearedMessageParts.has(item.id)
-        ? []
-        : item.part.filter((part) => !SKIP_PARTS.has(part.type)).map(runningToolPartPreview)
+      const fetched = load?.clearedMessageParts.has(item.id) ? [] : item.part.filter((part) => !SKIP_PARTS.has(part.type))
       const fetchedIDs = new Set(fetched.map((part) => part.id))
       const pending = pendingParts.get(sessionID)?.get(item.id)
       const touched = new Set([...(load?.touchedParts.get(item.id) ?? []), ...(pending ?? [])])
@@ -986,6 +1274,7 @@ export function createServerSession(
     batch(() => {
       if (source) {
         setData("session_message", sessionID, reconcile(source))
+        legacySourceIDs.set(sessionID, new Set(source.map((message) => message.id)))
         // HTTP hydration can replace message/content structure without passing
         // through the V2 reducer. Invalidate its positional stream index once at
         // this authoritative boundary so steady-state deltas can trust it without
@@ -993,7 +1282,29 @@ export function createServerSession(
         v2.invalidate(sessionID)
       }
       const messageIDs = replaceMessages(sessionID, messages)
+      if (source) {
+        v2Normalizers.set(
+          sessionID,
+          createSessionMessageNormalizer(
+            sessionID,
+            source,
+            (messageID) => data.message[sessionID]?.find((message) => message?.id === messageID),
+          ),
+        )
+      }
       replaceParts(sessionID, merged.part, messageIDs, load)
+      const pageMessageIDs = new Set(merged.session.map((message) => message.id))
+      setData(
+        produce((draft) => {
+          for (const messageID of pageMessageIDs) delete draft.message_window[messageID]
+          for (const item of merged.windowed ?? []) {
+            draft.message_window[item.messageID] = {
+              omittedContentItems: item.omittedContentItems,
+              truncatedStrings: item.truncatedStrings,
+            }
+          }
+        }),
+      )
       const orphans = orphanParts.get(sessionID)
       if (cleanupOrphans && page.complete && orphans) {
         for (const messageID of orphans) {
@@ -1005,7 +1316,9 @@ export function createServerSession(
       setMeta("cursor", sessionID, merged.cursor)
       setMeta("complete", sessionID, merged.complete)
       setMeta("at", sessionID, Date.now())
+      if (source) publishStructureChange(sessionID, { kind: "reset" })
     })
+    hydrateWindowedTimelineContent(sessionID)
   }
 
   const loadMessages = async (
@@ -1242,6 +1555,7 @@ export function createServerSession(
     if (stale.has(sessionID)) suspended.add(sessionID)
     else suspended.delete(sessionID)
     if (changed) publishStreamInterest()
+    hydrateWindowedTimelineContent(sessionID)
   }
 
   // Called by the SSE reader before it allocates/enqueues a high-frequency
@@ -1404,6 +1718,7 @@ export function createServerSession(
 
     const incremental = reduction.incremental
     const current = data.session_message[reduction.sessionID]
+    let appendApplied = false
     if (incremental?.kind === "assistant-content") {
       const message = current?.[incremental.index]
       const existing = message?.type === "assistant" ? message.content[incremental.partIndex] : undefined
@@ -1443,15 +1758,57 @@ export function createServerSession(
     } else if (incremental?.kind === "message" && current?.[incremental.index]?.id === incremental.message.id) {
       setData("session_message", reduction.sessionID, incremental.index, incremental.message)
       return
+    } else if (incremental?.kind === "append" && current && incremental.index === current.length) {
+      // The reducer proves this is the next structural slot. Preserve the
+      // Solid store array and append at its new index instead of reconciling a
+      // copied full transcript. The stateful normalizer advances the legacy
+      // Message/Part projection below from this same authoritative append.
+      appendApplied = true
+    }
+
+    if (appendApplied && incremental?.kind === "append") {
+      const normalizer = v2Normalizers.get(reduction.sessionID)
+      const projected = normalizer?.append(incremental.message, (messageID) => data.part[messageID] ?? [])
+      if (projected) {
+        batch(() => {
+          setData("session_message", reduction.sessionID, incremental.index, incremental.message)
+          for (const message of projected.messages) {
+            apply({ type: "message.updated", properties: { sessionID: reduction.sessionID, info: message } })
+          }
+          for (const [messageID, parts] of projected.parts) {
+            for (const part of parts) apply({ type: "message.part.updated", properties: { sessionID: reduction.sessionID, part } })
+            const nextIDs = new Set(parts.map((part) => part.id))
+            for (const part of data.part[messageID] ?? []) {
+              if (nextIDs.has(part.id)) continue
+              apply({ type: "message.part.removed", properties: { sessionID: reduction.sessionID, messageID, partID: part.id } })
+            }
+          }
+          publishStructureChange(reduction.sessionID, {
+            kind: "append",
+            message: incremental.message,
+            messages: projected.messages,
+          })
+        })
+        return
+      }
+      appendApplied = false
+      // If the normalizer is missing or rejects a duplicate, rebuild all
+      // compatibility projections from the authoritative source and restart
+      // its append cursor from that exact snapshot.
     }
 
     // An indexed delta can fall back here if hydration changed the layout under
     // it. The reconciled source is then authoritative, so force the next delta
     // to rebuild positional indexes from that source.
-    if (incremental) v2.invalidate(reduction.sessionID)
-    const messages = reduction.messages
-    setData("session_message", reduction.sessionID, reconcile(messages))
-    if (reduction.touched.length === 0) return
+    if (incremental && !appendApplied) v2.invalidate(reduction.sessionID)
+    const messages = appendApplied
+      ? (data.session_message[reduction.sessionID] ?? [])
+      : reduction.messages
+    if (!appendApplied) setData("session_message", reduction.sessionID, reconcile(messages))
+    if (reduction.touched.length === 0) {
+      publishStructureChange(reduction.sessionID, { kind: "reset" })
+      return
+    }
 
     const touched = new Set(reduction.touched)
     let parentID: string | undefined
@@ -1470,6 +1827,14 @@ export function createServerSession(
     }
 
     const normalized = normalizeSessionMessages(reduction.sessionID, messages)
+    v2Normalizers.set(
+      reduction.sessionID,
+      createSessionMessageNormalizer(
+        reduction.sessionID,
+        messages,
+        (messageID) => data.message[reduction.sessionID]?.find((message) => message?.id === messageID),
+      ),
+    )
     batch(() => {
       for (const message of normalized.messages) {
         if (!touched.has(message.id)) continue
@@ -1490,6 +1855,7 @@ export function createServerSession(
         }
       }
     })
+    publishStructureChange(reduction.sessionID, { kind: "reset" })
   }
 
   const hydrateV2Message = (sessionID: string, messageID: string) => {
@@ -1517,12 +1883,45 @@ export function createServerSession(
       markStale(sessionID)
       return
     }
-    if (!loaded && contentEvent) return
+    // A foreground history read can be installing the first authoritative
+    // snapshot for this session. Its live V2 deltas must still enter the
+    // reducer so projectV2 can mark the affected source message as touched and
+    // the snapshot merge can preserve it. Only drop deltas when neither a
+    // cached projection nor an in-flight reconciliation owns the session.
+    if (!loaded && !messageLoads.has(sessionID) && contentEvent) return
     if (loaded || messageLoads.has(sessionID)) {
       const reduction = v2.reduce(data.session_message[sessionID] ?? [], event)
       if (reduction) {
         projectV2(reduction)
         if (reduction.missing) hydrateV2Message(sessionID, reduction.missing)
+      }
+    }
+
+    // Prompted is the authoritative user-content event. The V1 execution
+    // adapter can create its legacy message row before the V1 text part exists,
+    // leaving that row with an empty placeholder forever. Lower this one event
+    // into the legacy part cache used by the timeline's shared Message view;
+    // this is constant work for the opened turn and avoids history hydration.
+    if (event.type === "session.next.prompted" && event.data.prompt.text) {
+      const message = data.message[sessionID]?.find((item) => item.id === event.data.messageID)
+      if (message?.role === "user" && message.provenance?.owner === "user" && userTurnPresentation(message) === "user") {
+        const parts = data.part[event.data.messageID] ?? []
+        const existing = parts.find((part) => part.type === "text" && !part.synthetic)
+        const part: Part = {
+          id: existing?.id ?? `prt_prompt_${event.data.messageID.slice(4)}_text`,
+          messageID: event.data.messageID,
+          sessionID,
+          type: "text",
+          text: event.data.prompt.text,
+        }
+        const result = Binary.search(parts, part.id, (item) => item.id)
+        if (result.found) setData("part", event.data.messageID, result.index, reconcile(part))
+        else
+          setData("part", event.data.messageID, (value = []) => {
+            const next = value.slice()
+            next.splice(result.index, 0, part)
+            return next
+          })
       }
     }
 
@@ -1653,7 +2052,7 @@ export function createServerSession(
       }
       case "message.updated": {
         const info = cleanMessage((event.properties as { info: Message }).info)
-        indexLegacyMessage(info)
+        const structuralAppend = indexLegacyMessage(info)
         const load = messageLoads.get(info.sessionID)
         load?.touchedMessages.add(info.id)
         load?.removedMessages.delete(info.id)
@@ -1671,24 +2070,51 @@ export function createServerSession(
         if (removedMessagesForSession?.size === 0) removedMessages.delete(info.sessionID)
         const messages = data.message[info.sessionID]
         if (!messages) {
-          setData("message", info.sessionID, [info])
+          batch(() => {
+            setData("message", info.sessionID, [info])
+            if (structuralAppend) {
+              publishStructureChange(info.sessionID, {
+                kind: "append",
+                message: structuralAppend,
+                messages: data.message[info.sessionID] ? [data.message[info.sessionID]![0]!] : [],
+              })
+            }
+          })
           return
         }
         const result = Binary.search(messages, messageKey(info), messageKey)
-        if (result.found) setData("message", info.sessionID, result.index, reconcile(info))
-        if (!result.found)
-          setData("message", info.sessionID, (value = []) => {
-            const next = value.slice()
-            next.splice(result.index, 0, info)
-            return next
-          })
+        batch(() => {
+          if (result.found) setData("message", info.sessionID, result.index, reconcile(info))
+          if (!result.found)
+            setData("message", info.sessionID, (value = []) => {
+              const next = value.slice()
+              next.splice(result.index, 0, info)
+              return next
+            })
+          if (structuralAppend) {
+            const projected = data.message[info.sessionID]?.[result.index]
+            publishStructureChange(info.sessionID, {
+              kind: "append",
+              message: structuralAppend,
+              messages: projected ? [projected] : [],
+            })
+          }
+        })
         return
       }
       case "message.removed": {
         const props = event.properties as { sessionID: string; messageID: string }
+        const recovery = timelineRecoveryChanges.get(props.sessionID)
+        if (recovery?.owners.has(props.messageID)) recovery.removedMessages.add(props.messageID)
+        // Removal can shift every positional reducer index, even when the
+        // resulting source length later happens to match an older snapshot.
+        v2.invalidate(props.sessionID)
+        v2Normalizers.delete(props.sessionID)
+        legacySourceIDs.delete(props.sessionID)
         setData("session_message", props.sessionID, (messages) =>
           messages?.filter((message) => message.id !== props.messageID),
         )
+        publishStructureChange(props.sessionID, { kind: "reset" })
         const load = messageLoads.get(props.sessionID)
         load?.touchedMessages.add(props.messageID)
         load?.removedMessages.add(props.messageID)
@@ -1716,7 +2142,7 @@ export function createServerSession(
         return
       }
       case "message.part.updated": {
-        const part = runningToolPartPreview((event.properties as { part: Part }).part)
+        const part = (event.properties as { part: Part }).part
         if (SKIP_PARTS.has(part.type)) return
         const messages = data.message[part.sessionID]
         const load = messageLoads.get(part.sessionID)
@@ -1759,6 +2185,17 @@ export function createServerSession(
           produce((draft) => void delete draft[part.id]),
         )
         const parts = data.part[part.messageID]
+        // A legacy placeholder may be replayed after Prompted has already
+        // supplied the authoritative text. Never let that empty projection
+        // erase the visible user turn.
+        if (part.type === "text" && !part.text && parts) {
+          const existing = parts.find((item) => item.id === part.id)
+          const message = messages?.find((item) => item.id === part.messageID)
+          if (
+            existing?.type === "text" && existing.text && message?.role === "user" &&
+            message.provenance?.owner === "user" && userTurnPresentation(message) === "user"
+          ) return
+        }
         if (!parts) {
           setData("part", part.messageID, [part])
           return
@@ -1876,7 +2313,7 @@ export function createServerSession(
             if (props.field === "state.metadata.output" && part.type === "tool" && part.state.status === "running") {
               part.state.metadata ??= {}
               const existing = part.state.metadata.output
-              part.state.metadata.output = appendRunningToolOutputPreview(existing, props.delta)
+              part.state.metadata.output = appendRunningToolOutput(existing, props.delta)
               return
             }
             const field = props.field as keyof typeof part
@@ -1950,6 +2387,9 @@ export function createServerSession(
 
   return {
     data,
+    inspectMessageParts,
+    retryTimelineContent,
+    timelineContentStatus,
     set: setData,
     get: (sessionID: string) => data.info[sessionID],
     peek: (sessionID: string) => data.info[sessionID],
@@ -1964,8 +2404,10 @@ export function createServerSession(
       },
     },
     sync,
+    loadFullMessage,
     resume,
     release,
+    structureChange,
     acceptStreamContent,
     invalidateStreamContent,
     repairStreamContent,
@@ -2071,7 +2513,7 @@ export function createServerSession(
         touch(sessionID)
         if (meta.loading[sessionID] || meta.complete[sessionID] || !meta.cursor[sessionID]) return
         await runInflight(inflight, sessionID, () =>
-          loadMessages(sessionID, count, meta.cursor[sessionID], "prepend", "interactive"),
+          loadMessages(sessionID, count, meta.cursor[sessionID], "prepend", "critical"),
         )
       },
     },

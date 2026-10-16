@@ -3,8 +3,11 @@ import type { PermissionRequest, Session } from "@opencode-ai/sdk/v2/client"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import {
   autoRespondsPermission,
+  directoryAcceptKey,
   directoryAutoAccept,
+  enqueuePolicyUpdate,
   isDirectoryAutoAccepting,
+  projectAutoAcceptPolicy,
   resolveNewSessionAutoAccept,
   sessionAutoAccept,
 } from "./permission-auto-respond"
@@ -167,5 +170,41 @@ describe("resolveNewSessionAutoAccept", () => {
     const directory = "/tmp/project"
     const autoAccept = { [`${base64Encode(directory)}/other`]: false }
     expect(resolveNewSessionAutoAccept(autoAccept, directory, true)).toBe(true)
+  })
+})
+
+describe("permission auto-accept policy projection", () => {
+  test("preserves saved overrides for sessions absent from loaded session rows", () => {
+    const directory = "/workspace/unloaded"
+    const autoAccept = {
+      [directoryAcceptKey(directory)]: true,
+      [`${base64Encode(directory)}/session_not_loaded`]: false,
+      [`${base64Encode("/other")}/session_other`]: true,
+    }
+
+    expect(projectAutoAcceptPolicy(autoAccept, directory)).toEqual({
+      "*": true,
+      session_not_loaded: false,
+    })
+  })
+
+  test("serializes same-location writes in invocation order", async () => {
+    const queue = new Map<string, Promise<boolean>>()
+    const order: number[] = []
+    let release!: () => void
+    const first = enqueuePolicyUpdate(queue, "/workspace", async () => {
+      await new Promise<void>((resolve) => { release = resolve })
+      order.push(1)
+      return true
+    })
+    const second = enqueuePolicyUpdate(queue, "/workspace", async () => {
+      order.push(2)
+      return true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(order).toEqual([])
+    release()
+    await Promise.all([first, second])
+    expect(order).toEqual([1, 2])
   })
 })

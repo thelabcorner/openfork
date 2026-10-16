@@ -1,7 +1,7 @@
 import type { ServerSession } from "./server-session"
 
 type SessionActivityRepairTarget = Pick<ServerSession, "set" | "apply">
-export type SessionActivityRepairSnapshot = Record<string, { readonly type: "running" | "paused" }>
+export type SessionActivityRepairSnapshot = Record<string, { readonly type: "running" | "paused" | "interrupted" }>
 
 export function shouldApplyTelemetrySnapshot(
   previous: { readonly updatedAt: number; readonly sampledAt?: number } | undefined,
@@ -43,7 +43,11 @@ export function applySessionActivityRepair(
       type: "session.status",
       properties: {
         sessionID,
-        status: { type: state?.type === "running" ? "busy" : "idle" },
+        status: {
+          type: state?.type === "running" ? "busy"
+            : state?.type === "interrupted" ? "interrupted"
+            : "idle",
+        },
       },
     })
   }

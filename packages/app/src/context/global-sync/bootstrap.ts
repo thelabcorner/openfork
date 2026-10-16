@@ -681,11 +681,6 @@ export async function bootstrapDirectory(input: {
             if (next) input.vcsCache.setStore("value", next)
           })
         }),
-      input.mcp &&
-        (() =>
-          loadCommands(input.directory, input.api.command, input.sdk, input.protocol, input.requests, "background").then((commands) =>
-            input.setStore("command", commands),
-          )),
       () =>
         input.queryClient.fetchQuery(
           loadReferencesQuery(

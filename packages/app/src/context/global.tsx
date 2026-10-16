@@ -10,6 +10,8 @@ import { getOwner } from "solid-js/web"
 import { QueryClient } from "@tanstack/solid-query"
 import type { ServerScope } from "@/utils/server-scope"
 import { findChatProject, isChatProjectAlias } from "@/utils/chat-project"
+import { indexProjects } from "@/pages/layout/helpers"
+import { sameServerTransport, snapshotServerTransport } from "./server-transport-identity"
 
 export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext({
   name: "Global",
@@ -38,9 +40,12 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
 
     const serverCtxs = new Map<
       ServerConnection.Key,
-      { dispose: () => void; serverCtx: ReturnType<typeof createServerCtx> }
+      { dispose: () => void; serverCtx: ReturnType<typeof createServerCtx>; transport: ServerConnection.Any }
     >()
-    const serverSDKs = new Map<ServerConnection.Key, { dispose: () => void; sdk: ServerSDK }>()
+    const serverSDKs = new Map<
+      ServerConnection.Key,
+      { dispose: () => void; sdk: ServerSDK; transport: ServerConnection.Any }
+    >()
 
     const owner = getOwner()
 
@@ -50,7 +55,7 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
     const ensureServerSdk = (conn: ServerConnection.Any) => {
       const key = ServerConnection.key(conn)
       const existing = serverSDKs.get(key)
-      if (existing && existing.sdk.url === conn.http.url) return existing.sdk
+      if (existing && sameServerTransport(existing.transport, conn)) return existing.sdk
       if (existing) {
         serverCtxs.get(key)?.dispose()
         serverCtxs.delete(key)
@@ -59,7 +64,7 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
       }
       const root = createRoot((dispose) => {
         const sdk = createServerSdkContext(conn, server.scope(key))
-        return { dispose, sdk }
+        return { dispose, sdk, transport: snapshotServerTransport(conn) }
       }, owner as never)
       serverSDKs.set(key, root)
       return root.sdk
@@ -68,7 +73,7 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
     const ensureServerCtx = (conn: ServerConnection.Any) => {
       const key = ServerConnection.key(conn)
       const existing = serverCtxs.get(key)
-      if (existing && existing.serverCtx.sdk.url === conn.http.url) return existing.serverCtx
+      if (existing && sameServerTransport(existing.transport, conn)) return existing.serverCtx
       if (existing) {
         existing.dispose()
         serverCtxs.delete(key)
@@ -79,7 +84,7 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
           server.projects.forServer(key),
           ensureServerSdk(conn),
         )
-        return { dispose, serverCtx }
+        return { dispose, serverCtx, transport: snapshotServerTransport(conn) }
       }, owner as never)
       serverCtxs.set(key, root)
       return root.serverCtx
@@ -97,7 +102,7 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
       const list = server.list
       for (const [key, context] of serverCtxs) {
         const conn = list.find((item) => ServerConnection.key(item) === key)
-        if (!conn || context.serverCtx.sdk.url !== conn.http.url) {
+        if (!conn || !sameServerTransport(context.transport, conn)) {
           const { dispose } = context
           dispose()
           serverCtxs.delete(key)
@@ -105,7 +110,7 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
       }
       for (const [key, context] of serverSDKs) {
         const conn = list.find((item) => ServerConnection.key(item) === key)
-        if (!conn || context.sdk.url !== conn.http.url) {
+        if (!conn || !sameServerTransport(context.transport, conn)) {
           const { dispose } = context
           dispose()
           serverSDKs.delete(key)
@@ -183,6 +188,9 @@ function createServerCtx(
   }
 
   const projectsList = createMemo(() => projects.list().map(enrich))
+  // Indexed once per server/project revision, shared by every session tab.
+  // Lazy memo: a server without tab/project consumers performs no indexing.
+  const projectsIndex = createMemo(() => indexProjects(projectsList()))
 
   // One-time migration for the original browser-side Chat faux-project. Older
   // builds persisted `/.local/share/opencode/chats` because the legacy renderer tried
@@ -223,6 +231,7 @@ function createServerCtx(
     projects: {
       ...projects,
       list: projectsList,
+      index: projectsIndex,
       recentlyClosed: recentlyClosedList,
     },
   }

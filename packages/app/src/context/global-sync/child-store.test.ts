@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test"
-import { createRoot, getOwner, type Owner } from "solid-js"
+import { createRoot, getOwner, onCleanup, type Owner } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import type { State } from "./types"
 import type { QueryOptionsApi } from "../server-sync"
 import { ServerScope } from "@/utils/server-scope"
+import { pathKey as directoryKey } from "@/utils/path-key"
 
 let createChildStoreManager: typeof import("./child-store").createChildStoreManager
 let queryExports: typeof import("@tanstack/solid-query")
@@ -37,7 +38,6 @@ const queryOptionsApi = {
   agents: (directory: string) => ({ queryKey: [directory, "agents"], queryFn: async () => [] }),
   mcp: (directory: string) => ({ queryKey: [directory, "mcp"], queryFn: async () => ({}) }),
   mcpResources: (directory: string) => ({ queryKey: [directory, "mcpResources"], queryFn: async () => ({}) }),
-  lsp: (directory: string) => ({ queryKey: [directory, "lsp"], queryFn: async () => [] }),
   references: (directory: string) => ({ queryKey: [directory, "references"], queryFn: async () => [] }),
   sessions: (directory: string) => ({ queryKey: [directory, "loadSessions"] as const }),
 } as unknown as QueryOptionsApi
@@ -53,6 +53,12 @@ function createOwner(callback: (owner: Owner) => void) {
 }
 
 beforeAll(async () => {
+  // The real platform context is a JSX component and must be compiled through
+  // Vite's Solid transform, not Bun's generic jsxDEV runner. These are
+  // headless lifecycle tests and only need the storage-independent web type.
+  mock.module("@/context/platform", () => ({
+    usePlatform: () => ({ platform: "web" }),
+  }))
   queryExports = { ...await import("@tanstack/solid-query") }
   mock.module("@tanstack/solid-query", () => ({
     ...queryExports,
@@ -65,7 +71,6 @@ beforeAll(async () => {
         get data() {
           if (options().queryKey?.[1] === "path") throw new Error("pending path data read")
           if (options().queryKey?.[1] === "mcp") return options().enabled ? { demo: { status: "disabled" } } : undefined
-          if (options().queryKey?.[1] === "lsp") return []
           if (options().queryKey?.[1] === "providers") return provider
           return undefined
         },
@@ -81,6 +86,105 @@ afterAll(() => {
 })
 
 describe("createChildStoreManager", () => {
+  test("evicting a directory also disposes its three persistence observers and recreates them only on reuse", () => {
+    let created = 0
+    let disposed = 0
+    let manager: ReturnType<typeof createChildStoreManager> | undefined
+    const observedPersist: typeof persist = (target, store, platform) => {
+      created++
+      onCleanup(() => { disposed++ })
+      return persist(target, store, platform)
+    }
+    const dispose = createOwner((owner) => {
+      manager = createChildStoreManager({
+        owner, scope: ServerScope.local, persist: observedPersist,
+        isBooting: () => false, isLoadingSessions: () => false,
+        onBootstrap() {}, onDispose() {}, translate: (key) => key,
+        queryOptions: queryOptionsApi, global: { provider },
+      })
+    })
+    try {
+      manager!.peek("/cache-lifetime", { bootstrap: false })
+      expect(created).toBe(3)
+      expect(disposed).toBe(0)
+      expect(manager!.disposeDirectory(directoryKey("/cache-lifetime"))).toBe(true)
+      expect(disposed).toBe(3)
+      expect(manager!.children["/cache-lifetime"]).toBeUndefined()
+      manager!.peek("/cache-lifetime", { bootstrap: false })
+      expect(created).toBe(6)
+      expect(disposed).toBe(3)
+    } finally {
+      dispose()
+    }
+    expect(disposed).toBe(6)
+  })
+
+  test("120 sequential directory switches bound retained persistence owners to the live directory cap", () => {
+    let created = 0
+    let disposed = 0
+    let manager: ReturnType<typeof createChildStoreManager> | undefined
+    const observedPersist: typeof persist = (target, store, platform) => {
+      created++
+      onCleanup(() => { disposed++ })
+      return persist(target, store, platform)
+    }
+    const dispose = createOwner((owner) => {
+      manager = createChildStoreManager({
+        owner, scope: ServerScope.local, persist: observedPersist,
+        isBooting: () => false, isLoadingSessions: () => false,
+        onBootstrap() {}, onDispose() {}, translate: (key) => key,
+        queryOptions: queryOptionsApi, global: { provider },
+      })
+    })
+    try {
+      for (let index = 0; index < 120; index++) {
+        manager!.peek(`/switch-${index}`, { bootstrap: false })
+        expect(Object.keys(manager!.children).length).toBeLessThanOrEqual(30)
+      }
+      expect(created).toBe(360)
+      expect(created - disposed).toBeLessThanOrEqual(90)
+      expect(disposed).toBeGreaterThanOrEqual(270)
+    } finally {
+      dispose()
+    }
+    expect(disposed).toBe(360)
+  })
+
+  test("partial storage initialization failure tears down observers before a clean retry", () => {
+    let registered = 0
+    let disposed = 0
+    let shouldThrow = true
+    let manager: ReturnType<typeof createChildStoreManager> | undefined
+    const observedPersist: typeof persist = (target, store, platform) => {
+      registered++
+      if (shouldThrow && registered === 2) {
+        shouldThrow = false
+        throw new Error("synthetic storage failure")
+      }
+      onCleanup(() => { disposed++ })
+      return persist(target, store, platform)
+    }
+    const dispose = createOwner((owner) => {
+      manager = createChildStoreManager({
+        owner, scope: ServerScope.local, persist: observedPersist,
+        isBooting: () => false, isLoadingSessions: () => false,
+        onBootstrap() {}, onDispose() {}, translate: (key) => key,
+        queryOptions: queryOptionsApi, global: { provider },
+      })
+    })
+    try {
+      expect(() => manager!.peek("/failed-storage", { bootstrap: false })).toThrow("synthetic storage failure")
+      expect(disposed).toBe(1)
+      expect(manager!.children["/failed-storage"]).toBeUndefined()
+      expect(manager!.peek("/failed-storage", { bootstrap: false })[0].status).toBe("loading")
+      expect(registered).toBe(5)
+      expect(disposed).toBe(1)
+    } finally {
+      dispose()
+    }
+    expect(disposed).toBe(4)
+  })
+
   test("does not evict the active directory during mark", () => {
     const owner = createRoot((dispose) => {
       const current = getOwner()
@@ -96,7 +200,6 @@ describe("createChildStoreManager", () => {
       isBooting: () => false,
       isLoadingSessions: () => false,
       onBootstrap() {},
-      onMcp() {},
       onDispose() {},
       translate: (key) => key,
       queryOptions: queryOptionsApi,
@@ -129,7 +232,6 @@ describe("createChildStoreManager", () => {
         onBootstrap(directory) {
           bootstraps.push(directory)
         },
-        onMcp() {},
         onDispose() {},
         translate: (key) => key,
         queryOptions: queryOptionsApi,
@@ -161,7 +263,6 @@ describe("createChildStoreManager", () => {
         isBooting: () => false,
         isLoadingSessions: () => false,
         onBootstrap() {},
-        onMcp() {},
         onDispose() {},
         translate: (key) => key,
         queryOptions: queryOptionsApi,
@@ -181,10 +282,9 @@ describe("createChildStoreManager", () => {
     }
   })
 
-  test("enables MCP only when requested for the directory", () => {
+  test("enables MCP status and resource queries only when requested for the directory", () => {
     let manager: ReturnType<typeof createChildStoreManager> | undefined
     const offset = querySingles.length
-    const mcpLoads: string[] = []
 
     const dispose = createOwner((owner) => {
       manager = createChildStoreManager({
@@ -194,9 +294,6 @@ describe("createChildStoreManager", () => {
         isBooting: () => false,
         isLoadingSessions: () => false,
         onBootstrap() {},
-        onMcp(directory) {
-          mcpLoads.push(directory)
-        },
         onDispose() {},
         translate: (key) => key,
         queryOptions: queryOptionsApi,
@@ -207,7 +304,7 @@ describe("createChildStoreManager", () => {
     try {
       if (!manager) throw new Error("manager required")
       const [store, setStore] = manager.child("/project", { bootstrap: false })
-      expect(querySingles.length - offset).toBe(6)
+      expect(querySingles.length - offset).toBe(5)
       const query = querySingles[offset + 1]
       const resourceQuery = querySingles[offset + 2]
       if (!query) throw new Error("query required")
@@ -220,7 +317,6 @@ describe("createChildStoreManager", () => {
       expect(query().enabled).toBe(true)
       expect(resourceQuery().enabled).toBe(true)
       expect(store.mcp).toEqual({ demo: { status: "disabled" } })
-      expect(mcpLoads).toEqual(["/project"])
 
       manager.disableMcp("/project")
       expect(query().enabled).toBe(false)
@@ -233,7 +329,6 @@ describe("createChildStoreManager", () => {
   test("holds MCP queries while a requested directory is still bootstrapping", () => {
     let manager: ReturnType<typeof createChildStoreManager> | undefined
     const offset = querySingles.length
-    const mcpLoads: string[] = []
 
     const dispose = createOwner((owner) => {
       manager = createChildStoreManager({
@@ -243,9 +338,6 @@ describe("createChildStoreManager", () => {
         isBooting: () => false,
         isLoadingSessions: () => false,
         onBootstrap() {},
-        onMcp(directory) {
-          mcpLoads.push(directory)
-        },
         onDispose() {},
         translate: (key) => key,
         queryOptions: queryOptionsApi,
@@ -263,7 +355,6 @@ describe("createChildStoreManager", () => {
       expect(store.mcp_ready).toBe(false)
       expect(query().enabled).toBe(false)
       expect(resourceQuery().enabled).toBe(false)
-      expect(mcpLoads).toEqual([])
 
       // Another consumer may have already started bootstrap, which changes the
       // store from loading -> partial before MCP demand arrives. Partial is
@@ -274,15 +365,11 @@ describe("createChildStoreManager", () => {
       expect(query().enabled).toBe(false)
       expect(resourceQuery().enabled).toBe(false)
       expect(store.mcp_ready).toBe(false)
-      expect(mcpLoads).toEqual([])
 
       manager!.enableMcpQueries("/project")
       expect(query().enabled).toBe(true)
       expect(resourceQuery().enabled).toBe(true)
       expect(store.mcp).toEqual({ demo: { status: "disabled" } })
-      // Initial bootstrap owns command/MCP hydration; onMcp is only for late
-      // demand after a directory has already completed bootstrap.
-      expect(mcpLoads).toEqual([])
     } finally {
       dispose()
     }
@@ -303,7 +390,6 @@ describe("createChildStoreManager", () => {
         onBootstrap(directory) {
           bootstraps.push(directory)
         },
-        onMcp() {},
         onDispose() {},
         translate: (key) => key,
         queryOptions: queryOptionsApi,
@@ -316,36 +402,36 @@ describe("createChildStoreManager", () => {
       const [store] = manager.child("/project", { bootstrap: false })
       const queries = querySingles.slice(offset)
 
-      expect(queries).toHaveLength(6)
+      expect(queries).toHaveLength(5)
       expect(queries[0]?.().enabled).toBe(false)
       expect(queries[3]?.().enabled).toBe(false)
       expect(queries[4]?.().enabled).toBe(false)
-      expect(queries[5]?.().enabled).toBe(false)
       expect(store.path.directory).toBe("/project")
       expect(store.provider_ready).toBe(false)
-      expect(store.lsp_ready).toBe(false)
+      expect(store.lsp_ready).toBe(true)
+      expect(store.lsp).toEqual([])
+      expect(queries.some((query) => query().queryKey?.[1] === "lsp")).toBe(false)
       expect(bootstraps).toEqual([])
 
       manager.enableProviderQueries("/project")
-      expect(queries[4]?.().enabled).toBe(true)
+      expect(queries[3]?.().enabled).toBe(true)
       expect(queries[0]?.().enabled).toBe(false)
-      expect(queries[3]?.().enabled).toBe(false)
-      expect(queries[5]?.().enabled).toBe(false)
+      expect(queries[4]?.().enabled).toBe(false)
       expect(bootstraps).toEqual([])
 
       manager.child("/project")
       // The narrow catalog can run while runtime auxiliary queries stay gated.
       expect(queries[0]?.().enabled).toBe(false)
-      expect(queries[3]?.().enabled).toBe(false)
-      expect(queries[4]?.().enabled).toBe(true)
-      expect(queries[5]?.().enabled).toBe(false)
+      expect(queries[2]?.().enabled).toBe(false)
+      expect(queries[3]?.().enabled).toBe(true)
+      expect(queries[4]?.().enabled).toBe(false)
       expect(bootstraps).toEqual(["/project"])
 
       manager.enableQueries("/project")
       expect(queries[0]?.().enabled).toBe(true)
+      expect(queries[2]?.().enabled).toBe(false)
       expect(queries[3]?.().enabled).toBe(true)
       expect(queries[4]?.().enabled).toBe(true)
-      expect(queries[5]?.().enabled).toBe(true)
 
       manager.child("/project", { bootstrap: false })
       expect(queries[0]?.().enabled).toBe(true)
