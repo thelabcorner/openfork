@@ -6,7 +6,7 @@
 
 import { Duration, Effect } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
-import { renderSearchResults, websearchHeaders, type SearchResult } from "./websearch-shared"
+import { readSearchResponseText, renderSearchResults, websearchHeaders, type SearchResult } from "./websearch-shared"
 
 export const DUCKDUCKGO_URL = "https://html.duckduckgo.com/html/"
 
@@ -71,7 +71,7 @@ export const call = (http: HttpClient.HttpClient, query: string, timeout: Durati
           orElse: () => Effect.die(new Error("DuckDuckGo request timed out")),
         }),
       )
-    const body = yield* response.text
+    const body = yield* readSearchResponseText(response)
     const results = parseDuckDuckGoHtml(body)
     return results ? renderSearchResults(results) : undefined
   })

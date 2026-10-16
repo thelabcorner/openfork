@@ -1,6 +1,8 @@
 import { Duration, Effect, Option, Schema } from "effect"
-import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { HttpClient, HttpClientError, HttpClientRequest } from "effect/unstable/http"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { renderSearchResults } from "./websearch-shared"
+import { readSearchResponseText } from "./websearch-shared"
 
 export const FIRECRAWL_URL = "https://api.firecrawl.dev/v2/search"
 
@@ -44,17 +46,7 @@ export type FirecrawlResult = {
 
 /** Render Firecrawl results in a markdown-ish shape consistent with the other providers. */
 export function renderFirecrawlResults(results: readonly FirecrawlResult[]): string | undefined {
-  const clean = results.filter((r): r is FirecrawlResult & { url: string } => Boolean(r && r.url))
-  if (clean.length === 0) return undefined
-  return clean
-    .map((r, i) => {
-      const lines = [`${i + 1}. ${r.title || r.url}`]
-      if (r.description) lines.push(`   ${r.description}`)
-      lines.push(`   ${r.url}`)
-      if (r.date) lines.push(`   ${r.date}`)
-      return lines.join("\n")
-    })
-    .join("\n\n")
+  return renderSearchResults(results)
 }
 
 export const parseFirecrawlResponse = Effect.fn("FirecrawlWebSearch.parseResponse")(function* (body: string) {
@@ -65,6 +57,58 @@ export const parseFirecrawlResponse = Effect.fn("FirecrawlWebSearch.parseRespons
   if (Option.isNone(parsed)) return undefined
   return renderFirecrawlResults(parsed.value.data?.web ?? [])
 })
+
+/**
+ * Typed non-2xx Firecrawl status failure. The search coordinator keys its
+ * process-local anonymous cooldown off the numeric `status` field, so cooldown
+ * decisions never depend on regex-matching provider error strings.
+ */
+export class FirecrawlHttpStatusError extends Schema.TaggedErrorClass<FirecrawlHttpStatusError>()(
+  "FirecrawlHttpStatusError",
+  {
+    status: Schema.Number,
+    detail: Schema.String,
+  },
+) {
+  override get message() {
+    return `Firecrawl search request rejected with HTTP ${this.status}${this.detail ? `: ${this.detail}` : ""}`
+  }
+}
+
+export function isFirecrawlHttpStatusError(value: unknown): value is FirecrawlHttpStatusError {
+  if (value instanceof FirecrawlHttpStatusError) return true
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { readonly _tag?: unknown })._tag === "FirecrawlHttpStatusError"
+  )
+}
+
+const MAX_STATUS_DETAIL_CHARS = 240
+const CONTROL_CHARS = new RegExp("[\\u0000-\\u001f\\u007f]+", "g")
+
+/**
+ * Single-line, credential-safe detail text for a status failure: control
+ * characters collapse to spaces, the configured key (if any) and any bearer
+ * token or key-shaped query parameter are redacted, and the result is bounded.
+ */
+export function sanitizeStatusDetail(raw: string): string {
+  let detail = raw.replace(CONTROL_CHARS, " ").trim()
+  const key = process.env.FIRECRAWL_API_KEY
+  if (key) detail = detail.split(key).join("[redacted]")
+  detail = detail
+    .replace(/(bearer\s+)\S+/gi, "$1[redacted]")
+    .replace(/((?:api[_-]?key|apikey)[=:]\s*)[^\s&]+/gi, "$1[redacted]")
+  return detail.slice(0, MAX_STATUS_DETAIL_CHARS)
+}
+
+/** Numeric status of a typed `filterStatusOk` rejection, else undefined. */
+function statusOfHttpClientError(error: unknown): number | undefined {
+  if (!HttpClientError.isHttpClientError(error)) return undefined
+  if (error.reason._tag !== "StatusCodeError") return undefined
+  const status = error.reason.response.status
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined
+}
 
 export const call = (
   http: HttpClient.HttpClient,
@@ -85,7 +129,17 @@ export const call = (
           duration: timeout,
           orElse: () => Effect.die(new Error("Firecrawl request timed out")),
         }),
+        // Non-2xx becomes a typed status error so the coordinator can apply an
+        // auth-mode-scoped cooldown. Transport/decoding failures stay as-is.
+        Effect.mapError((error): HttpClientError.HttpClientError | FirecrawlHttpStatusError => {
+          const status = statusOfHttpClientError(error)
+          if (status === undefined) return error
+          return new FirecrawlHttpStatusError({
+            status,
+            detail: sanitizeStatusDetail(error instanceof Error ? error.message : `HTTP ${status}`),
+          })
+        }),
       )
-    const body = yield* response.text
+    const body = yield* readSearchResponseText(response)
     return yield* parseFirecrawlResponse(body)
   })
