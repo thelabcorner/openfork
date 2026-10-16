@@ -17,7 +17,7 @@ Completed in the current consolidation pass:
 | Area | Implemented state |
 | --- | --- |
 | Browser | 25 provider-visible `browser_*` tools -> one `browser` gateway |
-| Lazy tools | `checkpoint`, `archive`, `json`, and `test` are lazy through the existing `tool` broker |
+| Lazy tools | Current built-in lazy inventory is `archive`, `checkpoint`, `github`, `json`, `quota`, `refactor`, `sqlite`, `swarm`, `sympy`, `test`, and `usage`, all through the existing `tool` broker |
 | Memory | remains direct/non-lazy by design |
 | Verification | `typecheck` remains direct; `test` is lazy rather than merged into `verify` |
 | Web | `webfetch` + `websearch` -> one fetch-first provider-visible `web` tool |
@@ -26,7 +26,39 @@ Completed in the current consolidation pass:
 | Non-GPT mutation | `edit`, `write`, and `patch` remain direct pending a separate mutation redesign |
 | File search | `glob` + `grep` -> one provider-visible `find` tool; legacy leaf implementations remain internal |
 
-The approved lazy set removes approximately **12.36 KB** of raw schema + description from ordinary provider manifests (`checkpoint`, `archive`, `json`, `test`). `memory` intentionally remains direct.
+The September consolidation pass removed approximately **12.36 KB** of raw schema + description from ordinary provider manifests via `checkpoint`, `archive`, `json`, and `test`. The lazy inventory has expanded since that measurement; `memory` intentionally remains direct.
+
+### Accounting tools — October 7, 2026
+
+`quota` and `usage` are now native first-party lazy tools backed by the same domain owners as the Limits panel and Usage page:
+
+```text
+quota -> Quota.Service -> provider/local quota adapters and existing cache/cooldown owners
+usage -> Usage.Service.inspect -> grouped SQL on the existing serialized analytics scan lane
+```
+
+The Usage tool deliberately does **not** call `Usage.summary()` and slice a small answer out of the rich page object. Its range actions execute grouped SQL that returns compact aggregate rows only; model-rate valuation is shared with the existing rich summary so recorded/estimated/unpriced cost semantics cannot drift. Maintenance usage remains separately classified, historical project attribution preserves `usage_session` fallbacks, and timeline bounding coalesces adjacent buckets so truncation preserves cost/token/message mass.
+
+Measured through the same `ToolJsonSchema` conversion path documented below:
+
+```text
+quota schema + description   1,188 + 1,128 = 2,316 B
+usage schema + description   1,868 + 1,243 = 3,111 B
+-----------------------------------------------------
+explicit leaf footprint                       5,427 B
+ordinary provider-manifest increase               0 B
+```
+
+The zero-byte ordinary-turn result is enforced structurally by `BUILTIN_LAZY_TOOL_IDS` and covered by the generic lazy-tool access test, which verifies every built-in lazy tool remains registered/discoverable while absent from the default provider toolset. The accounting tools are also classified snapshot-read-only and parent-native for OXP/OFXP: local provider credentials, quota state, and the host accounting database are not inherited by external principals.
+
+The compact Usage path was also exercised against synthetic durable ledgers using the production `Usage.Service`, the same ModelsDev valuation path, and a real migrated SQLite database. After removing project-attribution joins from global queries that do not consume project identity, five-sample warm-process medians were:
+
+| Rows in requested range | `Usage.inspect({action:"totals"})` | cold rich `Usage.summary()` | Wall-clock ratio |
+| ---: | ---: | ---: | ---: |
+| 10,000 | 23.89 ms | 37.42 ms | 1.57x faster |
+| 100,000 | 248.77 ms | 299.41 ms | 1.20x faster |
+
+This benchmark is intentionally secondary to the architectural bound: the compact path keeps generation rows inside SQLite and returns grouped aggregates instead of hydrating every generation into JavaScript merely to derive a few scalars. It still scans the requested durable range and shares Usage's single serialized analytics permit; no independent cache, poller, worker, or competing scan lane was added. Exact accounting parity is asserted against the rich summary for recorded/estimated/unpriced cost, tokens, cache savings, session cardinality, project filtering, maintenance classification, and bounded timeline mass.
 
 ### Implemented file-search consolidation
 
