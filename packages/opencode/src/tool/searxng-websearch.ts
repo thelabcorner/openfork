@@ -5,7 +5,7 @@
 
 import { Duration, Effect, Option, Schema } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
-import { renderSearchResults, websearchHeaders } from "./websearch-shared"
+import { readSearchResponseText, renderSearchResults, websearchHeaders } from "./websearch-shared"
 
 export function searxngBaseUrl(): string | undefined {
   return process.env.SEARXNG_URL?.trim() || undefined
@@ -48,6 +48,6 @@ export const call = (http: HttpClient.HttpClient, query: string, timeout: Durati
           orElse: () => Effect.die(new Error("SearXNG request timed out")),
         }),
       )
-    const body = yield* response.text
+    const body = yield* readSearchResponseText(response)
     return yield* parseSearxngResponse(body)
   })

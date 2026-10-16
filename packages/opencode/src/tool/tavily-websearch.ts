@@ -5,7 +5,7 @@
 
 import { Duration, Effect, Option, Schema } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
-import { renderSearchResults, websearchHeaders } from "./websearch-shared"
+import { readSearchResponseText, renderSearchResults, websearchHeaders } from "./websearch-shared"
 
 export const TAVILY_URL = "https://api.tavily.com/search"
 
@@ -65,6 +65,6 @@ export const call = (
           orElse: () => Effect.die(new Error("Tavily request timed out")),
         }),
       )
-    const body = yield* response.text
+    const body = yield* readSearchResponseText(response)
     return yield* parseTavilyResponse(body)
   })

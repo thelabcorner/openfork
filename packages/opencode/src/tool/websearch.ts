@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect"
+import { Cause, Clock, Effect, Exit, Option, Schema } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import * as Tool from "./tool"
 import * as McpWebSearch from "./mcp-websearch"
@@ -7,8 +7,8 @@ import * as DuckDuckGoWebSearch from "./duckduckgo-websearch"
 import * as BraveWebSearch from "./brave-websearch"
 import * as TavilyWebSearch from "./tavily-websearch"
 import * as SearxngWebSearch from "./searxng-websearch"
+import * as OllamaWebSearch from "./ollama-websearch"
 import DESCRIPTION from "./websearch.txt"
-import { checksum } from "@opencode-ai/core/util/encode"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 
@@ -20,6 +20,7 @@ export const WEBSEARCH_PROVIDERS = [
   "brave",
   "tavily",
   "searxng",
+  "ollama",
 ] as const
 export type WebSearchProvider = (typeof WEBSEARCH_PROVIDERS)[number]
 
@@ -48,14 +49,15 @@ export const Parameters = Schema.Struct({
   }),
   provider: Schema.optional(WebSearchProviderSchema).annotate({
     description:
-      "Explicitly pin a search provider: exa | parallel | firecrawl | duckduckgo | brave | tavily | searxng. Overrides automatic selection (env override, feature flags, session checksum). Run action:'providers' to see which are usable.",
+      "Advanced override: strictly pin one search provider. Normally omit this so automatic search can use the free-first fallback chain. Run action:'providers' to inspect backend status.",
   }),
 })
 
 export type WebSearchFlags = Partial<Record<WebSearchProvider, boolean>>
 
-// Keyless-ready providers work with no configuration; key/config providers
-// become available when their env var is set (or their flag is enabled).
+// These providers offer anonymous search endpoints, but network/anti-abuse
+// policy can still reject access for individual hosts. Feature flags are routing
+// preferences, never substitutes for credentials where required.
 const KEYLESS_PROVIDERS: ReadonlySet<WebSearchProvider> = new Set([
   "exa",
   "parallel",
@@ -67,6 +69,83 @@ const PROVIDER_ENV: Partial<Record<WebSearchProvider, string>> = {
   brave: "BRAVE_API_KEY",
   tavily: "TAVILY_API_KEY",
   searxng: "SEARXNG_URL",
+  ollama: "OLLAMA_API_KEY",
+}
+
+// ── Anonymous anti-abuse cooldown (process-local, lazily expired) ────────────
+// Keyless Firecrawl exists, but anti-abuse policy can deny individual hosts
+// outright (HTTP 403) or throttle them (HTTP 429). Typed denials are recorded
+// per provider + auth mode so automatic fallback stops re-probing a known-denied
+// anonymous endpoint. State is process-local and expires lazily against the
+// Effect Clock: no timers, no background probes, no persistence, no per-session
+// or per-user state. Strict pins (provider param / OPENCODE_WEBSEARCH_PROVIDER)
+// and a configured credential bypass the check by construction.
+
+/** Denial statuses that suspend automatic anonymous probing, with their TTLs. */
+const ANONYMOUS_COOLDOWN_TTL_MS: Readonly<Record<number, number>> = {
+  401: 5 * 60_000,
+  403: 5 * 60_000,
+  429: 60_000,
+}
+
+export type ProviderAuthMode = "anonymous" | "authenticated"
+
+type ProviderCooldown = {
+  readonly expiresAt: number
+  readonly status: number
+}
+
+const providerCooldowns = new Map<string, ProviderCooldown>()
+
+/** Auth mode of a provider as configured right now; never exposes secrets. */
+export function providerAuthMode(provider: WebSearchProvider): ProviderAuthMode {
+  if (provider === "firecrawl") return process.env.FIRECRAWL_API_KEY ? "authenticated" : "anonymous"
+  const env = PROVIDER_ENV[provider]
+  return env && process.env[env] ? "authenticated" : "anonymous"
+}
+
+const cooldownKey = (provider: WebSearchProvider, mode: ProviderAuthMode) => `${provider}:${mode}`
+
+/**
+ * Active cooldown for `provider` under its *current* auth mode at `now` (ms),
+ * or undefined. Expired entries are dropped here; nothing wakes up on expiry.
+ * Because the key includes the auth mode, an authenticated request never reads
+ * an anonymous cooldown and vice versa.
+ */
+export function providerCooldownInfo(
+  provider: WebSearchProvider,
+  now: number,
+): { readonly status: number; readonly remainingMs: number } | undefined {
+  const key = cooldownKey(provider, providerAuthMode(provider))
+  const state = providerCooldowns.get(key)
+  if (!state) return undefined
+  const remainingMs = state.expiresAt - now
+  if (remainingMs <= 0) {
+    providerCooldowns.delete(key)
+    return undefined
+  }
+  return { status: state.status, remainingMs }
+}
+
+/**
+ * Record a typed provider denial. Only anonymous keyless mode cools down: a
+ * configured credential is its own access mode and bypasses host-IP denials.
+ * A longer existing window is never shortened by a later, shorter status.
+ */
+export function noteProviderCooldown(provider: WebSearchProvider, status: number, now: number): void {
+  const ttl = ANONYMOUS_COOLDOWN_TTL_MS[status]
+  if (ttl === undefined) return
+  if (providerAuthMode(provider) !== "anonymous") return
+  const expiresAt = now + ttl
+  const key = cooldownKey(provider, "anonymous")
+  const existing = providerCooldowns.get(key)
+  if (existing && existing.expiresAt >= expiresAt) return
+  providerCooldowns.set(key, { expiresAt, status })
+}
+
+/** Test-only: clear process-local cooldown state so tests cannot leak into each other. */
+export function resetWebSearchCooldowns(): void {
+  providerCooldowns.clear()
 }
 
 // Flag precedence when multiple flags are set (parallel-first preserved, then
@@ -79,6 +158,21 @@ export const PROVIDER_FLAG_ORDER: readonly WebSearchProvider[] = [
   "brave",
   "tavily",
   "searxng",
+  "ollama",
+]
+
+// Automatic search should be predictable and resilient, not session-random.
+// Prefer agent-oriented keyless APIs before brittle HTML scraping. Configured
+// key/self-hosted providers remain ahead of DuckDuckGo as a final fallback.
+export const DEFAULT_PROVIDER_ORDER: readonly WebSearchProvider[] = [
+  "parallel",
+  "exa",
+  "firecrawl",
+  "searxng",
+  "brave",
+  "tavily",
+  "ollama",
+  "duckduckgo",
 ]
 
 export function isWebSearchProvider(value: string | undefined): value is WebSearchProvider {
@@ -86,19 +180,47 @@ export function isWebSearchProvider(value: string | undefined): value is WebSear
 }
 
 export function isProviderAvailable(p: WebSearchProvider, flags: WebSearchFlags = {}): boolean {
-  if (flags[p]) return true
+  void flags
   if (KEYLESS_PROVIDERS.has(p)) return true
   const env = PROVIDER_ENV[p]
   return env !== undefined && Boolean(process.env[env])
 }
 
 /** Per-provider config status for the `providers` action. */
-export function providerStatus(p: WebSearchProvider, flags: WebSearchFlags = {}): string {
-  if (flags[p]) return "enabled via flag"
-  if (KEYLESS_PROVIDERS.has(p)) return "keyless-ready"
+export function providerStatus(p: WebSearchProvider, flags: WebSearchFlags = {}, now: number = Date.now()): string {
+  const base = configuredProviderStatus(p, flags)
+  const cooldown = providerCooldownInfo(p, now)
+  if (!cooldown) return base
+  return `${base} (cooldown ${Math.ceil(cooldown.remainingMs / 1000)}s after HTTP ${cooldown.status})`
+}
+
+function configuredProviderStatus(p: WebSearchProvider, flags: WebSearchFlags): string {
+  if (p === "firecrawl") {
+    const mode = process.env.FIRECRAWL_API_KEY
+      ? "ready (authenticated)"
+      : "keyless-conditional (IP policy may require FIRECRAWL_API_KEY)"
+    return flags[p] ? `${mode} (preferred via flag)` : mode
+  }
+  if (KEYLESS_PROVIDERS.has(p)) return flags[p] ? "keyless-ready (preferred via flag)" : "keyless-ready"
   const env = PROVIDER_ENV[p]
-  if (env && process.env[env]) return "ready"
-  return `needs ${env}`
+  if (env && process.env[env]) return flags[p] ? "ready (preferred via flag)" : "ready"
+  return flags[p] ? `needs ${env} (flag set but provider is not configured)` : `needs ${env}`
+}
+
+export function webSearchProviderCandidates(
+  flags: WebSearchFlags = {},
+  pin?: WebSearchProvider,
+): readonly WebSearchProvider[] {
+  // Explicit call-site pins and the operational env override retain strict
+  // semantics. Flags are preferences: if a preferred backend fails, automatic
+  // search may still fall through to another available backend.
+  if (pin && isWebSearchProvider(pin)) return [pin]
+  const override = process.env.OPENCODE_WEBSEARCH_PROVIDER
+  if (isWebSearchProvider(override)) return [override]
+
+  const preferred = PROVIDER_FLAG_ORDER.filter((provider) => flags[provider] && isProviderAvailable(provider, flags))
+  const automatic = DEFAULT_PROVIDER_ORDER.filter((provider) => isProviderAvailable(provider, flags))
+  return [...new Set([...preferred, ...automatic])]
 }
 
 export function selectWebSearchProvider(
@@ -106,19 +228,8 @@ export function selectWebSearchProvider(
   flags: WebSearchFlags = {},
   pin?: WebSearchProvider,
 ): WebSearchProvider {
-  // Explicit in-call pin wins (the agent/user deliberately chose a provider).
-  if (pin && isWebSearchProvider(pin)) return pin
-  const override = process.env.OPENCODE_WEBSEARCH_PROVIDER
-  if (isWebSearchProvider(override)) return override
-  for (const p of PROVIDER_FLAG_ORDER) {
-    if (flags[p]) return p
-  }
-
-  // Deterministic per-session spread over the AVAILABLE providers only —
-  // keyless-first when no keys are configured.
-  const available = WEBSEARCH_PROVIDERS.filter((p) => isProviderAvailable(p, flags))
-  const mod = Number.parseInt(checksum(sessionID) ?? "0", 36) % available.length
-  return available[mod]
+  void sessionID
+  return webSearchProviderCandidates(flags, pin)[0] ?? "parallel"
 }
 
 export function webSearchProviderLabel(provider: unknown) {
@@ -130,6 +241,7 @@ export function webSearchProviderLabel(provider: unknown) {
     brave: "Brave Search",
     tavily: "Tavily Search",
     searxng: "SearXNG",
+    ollama: "Ollama Web Search",
   }
   if (typeof provider === "string" && provider in labels) return labels[provider]
   return "Web Search"
@@ -197,6 +309,10 @@ export function callProvider(
     return SearxngWebSearch.call(http, params.query!)
   }
 
+  if (provider === "ollama") {
+    return OllamaWebSearch.call(http, params.query!, Math.min(Math.max(Math.trunc(params.numResults || 8), 1), 20))
+  }
+
   return McpWebSearch.call(
     http,
     McpWebSearch.EXA_URL,
@@ -213,17 +329,129 @@ export function callProvider(
   )
 }
 
-export function providersOutput(flags: Record<string, boolean>): string {
+export type WebSearchAttempt = {
+  readonly provider: WebSearchProvider
+  readonly status: "success" | "empty" | "error" | "unavailable"
+  readonly detail?: string
+}
+
+export type WebSearchExecution = {
+  readonly provider: WebSearchProvider
+  readonly output: string
+  readonly attempts: readonly WebSearchAttempt[]
+}
+
+// Some remote search tools return a natural-language empty-result marker as a
+// successful text block. Such a response must not terminate the fallback chain.
+export function hasSearchResults(output: string | undefined): boolean {
+  if (!output?.trim()) return false
+  return !/^(?:no (?:search )?results(?: found)?|no relevant results(?: found)?)(?:[.!]\s*(?:please try.*)?)?$/i.test(
+    output.trim(),
+  )
+}
+
+export const searchWithFallback = Effect.fn("WebSearch.searchWithFallback")(function* (
+  http: HttpClient.HttpClient,
+  params: Schema.Schema.Type<typeof Parameters>,
+  context: { readonly sessionID: string; readonly modelName?: string },
+  flags: WebSearchFlags = {},
+) {
+  const candidates = webSearchProviderCandidates(flags, params.provider)
+  const attempts: WebSearchAttempt[] = []
+  // Strict selection (explicit provider param, or the operational env pin that
+  // `webSearchProviderCandidates` also treats as strict) bypasses the anonymous
+  // cooldown: that caller deliberately chose this backend over the chain.
+  const envPin = process.env.OPENCODE_WEBSEARCH_PROVIDER
+  const pinned = params.provider ?? (isWebSearchProvider(envPin) ? envPin : undefined)
+
+  for (const provider of candidates) {
+    const now = yield* Clock.currentTimeMillis
+    if (!isProviderAvailable(provider, flags)) {
+      attempts.push({ provider, status: "unavailable", detail: providerStatus(provider, flags, now) })
+      continue
+    }
+
+    if (pinned !== provider) {
+      const cooldown = providerCooldownInfo(provider, now)
+      if (cooldown) {
+        attempts.push({
+          provider,
+          status: "unavailable",
+          detail: `cooldown ${Math.ceil(cooldown.remainingMs / 1000)}s after HTTP ${cooldown.status}`,
+        })
+        continue
+      }
+    }
+
+    // Provider clients are not yet uniform about typed failures versus defects.
+    // Capture the full Exit so one broken backend cannot terminate auto search.
+    // Bound *the complete provider effect*, including response body consumption.
+    // Provider adapters currently time out their header request only.
+    const exit = yield* Effect.exit(
+      callProvider(http, provider, params, context).pipe(
+        Effect.timeoutOrElse({
+          duration: candidates.length === 1 ? "25 seconds" : "12 seconds",
+          orElse: () => Effect.fail(new Error("Search provider exceeded its response deadline")),
+        }),
+      ),
+    )
+    if (Exit.isSuccess(exit)) {
+      const output = exit.value?.trim()
+      if (hasSearchResults(output)) {
+        attempts.push({ provider, status: "success" })
+        return { provider, output: output!, attempts } satisfies WebSearchExecution
+      }
+      attempts.push({ provider, status: "empty" })
+      continue
+    }
+
+    // Do not misclassify a caller cancellation as an unavailable provider and
+    // continue issuing network requests after an interrupted search. A
+    // cancelled attempt also records no cooldown: only completed denials do.
+    if (Cause.hasInterrupts(exit.cause)) return yield* Effect.failCause(exit.cause)
+
+    const failure = Cause.findErrorOption(exit.cause)
+    if (Option.isSome(failure) && FirecrawlWebSearch.isFirecrawlHttpStatusError(failure.value)) {
+      noteProviderCooldown(provider, failure.value.status, yield* Clock.currentTimeMillis)
+    }
+    attempts.push({
+      provider,
+      status: "error",
+      detail: Cause.pretty(exit.cause).slice(0, 500),
+    })
+  }
+
+  const summary = attempts.map((attempt) => `${attempt.provider}:${attempt.status}`).join(", ")
+  return yield* Effect.fail(new Error(`Web search failed across all eligible providers (${summary || "none"})`))
+})
+
+export const executeWebSearch = Effect.fn("WebSearch.execute")(function* (
+  http: HttpClient.HttpClient,
+  params: Schema.Schema.Type<typeof Parameters>,
+  context: { readonly sessionID: string; readonly modelName?: string },
+  flags: WebSearchFlags = {},
+) {
+  return yield* searchWithFallback(http, params, context, flags).pipe(
+    Effect.timeoutOrElse({
+      duration: "45 seconds",
+      orElse: () => Effect.fail(new Error("Web search exceeded its 45-second total deadline")),
+    }),
+  )
+})
+
+export function providersOutput(flags: Record<string, boolean>, now: number = Date.now()): string {
   const keyless = WEBSEARCH_PROVIDERS.filter((p) => KEYLESS_PROVIDERS.has(p)).length
   const lines = [
     `websearch providers (${WEBSEARCH_PROVIDERS.length}, ${keyless} keyless-ready):`,
   ]
   for (const p of WEBSEARCH_PROVIDERS) {
-    const status = providerStatus(p, flags)
+    const status = providerStatus(p, flags, now)
     const note =
       p === "brave" ? "  (free tier: https://brave.com/search/api/)"
       : p === "tavily" ? "  (free tier: https://tavily.com)"
+      : p === "firecrawl" ? "  (free tier: https://firecrawl.dev/pricing)"
       : p === "searxng" ? "  (self-hosted: https://docs.searxng.org)"
+      : p === "ollama" ? "  (free account: https://ollama.com/blog/web-search)"
       : ""
     lines.push(`  ${p.padEnd(11)} ${status}${note}`)
   }
@@ -242,10 +470,15 @@ export function flagMap(flags: RuntimeFlags.Info): Record<WebSearchProvider, boo
     brave: flags.enableBrave,
     tavily: flags.enableTavily,
     searxng: flags.enableSearxng,
+    ollama: flags.enableOllamaSearch,
   }
 }
 
-type WebSearchMeta = { action: "search" | "providers"; provider: WebSearchProvider | undefined }
+type WebSearchMeta = {
+  action: "search" | "providers"
+  provider: WebSearchProvider | undefined
+  attemptedProviders?: readonly WebSearchProvider[]
+}
 
 export const WebSearchTool = Tool.define<
   typeof Parameters,
@@ -268,7 +501,7 @@ export const WebSearchTool = Tool.define<
 
           // ── Introspection: no query, no network, no permission ask ──
           if (params.action === "providers") {
-            const output = providersOutput(flagsByProvider)
+            const output = providersOutput(flagsByProvider, yield* Clock.currentTimeMillis)
             return {
               title: "websearch providers",
               output,
@@ -280,9 +513,12 @@ export const WebSearchTool = Tool.define<
             return yield* Effect.fail(new Error("query is required for action 'search'"))
           }
 
-          const provider = selectWebSearchProvider(ctx.sessionID, flagsByProvider, params.provider)
-          const title = webSearchProviderLabel(provider)
-          yield* ctx.metadata({ title: `${title} "${params.query}"`, metadata: { provider } })
+          const candidates = webSearchProviderCandidates(flagsByProvider, params.provider)
+          const preferredProvider = candidates[0]
+          yield* ctx.metadata({
+            title: `Web Search "${params.query}"`,
+            metadata: { provider: preferredProvider, providers: candidates },
+          })
 
           yield* ctx.ask({
             permission: "websearch",
@@ -294,19 +530,30 @@ export const WebSearchTool = Tool.define<
               livecrawl: params.livecrawl,
               type: params.type,
               contextMaxCharacters: params.contextMaxCharacters,
-              provider,
+              provider: preferredProvider,
+              providers: candidates,
             },
           })
 
-          const result = yield* callProvider(http, provider, params, {
-            sessionID: ctx.sessionID,
-            modelName: webSearchModelName(ctx.extra),
-          })
+          const result = yield* executeWebSearch(
+            http,
+            params,
+            {
+              sessionID: ctx.sessionID,
+              modelName: webSearchModelName(ctx.extra),
+            },
+            flagsByProvider,
+          )
+          const title = webSearchProviderLabel(result.provider)
 
           return {
-            output: result ?? "No search results found. Please try a different query.",
+            output: result.output,
             title: `${title}: ${params.query}`,
-            metadata: { provider, action: "search" as const },
+            metadata: {
+              provider: result.provider,
+              action: "search" as const,
+              attemptedProviders: result.attempts.map((attempt) => attempt.provider),
+            },
           }
         }).pipe(Effect.orDie),
     }
