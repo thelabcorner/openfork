@@ -34,6 +34,8 @@ export interface Candidate {
   readonly ineligibleReason?: IneligibilityReason
   readonly usedPercent?: number
   readonly resetAt?: number
+  /** Remaining quota fraction per hour until reset; higher means more urgent to use. */
+  readonly quotaExpiryUrgency?: number
   readonly maxSessionBindings?: number
 }
 
@@ -46,7 +48,7 @@ export interface CandidateStats {
 export interface Cursor {
   /** Durable affinity-domain assignment epoch. */
   readonly epoch: number
-  /** Last account selected by session-round-robin, if any. */
+  /** Last account selected by a round-robin policy, if any. */
   readonly lastAssignedHandle?: string
 }
 
@@ -278,6 +280,12 @@ export function select(input: SelectInput): Result {
     if (candidate.resetAt !== undefined && !finiteNonNegative(candidate.resetAt)) {
       return invalid("candidate.resetAt", "must be finite and non-negative")
     }
+    if (
+      candidate.quotaExpiryUrgency !== undefined &&
+      !finiteNonNegative(candidate.quotaExpiryUrgency)
+    ) {
+      return invalid("candidate.quotaExpiryUrgency", "must be finite and non-negative")
+    }
 
     if (candidate.providerID !== input.providerID) continue
     if (targetHandles.has(candidate.credentialHandle)) {
@@ -347,6 +355,26 @@ export function select(input: SelectInput): Result {
   if (input.mode === "concentrate") {
     selected = [...eligibleByHandle.values()].sort(concentrateCompare)[0]
   } else {
+    const eligible = [...eligibleByHandle.values()]
+    let urgencyHandles: Set<string> | undefined
+    if (
+      input.mode === "session-round-robin" &&
+      eligible.length > 0 &&
+      eligible.every((item) => item.candidate.quotaExpiryUrgency !== undefined)
+    ) {
+      const highest = eligible.reduce(
+        (value, item) => Math.max(value, item.candidate.quotaExpiryUrgency!),
+        0,
+      )
+      const tolerance = Math.max(1, Math.abs(highest)) * 1e-9
+      urgencyHandles = new Set(
+        eligible
+          .filter(
+            (item) => item.candidate.quotaExpiryUrgency! >= highest - tolerance,
+          )
+          .map((item) => item.candidate.credentialHandle),
+      )
+    }
     const ring = [...targetRing].sort(
       (left, right) =>
         left.credentialHandle.localeCompare(right.credentialHandle) ||
@@ -362,6 +390,7 @@ export function select(input: SelectInput): Result {
       const index = (Math.max(-1, position) + offset) % ring.length
       const candidate = ring[index]
       if (!candidate) continue
+      if (urgencyHandles && !urgencyHandles.has(candidate.credentialHandle)) continue
       const prepared = eligibleByHandle.get(candidate.credentialHandle)
       if (prepared) {
         selected = prepared
@@ -382,7 +411,7 @@ export function select(input: SelectInput): Result {
   const assignmentEpoch = cursor.epoch + 1
   const nextCursor: Cursor = {
     epoch: assignmentEpoch,
-    ...(input.mode === "session-round-robin"
+    ...(input.mode !== "concentrate"
       ? { lastAssignedHandle: selected.candidate.credentialHandle }
       : cursor.lastAssignedHandle
         ? { lastAssignedHandle: cursor.lastAssignedHandle }

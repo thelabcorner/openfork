@@ -39,7 +39,7 @@ export type AccountCommitInput =
     })
   | (AccountCommitBaseInput & {
       readonly reason: "failover"
-      readonly current: AccountRouteBinding
+      readonly current: ProviderRoute.Binding
     })
 
 export type AccountCommitResult =
@@ -323,6 +323,9 @@ function safeCandidate(candidate: AccountCandidate): AccountCandidate {
     ...(candidate.usedPercent === undefined
       ? {}
       : { usedPercent: candidate.usedPercent }),
+    ...(candidate.quotaExpiryUrgency === undefined
+      ? {}
+      : { quotaExpiryUrgency: candidate.quotaExpiryUrgency }),
     ...(candidate.resetAt === undefined ? {} : { resetAt: candidate.resetAt }),
     ...(candidate.maxSessionBindings === undefined
       ? {}
@@ -379,7 +382,7 @@ function validateAccountCommitBinding(
   excluded: ReadonlySet<string>,
   reason: "initial" | "failover",
   outcome: "committed" | "winner",
-  current?: AccountRouteBinding,
+  current?: ProviderRoute.Binding,
 ): Effect.Effect<ProviderRoute.Binding, AccountCommitViolationError> {
   if (binding.sessionID !== input.sessionID) {
     return Effect.fail(accountCommitViolation(input, "session-mismatch"))
@@ -448,8 +451,8 @@ function validateAccountCommitBinding(
     }
     if (
       binding.reason !== "failover" ||
-      binding.mode !== (current.mode ?? input.mode) ||
-      binding.pin !== current.pin
+      binding.mode !== input.mode ||
+      binding.pin !== (current.routeKind === "account" ? current.pin : undefined)
     ) {
       return Effect.fail(accountCommitViolation(input, "metadata-mismatch", binding.credentialHandle))
     }
@@ -468,7 +471,7 @@ export function make<CommitError = never, CredentialError = never>(
     reason: "initial" | "failover",
     excludedCredentialHandles: ReadonlySet<string>,
     mode = input.mode,
-    current?: AccountRouteBinding,
+    current?: ProviderRoute.Binding,
   ) =>
     Effect.gen(function* () {
       const base = {
@@ -682,7 +685,16 @@ export function make<CommitError = never, CredentialError = never>(
   ) =>
     Effect.gen(function* () {
       yield* validateProvider(current, input.providerID)
-      if (current.routeKind === "public") return yield* compile(input, current)
+      if (current.routeKind === "public") {
+        // Account-first decides INITIAL Auto selection; it must never cause a
+        // healthy, already-committed worker Public generation to churn solely
+        // because a config or account-roster preference changed.
+        // If upstream Public is no longer eligible, fail over to a real account.
+        if (publicAvailable(input)) return yield* compile(input, current)
+        const rebound = yield* commitAccount(input, "failover", new Set(), input.mode, current)
+        if (rebound) return yield* compile(input, rebound)
+        return yield* compile(input, current)
+      }
 
       const candidate = input.candidates.find(
         (item) =>
@@ -690,24 +702,66 @@ export function make<CommitError = never, CredentialError = never>(
           item.accountID === current.accountID &&
           item.credentialHandle === current.credentialHandle,
       )
-      if (candidate?.admissible) return yield* compile(input, current)
+
+      // An account pin is authoritative only while the current turn explicitly
+      // selects that account. Auto clears a pin from an earlier turn but keeps
+      // a healthy session route sticky. The selected policy chooses new routes
+      // and actual failovers; changing policy alone must not churn a healthy
+      // route or make Round-robin advance from a manual pin instead of its
+      // durable cursor.
       if (current.pin === "hard") {
+        const softened = yield* rebind(
+          input,
+          current,
+          {
+            kind: "account",
+            providerID: current.providerID,
+            accountID: current.accountID,
+            credentialHandle: current.credentialHandle,
+            mode: input.mode,
+            pin: "soft",
+          },
+          "model-selection",
+        )
+
+        if (candidate?.admissible) return yield* compile(input, softened)
+
+        const rebound = yield* commitAccount(
+          input,
+          "failover",
+          new Set([current.credentialHandle]),
+          input.mode,
+          softened,
+        )
+        if (rebound) return yield* compile(input, rebound)
+
+        if (publicAvailable(input)) {
+          const publicBinding = yield* rebind(input, softened, publicRoute(input.providerID), "failover")
+          return yield* compile(input, publicBinding)
+        }
+
         return yield* new BoundRouteUnavailableError({
           providerID: input.providerID,
           routeKind: "account",
           accountID: current.accountID,
-          hardPin: true,
+          hardPin: false,
         })
       }
+
+      if (candidate?.admissible) return yield* compile(input, current)
 
       const rebound = yield* commitAccount(
         input,
         "failover",
         new Set([current.credentialHandle]),
-        current.mode ?? input.mode,
+        input.mode,
         current,
       )
       if (!rebound) {
+        if (publicAvailable(input)) {
+          const publicBinding = yield* rebind(input, current, publicRoute(input.providerID), "failover")
+          return yield* compile(input, publicBinding)
+        }
         return yield* new BoundRouteUnavailableError({
           providerID: input.providerID,
           routeKind: "account",

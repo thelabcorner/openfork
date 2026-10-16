@@ -251,8 +251,7 @@ const layer = Layer.effect(
       Duration.infinity,
     )
 
-    const fetchAndWrite = Effect.fn("ModelsDev.fetchAndWrite")(function* () {
-      const catalog = yield* fetchCatalog()
+    const writeCatalog = Effect.fn("ModelsDev.writeCatalog")(function* (catalog: Record<string, Provider>) {
       const text = JSON.stringify(catalog)
       const tempfile = `${filepath}.${process.pid}.${Date.now()}.tmp`
       yield* fs.writeWithDirs(tempfile, text).pipe(
@@ -273,6 +272,10 @@ const layer = Layer.effect(
       const snapshot = yield* loadSnapshot
       if (snapshot) return snapshot
       if (Flag.OPENCODE_DISABLE_MODELS_FETCH) return {}
+      // Never hold the cross-process cache lock over outbound network I/O.
+      // A silent packet drop must not make every other process waiting for
+      // this catalog inherit the network timeout (or a process-wide stall).
+      const fetched = yield* fetchCatalog()
       // Flock is cross-process: concurrent opencode CLIs can race on this cache file.
       const catalog = yield* Effect.scoped(
         Effect.gen(function* () {
@@ -283,7 +286,7 @@ const layer = Layer.effect(
           if (disk) return disk
           const snapshot = yield* loadSnapshot
           if (snapshot) return snapshot
-          return yield* fetchAndWrite()
+          return yield* writeCatalog(fetched)
         }),
       )
       yield* invalidateSnapshot
@@ -332,19 +335,24 @@ const layer = Layer.effect(
 
     const refresh = Effect.fn("ModelsDev.refresh")(function* (force = false) {
       if (!force && (yield* fresh())) return
-      yield* Effect.scoped(
-        Effect.gen(function* () {
-          yield* Flock.effect(lockKey)
-          // Re-check under the lock: another process may have refreshed between
-          // our outer check and lock acquisition.
-          if (!force && (yield* fresh())) return
-          yield* fetchAndWrite()
-          yield* invalidate
-          yield* invalidateSnapshot
-          yield* invalidateDecisionModels
-          yield* events.publish(Event.Refreshed, {})
-        }),
-      ).pipe(
+      // Refresh the remote snapshot before taking the file lock. The lock only
+      // protects the short recheck-and-rename commit below.
+      yield* fetchCatalog().pipe(
+        Effect.flatMap((fetched) =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              yield* Flock.effect(lockKey)
+              // Re-check under the lock: another process may have refreshed between
+              // our outer check and lock acquisition.
+              if (!force && (yield* fresh())) return
+              yield* writeCatalog(fetched)
+              yield* invalidate
+              yield* invalidateSnapshot
+              yield* invalidateDecisionModels
+              yield* events.publish(Event.Refreshed, {})
+            }),
+          ),
+        ),
         Effect.tapCause((cause) => Effect.logError("Failed to fetch models.dev", { cause: cause })),
         Effect.ignore,
       )
