@@ -24,7 +24,11 @@ mobile must not fork durable session/runtime semantics from `packages/app`.
 
 ## Development
 
-Run the sanctioned paired development stack from the desktop package:
+Run the sanctioned paired development stack from the desktop package.
+The mobile dev proxy preserves protected API `401` responses but rewrites
+legacy upstream Basic challenges to Bearer challenges so an unauthorized
+request cannot summon the browser-native password dialog. Production still
+requires the authoritative API server to enforce device authorization:
 
 ```bash
 cd packages/desktop
@@ -49,10 +53,13 @@ carries the PWA/API location while the one-time code is placed in the fragment s
 it is stripped before application/runtime code can observe or accidentally share
 it.
 
-A successful claim returns a device-scoped credential. When the backend exposes
-an OFXP identity, the PWA also persists its public peer ID, fingerprint, and
-realm. On subsequent cold starts the PWA probes `/instance/identity` **without
-credentials** and verifies that pin before transmitting the stored device token.
+Before submitting a pairing code, the PWA requires an unauthenticated,
+parseable public OFXP identity from `/instance/identity`. After a successful
+claim, it verifies the same peer, fingerprint and realm again before accepting
+the device-scoped credential. On subsequent cold starts, it repeats the public
+identity probe **without credentials** and verifies the persisted pin before
+transmitting the device token. An older pairing lacking a pin must be paired
+again; its credential is never transmitted for trust-on-first-use migration.
 
 This makes the URL a transport location rather than the trusted identity. A
 recycled tunnel/hostname that presents a different OpenFork Network identity

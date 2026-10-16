@@ -15,8 +15,8 @@ export function normalizeServerUrl(value: string, options?: { allowInsecureRemot
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
   if (!options?.allowInsecureRemote && url.protocol !== "https:" && !local)
     throw new Error("Remote servers must use HTTPS")
-  url.username = ""
-  url.password = ""
-  url.hash = ""
-  return url.toString().replace(/\/$/, "")
+  if (url.username || url.password) throw new Error("Server URL must not include a username or password")
+  if (url.pathname !== "/" || url.search || url.hash)
+    throw new Error("Server URL must be the API origin, without a path, query or fragment")
+  return url.origin
 }

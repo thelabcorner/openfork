@@ -1,33 +1,13 @@
 import type { Component } from "solid-js"
 import { Show, createSignal, onCleanup, onMount } from "solid-js"
 import QrScanner from "qr-scanner"
+import { parsePairingPayload } from "./pairing-payload"
 
 interface PairingCameraProps {
   onPairCode: (code: string, serverUrl?: string) => void
   onError: (msg: string) => void
 }
 
-type PairingPayload = { code: string; serverUrl?: string }
-
-export function parsePairingPayload(raw: string): PairingPayload | undefined {
-  const trimmed = raw.trim()
-  try {
-    const url = new URL(trimmed)
-    const code = new URLSearchParams(url.hash.replace(/^#/, "")).get("pair") ?? url.searchParams.get("pair")
-    if (code) {
-      // The default QR is served by the API server itself, so its origin IS
-      // the server base URL when no explicit ?server= rides along.
-      const serverUrl =
-        url.searchParams.get("server") ??
-        (url.protocol === "http:" || url.protocol === "https:" ? url.origin : undefined)
-      return { code: code.toUpperCase(), serverUrl }
-    }
-  } catch {
-    // Not a URL — fall through to raw-code matching.
-  }
-  if (/^[A-Z0-9]{4,10}$/i.test(trimmed)) return { code: trimmed.toUpperCase() }
-  return undefined
-}
 
 export const PairingCamera: Component<PairingCameraProps> = (props) => {
   let videoRef: HTMLVideoElement | undefined

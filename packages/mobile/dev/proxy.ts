@@ -118,7 +118,16 @@ export function createApiProxy(options: ApiProxyOptions) {
         if (HOP_BY_HOP.has(key.toLowerCase())) continue
         headers[key] = value
       }
-      response.writeHead(upstreamResponse.statusCode ?? 502, headers)
+      const status = upstreamResponse.statusCode ?? 502
+      if (status === 401) {
+        // This proxy is the MOBILE application entry point. A Basic challenge
+        // from an older live sidecar would otherwise open the browser-owned
+        // username/password dialog before our QR pairing UI can handle 401.
+        // Preserve the denial and body; change only the authentication hint.
+        headers["www-authenticate"] = 'Bearer realm="OpenFork"'
+        headers["cache-control"] = "no-store"
+      }
+      response.writeHead(status, headers)
       // Flush the head before the first chunk so an SSE client sees the stream
       // open immediately instead of after the first event.
       response.flushHeaders()
