@@ -468,15 +468,39 @@ const layer = Layer.effect(
       )
       const candidates = Array.from(new Set([...tracked, ...untracked]))
       if (!candidates.length) return { skipped: [] }
-      const ignored = input.ignores
-        ? new Set(
-            (yield* repositoryOperation("refresh", input.ignores, ["check-ignore", "--no-index", "--stdin", "-z"], {
-              stdin: candidates.join("\0") + "\0",
-            }).pipe(Effect.catch(() => Effect.succeed({ text: "", stderr: "" })))).text
-              .split("\0")
-              .filter(Boolean),
+      const ignored = new Set<string>()
+      if (input.ignores) {
+        // Git check-ignore exits 1 for "nothing ignored"; any other failure
+        // must abort the capture, rather than silently treating ignored files
+        // as safe to stage into a snapshot.
+        const check = yield* proc
+          .run(
+            ChildProcess.make(
+              "git",
+              repositoryArgs(input.ignores, ["check-ignore", "--no-index", "--stdin", "-z"]),
+              { cwd: input.ignores.worktree, extendEnv: true },
+            ),
+            { stdin: candidates.join("\0") + "\0" },
           )
-        : new Set<string>()
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new OperationError({
+                  operation: "refresh",
+                  directory: input.ignores!.worktree,
+                  message: cause.message,
+                  cause,
+                }),
+            ),
+          )
+        if (check.exitCode !== 0 && check.exitCode !== 1)
+          return yield* new OperationError({
+            operation: "refresh",
+            directory: input.ignores.worktree,
+            message: check.stderr.toString("utf8").trim() || "Failed to check ignored paths",
+          })
+        for (const file of check.stdout.toString("utf8").split("\0").filter(Boolean)) ignored.add(file)
+      }
       const allowed = candidates.filter((item) => !ignored.has(item))
       const maximum = input.maximumUntrackedFileBytes
       const skipped = maximum
@@ -623,7 +647,16 @@ const layer = Layer.effect(
     })
 
     const writeTree = Effect.fn("Git.tree.write")(function* (repository: Repository) {
-      return TreeID.make((yield* repositoryOperation("write_tree", repository, ["write-tree"])).text.trim())
+      const result = yield* repositoryOperation("write_tree", repository, ["write-tree"])
+      const oid = result.text.trim()
+      if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(oid)) {
+        return yield* new OperationError({
+          operation: "write_tree",
+          directory: repository.worktree,
+          message: "Git write-tree did not return a valid tree object ID",
+        })
+      }
+      return TreeID.make(oid)
     })
 
     type CaptureInput = {

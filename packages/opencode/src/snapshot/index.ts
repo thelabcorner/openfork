@@ -19,6 +19,7 @@ import { GitRuntime } from "@opencode-ai/core/git-runtime"
 import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Hash } from "@opencode-ai/core/util/hash"
+import { SnapshotIndexLock } from "@opencode-ai/core/snapshot-index-lock"
 import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
@@ -56,6 +57,7 @@ const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = [...GitRuntime.args([]), ...core]
 const quote = [...cfg, "-c", "core.quotepath=false"]
 const CAPTURE_TIMEOUT = Duration.minutes(5)
+const TREE_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i
 interface GitResult {
   readonly code: ChildProcessSpawner.ExitCode
   readonly text: string
@@ -121,8 +123,9 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Sn
 // Process-wide shadow-repo lock. Every Snapshot layer instance in this process
 // must serialize mutations to one shadow gitdir: the earlier per-layer map let
 // two instances write a single index concurrently, which is how a non-atomic
-// seed copy could leave a zeroed index. Cross-process writers (separate server
-// runs) are additionally protected by Git's own `index.lock`.
+// seed copy could leave a zeroed index. The filesystem Flock below serializes
+// the entire shadow-index transaction across independent server processes.
+// Git's index.lock remains the last defense against legacy/noncooperating writers.
 const shadowLocks = new Map<string, Semaphore.Semaphore>()
 const shadowLock = (key: string) => {
   const hit = shadowLocks.get(key)
@@ -302,7 +305,7 @@ const layer: Layer.Layer<
               stdin: encodeNulTerminatedPaths(checkIgnorePaths),
             },
           )
-          if (check.code !== 0 && check.code !== 1) return new Set<string>()
+          if (check.code !== 0 && check.code !== 1) return yield* failGit("check-ignore", check)
           return new Set(
             check.text
               .split("\0")
@@ -311,9 +314,12 @@ const layer: Layer.Layer<
           )
         })
 
+        const failGit = (command: string, result: GitResult) =>
+          Effect.die(new Error(`snapshot ${command} failed (exit ${result.code}): ${result.stderr.trim() || "no stderr"}`))
+
         const drop = Effect.fnUntraced(function* (files: string[]) {
           if (!files.length) return
-          yield* git(
+          const result = yield* git(
             [
               ...cfg,
               ...args(["rm", "--cached", "-f", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"]),
@@ -323,28 +329,44 @@ const layer: Layer.Layer<
               stdin: encodeTopLevelLiteralPathspecs(files),
             },
           )
+          if (result.code !== 0) return yield* failGit("rm --cached", result)
         })
 
         const stage = Effect.fnUntraced(function* (files: string[]) {
           if (!files.length) return
-          const result = yield* git(
-            [...cfg, ...args(["add", "--all", "--sparse", "--pathspec-from-file=-", "--pathspec-file-nul"])],
-            {
-              cwd: state.worktree,
-              stdin: encodeTopLevelLiteralPathspecs(files),
-            },
-          )
-          if (result.code === 0) return
-          yield* Effect.logWarning("failed to add snapshot files", {
-            exitCode: result.code,
-            stderr: result.stderr,
-          })
+          // A legacy server that predates our cross-process lease may still
+          // hold Git's index.lock. Retry only that transient contention.
+          // Never write-tree after an unsuccessful stage.
+          for (let attempt = 0; attempt < 4; attempt++) {
+            const result = yield* git(
+              [...cfg, ...args(["add", "--all", "--sparse", "--pathspec-from-file=-", "--pathspec-file-nul"])],
+              {
+                cwd: state.worktree,
+                stdin: encodeTopLevelLiteralPathspecs(files),
+              },
+            )
+            if (result.code === 0) return
+            if (attempt < 3 && result.stderr.includes("index.lock") && /file exists/i.test(result.stderr)) {
+              yield* Effect.sleep(Duration.millis(100 * (attempt + 1)))
+              continue
+            }
+            yield* Effect.logWarning("failed to add snapshot files", {
+              exitCode: result.code,
+              stderr: result.stderr,
+              attempt: attempt + 1,
+            })
+            return yield* failGit("add", result)
+          }
         })
 
         const exists = (file: string) => fs.exists(file).pipe(Effect.orDie)
         const read = (file: string) => fs.readFileString(file).pipe(Effect.catch(() => Effect.succeed("")))
         const remove = (file: string) => fs.remove(file).pipe(Effect.catch(() => Effect.void))
-        const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) => shadowLock(state.gitdir).withPermits(1)(fx)
+        const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) =>
+          shadowLock(state.gitdir).withPermits(1)(
+            // Exclusive across V1, core/V2 and any number of server processes.
+            SnapshotIndexLock.withLock(state.gitdir, Global.Path.data, fx),
+          )
 
         const enabled = Effect.fnUntraced(function* () {
           if (state.vcs !== "git") return false
@@ -465,6 +487,7 @@ const layer: Layer.Layer<
               exitCode: result.code,
               stderr: result.stderr,
             })
+            return yield* failGit("rebuild index", result)
           }
         })
 
@@ -510,7 +533,7 @@ const layer: Layer.Layer<
               otherCode: other.code,
               otherStderr: other.stderr,
             })
-            return
+            return yield* failGit("list files", diff.code !== 0 ? diff : other)
           }
 
           const tracked = diff.text.split("\0").filter(Boolean)
@@ -600,6 +623,16 @@ const layer: Layer.Layer<
           yield* add()
           const result = yield* git(args(["write-tree"]), { cwd: state.directory })
           const hash = result.text.trim()
+          // An empty or malformed hash is never a snapshot. In particular,
+          // a failed git add must not silently reuse the previous index tree.
+          if (result.code !== 0 || !TREE_OID.test(hash)) {
+            yield* Effect.logWarning("snapshot write-tree failed", {
+              exitCode: result.code,
+              stderr: result.stderr,
+              hash,
+            })
+            return yield* failGit("write-tree", result)
+          }
           yield* Effect.logInfo("tracking", { hash, cwd: state.directory, git: state.gitdir })
           return hash
         })
@@ -648,6 +681,19 @@ const layer: Layer.Layer<
                     }),
                   ),
                 ).pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.gen(function* () {
+                      yield* Effect.logWarning("snapshot capture failed; no tree published", {
+                        directory: state.directory,
+                        git: state.gitdir,
+                        cause: Cause.pretty(cause),
+                      })
+                      yield* SynchronizedRef.update(materialization, (snapshot) =>
+                        snapshot.cached?.token === token ? { ...snapshot, cached: undefined } : snapshot,
+                      )
+                      return undefined as string | undefined
+                    }),
+                  ),
                   Effect.timeoutOrElse({
                     duration: CAPTURE_TIMEOUT,
                     orElse: () =>
@@ -748,23 +794,11 @@ const layer: Layer.Layer<
             Effect.gen(function* () {
               yield* Effect.logInfo("restore", { commit: snapshot })
               const result = yield* git([...core, ...args(["read-tree", snapshot])], { cwd: state.worktree })
-              if (result.code === 0) {
-                const checkout = yield* git([...core, ...args(["checkout-index", "-a", "-f"])], {
-                  cwd: state.worktree,
-                })
-                if (checkout.code === 0) return
-                yield* Effect.logError("failed to restore snapshot", {
-                  snapshot,
-                  exitCode: checkout.code,
-                  stderr: checkout.stderr,
-                })
-                return
-              }
-              yield* Effect.logError("failed to restore snapshot", {
-                snapshot,
-                exitCode: result.code,
-                stderr: result.stderr,
+              if (result.code !== 0) return yield* failGit("read-tree (restore)", result)
+              const checkout = yield* git([...core, ...args(["checkout-index", "-a", "-f"])], {
+                cwd: state.worktree,
               })
+              if (checkout.code !== 0) return yield* failGit("checkout-index (restore)", checkout)
             }),
           ), "snapshot.restore")
         })
@@ -775,13 +809,22 @@ const layer: Layer.Layer<
               const ops: { hash: string; file: string; rel: string }[] = []
               const seen = new Set<string>()
               for (const item of patches) {
+                // Reject invalid source trees *before* touching any worktree file.
+                // A failed lookup must never be interpreted as an absent file.
+                if (item.files.length && !TREE_OID.test(item.hash)) {
+                  return yield* Effect.die(new Error(`invalid snapshot revert tree: ${item.hash}`))
+                }
                 for (const file of item.files) {
                   if (seen.has(file)) continue
+                  const relative = path.relative(state.worktree, file)
+                  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+                    return yield* Effect.die(new Error(`snapshot revert path escapes worktree: ${file}`))
+                  }
                   seen.add(file)
                   ops.push({
                     hash: item.hash,
                     file,
-                    rel: path.relative(state.worktree, file).replaceAll("\\", "/"),
+                    rel: relative.replaceAll("\\", "/"),
                   })
                 }
               }
@@ -795,13 +838,8 @@ const layer: Layer.Layer<
                 const tree = yield* git([...core, ...args(["ls-tree", op.hash, "--", op.rel])], {
                   cwd: state.worktree,
                 })
-                if (tree.code === 0 && tree.text.trim()) {
-                  yield* Effect.logInfo("file existed in snapshot but checkout failed, keeping", {
-                    file: op.file,
-                    hash: op.hash,
-                  })
-                  return
-                }
+                if (tree.code !== 0) return yield* failGit("ls-tree (revert)", tree)
+                if (tree.text.trim()) return yield* failGit("checkout (revert)", result)
                 yield* Effect.logInfo("file did not exist in snapshot, deleting", { file: op.file, hash: op.hash })
                 yield* remove(op.file)
               })
