@@ -1,4 +1,7 @@
 import { describe, test, expect } from "bun:test"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { ClaudeAgentRuntime, normalizeQueryResult } from "../../src/claude/runtime"
 import { ClaudeDisposedError } from "../../src/claude/errors"
 import type { SdkQueryHandle, SdkQueryRequest } from "../../src/claude/runtime"
@@ -154,16 +157,25 @@ describe("ClaudeAgentRuntime lifecycle", () => {
   })
 
   test("JavaScript-only Claude CLI uses the Node executable in SDK options", async () => {
-    const stream = new StreamController()
-    const fixture = fixtureSdk([stream])
-    const { runtime } = makeRuntime(fixture.module, { executablePath: "/npm/claude-code/cli.js" })
-    const done = runtime.run({ prompt: "cli js fallback" })
-    stream.push(initEvent)
-    stream.push(resultEvent)
-    stream.end()
-    expect((await done).status).toBe("completed")
-    expect(fixture.queryCalls[0]?.options.pathToClaudeCodeExecutable).toBe("/npm/claude-code/cli.js")
-    expect(fixture.queryCalls[0]?.options.executable).toBe("node")
+    // Windows correctly refuses a non-existent explicit CLI path. Provide a
+    // real fixture file instead of assuming a Linux-style pseudo-path exists.
+    const dir = mkdtempSync(join(tmpdir(), "openfork-claude-cli-"))
+    const cli = join(dir, "cli.js")
+    try {
+      writeFileSync(cli, "// fixture; never executed\n")
+      const stream = new StreamController()
+      const fixture = fixtureSdk([stream])
+      const { runtime } = makeRuntime(fixture.module, { executablePath: cli })
+      const done = runtime.run({ prompt: "cli js fallback" })
+      stream.push(initEvent)
+      stream.push(resultEvent)
+      stream.end()
+      expect((await done).status).toBe("completed")
+      expect(fixture.queryCalls[0]?.options.pathToClaudeCodeExecutable).toBe(cli)
+      expect(fixture.queryCalls[0]?.options.executable).toBe("node")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test("SDK error result fails the turn instead of persisting a successful completion", async () => {
