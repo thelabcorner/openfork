@@ -6,6 +6,7 @@ import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
 import { isImageAttachment } from "@/util/media"
 import { collectBoundedResponseBody } from "@opencode-ai/core/tool/http-body"
+import { githubFetchGuidance } from "./github-fetch-guidance"
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
@@ -20,31 +21,8 @@ export const Parameters = Schema.Struct({
     })
     .pipe(Schema.withDecodingDefault(Effect.succeed("markdown" as const))),
   timeout: Schema.optional(Schema.Number).annotate({ description: "Optional timeout in seconds (max 120)" }),
+  forceWeb: Schema.optional(Schema.Boolean).annotate({ description: "Explicitly bypass authenticated GitHub research guidance and perform an ordinary unauthenticated HTTP fetch (e.g. when gh is unavailable)." }),
 })
-
-const GITHUB_HOSTS = new Set([
-  "github.com",
-  "www.github.com",
-  "api.github.com",
-  "raw.githubusercontent.com",
-  "patch-diff.githubusercontent.com",
-  "codeload.github.com",
-])
-
-export function isGitHubUrl(url: string): boolean {
-  try {
-    return GITHUB_HOSTS.has(new URL(url).hostname.toLowerCase())
-  } catch {
-    return false
-  }
-}
-
-export const GITHUB_TOOL_NUDGE =
-  'Prefer the github tool for GitHub content (authenticated, structured, paginated): e.g. github({action:"command", argv:["pr","diff","123"]}) or github({action:"catalog", q:"..."}). This webfetch fallback is unauthenticated and unstructured.'
-
-export function applyGitHubNudge(output: string, url: string): string {
-  return isGitHubUrl(url) ? `${output}\n\n${GITHUB_TOOL_NUDGE}` : output
-}
 
 export const executeFetch = Effect.fn("WebFetch.execute")(
   function* (
@@ -114,12 +92,12 @@ export const executeFetch = Effect.fn("WebFetch.execute")(
     }
     const content = new TextDecoder().decode(body)
     if (params.format === "markdown" && contentType.includes("text/html")) {
-      return { output: applyGitHubNudge(convertHTMLToMarkdown(content), params.url), title, metadata: {} }
+      return { output: convertHTMLToMarkdown(content), title, metadata: {} }
     }
     if (params.format === "text" && contentType.includes("text/html")) {
-      return { output: applyGitHubNudge(extractTextFromHTML(content), params.url), title, metadata: {} }
+      return { output: extractTextFromHTML(content), title, metadata: {} }
     }
-    return { output: applyGitHubNudge(content, params.url), title, metadata: {} }
+    return { output: content, title, metadata: {} }
   },
 )
 
@@ -132,6 +110,10 @@ export const WebFetchTool = Tool.define(
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
+          if (!params.forceWeb) {
+            const guidance = githubFetchGuidance(params.url, params.format)
+            if (guidance) return guidance
+          }
           yield* ctx.ask({
             permission: "webfetch",
             patterns: [params.url],

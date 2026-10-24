@@ -2155,7 +2155,7 @@ const layer = Layer.effect(
       right: SessionV1.User["model"]["routeIntent"],
     ) => {
       if (left?.kind !== right?.kind) return false
-      if (left?.kind === "auto" && right?.kind === "auto") return left.strategy === right.strategy
+      if (left?.kind === "strategy" && right?.kind === "strategy") return left.strategy === right.strategy
       if (left?.kind === "account" && right?.kind === "account")
         return left.accountID === right.accountID && left.pin === right.pin
       return true
@@ -2203,10 +2203,10 @@ const layer = Layer.effect(
       if (!delegation) return yield* delegatedWorkerError(session)
 
       const protectedVariant = normalizedDelegatedVariant(delegation.model.variant)
-      if (
-        (input.agent !== undefined && input.agent !== delegation.agent) ||
-        Object.keys(input.tools ?? {}).length > 0
-      ) {
+      // An explicitly human-authored turn may select a different agent.
+      // The worker's producer-owned default stays intact for later controller turns.
+      // Tool permission mutation remains a separately protected operation.
+      if (Object.keys(input.tools ?? {}).length > 0) {
         return yield* delegatedWorkerError(session)
       }
 
@@ -2216,7 +2216,7 @@ const layer = Layer.effect(
         delegation,
         input: {
           ...input,
-          agent: delegation.agent,
+          agent: input.agent ?? delegation.agent,
           model: input.model ?? {
             providerID: ProviderV2.ID.make(delegation.model.providerID),
             modelID: ModelV2.ID.make(delegation.model.modelID),
@@ -2845,8 +2845,10 @@ const layer = Layer.effect(
       // aggregate immediately before persistence so a concurrent OXP selection
       // rebind cannot turn a stale interactive prompt into a contract takeover.
       if (protectedDelegation) {
+        // Preserve the producer's aggregate selection, not its monopoly over
+        // human-authored turns. A human agent override is scoped to this
+        // message; a changed controller selection still fails the CAS above.
         yield* assertDelegatedWorkerSelection(input.sessionID, protectedDelegation)
-        if (info.agent !== protectedDelegation.agent) return yield* delegatedWorkerError(current)
       }
       yield* sessions.updateMessage(info)
       for (const part of parts) yield* sessions.updatePart(part)
@@ -4849,7 +4851,7 @@ const layer = Layer.effect(
       requestSentAt: number
       model: { providerID: string; modelID: string; accountID?: string; variant?: string }
     }) {
-      const current = yield* requirePromptable(input.sessionID, "user")
+      const current = yield* requirePromptable(input.sessionID, "user", { allowDelegatedWorkerUser: true })
       if (current.pausedAt !== undefined || current.time.archived !== undefined) return false
 
       // Validate the exact requested model before claiming or cancelling the
@@ -5561,16 +5563,16 @@ const layer = Layer.effect(
       const taskAccountID =
         "accountID" in taskModel && typeof taskModel.accountID === "string" ? taskModel.accountID : undefined
       const taskRouteIntent = "routeIntent" in taskModel ? taskModel.routeIntent : undefined
-      const inheritedAutoIntent =
+      const inheritedStrategyIntent =
         !taskRouteIntent &&
         !taskAccountID &&
         selectedInputModel?.providerID === taskModel.providerID &&
-        selectedInputModel.routeIntent?.kind === "auto"
+        selectedInputModel.routeIntent?.kind === "strategy"
           ? selectedInputModel.routeIntent
           : undefined
       const routedTaskModel =
-        taskRouteIntent || inheritedAutoIntent
-          ? { ...taskModel, routeIntent: taskRouteIntent ?? inheritedAutoIntent }
+        taskRouteIntent || inheritedStrategyIntent
+          ? { ...taskModel, routeIntent: taskRouteIntent ?? inheritedStrategyIntent }
           : taskModel
 
       // Explicit account models are validated authoritatively by

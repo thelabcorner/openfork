@@ -117,7 +117,7 @@ function memoryRoutes(
   }
 }
 
-const auto = ProviderRouteIntent.Info.make({ kind: "auto" })
+const auto = ProviderRouteIntent.Info.make({ kind: "strategy" })
 const explicitPublic = ProviderRouteIntent.Info.make({ kind: "public" })
 const explicitAccount = (accountID: string, pin: "hard" | "soft" = "hard") =>
   ProviderRouteIntent.Info.make({ kind: "account", accountID, pin })
@@ -221,7 +221,53 @@ function harness(options?: {
 const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect)
 
 describe("ProviderRouteResolution", () => {
-  test("new Auto free route defaults to Public even when eligible accounts exist", async () => {
+  test("changing from Adaptive to Round Robin applies the new policy instead of silently retaining the old binding mode", async () => {
+    const initial = accountBinding({
+      kind: "account",
+      providerID,
+      accountID: accountB.accountID,
+      credentialHandle: accountB.credentialHandle,
+      mode: "concentrate",
+      pin: "soft",
+    })
+    const h = harness({ initial })
+    const result = await run(h.resolver.resolve(input({
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy", strategy: "round-robin" }),
+      mode: "round-robin",
+      freeRoutePreference: "account-first",
+    })))
+
+    expect(h.commits).toHaveLength(1)
+    expect(h.commits[0]?.mode).toBe("round-robin")
+    expect(h.commits[0]?.reason).toBe("failover")
+    expect(h.commits[0]?.excludedCredentialHandles.size).toBe(0)
+    expect(h.routes.current()).toMatchObject({ routeKind: "account", mode: "round-robin", pin: "soft" })
+    expect(result.lease.route.kind).toBe("account")
+  })
+
+  test("explicitly selecting Adaptive after a hard account pin releases the pin and applies policy selection", async () => {
+    const initial = accountBinding({
+      kind: "account",
+      providerID,
+      accountID: accountB.accountID,
+      credentialHandle: accountB.credentialHandle,
+      mode: "concentrate",
+      pin: "hard",
+    })
+    const h = harness({ initial })
+    const result = await run(h.resolver.resolve(input({
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy", strategy: "adaptive" }),
+      mode: "concentrate",
+      freeRoutePreference: "account-first",
+    })))
+
+    expect(h.commits).toHaveLength(1)
+    expect(h.commits[0]?.excludedCredentialHandles.size).toBe(0)
+    expect(h.routes.current()).toMatchObject({ routeKind: "account", accountID: accountA.accountID, pin: "soft" })
+    expect(result.lease.route).toMatchObject({ kind: "account", accountID: accountA.accountID })
+  })
+
+  test("new public-first strategy route defaults to Public even when eligible accounts exist", async () => {
     const h = harness({
       commit: () => {
         throw new Error("account commit must not run for public-first eligible free route")
@@ -395,7 +441,7 @@ describe("ProviderRouteResolution", () => {
     expect(h.routes.current()).toBeUndefined()
   })
 
-  test("Auto clears a previous-turn hard pin and fails over to an eligible account", async () => {
+  test("Adaptive clears a previous-turn hard pin and selects an eligible account", async () => {
     const initial = binding({
       kind: "account",
       providerID,
@@ -752,7 +798,7 @@ describe("ProviderRouteResolution", () => {
     expect(routes.current()?.routeKind).toBe("public")
   })
 
-  test("Auto initial bind race compiles the committed winner instead of overwriting it", async () => {
+  test("strategy initial bind race compiles the committed winner instead of overwriting it", async () => {
     const winner = binding({
       kind: "account",
       providerID,

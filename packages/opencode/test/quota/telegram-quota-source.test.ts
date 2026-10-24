@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { QuotaNotificationSource } from "../../src/notification/telegram/quota-source"
@@ -118,6 +118,85 @@ describe("quota reset notification source as registered Telegram service", () =>
       await source.update({ enabled: false, subscriptions: [subscription] })
       expect(source.active()).toBe(false)
       expect(await source.collect(nextReset + 60_000)).toEqual([])
+    } finally { await rm(dir, { recursive: true, force: true }) }
+  })
+
+  test("detects early resets, persists the distinct event, and suppresses duplicates across restart", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "openfork-telegram-early-"))
+    const file = join(dir, "quota.json")
+    const expectedAt = before + 3 * 3600_000
+    const detectedAt = before + 10 * 60_000
+    const revisedAt = expectedAt + 7 * 86400_000
+    let current = snapshot(before, expectedAt, 2)
+    try {
+      const source = new QuotaNotificationSource(async () => current, file)
+      await source.initialize()
+      await source.update({ enabled: true, subscriptions: [subscription] })
+      expect(await source.collect(before)).toEqual([])
+      current = snapshot(detectedAt, revisedAt, 100)
+      const notices = await source.collect(detectedAt)
+      expect(notices).toHaveLength(1)
+      expect(notices[0]!.text).toContain("EARLY QUOTA RESET DETECTED")
+      expect(notices[0]!.text).toContain("Available: 2% → 100%")
+      expect(notices[0]!.text).toContain("Previously expected:")
+      expect(notices[0]!.text).toContain("Provider's new reset time:")
+      expect(notices[0]!.text).not.toContain("quota reset confirmed")
+      expect(source.status().scheduled).toBe(2)
+      const persisted = JSON.parse(await readFile(file, "utf8")) as { early: unknown[] }
+      expect(persisted.early).toHaveLength(1)
+
+      const restarted = new QuotaNotificationSource(async () => current, file)
+      await restarted.initialize()
+      expect((await restarted.collect(detectedAt)).map((row) => row.id)).toEqual([notices[0]!.id])
+      await restarted.acknowledge(notices[0]!.id)
+      expect(await restarted.collect(detectedAt)).toEqual([])
+      expect(restarted.status().scheduled).toBe(1)
+      current = snapshot(detectedAt + 10 * 60_000, revisedAt, 100)
+      expect(await restarted.collect(detectedAt + 10 * 60_000)).toEqual([])
+    } finally { await rm(dir, { recursive: true, force: true }) }
+  })
+
+  test("large unscheduled bonus is reported as replenishment, not a proven reset", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "openfork-telegram-bonus-"))
+    const file = join(dir, "quota.json")
+    const expectedAt = before + 3 * 3600_000
+    let current = snapshot(before, expectedAt, 10)
+    try {
+      const source = new QuotaNotificationSource(async () => current, file)
+      await source.initialize()
+      await source.update({ enabled: true, subscriptions: [subscription] })
+      await source.collect(before)
+      current = snapshot(before + 10 * 60_000, expectedAt, 35)
+      const notices = await source.collect(before + 10 * 60_000)
+      expect(notices).toHaveLength(1)
+      expect(notices[0]!.text).toContain("UNEXPECTED EARLY QUOTA REPLENISHMENT")
+      expect(notices[0]!.text).toContain("may be bonus capacity")
+      expect(notices[0]!.text).not.toContain("EARLY QUOTA RESET DETECTED")
+      await source.acknowledge(notices[0]!.id)
+      expect(source.status().scheduled).toBe(1)
+      expect(await source.collect(before + 10 * 60_000)).toEqual([])
+      current = snapshot(before + 20 * 60_000, expectedAt, 36)
+      expect(await source.collect(before + 20 * 60_000)).toEqual([])
+    } finally { await rm(dir, { recursive: true, force: true }) }
+  })
+
+  test("re-enabling cannot compare fresh quota to a baseline from the disabled interval", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "openfork-telegram-reenable-"))
+    const file = join(dir, "quota.json")
+    const expectedAt = before + 3 * 3600_000
+    let current = snapshot(before, expectedAt, 5)
+    try {
+      const source = new QuotaNotificationSource(async () => current, file)
+      await source.initialize()
+      await source.update({ enabled: true, subscriptions: [subscription] })
+      expect(await source.collect(before)).toEqual([])
+      expect(source.nextPollDelayMs(before)).toBe(10 * 60_000)
+      await source.update({ enabled: false, subscriptions: [subscription] })
+      expect(source.status().scheduled).toBe(0)
+      current = snapshot(before + 10 * 60_000, expectedAt + 7 * 86400_000, 100)
+      await source.update({ enabled: true, subscriptions: [subscription] })
+      expect(await source.collect(before + 10 * 60_000)).toEqual([])
+      expect(source.status().scheduled).toBe(1)
     } finally { await rm(dir, { recursive: true, force: true }) }
   })
 

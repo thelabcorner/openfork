@@ -288,6 +288,19 @@ export const SettingsOxpV2 = (props: { section?: Accessor<SettingsSection | unde
   )
 
 
+  const sessionScopeOptions = createMemo(() => [
+    { id: "approved-roots" as const, label: language.t("settings.oxp.agentSupport.sessions.scope.roots") },
+    { id: "all-native" as const, label: language.t("settings.oxp.agentSupport.sessions.scope.all") },
+  ])
+  const sessionScope = createMemo(() =>
+    sessionScopeOptions().find((option) => option.id === state()?.grant.sessionSupervision),
+  )
+
+  const setSessionScope = (scope: "approved-roots" | "all-native") => {
+    if (!api || !state()) return
+    void run("grant:sessionSupervision", () => api.setGrant({ sessionSupervision: scope }))
+  }
+
   const setGrant = (key: keyof OxpGrant, value: boolean) => {
     const current = state()
     if (!api || !current) return
@@ -732,6 +745,9 @@ export const SettingsOxpV2 = (props: { section?: Accessor<SettingsSection | unde
                     </div>
                   </div>
                   <SettingsListV2>
+                    <SettingsRowV2 title={language.t("settings.oxp.agentSupport.globalUsage.title")} description={language.t("settings.oxp.agentSupport.globalUsage.description")}>
+                      <Switch checked={current().grant.globalUsageAnalytics} disabled={!!store.busy} onChange={(value) => setGrant("globalUsageAnalytics", value)} />
+                    </SettingsRowV2>
                     <SettingsRowV2 title={language.t("settings.oxp.agentSupport.sessions.title")} description={language.t("settings.oxp.agentSupport.sessions.description")}>
                       <Switch
                         checked={current().grant.sessionSupervision !== "none"}
@@ -739,6 +755,25 @@ export const SettingsOxpV2 = (props: { section?: Accessor<SettingsSection | unde
                         onChange={(value) => setGrant("sessionSupervision", value)}
                       />
                     </SettingsRowV2>
+                    <Show when={current().grant.sessionSupervision !== "none"}>
+                      <SettingsRowV2
+                        title={language.t("settings.oxp.agentSupport.sessions.scope.title")}
+                        description={language.t("settings.oxp.agentSupport.sessions.scope.description")}
+                      >
+                        <SelectV2
+                          appearance="inline"
+                          data-action="oxp-session-supervision-scope"
+                          options={sessionScopeOptions()}
+                          current={sessionScope()}
+                          value={(option) => option.id}
+                          label={(option) => option.label}
+                          placement="bottom-end"
+                          gutter={6}
+                          disabled={!!store.busy}
+                          onSelect={(option) => option && setSessionScope(option.id)}
+                        />
+                      </SettingsRowV2>
+                    </Show>
                     <SettingsRowV2 title={language.t("settings.oxp.agentSupport.requests.title")} description={language.t("settings.oxp.agentSupport.requests.description")}>
                       <Switch
                         checked={current().grant.requestSupervision}

@@ -1,4 +1,4 @@
-import { defaultSdkLoader, resolveCliPath } from "./availability"
+import { defaultSdkLoader, resolveSdkCliPath, sdkCliUsesNode } from "./availability"
 import { buildChildEnv, type ChildEnv } from "./env"
 import {
   CLAUDE_SUBSCRIPTION_MODEL_REFRESH_MS,
@@ -85,8 +85,8 @@ export async function listClaudeSupportedModels(input?: {
   })()
 
   const env = buildChildEnv(input?.env ?? process.env)
-  const executable = resolveCliPath(env)
-  const query = (sdk.query as (request: unknown) => unknown)({
+   const executable = resolveSdkCliPath(env)
+   const query = (sdk.query as (request: unknown) => unknown)({
     prompt: idle,
     options: {
       env,
@@ -94,7 +94,8 @@ export async function listClaudeSupportedModels(input?: {
       settingSources: [],
       strictMcpConfig: true,
       settings: { disableClaudeAiConnectors: true },
-      ...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
+       ...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
+       ...(executable && sdkCliUsesNode(executable) ? { executable: "node" } : {}),
     },
   }) as SupportedModelsQuery
 

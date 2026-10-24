@@ -77,9 +77,10 @@ describe("claude model metadata", () => {
     expect(MODEL_IDS).not.toContain("sonnet")
     expect(MODEL_IDS).not.toContain("opus")
     expect(MODEL_IDS).not.toContain("haiku")
-    expect(MODEL_IDS).toContain("claude-opus-4-8")
-    expect(MODEL_IDS).toContain("claude-sonnet-4-6")
-    expect(MODEL_IDS).toContain("claude-haiku-4-5")
+    expect(MODEL_IDS).toContain("claude-opus-5-5")
+    expect(MODEL_IDS).toContain("claude-sonnet-5-5")
+    expect(MODEL_IDS).toContain("claude-haiku-5-5")
+    expect(MODEL_IDS).not.toContain("fable")
   })
 
   it("normalizes SDK supportedModels into concrete stable IDs and 1M rules", () => {
@@ -108,6 +109,11 @@ describe("claude model metadata", () => {
     expect(models["claude-sonnet-5[1m]"]?.contextLimit).toBe(1_000_000)
     expect(models["claude-opus-4-8"]?.contextLimit).toBe(1_000_000)
     expect(models["claude-opus-4-8[1m]"]).toBeUndefined()
+    const fable = claudeSubscriptionModelsFromSdk([{ value: "fable", resolvedModel: "claude-fable-5-1" }])
+    expect(fable["claude-fable-5-1[1m]"]?.contextLimit).toBe(1_000_000)
+    const haiku = claudeSubscriptionModelsFromSdk([{ value: "haiku", resolvedModel: "claude-haiku-5-5" }])
+    expect(haiku["claude-haiku-5-5"]?.contextLimit).toBe(1_000_000)
+    expect(haiku["claude-haiku-5-5[1m]"]).toBeUndefined()
     expect(models.default).toBeUndefined()
   })
 
@@ -129,7 +135,7 @@ describe("claude model metadata", () => {
       [
         {
           value: "sonnet",
-          resolvedModel: "claude-sonnet-5",
+          resolvedModel: "claude-sonnet-5-5",
           supportedEffortLevels: ["high"],
         },
       ],
@@ -138,8 +144,8 @@ describe("claude model metadata", () => {
         name: "Anthropic",
         env: [],
         models: {
-          "claude-sonnet-5": {
-            id: "claude-sonnet-5",
+          "claude-sonnet-5-5": {
+            id: "claude-sonnet-5-5",
             name: "Claude Sonnet 5",
             release_date: "2026-01-01",
             attachment: true,
@@ -151,24 +157,29 @@ describe("claude model metadata", () => {
         },
       } as any,
     )
-    expect(models["claude-sonnet-5"]?.contextLimit).toBe(200_000)
-    expect(models["claude-sonnet-5[1m]"]?.contextLimit).toBe(1_000_000)
-    expect(models["claude-sonnet-5[1m]"]?.outputLimit).toBe(128_000)
+    expect(models["claude-sonnet-5-5"]?.contextLimit).toBe(200_000)
+    expect(models["claude-sonnet-5-5[1m]"]?.contextLimit).toBe(1_000_000)
+    expect(models["claude-sonnet-5-5[1m]"]?.outputLimit).toBe(128_000)
   })
 
   it("uses only concrete current models for emergency subscription bootstrap", () => {
     resetClaudeSubscriptionModelCacheForTest()
     const models = getClaudeSubscriptionModelMetadata()
     expect(models["claude-opus-5-5[1m]"]).toBeDefined()
-    expect(models["claude-fable-5-1[1m]"]).toBeDefined()
+    expect(models["claude-sonnet-5-5"]).toBeDefined()
+    expect(models["claude-sonnet-5-5[1m]"]?.contextLimit).toBe(1_000_000)
+    expect(models["claude-haiku-5-5"]).toBeDefined()
+    expect(models["claude-opus-4-8"]?.contextLimit).toBe(1_000_000)
+    expect(models["claude-fable-5-1[1m]"]?.contextLimit).toBe(1_000_000)
     expect(models["claude-sonnet-5"]).toBeDefined()
-    expect(models["claude-sonnet-5[1m]"]).toBeDefined()
     expect(models["claude-haiku-4-5"]).toBeDefined()
-    expect(models["claude-opus-4-8"]).toBeDefined()
     expect(models.sonnet).toBeUndefined()
     expect(models.opus).toBeUndefined()
     expect(models.haiku).toBeUndefined()
     expect(models.fable).toBeUndefined()
+    expect(models["claude-opus-5-5[1m]"]?.contextLimit).toBe(1_000_000)
+    expect(models["claude-sonnet-5-5"]?.contextLimit).toBe(200_000)
+    expect(models["claude-haiku-5-5"]?.contextLimit).toBe(1_000_000)
   })
 
   it("does not let models.dev expand the subscription entitlement catalog", () => {
@@ -188,8 +199,8 @@ describe("claude model metadata", () => {
           tool_call: true,
           limit: { context: 123_456, output: 7_777 },
         },
-        "claude-sonnet-5": {
-          id: "claude-sonnet-5",
+        "claude-sonnet-5-5": {
+          id: "claude-sonnet-5-5",
           name: "Claude Sonnet 5 API metadata",
           release_date: "2026-01-01",
           attachment: true,
@@ -201,9 +212,9 @@ describe("claude model metadata", () => {
       },
     } as any)
     expect(models["claude-sonnet-2"]).toBeUndefined()
-    expect(models["claude-sonnet-5"]?.contextLimit).toBe(200_000)
-    expect(models["claude-sonnet-5"]?.outputLimit).toBe(64_000)
-    expect(models["claude-sonnet-5"]?.releaseDate).toBe("2026-01-01")
+    expect(models["claude-sonnet-5-5"]?.contextLimit).toBe(200_000)
+    expect(models["claude-sonnet-5-5"]?.outputLimit).toBe(64_000)
+    expect(models["claude-sonnet-5-5"]?.releaseDate).toBe("2026-01-01")
   })
 
   it("uses recorded SDK discovery as the subscription catalog and resolves family aliases", () => {
@@ -275,6 +286,22 @@ describe("claude model metadata", () => {
     ])
     await Promise.all([first, second])
     expect(calls).toBe(1)
+    resetClaudeModelDiscoveryForTest()
+    resetClaudeSubscriptionModelCacheForTest()
+  })
+
+  it("does not replace a known catalog when supportedModels returns no rows", async () => {
+    resetClaudeSubscriptionModelCacheForTest()
+    resetClaudeModelDiscoveryForTest()
+    recordClaudeSubscriptionModels(
+      [{ value: "opus", resolvedModel: "claude-opus-5-5", supportedEffortLevels: ["high"] }],
+      0,
+    )
+    const changed = await refreshClaudeSubscriptionModelsFromHandle({
+      supportedModels: async () => [],
+    })
+    expect(changed).toBe(false)
+    expect(getClaudeSubscriptionModelMetadata()["claude-opus-5-5[1m]"]).toBeDefined()
     resetClaudeModelDiscoveryForTest()
     resetClaudeSubscriptionModelCacheForTest()
   })

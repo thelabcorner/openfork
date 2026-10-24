@@ -47,7 +47,7 @@ export const generateProjectCopyName = Effect.fn("ProjectCopyHttpApi.generateNam
       const routed = yield* input.provider.resolveTransientRoutedModel({
         providerID: candidate.providerID,
         modelID: candidate.id,
-        routeIntent: { kind: "auto" },
+        routeIntent: { kind: "strategy" },
         executionPurpose: "special-agent",
       }).pipe(Effect.catch((error) =>
         Provider.isHostedZenProvider(candidate.providerID) ? Effect.succeed(undefined) : Effect.fail(error),

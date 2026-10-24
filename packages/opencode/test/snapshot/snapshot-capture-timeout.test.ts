@@ -61,8 +61,9 @@ it.effect("times out a stuck capture, warns once, and starts a fresh capture on 
         [
           "snapshot capture timed out",
           expect.objectContaining({
-            directory: test.directory,
-            captures: 1,
+          directory: test.directory,
+          captures: 1,
+          capturePhase: "git-capture",
           }),
         ],
       ])

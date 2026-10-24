@@ -4,7 +4,7 @@ import { OxpError } from "@/oxp/error"
 import { OxpRouteIntent } from "@/oxp/route-intent"
 
 const publicIntent: ProviderRouteIntent.Info = { kind: "public" }
-const autoIntent: ProviderRouteIntent.Info = { kind: "auto" }
+const adaptiveIntent: ProviderRouteIntent.Info = { kind: "strategy", strategy: "adaptive" }
 const accountIntent = (accountID: string, pin?: "hard" | "soft"): ProviderRouteIntent.Info => ({
   kind: "account",
   accountID,
@@ -23,14 +23,14 @@ function failure(run: () => unknown) {
 
 describe("OxpRouteIntent.normalize", () => {
   test("reuses the Core migration-window rules instead of restating them", () => {
-    expect(OxpRouteIntent.normalize({})).toEqual({ kind: "auto" })
+    expect(OxpRouteIntent.normalize({})).toEqual({ kind: "strategy" })
     expect(OxpRouteIntent.normalize({ legacyAccountID: "acct-a" })).toEqual({
       kind: "account",
       accountID: "acct-a",
       pin: "hard",
     })
     expect(OxpRouteIntent.normalize({ routeIntent: publicIntent })).toEqual({ kind: "public" })
-    expect(OxpRouteIntent.normalize({ routeIntent: autoIntent })).toEqual({ kind: "auto" })
+    expect(OxpRouteIntent.normalize({ routeIntent: adaptiveIntent })).toEqual(adaptiveIntent)
     expect(OxpRouteIntent.normalize({ routeIntent: accountIntent("acct-a", "soft") })).toEqual({
       kind: "account",
       accountID: "acct-a",
@@ -38,8 +38,8 @@ describe("OxpRouteIntent.normalize", () => {
     })
   })
 
-  test("preserves explicit Public as a first-class route, never as Auto", () => {
-    expect(OxpRouteIntent.normalize({ routeIntent: publicIntent })).not.toEqual({ kind: "auto" })
+  test("preserves explicit Public as a first-class route, never as an account strategy", () => {
+    expect(OxpRouteIntent.normalize({ routeIntent: publicIntent })).not.toEqual({ kind: "strategy" })
     expect(OxpRouteIntent.accountMode(OxpRouteIntent.normalize({ routeIntent: publicIntent }))).toBe("public")
   })
 
@@ -58,10 +58,10 @@ describe("OxpRouteIntent.normalize", () => {
     expect(publicConflict.detail).toContain("acct-a")
     expect(publicConflict.detail).toContain("account-free")
 
-    const autoConflict = failure(() =>
-      OxpRouteIntent.normalize({ routeIntent: autoIntent, legacyAccountID: "acct-a" }),
+    const strategyConflict = failure(() =>
+      OxpRouteIntent.normalize({ routeIntent: adaptiveIntent, legacyAccountID: "acct-a" }),
     )
-    expect(autoConflict._tag).toBe("OXP_CONFLICT")
+    expect(strategyConflict._tag).toBe("OXP_CONFLICT")
 
     const accountConflict = failure(() =>
       OxpRouteIntent.normalize({ routeIntent: accountIntent("acct-b"), legacyAccountID: "acct-a" }),
@@ -76,7 +76,7 @@ describe("OxpRouteIntent.normalize", () => {
 
   test("never derives an account identity from a non-account route", () => {
     expect(OxpRouteIntent.accountRouteID(publicIntent)).toBeUndefined()
-    expect(OxpRouteIntent.accountRouteID(autoIntent)).toBeUndefined()
+    expect(OxpRouteIntent.accountRouteID(adaptiveIntent)).toBeUndefined()
     expect(OxpRouteIntent.accountRouteID(accountIntent("acct-a"))).toBe("acct-a")
     const resolved = OxpRouteIntent.normalize({ routeIntent: publicIntent })
     expect(resolved).toEqual({ kind: "public" })
@@ -85,7 +85,8 @@ describe("OxpRouteIntent.normalize", () => {
   })
 
   test("reports account mode from route intent rather than from a missing account", () => {
-    expect(OxpRouteIntent.accountMode(autoIntent)).toBe("automatic")
+    expect(OxpRouteIntent.accountMode(adaptiveIntent)).toBe("adaptive")
+    expect(OxpRouteIntent.accountMode({ kind: "strategy", strategy: "round-robin" })).toBe("round-robin")
     expect(OxpRouteIntent.accountMode(publicIntent)).toBe("public")
     expect(OxpRouteIntent.accountMode(accountIntent("acct-a"))).toBe("explicit")
   })

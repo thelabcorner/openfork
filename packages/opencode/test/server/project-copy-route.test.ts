@@ -126,7 +126,7 @@ describe("Project Copy standalone provider route authority", () => {
       expect(h.routeInputs[0]).toMatchObject({
         providerID: "opencode",
         modelID: "copy-model",
-        routeIntent: { kind: "auto" },
+        routeIntent: { kind: "strategy" },
         executionPurpose: "special-agent",
       })
       expect(h.streamInputs).toHaveLength(0)

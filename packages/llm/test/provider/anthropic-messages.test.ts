@@ -42,6 +42,96 @@ const expectToolResult = (body: AnthropicMessages.AnthropicMessagesBody): Anthro
 }
 
 describe("Anthropic Messages route", () => {
+  it.effect("projects MCP root unions before sending any Anthropic tool request", () =>
+    Effect.gen(function* () {
+      const source = {
+        type: "object",
+        properties: {
+          rootID: { type: "string" },
+          path: { type: "string" },
+          nullable: { anyOf: [{ type: "string" }, { type: "null" }] },
+        },
+        oneOf: [{ required: ["rootID"] }, { required: ["path"] }],
+      }
+      const copy = structuredClone(source)
+      const prepared = yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(
+        LLM.request({
+          model,
+          prompt: "Continue existing conversation.",
+          tools: [
+            { name: "read", description: "Read files.", inputSchema: { type: "object", properties: {} } },
+            { name: "git", description: "Git tool.", inputSchema: source },
+          ],
+        }),
+      )
+      const lowered = prepared.body.tools?.[1]?.input_schema as Record<string, any>
+      expect(lowered?.type).toBe("object")
+      expect(lowered).not.toHaveProperty("oneOf")
+      expect(lowered).not.toHaveProperty("anyOf")
+      expect(lowered).not.toHaveProperty("allOf")
+      expect(lowered?.properties?.nullable.anyOf).toEqual(source.properties.nullable.anyOf)
+      expect(prepared.body.tools?.[0]?.input_schema).toEqual({ type: "object", properties: {} })
+      expect(source).toEqual(copy)
+    }),
+  )
+
+  it.effect("recovers a Haiku continuation with prior tool history and an incompatible MCP tool schema", () =>
+    Effect.gen(function* () {
+      const haiku = AnthropicMessages.route
+        .with({ endpoint: { baseURL: "https://api.anthropic.test/v1/" }, auth: Auth.header("x-api-key", "test") })
+        .model({ id: "claude-haiku-5-5" })
+      const history = continuationRequest({
+        id: "req_haiku_recovery",
+        model: haiku,
+        features: nativeAnthropicMessagesContinuation,
+      })
+      const mcpSchema = {
+        type: "object",
+        properties: { route: { type: "string" }, file: { type: "string" } },
+        additionalProperties: false,
+        anyOf: [{ required: ["route"] }, { required: ["file"] }],
+      }
+      const next = {
+        ...history,
+        tools: [
+          ...history.tools,
+          { name: "gitnexus_api_impact", description: "Look up impact.", inputSchema: mcpSchema },
+        ],
+      }
+      let sent: any
+      const response = yield* LLMClient.generate(next).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.sync(() => {
+              sent = JSON.parse(input.text)
+              return input.respond(
+                sseEvents(
+                  { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+                  { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Recovered." } },
+                  { type: "content_block_stop", index: 0 },
+                  { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+                  { type: "message_stop" },
+                ),
+                { headers: { "content-type": "text/event-stream" } },
+              )
+            }),
+          ),
+        ),
+      )
+      expect(sent.model).toBe("claude-haiku-5-5")
+      expect(sent.messages).toHaveLength(7)
+      expect(sent.messages[3]?.content[0]).toMatchObject({ type: "tool_use", name: "get_weather" })
+      expect(sent.messages[4]?.content[0]).toMatchObject({ type: "tool_result", tool_use_id: "call_weather_1" })
+      expect(sent.tools[1].input_schema).toMatchObject({
+        type: "object",
+        properties: mcpSchema.properties,
+        additionalProperties: false,
+      })
+      expect(sent.tools[1].input_schema).not.toHaveProperty("anyOf")
+      expect(response.text).toBe("Recovered.")
+    }),
+  )
+
   it.effect("prepares Anthropic Messages target", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare(request)

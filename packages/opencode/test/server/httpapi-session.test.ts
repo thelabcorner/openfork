@@ -1139,7 +1139,7 @@ describe("session HttpApi", () => {
         expect(yield* responseJson(blocked)).toMatchObject({
           _tag: "InvalidRequestError",
           kind: "child",
-          message: "This worker's model selection is managed by its owning controller and cannot be switched here.",
+          message: "This child session does not allow interactive model switching.",
         })
       }),
     { git: true, config: { formatter: false, lsp: false } },
@@ -2401,6 +2401,124 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "legacy persisted auto-routing worker remains human-promptable, stoppable, pausable and resumable",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const svc = yield* Session.Service
+        // Reproduce a genuine pre-migration Session row, not the canonicalized
+        // metadata constructor. This is the shape seen in ses_e9ff237b5ffeBiw10zHEVFvqZh.
+        const metadata = {
+          workerDelegation: {
+            producer: "oxp",
+            principalRef: "oxp:legacy-principal",
+            invocationRef: "oxp-inv:legacy-invocation",
+            rootRef: "legacy-root",
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model", routeIntent: { kind: "auto" } },
+            nestedDelegation: false,
+          },
+        }
+        const chat = yield* createSession({
+          title: "Legacy adaptive worker",
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), id: ModelV2.ID.make("test-model") },
+          metadata,
+        })
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const prompted = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: chat.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ parts: [{ type: "text", text: "human poke" }], noReply: true }),
+        })
+        expect(prompted.status).toBe(204)
+        const messages = yield* svc.messages({ sessionID: chat.id })
+        expect(messages.some((message) => message.info.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === "human poke"))).toBe(true)
+        const pause = yield* request(pathFor(SessionPaths.pause, { sessionID: chat.id }), {
+          method: "POST", headers,
+        })
+        expect(pause.status).toBe(204)
+        expect((yield* svc.get(chat.id)).pausedAt).toBeDefined()
+        const resume = yield* request(pathFor(SessionPaths.resume, { sessionID: chat.id }), {
+          method: "POST", headers,
+        })
+        expect(resume.status).toBe(204)
+        const stop = yield* request(pathFor(SessionPaths.abort, { sessionID: chat.id }), {
+          method: "POST", headers,
+        })
+        expect(stop.status).toBe(200)
+        expect(yield* responseJson(stop)).toBe(true)
+        const beforeOverride = yield* svc.get(chat.id)
+        expect(beforeOverride.agent).toBe("build")
+        expect(String(beforeOverride.model?.providerID)).toBe("test")
+        expect(String(beforeOverride.model?.id)).toBe("test-model")
+        expect(SessionMetadataOwnership.isHumanControllableWorker(beforeOverride.metadata)).toBe(true)
+        const override = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: chat.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            parts: [{ type: "text", text: "use the user's chosen agent for this turn" }],
+            agent: "plan",
+            noReply: true,
+          }),
+        })
+        expect(override.status).toBe(204)
+        const updatedMessages = yield* svc.messages({ sessionID: chat.id })
+        expect(updatedMessages.some((message) => message.info.role === "user" &&
+          message.info.agent === "plan" &&
+          message.parts.some((part) => part.type === "text" && part.text === "use the user's chosen agent for this turn"))).toBe(true)
+        const after = yield* svc.get(chat.id)
+        expect(after.agent).toBe("build")
+        expect(after.metadata).toEqual(metadata)
+        const modelSwitch = yield* request(pathFor(SessionPaths.switchModel, { sessionID: chat.id }), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            assistantMessageID: MessageID.ascending(),
+            requestSentAt: Date.now(),
+            providerID: "missing-provider",
+            modelID: "missing-model",
+          }),
+        })
+        // Must reach model validation, not reject the human because a controller
+        // owns the Session's default selection. A real live attempt has a
+        // separate exact-generation switch fence.
+        expect(modelSwitch.status).toBe(400)
+        expect(yield* responseJson(modelSwitch)).toMatchObject({
+          _tag: "InvalidRequestError", kind: "model", field: "modelID",
+        })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
+  )
+
+  it.instance(
+    "human Stop overrides a producer's session ownership without rewriting its metadata",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const svc = yield* Session.Service
+        const cases = [
+          { specialAgent: "goal_auditor", specialAgentOwnerKind: "goal", specialAgentOwnerID: "goal_test" },
+          { scheduledTaskID: "stk_operator_stop", scheduledTaskRunID: "str_operator_stop" },
+        ]
+        for (const metadata of cases) {
+          const chat = yield* createSession({ title: "Human controlled producer session", metadata })
+          const stopped = yield* request(pathFor(SessionPaths.abort, { sessionID: chat.id }), {
+            method: "POST",
+            headers: { "x-opencode-directory": test.directory },
+          })
+          expect(stopped.status).toBe(200)
+          expect(yield* responseJson(stopped)).toBe(true)
+          expect((yield* svc.get(chat.id)).metadata).toEqual(metadata)
+        }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    30_000,
+  )
+
+  it.instance(
     "human Stop/Pause/Resume reach root and nested delegated workers without granting aggregate mutation",
     () =>
       Effect.gen(function* () {
@@ -2662,7 +2780,7 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
-    "rejects delegated selection/permission overrides and malformed origins before acknowledgement or persistence",
+    "allows human per-turn worker selection overrides while rejecting permission mutations and malformed origins",
     () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
@@ -2684,12 +2802,7 @@ describe("session HttpApi", () => {
           metadata: SessionMetadataOwnership.delegatedWorker(origin),
         })
         for (const override of [
-          { model: { providerID: "other", modelID: "other" } },
-          { model: { providerID: "test", modelID: "test-model", accountID: "other" } },
-          { variant: "max" },
           { tools: { shell: true } },
-          { subProvider: "other" },
-          { agent: "plan" },
         ]) {
           const response = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: chat.id }), {
             method: "POST",
@@ -2700,10 +2813,28 @@ describe("session HttpApi", () => {
           expect(yield* response.json).toMatchObject({
             _tag: "InvalidRequestError",
             kind: "delegated_worker",
-            message: expect.stringContaining("assigned"),
+            message: expect.stringContaining("permission override"),
           })
           expect(yield* svc.messages({ sessionID: chat.id })).toHaveLength(0)
           expect((yield* svc.get(chat.id)).metadata).toEqual(chat.metadata)
+        }
+        for (const [index, override] of [
+          { model: { providerID: "other", modelID: "other" } },
+          { model: { providerID: "test", modelID: "test-model", accountID: "other" } },
+          { variant: "max" },
+          { subProvider: "other" },
+          { agent: "plan" },
+        ].entries()) {
+          const response = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: chat.id }), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ noReply: true, parts: [{ type: "text", text: "human selection" }], ...override }),
+          })
+          expect(response.status).toBe(204)
+          expect(yield* svc.messages({ sessionID: chat.id })).toHaveLength(index + 1)
+          const stored = yield* svc.get(chat.id)
+          expect(stored.agent).toBe("build")
+          expect(stored.metadata).toEqual(chat.metadata)
         }
         const malformed = yield* createSession({ metadata: { workerDelegation: { producer: "oxp" } } })
         const response = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: malformed.id }), {
@@ -2720,7 +2851,7 @@ describe("session HttpApi", () => {
           body: JSON.stringify({ noReply: true, parts: [{ type: "text", text: "synchronous follow-up" }] }),
         })
         expect(admitted.status).toBe(200)
-        expect(yield* svc.messages({ sessionID: chat.id })).toHaveLength(1)
+        expect(yield* svc.messages({ sessionID: chat.id })).toHaveLength(6)
       }),
     { git: true, config: { formatter: false, lsp: false } },
     { timeout: 30000 },

@@ -132,7 +132,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
                 kind: error.kind,
                 message:
                   error.kind === "delegated_worker"
-                    ? "This worker accepts follow-up messages using its assigned agent, model, account and variant. Its configuration must be changed by its owning controller."
+                    ? "This worker's delegation record is invalid or conflicted. The follow-up was not admitted; refresh its state before retrying."
                     : `This ${error.kind} session does not accept interactive prompts.`,
               }),
           ),
@@ -477,7 +477,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
                 kind: error instanceof SessionPrompt.HostOwnedSessionError ? error.kind : "admission",
                 message:
                   error instanceof SessionPrompt.HostOwnedSessionError
-                    ? "Follow-up messages must use this worker's assigned agent, model, account and variant; permission overrides are not allowed."
+                     ? "The worker's delegation changed, is invalid, or this prompt attempted a protected permission override. No follow-up was queued."
                     : error instanceof Error
                       ? error.message
                       : "Unable to admit this prompt.",
@@ -508,19 +508,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof ModelSwitchPayload.Type
     }) {
-      // Scheduled-run roots are conversationally promptable despite
-      // producer-owned metadata. Child/delegated/special-agent model selection
-      // belongs to their controller. Match SessionPrompt.switchModel's fence.
+      // Native human supervision can switch an exact in-flight provider attempt
+      // on a delegated worker, without rewriting the controller-owned default
+      // agent/model/account or immutable delegation metadata. Child transcripts
+      // and special-agent internals retain their separate conversational fence.
       yield* requireSession(ctx.params.sessionID)
-      yield* promptSvc.assertUserPromptable(ctx.params.sessionID).pipe(
+      yield* promptSvc.assertInteractiveUserPromptable(ctx.params.sessionID).pipe(
         Effect.mapError(
           (error) =>
             new InvalidRequestError({
               kind: error.kind,
-              message:
-                error.kind === "child" || error.kind === "delegated_worker"
-                  ? "This worker's model selection is managed by its owning controller and cannot be switched here."
-                  : `This ${error.kind} session does not allow interactive model switching.`,
+              message: `This ${error.kind} session does not allow interactive model switching.`,
             }),
         ),
       )
@@ -606,6 +604,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
               ) {
                 yield* Effect.logInfo("prompt_async wake coalesced with existing Session owner", {
                   sessionID: ctx.params.sessionID,
+                })
+                return
+              }
+              // SessionPrompt already published a concise Session.Error when
+              // route resolution failed. Do not publish a second UnknownError
+              // containing Cause.pretty's stack trace for that same failure.
+              // Other wake failures retain the existing diagnostic path.
+              if (error instanceof Provider.RouteResolutionError) {
+                yield* Effect.logWarning("prompt_async provider route unavailable", {
+                  sessionID: ctx.params.sessionID,
+                  error: error.message,
                 })
                 return
               }

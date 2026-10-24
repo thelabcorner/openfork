@@ -495,7 +495,7 @@ export const eagerDict = {
   "dialog.model.account.remaining": "{{account}} · {{percent}}% remaining",
   "dialog.model.account.pinUnavailable": "Account could not be pinned",
   "dialog.model.account.pinUnavailableDescription":
-    "This account is not available for the selected model. Your previous model and routing selection were kept.",
+    "The selected account is missing from the current account roster or provider catalog. Your previous routing selection was kept.",
 
   "dialog.titlePrompt.title": "Title generation policy",
   "dialog.titlePrompt.description":

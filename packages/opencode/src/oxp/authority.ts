@@ -85,6 +85,7 @@ export function classify(plane: OxpSchema.Plane, operation: string): OxpSchema.A
     return "read"
   }
   if (operation === "capability.list" || operation === "capability.describe") return "catalog"
+  if (operation === "usage.global") return "globalUsageAnalytics"
   if (operation === "code" || operation.startsWith("code.")) return "code"
   if (operation === "write" || operation === "edit" || operation === "patch" || operation === "memory.write" || operation === "sqlite.write" || operation === "refactor.write" || operation === "json.write" || operation === "archive.write") return "write"
   if (operation === "git" || operation.startsWith("git.")) return "git"
@@ -119,14 +120,16 @@ function grantAllows(grant: OxpSchema.Grant, authority: OxpSchema.AuthorityClass
       return grant.code ?? false
     case "automation":
       return grant.automation === true
+    case "globalUsageAnalytics":
+      return grant.globalUsageAnalytics === true
     case "filesSend":
       return grant.filesSend && grant.read
     case "filesReceive":
       return grant.filesReceive && grant.write
     case "sessionSupervision":
-      return grant.sessionSupervision === "approved-roots"
+      return grant.sessionSupervision !== "none"
     case "requestSupervision":
-      return grant.sessionSupervision === "approved-roots" && grant.requestSupervision
+      return grant.sessionSupervision !== "none" && grant.requestSupervision
     case "delegation":
       return grant.delegation === "spawn"
     case "nestedDelegation":
@@ -134,8 +137,10 @@ function grantAllows(grant: OxpSchema.Grant, authority: OxpSchema.AuthorityClass
   }
 }
 
-function requiresRoot(plane: OxpSchema.Plane, operation: string, authority: OxpSchema.AuthorityClass) {
-  if (plane === "supervision") return true
+function requiresRoot(plane: OxpSchema.Plane, operation: string, authority: OxpSchema.AuthorityClass, grant: OxpSchema.Grant) {
+  // Native Session identity can be explicitly supervised without a filesystem
+  // root. Workspace commands and explicit path/root filters remain root-bound.
+  if (plane === "supervision") return grant.sessionSupervision !== "all-native"
   if (plane === "delegation") {
     // Delegation is always workspace-bound. Model/agent choice is a runtime
     // selection preference, not connector-level authority.
@@ -143,6 +148,7 @@ function requiresRoot(plane: OxpSchema.Plane, operation: string, authority: OxpS
   }
   if (authority === "integrations" || authority === "browser" || authority === "code") return false
   if (operation === "capability.list" || operation === "capability.describe" || operation.startsWith("info.")) return false
+  if (operation === "usage.global") return false
   if (operation === "runtime" || operation.startsWith("runtime.")) return false
   return true
 }
@@ -176,7 +182,7 @@ const layer = Layer.effect(
         root = yield* roots.resolvePath(request.path, { rootID: request.rootID, allowMissing: request.allowMissing })
       } else if (request.rootID) {
         root = yield* roots.resolveRoot(request.rootID)
-      } else if (requiresRoot(request.plane, request.operation, authority)) {
+      } else if (requiresRoot(request.plane, request.operation, authority, current.grant)) {
         return yield* new OxpError.RootRequired({ detail: "This OXP operation requires an explicit approved root or path" })
       }
 

@@ -133,6 +133,45 @@ function createGoal(overrides: Partial<GoalV2.CreateInput> = {}) {
 }
 
 describe("Goal", () => {
+  it.effect("submits objective-only Goals without model-authored titles or criterion IDs", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const agent = yield* GoalAgent.Service
+      const first = yield* agent.submit(
+        sessionA,
+        { objective: "  Ship the stable renderer  " },
+        { userMessageID: "msg_objective_only", userText: "Create a Goal for the stable renderer." },
+      )
+      expect(first.goal.goal.objective).toBe("Ship the stable renderer")
+      expect(first.goal.goal.status).toBe("active")
+
+      const replay = yield* agent.submit(
+        sessionA,
+        { objective: "Ship the stable renderer" },
+        { userMessageID: "msg_objective_retry", userText: "Continue." },
+      )
+      expect(replay.goal.goal.id).toBe(first.goal.goal.id)
+
+      const unauthorized = yield* agent
+        .submit(
+          sessionA,
+          { objective: "Quietly replace the objective" },
+          { userMessageID: "msg_not_update", userText: "Continue working." },
+        )
+        .pipe(Effect.exit)
+      expect(unauthorized._tag).toBe("Failure")
+
+      const updated = yield* agent.submit(
+        sessionA,
+        { objective: "Ship the stable renderer with verified browser parity" },
+        { userMessageID: "msg_objective_update", userText: "Update this Goal to include browser parity." },
+      )
+      expect(updated.action).toBe("update")
+      expect(updated.goal.goal.id).toBe(first.goal.goal.id)
+      expect(updated.goal.goal.objective).toBe("Ship the stable renderer with verified browser parity")
+    }),
+  )
+
   it.effect("lets the agent create, focus, and start a Goal only from an authorized user turn", () =>
     Effect.gen(function* () {
       yield* setup
@@ -205,9 +244,7 @@ describe("Goal", () => {
 
       expect(created.goal.goal.status).toBe("active")
       expect(created.goal.goal.objective).toBe("Stabilize the renderer")
-      expect(created.goal.criteria.map((criterion) => criterion.description)).toEqual([
-        "The complete Goal objective has been achieved and independently verified.",
-      ])
+      expect(created.goal.criteria).toEqual([])
       expect((yield* goals.audit(created.goal.goal.id)).find((item) => item.type === "created")?.payload.sourceMessageID)
         .toBe("msg_natural_goal")
     }),
@@ -546,18 +583,65 @@ describe("Goal", () => {
     }),
   )
 
-  it.effect("requires acceptance criteria before start and preserves the draft on rejection", () =>
+  it.effect("starts a Goal with no acceptance criteria", () =>
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
       const created = yield* createGoal({ criteria: [] })
-      const error = yield* goals
-        .transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
-        .pipe(Effect.flip)
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      expect(active.goal.status).toBe("active")
+      expect(active.criteria).toEqual([])
+      expect((yield* goals.get(created.goal.id)).goal).toMatchObject({ status: "active", revision: 1 })
+      expect(yield* goals.audit(created.goal.id)).toHaveLength(2)
+    }),
+  )
 
-      expect(error._tag).toBe("Goal.ValidationError")
-      expect((yield* goals.get(created.goal.id)).goal).toMatchObject({ status: "draft", revision: 0 })
-      expect(yield* goals.audit(created.goal.id)).toHaveLength(1)
+  it.effect("independently completes objective-only Goals without criterion IDs", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const created = yield* createGoal({ criteria: [] })
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      const reviewed = yield* goals.reconcileAuditorVerdict({
+        goalID: active.goal.id,
+        expectedRevision: active.goal.revision,
+        verdict: {
+          decision: "complete",
+          rationale: "The complete objective has independent evidence from host-observed execution.",
+          progressMade: true,
+        },
+      })
+      expect(reviewed.completed).toBe(true)
+      expect(reviewed.detail.goal.status).toBe("completed")
+      expect(reviewed.detail.criteria).toEqual([])
+      expect((yield* goals.audit(active.goal.id)).find((entry) => entry.type === "audited")?.actor).toBe("auditor")
+    }),
+  )
+
+  it.effect("completes legacy Goals without fabricating criterion passes or IDs", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const created = yield* createGoal()
+      expect(created.criteria).toHaveLength(2)
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      const reviewed = yield* goals.reconcileAuditorVerdict({
+        goalID: active.goal.id,
+        expectedRevision: active.goal.revision,
+        verdict: {
+          decision: "complete",
+          rationale: "Host-verified completed objective.",
+          progressMade: true,
+        },
+      })
+      expect(reviewed.completed).toBe(true)
+      expect(reviewed.detail.goal.status).toBe("completed")
+      expect(reviewed.detail.criteria.map((criterion) => criterion.status)).toEqual(["pending", "pending"])
+      expect(yield* goals.evidence(created.goal.id)).toHaveLength(0)
+      const audit = yield* goals.audit(created.goal.id)
+      const verdict = audit.find((entry) => entry.type === "audited")
+      expect(verdict?.payload).toMatchObject({ decision: "complete", rationale: "Host-verified completed objective." })
+      expect(verdict?.payload.criteria).toBeUndefined()
     }),
   )
 

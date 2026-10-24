@@ -6,9 +6,13 @@ export const isHostedAccountProvider = (providerID: string) => providerID === "o
 
 const HOSTED_ROUTING_STRATEGIES = ["adaptive", "round-robin"] as const satisfies readonly Strategy[]
 
-/** Hosted routing strategies are independent of catalog variants and account-roster readiness. */
-export const hostedAccountRoutingStrategies = (providerID: string, supportsRouteIntent: boolean) =>
-  isHostedAccountProvider(providerID) && supportsRouteIntent ? HOSTED_ROUTING_STRATEGIES : undefined
+/**
+ * Routing strategies only choose among live accounts. With zero or one
+ * account/key there is nothing to route across, so offering them is a no-op.
+ * Uses the live roster count, never catalog variants.
+ */
+export const hostedAccountRoutingStrategies = (providerID: string, supportsRouteIntent: boolean, accountCount: number) =>
+  isHostedAccountProvider(providerID) && supportsRouteIntent && accountCount > 1 ? HOSTED_ROUTING_STRATEGIES : undefined
 
 /**
  * Hosted Zen/Go routing choices are session intent, never a model identity.
@@ -18,7 +22,7 @@ export const hostedAccountRoutingStrategies = (providerID: string, supportsRoute
  * remain selectable via real model IDs even in model-only fields.
  */
 export const showAccountSubmenu = (providerID: string, accountCount: number, supportsRouteIntent = true) =>
-  isHostedAccountProvider(providerID) ? supportsRouteIntent : accountCount > 1
+  isHostedAccountProvider(providerID) ? supportsRouteIntent : providerID === "workbuddy" ? accountCount > 0 : accountCount > 1
 
 /** O(accounts) once per quota update; account-list rows use the O(1) revision. */
 export function hostedAccountRosterRevision(accounts: ReadonlyMap<string, { label: string }>) {

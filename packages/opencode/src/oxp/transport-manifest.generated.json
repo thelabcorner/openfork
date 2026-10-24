@@ -1,7 +1,7 @@
 {
   "generator": "oxp-transport-manifest-v1",
   "majorVersion": 0,
-  "fingerprint": "b9fefeb3b8223adb4902adf831071f4a6d839e3d1a419cfef66c7326fb68956d",
+  "fingerprint": "8ca6d5c5bedcf783c55728097f5402ef5dcf6c82610ba72a8649a4514c67bf92",
   "instructions": "OXP serves the current ChatGPT/OpenAI agent; no backing OpenFork Session; no implicit ChatGPT workspace. Roots bound authority.\nFirst call openfork_info(action=status, sessionTitle=this conversation's title). Prefer direct tools for work; for brokered tools use capability.list to discover, capability.describe to obtain the exact schema/contract, then capability.call with that contract. Discovery never grants authority. Never blindly retry a write with an unknown commit outcome.\nDelegation uses explicit valid caller selections, otherwise user-configured OXP defaults; missing required defaults fail closed. Defaults are preferences, not allowlists.\nDefault model/agent changes require explicit user request; never change them autonomously.\nFile mutations: write creates/replaces whole files; edit handles surgical changes; compatible create/missing-file shapes self-heal through atomic write semantics; patch handles verified multi-file changes. process remains general-purpose.\nUse openfork_worker model_catalog for provider/model/variant discovery and agent_catalog for agents. If the direct worker schema is stale, capability describe/call the live contract.\nOn the first openfork_info action=status, pass sessionTitle set to this conversation's own title (not the repo or root). Status re-checks it on later calls; a different value updates the session title.\nDelegated worker wait/result may return blocked with native request IDs. Resolve each blocker via openfork_request using blockedBy[].sessionID, then wait again. externalDirectory=true is reject-only. Without request supervision, preserve/report the block; never auto-answer or restart it.\nDo not infer worker staleness from quiet messages, unchanged updatedAt, or elapsed time; native permission/question Deferreds can pause workers. Use wait/result before replacing or cancelling.\nUpstream may reject model-authored authentication before OXP receives it. For OpenAI Files call openai_files directly; OXP owns the OpenAI connection. Never read secrets or build auth in process.\nCode Mode is brokered: capability describe code, then capability call code with action search/describe/run. Every generated leaf retains its own authority.\nParent 25m; delegate. capability.list lazy; openfork_info capabilities complete. OXP_INTERNAL errors include incident IDs; query openfork_diagnostics by incidentID if openfork_info fails.",
   "tools": [
     {
@@ -2897,6 +2897,29 @@
               }
             ]
           },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "roots": {
             "anyOf": [
               {
@@ -3208,6 +3231,65 @@
           "ProviderRouteIntent": {
             "anyOf": [
               {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "strategy"
+                        ]
+                      },
+                      "strategy": {
+                        "$ref": "#/$defs/ProviderRouteIntent.Strategy"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "public"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "account"
+                        ]
+                      },
+                      "accountID": {
+                        "$ref": "#/$defs/ProviderRouteIntent.AccountID"
+                      },
+                      "pin": {
+                        "$ref": "#/$defs/ProviderRouteIntent.Pin"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "accountID"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              {
                 "type": "object",
                 "properties": {
                   "kind": {
@@ -3222,43 +3304,6 @@
                 },
                 "required": [
                   "kind"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string",
-                    "enum": [
-                      "public"
-                    ]
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string",
-                    "enum": [
-                      "account"
-                    ]
-                  },
-                  "accountID": {
-                    "$ref": "#/$defs/ProviderRouteIntent.AccountID"
-                  },
-                  "pin": {
-                    "$ref": "#/$defs/ProviderRouteIntent.Pin"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "accountID"
                 ],
                 "additionalProperties": false
               }
@@ -4063,6 +4108,65 @@
           "ProviderRouteIntent": {
             "anyOf": [
               {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "strategy"
+                        ]
+                      },
+                      "strategy": {
+                        "$ref": "#/$defs/ProviderRouteIntent.Strategy"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "public"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "account"
+                        ]
+                      },
+                      "accountID": {
+                        "$ref": "#/$defs/ProviderRouteIntent.AccountID"
+                      },
+                      "pin": {
+                        "$ref": "#/$defs/ProviderRouteIntent.Pin"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "accountID"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              {
                 "type": "object",
                 "properties": {
                   "kind": {
@@ -4077,43 +4181,6 @@
                 },
                 "required": [
                   "kind"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string",
-                    "enum": [
-                      "public"
-                    ]
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "kind": {
-                    "type": "string",
-                    "enum": [
-                      "account"
-                    ]
-                  },
-                  "accountID": {
-                    "$ref": "#/$defs/ProviderRouteIntent.AccountID"
-                  },
-                  "pin": {
-                    "$ref": "#/$defs/ProviderRouteIntent.Pin"
-                  }
-                },
-                "required": [
-                  "kind",
-                  "accountID"
                 ],
                 "additionalProperties": false
               }

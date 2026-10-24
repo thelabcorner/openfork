@@ -1,5 +1,8 @@
 # OpenFork plan — port upstream OpenCode account authentication
 
+> **Historical architecture ledger.** Account-routing terminology in this proposal has been superseded: the only hosted strategies are **Adaptive** and **Round Robin**, with an independent explicit account pin. The authoritative live contract is [model-picker account routing](../architecture/model-picker-account-routing.md).
+
+
 Status: **canonical implementation plan; planning only**
 
 Date: **2026-09-25**
@@ -516,9 +519,9 @@ Initial policy:
 - keep the existing 5-minute discovery TTL as the fresh window;
 - use a bounded automatic stale grace (proposed initial value: 6 hours) so transient
   `/models` outages do not erase the free catalog;
-- `fresh` and `stale` may participate in Auto routing; stale always triggers
+- `fresh` and `stale` may participate in account-strategy routing; stale always triggers
   single-flight background revalidation;
-- `expired` is excluded from **Auto** public routing, but remains visible as stale history;
+- `expired` is excluded from **Adaptive/Round Robin** public routing, but remains visible as stale history;
 - an explicit **Public free** selection against `expired` may force one revalidation and,
   if the catalog service itself remains unavailable, may make one last-known-good public
   attempt because no paid credential can be charged. Failure is surfaced as a typed
@@ -1275,9 +1278,9 @@ Resolution order for OpenCode generation:
 2. explicit public pin -> `opencode:public` only if the model is independently public
    eligible; otherwise fail closed;
 3. existing healthy account binding -> preserve its account for session affinity;
-4. Auto on an existing Public binding -> try eligible subscription accounts first, then
+4. Adaptive/Round Robin on an existing Public binding -> try eligible subscription accounts first, then
    retain Public if none qualify;
-5. for an unbound Auto Session, choose an eligible subscription account, otherwise use
+5. for an unbound Adaptive/Round Robin Session, choose an eligible subscription account, otherwise use
    Public only when the model is currently public-eligible. Adaptive uses complete fresh
    quota-reset data to rank accounts and falls back to round-robin when that data is
    incomplete; Round-robin always uses the durable cursor without quota scoring;
@@ -1292,17 +1295,17 @@ policy; it does not change the upstream wire contract.
 Be precise about upstream parity: the current Core OpenCode provider plugin uses the
 `"public"` sentinel only when it sees no configured key/active connection, and in that
 anonymous state disables models with positive input cost. OpenFork's decision to prefer
-eligible subscriptions for Auto while preserving explicit Public selection is a
+eligible subscriptions for Adaptive/Round Robin while preserving explicit Public selection is a
 fork-owned routing/UX policy. The wire route itself remains the same upstream public
 contract; we are not claiming upstream makes the same local selection choice.
 
 Session routing remains stable while preserving the selected policy:
 
 - a healthy account binding remains sticky when the user changes routing policy;
-- an Auto-bound Public session may move to a newly eligible account; explicit Public stays
+- an strategy-bound Public session may move to a newly eligible account; explicit Public stays
   Public;
 - explicit account pins remain strongest and fail closed;
-- an ineligible Auto account can fail over to another eligible account, then Public only
+- an ineligible Adaptive/Round Robin account can fail over to another eligible account, then Public only
   when the model is currently public-eligible;
 - explicit Public never hops to an account because of quota, cooldown, or admission
   failures; and
@@ -1323,7 +1326,7 @@ type ProviderRoutingConfig = {
 }
 
 // effective hosted OpenCode model-picker default:
-// Auto/Adaptive prefers eligible subscriptions and uses Public only as fallback.
+// Adaptive prefers eligible subscriptions and uses Public only as fallback.
 // providers without a validated public lane ignore this setting.
 ~~~
 
@@ -1724,7 +1727,7 @@ Current ingress contracts are account-centric:
 - `ScheduledTask.Action.model` is `Model.Ref`, which likewise has only optional accountID;
 - delegated-worker/subagent policy equality compares provider/model/account/variant.
 
-That means `accountID === undefined` cannot distinguish **Auto** from **explicit Public**.
+That means `accountID === undefined` cannot distinguish **Adaptive/Round Robin** from **explicit Public**.
 Fix this without turning route state into model identity.
 
 Add one safe reusable public schema, conceptually:
@@ -1743,7 +1746,7 @@ legacy accountID present + no routeIntent
   -> routeIntent = account(accountID, hard)
 
 legacy accountID absent + no routeIntent
-  -> routeIntent = auto
+  -> routeIntent = strategy(Adaptive)
 
 routeIntent=public
   -> accountID MUST be absent
@@ -1751,7 +1754,7 @@ routeIntent=public
 routeIntent=account(A)
   -> any legacy accountID MUST be absent or exactly A
 
-routeIntent=auto
+routeIntent=strategy(Adaptive)
   -> accountID MUST be absent
 ~~~
 
@@ -1766,12 +1769,12 @@ Recommended surface evolution:
 - update `OxpModelSelection.normalize/materialize/fromProviderModel` so public remains
   first-class and can no longer collapse to `automatic`; providerModelID lowering happens
   only after route resolution, not by inventing a suffix for public;
-- extend `ScheduledTask.Action` with optional `routeIntent`; old tasks derive account/auto
+- extend `ScheduledTask.Action` with optional `routeIntent`; old tasks derive account/strategy
   semantics from `model.accountID` exactly as above;
 - Session control `set_selection` accepts model + route intent as one transactional
   user action when both change;
 - OXP/session inspection returns the **effective explicit intent** where one exists plus
-  the current safe bound-route projection separately. Do not pretend Auto and current
+  the current safe bound-route projection separately. Do not pretend Adaptive/Round Robin and current
   binding are the same thing.
 
 #### Scheduled-task semantics
@@ -1780,13 +1783,13 @@ For a scheduled run:
 
 - `SessionPolicy=new` -> apply the task's persisted route intent before first dispatch;
 - `reuse/auto/existing` with no explicit task route intent -> preserve the reused
-  Session's healthy durable route binding; do not recompute Auto merely because a run
+  Session's healthy durable route binding; do not recompute Adaptive/Round Robin merely because a run
   started;
 - an explicit task `public` or `account` intent against a reused Session is a deliberate
   rebind request and must pass the normal authority/model-eligibility/CAS checks before
   any prompt is sent;
 - if the rebind cannot be satisfied, fail the run with a typed route error; do not
-  silently fall back to Auto;
+  silently fall back to Adaptive/Round Robin;
 - editing global routing defaults does not rewrite persisted tasks or existing Session
   bindings.
 
@@ -1817,7 +1820,7 @@ In ProviderConnection.selectMethod():
 
 Do not synthesize a directory.
 
-### 10.3 Auto/device mode
+### 10.3 Adaptive/Round Robin/device mode
 
 Reuse existing OAuthAutoView:
 
@@ -1865,7 +1868,7 @@ Split the safe projection conceptually:
 ~~~ts
 type ProviderAvailability = {
   connected: boolean          // user has credential/config auth state
-  publicAvailable: boolean    // derived: at least one Auto-eligible public model
+  publicAvailable: boolean    // derived: at least one eligible public model
   publicCatalogState?: "fresh" | "stale" | "expired" | "unavailable"
   publicCatalogFetchedAt?: number
   publicModels?: Array<{
@@ -1881,7 +1884,7 @@ For OpenCode:
   `publicAvailable=true`;
 - OAuth/key configured => `connected=true`; public availability remains independently
   observable;
-- expired-only snapshots => `publicAvailable=false` for Auto while retaining stale model
+- expired-only snapshots => `publicAvailable=false` for Adaptive/Round Robin while retaining stale model
   history for explicit Public-free revalidation;
 - model-list/model-picker APIs must include trusted public models even when
   `connected=false`, with freshness/drift state sufficient to explain disabled/manual
@@ -1892,7 +1895,7 @@ For OpenCode:
 
 At model/route selection, OpenCode may expose:
 
-- **Auto** — use the configured provider route policy;
+- **Adaptive/Round Robin** — use the configured provider route policy;
 - **Public free** — explicit public route; enabled only for a currently public-eligible
   model;
 - real account rows — explicit account pin.
@@ -1902,14 +1905,14 @@ Provider routing settings should expose:
 - account routing mode: `concentrate` / `session-round-robin` / `round-robin`;
 - free-route preference: `account-first` / `public-first-for-free`.
 
-For hosted OpenCode models, the model picker calls the former `Auto` choice **Adaptive**.
+For hosted OpenCode models, the model picker calls the former `Adaptive/Round Robin` choice **Adaptive**.
 Adaptive prefers eligible subscription accounts, uses reset-time quota urgency when every
 eligible account has comparable current quota-window data, and otherwise rotates evenly.
 Public is the fallback when no subscription account is eligible. **Round-robin** skips quota
-scoring and rotates evenly through eligible accounts. Healthy account bindings remain sticky; an Auto
+scoring and rotates evenly through eligible accounts. Healthy account bindings remain sticky; an Adaptive/Round Robin
 session bound to Public can move to an eligible subscription account when the next request
 uses Adaptive or Round-robin, and an unavailable account can fall back to Public when that
-route is eligible. Explicit account pins remain fail-closed until the user selects Auto.
+route is eligible. Explicit account pins remain fail-closed until the user selects Adaptive/Round Robin.
 
 UI state must distinguish:
 
@@ -2055,11 +2058,11 @@ Cut it over deliberately.
 - if System One is invoked **from a durable Session execution**, pass the parent's
   ProviderRouteLease internally and validate the System One model against that route;
 - if it is a standalone semantic inference with no durable Session, resolve the explicit/
-  Auto route once for that call and compile it directly into transport; do **not** create
+  Adaptive/Round Robin route once for that call and compile it directly into transport; do **not** create
   a fake Session row merely for routing;
 - standalone `routeIntent=public` uses the public sentinel even if accounts exist;
 - standalone `routeIntent=account(A)` resolves exact A or fails closed;
-- standalone Auto applies the provider routing policy to that call. Do not promise durable
+- standalone Adaptive/Round Robin applies the provider routing policy to that call. Do not promise durable
   account affinity across separate standalone calls unless a separate semantic-route
   binding contract is deliberately introduced later;
 - existing `affinityID` remains a caller-owned **remote/cache/session-token affinity**
@@ -2297,7 +2300,7 @@ Fix **route** propagation before broadening the new auth path:
 
 - every explicit account route must resolve the same provider account or fail closed;
 - every explicit public route must remain public or fail with a typed public eligibility/
-  admission error; it must not degrade to Auto merely because accountID is absent;
+  admission error; it must not degrade to Adaptive/Round Robin merely because accountID is absent;
 - Goal Auditor, Session Title candidate selection, SPAD model selection, Prompt Revisor,
   OXP, scheduled tasks, swarms, delegated workers, subagents, and ordinary Sessions must
   feed the same route resolver/lease boundary;
@@ -2311,7 +2314,7 @@ Route inheritance follows **execution lineage**, not optional account fields:
 1. **same Session / maintenance call** (Title, SPAD, Prompt Revisor, Goal Auditor,
    compaction where it uses the same selected model policy): acquire/receive the parent
    Session's current ProviderRouteLease and validate that route against the chosen model;
-   do not call Auto independently;
+   do not call Adaptive/Round Robin independently;
 2. **child/delegated Session with inherited model policy**: create the child route binding
    transactionally from the parent/authorized route intent before its first provider
    dispatch. Public parent -> public child; account parent A -> account child A;
@@ -2320,7 +2323,7 @@ Route inheritance follows **execution lineage**, not optional account fields:
    or active/default;
 4. **child model differs but route intent is inherited**: keep the inherited route kind
    only if that route can serve the new model. Otherwise fail with typed route/model
-   incompatibility unless the delegation policy explicitly authorizes a new Auto
+   incompatibility unless the delegation policy explicitly authorizes a new Adaptive/Round Robin
    resolution;
 5. **resumed child**: its own durable route binding wins. Parent routing/default changes
    do not rewrite it;
@@ -2330,7 +2333,7 @@ Route inheritance follows **execution lineage**, not optional account fields:
 
 Current delegated/subagent model-policy equality is provider/model/account/variant only.
 Extend the policy comparison so explicit `public` and `auto` are not considered equal
-merely because both have no accountID. A resumed public worker must not pass an Auto policy
+merely because both have no accountID. A resumed public worker must not pass an Adaptive/Round Robin policy
 check and then bind to a newly available account.
 
 For maintenance request classes that the upstream free service demonstrably does not
@@ -2996,7 +2999,7 @@ Likely touch/create:
 
 Goal:
 
-- external/user-owned surfaces can express Auto, Public, or a safe stable accountID
+- external/user-owned surfaces can express Adaptive/Round Robin, Public, or a safe stable accountID
   without exposing credential handles;
 - public and automatic survive normalization, persistence, delegation, scheduling, and
   inspection as distinct intents.
@@ -3326,7 +3329,7 @@ Tasks:
 - cut P5A production generation paths away from `resolveZenRequest()` as a routing
   authority; legacy resolver may remain only behind explicitly transitional callers;
 - cut System One over to the shared route-intent/lease model: Session-owned calls inherit
-  a lease; standalone calls resolve one explicit/Auto route per inference without
+  a lease; standalone calls resolve one explicit/Adaptive/Round Robin route per inference without
   fabricating a Session, and `affinityID` remains non-authoritative for route choice;
 - bind Console OAuth credentials into the secret-free candidate projection using the
   account-specific capability snapshots from §7.7;
@@ -3449,7 +3452,7 @@ Tasks:
   policy, scheduled-task actions, swarms/delegation, and trusted Session creation;
 - propagate accountID only where an account route exists; public remains account-free;
 - extend delegated/subagent protected-policy comparison and lineage metadata so Public
-  and Auto cannot compare equal solely because both lack accountID;
+  and Adaptive/Round Robin cannot compare equal solely because both lack accountID;
 - make same-Session maintenance/special-agent calls inherit the current ProviderRouteLease
   when using the same model policy; derived child Sessions persist the authorized route
   before first dispatch;
@@ -3467,10 +3470,10 @@ Gate:
 
 - explicit account selection survives restart and routes deterministically;
 - explicit Public intent survives OXP normalization, scheduled-task persistence, worker/
-  subagent delegation, and restart without becoming Auto;
+  subagent delegation, and restart without becoming Adaptive/Round Robin;
 - public route binding survives restart with no fabricated accountID;
 - same-policy Title/SPAD/Prompt Revisor/Goal Auditor/compaction uses the parent Session
-  route rather than independently resolving Auto;
+  route rather than independently resolving Adaptive/Round Robin;
 - a child inheriting public/account route creates a matching durable child binding before
   first dispatch; resumed child binding remains authoritative;
 - every downstream consumer observes the same routeKind and, for account routes, the same
@@ -3621,7 +3624,7 @@ synthetic directory.
 - removed pinned account fails closed;
 - before P5A, active/default switch preserves the legacy unpinned behavior;
 - after P5A, active/default switch does not move an existing healthy account binding; an
-  Auto-bound Public session may move to an eligible account on its next request;
+  strategy-bound Public session may move to an eligible account on its next request;
 - zero-credential Zen public/free primary generation succeeds;
 - adding one OAuth credential does not delete or hide the public model catalog;
 - removing the last OAuth/API-key credential restores/retains public eligibility without restart;
@@ -3629,13 +3632,13 @@ synthetic directory.
 - with a populated account pool, an explicitly Public-bound Session still sends the public
   sentinel rather than being rewritten by `pool.defaultAccount()`;
 - a public route-scoped provider client is never reused for an account route and vice versa;
-- a healthy account-bound Session stays on its account; an Auto account route may use
+- a healthy account-bound Session stays on its account; an Adaptive/Round Robin account route may use
   Public only after no subscription account remains eligible and the model is public;
 - explicit Public free selection succeeds even when accounts exist, for a public-eligible model;
 - Adaptive and Round-robin both prefer eligible subscription accounts; Adaptive uses
   comparable current reset-window data when available and Round-robin never fetches quota
   for ranking;
-- Auto-bound Public routes can promote to eligible accounts; explicit Public remains pinned;
+- strategy-bound Public routes can promote to eligible accounts; explicit Public remains pinned;
 - Zen explicit @zen account unaffected;
 - Go direct-auth precedence unaffected;
 - Go never public-fallbacks.
@@ -3705,9 +3708,9 @@ For a public route, assert:
   back to plain round-robin;
 - Round-robin skips quota scoring and uses the durable cursor over all eligible
   subscription accounts;
-- hosted OpenCode Auto routing prefers eligible subscriptions, then falls back to Public;
+- hosted OpenCode account-strategy routing prefers eligible subscriptions, then falls back to Public;
 - this is a best-effort allocation heuristic: percentage windows do not reveal
-  absolute entitlement sizes or predict future prompt/token demand, so Auto must
+  absolute entitlement sizes or predict future prompt/token demand, so Adaptive/Round Robin must
   not claim a provable global maximum;
 - selecting Adaptive or Round-robin clears a hard account pin from an earlier turn while
   keeping a healthy session route sticky; the selected strategy applies to new route
@@ -3784,7 +3787,7 @@ For a public route, assert:
 - fresh -> stale -> expired transitions obey the configured clocks;
 - successful current catalog omission immediately invalidates that model's public
   eligibility even if an older snapshot included it;
-- expired snapshots are excluded from Auto; explicit Public free follows the one-forced-
+- expired snapshots are excluded from Adaptive/Round Robin; explicit Public free follows the one-forced-
   revalidation/last-known-good attempt policy from §6.7;
 - one public-catalog refresh is single-flight under concurrent provider loads;
 - `FreeUsageLimitError` yields user-visible quota/upsell state but no immediate retry;
@@ -3811,17 +3814,17 @@ For a public route, assert:
 Backward compatibility:
 
 - legacy OXP selection with accountID A + no routeIntent -> explicit account A;
-- legacy OXP selection with no accountID/routeIntent -> Auto;
+- legacy OXP selection with no accountID/routeIntent -> Adaptive/Round Robin;
 - legacy scheduled task model.accountID A + no routeIntent -> explicit account A;
-- legacy scheduled task with no accountID/routeIntent -> Auto;
+- legacy scheduled task with no accountID/routeIntent -> Adaptive/Round Robin;
 - conflicting accountID A + routeIntent account B -> validation failure;
-- accountID present + routeIntent public/auto -> validation failure;
+- accountID present + routeIntent public/strategy -> validation failure;
 - routeIntent public never materializes as `accountID="public"` or a `@public` model suffix.
 
 OXP Session/worker:
 
 - explicit Public survives normalize -> control -> durable binding -> inspection round-trip;
-- Auto and Public with identical provider/model/variant compare as **different intents**;
+- Adaptive/Round Robin and Public with identical provider/model/variant compare as **different intents**;
 - OXP worker policy can authorize public without authorizing an account handle;
 - account labels/aliases canonicalize to stable accountID before route binding;
 - changing global default does not mutate an OXP Session already bound public/account.
@@ -3832,8 +3835,8 @@ Scheduled tasks:
 - new Session + account A task -> exact account A binding or fail closed;
 - reused Session + omitted route intent -> preserve healthy existing binding;
 - reused public Session + explicit account A task -> deliberate CAS rebind before prompt;
-- failed deliberate rebind aborts run; it does not execute under prior/Auto route;
-- persisted task survives restart with Public distinct from Auto.
+- failed deliberate rebind aborts run; it does not execute under prior/Adaptive/Round Robin route;
+- persisted task survives restart with Public distinct from Adaptive/Round Robin.
 
 Delegation/special agents:
 
@@ -3842,7 +3845,7 @@ Delegation/special agents:
 - explicit child route B requires delegation authority and never silently falls back;
 - resumed child preserves its own binding even if parent/default route changed;
 - nested public delegation metadata never contains a credentialHandle;
-- protected-policy equality distinguishes Auto from Public;
+- protected-policy equality distinguishes Adaptive/Round Robin from Public;
 - same-policy Title/SPAD/Prompt Revisor/Goal Auditor/compaction consumes parent lease;
 - a maintenance route override, where explicitly configured, settles under its own route
   attribution and is never reported as the parent public/account route.
@@ -3852,7 +3855,7 @@ System One:
 - Session-owned System One inherits the parent public/account lease;
 - standalone routeIntent=public uses the public sentinel even with populated account pool;
 - standalone routeIntent=account(A) uses exact A or fails closed;
-- standalone Auto follows current provider policy for that one call;
+- standalone Adaptive/Round Robin follows current provider policy for that one call;
 - same `affinityID` with different explicit route intents does not change/override those
   intents; affinityID is never route authority;
 - legacy accountID input maps to account route intent during compatibility window;
@@ -4034,7 +4037,7 @@ The port is complete only when all are true.
 23. Credential refresh/rotation never changes the stable router handle or silently
     rebinds a healthy session.
 24. Public and account route bindings are distinct; explicit Public and healthy account
-    bindings stay stable across credential changes. Auto-bound Public may promote to an
+    bindings stay stable across credential changes. strategy-bound Public may promote to an
     eligible subscription on a later request.
 25. `FreeTierError`/`MissingSessionID`/equivalent service-admission failure alone never
     causes credential invalidation, account rotation, or public/account hopping; only
@@ -4044,7 +4047,7 @@ The port is complete only when all are true.
     rerouted with a typed admission reason rather than spoofed.
 27. Explicit route intent survives ordinary turns, Title, SPAD, Prompt Revisor, Goal
     Auditor, delegated agents, OXP, scheduled tasks, swarms, provider dispatch, and
-    settlement: Public never collapses to Auto/account, and account A never silently
+    settlement: Public never collapses to Adaptive/Round Robin/account, and account A never silently
     becomes the active/default credential.
 28. Console OAuth account IDs do not require a fake `zen-` prefix; the legacy suffix
     ABI is contained to legacy provider adapters.
@@ -4061,7 +4064,7 @@ The port is complete only when all are true.
     Public only when no subscription candidate qualifies; Round-robin rotates evenly
     without quota scoring.
 33. Explicit Public quota/cooldown/request-admission failure never silently becomes an
-    account request. Auto may use Public only as fallback after subscription candidates
+    account request. Adaptive/Round Robin may use Public only as fallback after subscription candidates
     are ineligible.
 34. Explicit Public survives OXP normalization, scheduled-task persistence, delegation/
     nested delegation, special-agent execution, restart, and a populated account pool

@@ -47,7 +47,7 @@ const selectedHandle = (result: ProviderAccountPolicy.Result) => {
 }
 
 describe("ProviderAccountPolicy concentrate", () => {
-  test("preserves donor concentration semantics by preferring an already-used account", () => {
+  test("Adaptive prefers actual quota utilization over historical assignment count", () => {
     const unused = candidate("cred-a", { healthRank: 0, usedPercent: 99 })
     const used = candidate("cred-b", { healthRank: 50, usedPercent: 1 })
     const result = select({
@@ -58,7 +58,31 @@ describe("ProviderAccountPolicy concentrate", () => {
       ]),
     })
 
-    expect(selectedHandle(result)).toBe("cred-b")
+    expect(selectedHandle(result)).toBe("cred-a")
+  })
+
+  test("Adaptive prioritizes time-adjusted expiry pressure and excludes ineligible accounts", () => {
+    const result = select({
+      candidates: [
+        candidate("cred-long", { quotaExpiryUrgency: 0.1, usedPercent: 95, resetAt: 10000 }),
+        candidate("cred-expiring", { quotaExpiryUrgency: 0.9, usedPercent: 70, resetAt: 500 }),
+        candidate("cred-blocked", { quotaExpiryUrgency: 2, usedPercent: 100, admissible: false, ineligibleReason: "cooldown" }),
+      ],
+    })
+    expect(selectedHandle(result)).toBe("cred-expiring")
+  })
+
+  test("Round Robin ignores Adaptive's quota and usage preference", () => {
+    const result = select({
+      mode: "round-robin",
+      cursor: { epoch: 2, lastAssignedHandle: "cred-b" },
+      candidates: [
+        candidate("cred-a", { quotaExpiryUrgency: 0.1, usedPercent: 5 }),
+        candidate("cred-b", { quotaExpiryUrgency: 5, usedPercent: 99 }),
+        candidate("cred-c", { quotaExpiryUrgency: 1, usedPercent: 90 }),
+      ],
+    })
+    expect(selectedHandle(result)).toBe("cred-c")
   })
 
   test("uses provider-supplied health rank without interpreting entitlement state", () => {

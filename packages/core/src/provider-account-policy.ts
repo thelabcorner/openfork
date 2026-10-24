@@ -168,12 +168,21 @@ interface PreparedCandidate {
 }
 
 function concentrateCompare(left: PreparedCandidate, right: PreparedCandidate) {
-  const leftUsed = left.stats.assignmentCount > 0
-  const rightUsed = right.stats.assignmentCount > 0
-  if (leftUsed !== rightUsed) return leftUsed ? -1 : 1
-
-  const health = left.candidate.healthRank - right.candidate.healthRank
-  if (health !== 0) return health
+  // Adaptive spends the account under the greatest *time-adjusted quota
+  // pressure* first, preserving less-used/longer-lived budgets for later.
+  // These are provider-supplied signals for accounts already found admissible.
+  // Do not confuse assignment count with actual quota consumption.
+  const leftUrgency = left.candidate.quotaExpiryUrgency
+  const rightUrgency = right.candidate.quotaExpiryUrgency
+  const safeUrgency = (value: number | undefined) =>
+    value !== undefined && Number.isFinite(value) && value >= 0 ? value : undefined
+  const aUrgency = safeUrgency(leftUrgency)
+  const bUrgency = safeUrgency(rightUrgency)
+  if (aUrgency !== undefined || bUrgency !== undefined) {
+    if (aUrgency === undefined) return 1
+    if (bUrgency === undefined) return -1
+    if (aUrgency !== bUrgency) return bUrgency - aUrgency
+  }
 
   if (left.usedPercent !== undefined || right.usedPercent !== undefined) {
     if (left.usedPercent === undefined) return 1
@@ -181,12 +190,19 @@ function concentrateCompare(left: PreparedCandidate, right: PreparedCandidate) {
     if (left.usedPercent !== right.usedPercent) return right.usedPercent - left.usedPercent
   }
 
-  const assignments = right.stats.assignmentCount - left.stats.assignmentCount
-  if (assignments !== 0) return assignments
-
   const leftReset = left.candidate.resetAt ?? Infinity
   const rightReset = right.candidate.resetAt ?? Infinity
   if (leftReset !== rightReset) return leftReset - rightReset
+
+  const health = left.candidate.healthRank - right.candidate.healthRank
+  if (health !== 0) return health
+
+  const leftUsed = left.stats.assignmentCount > 0
+  const rightUsed = right.stats.assignmentCount > 0
+  if (leftUsed !== rightUsed) return leftUsed ? -1 : 1
+
+  const assignments = right.stats.assignmentCount - left.stats.assignmentCount
+  if (assignments !== 0) return assignments
 
   const active = right.stats.activeBindings - left.stats.activeBindings
   if (active !== 0) return active

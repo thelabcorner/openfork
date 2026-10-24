@@ -166,7 +166,7 @@ describe("hosted provider route authority", () => {
         .resolveTransientRoutedModel({
           providerID: hostedProviderID,
           modelID: hostedModelID,
-          routeIntent: { kind: "auto" },
+          routeIntent: { kind: "strategy" },
         })
         .pipe(Effect.flip)
 
@@ -178,7 +178,7 @@ describe("hosted provider route authority", () => {
           sessionID: "ses_hostedfailclosed" as never,
           providerID: hostedProviderID,
           modelID: hostedModelID,
-          routeIntent: { kind: "auto" },
+          routeIntent: { kind: "strategy" },
         })
         .pipe(Effect.flip)
 
@@ -195,7 +195,7 @@ describe("hosted provider route authority", () => {
       const result = yield* provider.resolveTransientRoutedModel({
         providerID: thirdPartyProviderID,
         modelID: thirdPartyModelID,
-        routeIntent: { kind: "auto" },
+        routeIntent: { kind: "strategy" },
       })
 
       expect(result).toBeUndefined()
@@ -223,6 +223,21 @@ describe("hosted provider route authority", () => {
         .pipe(Effect.flip)
 
       expect(pinned._tag).toBe("ProviderRouteResolutionError")
+      expect(pinned.message).toContain("selected account")
+      expect(pinned.message).toContain("Select another account, Adaptive, or Round Robin")
+
+      // Legacy account-qualified models must receive the same actionable
+      // failure as first-class route intents; they must not silently fall back
+      // to the public pool or another account.
+      const legacy = yield* provider
+        .resolveTransientRoutedModel({
+          providerID: hostedProviderID,
+          modelID: ModelV2.ID.make("jev-1.13@zen-unavailable"),
+        })
+        .pipe(Effect.flip)
+      expect(legacy._tag).toBe("ProviderRouteResolutionError")
+      expect(legacy.message).toContain("selected account")
+      expect(legacy.message).toContain("Select another account, Adaptive, or Round Robin")
     }),
     30000,
   )
@@ -286,7 +301,7 @@ describe("hosted provider route authority", () => {
       const noAccount = yield* provider.resolveTransientRoutedModel({
         providerID: hostedProviderID,
         modelID: hostedModelID,
-        routeIntent: { kind: "auto" },
+        routeIntent: { kind: "strategy" },
         executionPurpose: "special-agent",
       }).pipe(Effect.flip)
       expect(noAccount._tag).toBe("ProviderRouteResolutionError")

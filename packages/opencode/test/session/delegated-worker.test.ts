@@ -34,8 +34,8 @@ afterAll(async () => {
 
 const MODEL = { providerID: "test", modelID: "test-model" } as const
 const ALT_MODEL = { providerID: "test", modelID: "test-model-alt" } as const
-const CANONICAL_MODEL = { ...MODEL, routeIntent: { kind: "auto" } } as const
-const CANONICAL_ALT_MODEL = { ...ALT_MODEL, routeIntent: { kind: "auto" } } as const
+const CANONICAL_MODEL = { ...MODEL, routeIntent: { kind: "strategy" } } as const
+const CANONICAL_ALT_MODEL = { ...ALT_MODEL, routeIntent: { kind: "strategy" } } as const
 
 const ORIGIN = {
   producer: "oxp",
@@ -419,7 +419,7 @@ describe("DelegatedWorker start path", () => {
     await llmRuntime.runPromise(llm.pushMatch((hit) => !isTitleRequest(hit), workerReply("after rebind")))
 
     const rebound = { ...ALT_MODEL, variant: "high" } as const
-    const canonicalRebound = { ...rebound, routeIntent: { kind: "auto" } } as const
+    const canonicalRebound = { ...rebound, routeIntent: { kind: "strategy" } } as const
     const outcome = await AppRuntime.runPromise(
       runInInstance(llm, () =>
         Effect.gen(function* () {

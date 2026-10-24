@@ -153,6 +153,19 @@ describe("ClaudeAgentRuntime lifecycle", () => {
     expect(diag.lastFailureCategory).toBeUndefined()
   })
 
+  test("JavaScript-only Claude CLI uses the Node executable in SDK options", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module, { executablePath: "/npm/claude-code/cli.js" })
+    const done = runtime.run({ prompt: "cli js fallback" })
+    stream.push(initEvent)
+    stream.push(resultEvent)
+    stream.end()
+    expect((await done).status).toBe("completed")
+    expect(fixture.queryCalls[0]?.options.pathToClaudeCodeExecutable).toBe("/npm/claude-code/cli.js")
+    expect(fixture.queryCalls[0]?.options.executable).toBe("node")
+  })
+
   test("SDK error result fails the turn instead of persisting a successful completion", async () => {
     const stream = new StreamController()
     const fixture = fixtureSdk([stream])
@@ -529,6 +542,39 @@ describe("ClaudeAgentRuntime lifecycle", () => {
     const outcome = await done
     expect(outcome.status).toBe("failed")
     expect(outcome.category).toBe("empty-stream")
+  })
+
+  test("init and streamed output without terminal result cannot be recorded as a completed turn", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module)
+    const done = runtime.run({ prompt: "crashed mid-reply" })
+    stream.push(initEvent)
+    stream.push({ type: "assistant", message: { content: [{ type: "text", text: "partial answer" }] } })
+    stream.end()
+    const outcome = await done
+    expect(outcome.status).toBe("failed")
+    expect(outcome.category).toBe("empty-stream")
+    expect(outcome.message).toContain("without a terminal result")
+    expect(outcome.sessionID).toBe("ext-session-1")
+    expect(runtime.diagnostics().completed).toBe(0)
+  })
+
+  test("pre-aborted input is cancelled before loading SDK or spawning a Claude process", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    let loads = 0
+    const runtime = new ClaudeAgentRuntime({
+      loader: async () => {
+        loads += 1
+        return { query: () => { throw new Error("must not create SDK process") } }
+      },
+      cwd: "/tmp/claude-test",
+    })
+    const outcome = await runtime.run({ prompt: "must not be sent", signal: controller.signal })
+    expect(outcome.status).toBe("cancelled")
+    expect(loads).toBe(0)
+    expect(runtime.diagnostics().cancelled).toBe(1)
   })
 
   test("rollback gate fails the turn as disabled without loading the SDK", async () => {

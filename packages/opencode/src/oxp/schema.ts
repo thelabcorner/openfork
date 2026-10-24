@@ -32,7 +32,7 @@ export const MAX_ROOTS = 256
 export const Plane = Schema.Literals(["augmentation", "supervision", "delegation"])
 export type Plane = Schema.Schema.Type<typeof Plane>
 
-export const SessionSupervision = Schema.Literals(["none", "approved-roots"])
+export const SessionSupervision = Schema.Literals(["none", "approved-roots", "all-native"])
 export type SessionSupervision = Schema.Schema.Type<typeof SessionSupervision>
 
 export const Delegation = Schema.Literals(["disabled", "spawn"])
@@ -110,6 +110,7 @@ export const AuthorityClass = Schema.Literals([
   "filesSend",
   "catalog",
   "automation",
+  "globalUsageAnalytics",
   "sessionSupervision",
   "requestSupervision",
   "delegation",
@@ -130,6 +131,8 @@ export const Grant = Schema.Struct({
   filesSend: Schema.Boolean,
   /** Added compatibly in v1: omission in older oxp.json means false. */
   automation: Schema.optional(Schema.Boolean),
+  /** Explicit opt-in for cross-project usage/accounting analytics. */
+  globalUsageAnalytics: Schema.optional(Schema.Boolean),
   sessionSupervision: SessionSupervision,
   requestSupervision: Schema.Boolean,
   delegation: Delegation,
@@ -189,6 +192,7 @@ export const DEFAULT_GRANT: Grant = Object.freeze({
   filesReceive: false,
   filesSend: false,
   automation: false,
+  globalUsageAnalytics: false,
   sessionSupervision: "none",
   requestSupervision: false,
   delegation: "disabled",

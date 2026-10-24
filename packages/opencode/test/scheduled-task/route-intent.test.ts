@@ -45,8 +45,8 @@ describe("ScheduledTaskRouteIntent.normalizeAction", () => {
   })
 
   test("carries explicit Auto durably without inventing an account identity", () => {
-    const result = outcome(action({ routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }) }))
-    expect(result).toEqual({ ok: true, routeIntent: { kind: "auto" } })
+    const result = outcome(action({ routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }) }))
+    expect(result).toEqual({ ok: true, routeIntent: { kind: "strategy" } })
   })
 
   test("carries explicit Public durably for SessionPrompt/P5A binding", () => {

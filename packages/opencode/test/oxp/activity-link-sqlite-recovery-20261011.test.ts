@@ -199,6 +199,9 @@ test("contention released inside the bounded retry budget recovers silently with
 test("sustained contention beyond the budget records a fixed-operation link incident and preserves tool flow", async () => {
   await withRecorderDb("sustained", (services, filename) =>
     Effect.gen(function* () {
+      expect(services.database.activityDb).toBeDefined()
+      const activityLane = yield* services.database.activityDb!()
+      expect(activityLane).not.toBe(services.database.db)
       const input = {
         parentCorrelation: correlation("recorder-sustained"),
         tool: "openfork_worker",
@@ -213,6 +216,10 @@ test("sustained contention beyond the budget records a fixed-operation link inci
         yield* services.recorder.success(handle, input, { output: "ok", structured: { workerID: "wrk_sustained" } })
         const elapsed = performance.now() - at
         expect(elapsed).toBeGreaterThanOrEqual(450)
+        // A primary-lane BEGIN can retry for 15 seconds. Optional OXP
+        // attribution must use its isolated bounded writer and never inherit
+        // that foreground retry policy on a contended SQLite WAL.
+        expect(elapsed).toBeLessThan(3_000)
       } finally {
         try {
           if (peer.inTransaction) peer.exec("COMMIT")
@@ -235,7 +242,7 @@ test("sustained contention beyond the budget records a fixed-operation link inci
       expect(settleIncidents.some((incident) => incident.errorCode === "SQLITE_BUSY")).toBe(true)
     }),
   )
-})
+}, 15_000)
 
 test("stale invocation link failures are non-busy and do not replay", async () => {
   await withRecorderDb("stale", (services) =>
@@ -262,7 +269,7 @@ test("stale invocation link failures are non-busy and do not replay", async () =
   )
 })
 
-test("the proposed classifier unwraps genuine production link defects, while the current diagnostics implementation cannot", async () => {
+test("production classifier unwraps genuine busy and foreign-key link defects without leakage", async () => {
   await withRecorderDb("shim", (services, filename) =>
     Effect.gen(function* () {
       const busyHandle = yield* services.activity.begin({
@@ -293,6 +300,7 @@ test("the proposed classifier unwraps genuine production link defects, while the
       const busyDefect = defectOf(busyExit)
       expect(sqliteBusyCode(busyDefect)).toBe("SQLITE_BUSY")
       expect(proposedSqliteIncidentCode(busyDefect)).toBe("SQLITE_BUSY")
+      expect(OxpDiagnostics.sqliteIncidentCode(busyDefect)).toBe("SQLITE_BUSY")
 
       const staleHandle = yield* services.activity.begin({
         correlation: activityCorrelation("shim-stale"),
@@ -310,11 +318,11 @@ test("the proposed classifier unwraps genuine production link defects, while the
       const fkDefect = defectOf(fkExit)
       expect(sqliteBusyCode(fkDefect)).toBeUndefined()
       expect(proposedSqliteIncidentCode(fkDefect)).toBe("SQLITE_CONSTRAINT_FOREIGNKEY")
+      expect(OxpDiagnostics.sqliteIncidentCode(fkDefect)).toBe("SQLITE_CONSTRAINT_FOREIGNKEY")
     }),
   )
 })
 
-test.todo("OxpDiagnostics.sqliteIncidentCode must classify EffectDrizzleQueryError link defects natively (patch in B-activity-link.md)", () => {})
 
 test("44 concurrent recorder invocations under a competing writer settle exactly once with intact lineage", async () => {
   await withRecorderDb("concurrent", (services, filename) =>

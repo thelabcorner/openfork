@@ -22,6 +22,9 @@ export const Parameters = Schema.Struct({
   timeout: Schema.optional(Schema.Number).annotate({
     description: "Fetch timeout in seconds (max 120).",
   }),
+  forceWeb: Schema.optional(Schema.Boolean).annotate({
+    description: "On GitHub repo/RAG URLs, bypass the successful guidance-only result and perform a public unauthenticated HTTP fetch. Use only when gh is unavailable or raw HTTP behavior is required.",
+  }),
   query: Schema.optional(Schema.String).annotate({
     description: "Search query for action=search.",
   }),
@@ -79,7 +82,7 @@ export const WebTool = Tool.define<
           "Fetch known URLs or search the web through one compact tool.",
           "SEARCH for current facts, upstream code/API research, provider releases, and external discovery: pass query and omit action, or use action=search.",
           "FETCH when the exact URL is already known: pass url and omit action (or use action=fetch). Follow search hits with fetch when primary-source details matter.",
-          "For github.com URLs (repos, issues, PRs, diffs, Actions), prefer the github tool over fetch.",
+          "For GitHub repository files, issues, or PRs, use the authenticated lazy github tool (gh CLI) instead of anonymous fetch. Recognized repository URLs return actionable, non-error routing guidance before any request; forceWeb=true explicitly fetches via public HTTP when needed.",
           "Use action=providers to inspect configured and keyless backends without a network search.",
           `For current-event searches, include the current year (${year}) when it materially improves freshness.`,
         ].join(" ")
@@ -97,6 +100,7 @@ export const WebTool = Tool.define<
               url: params.url,
               format: params.format ?? "markdown",
               ...(params.timeout !== undefined ? { timeout: params.timeout } : {}),
+              ...(params.forceWeb !== undefined ? { forceWeb: params.forceWeb } : {}),
             }
           } else if (action === "providers") {
             args = { action: "providers" }

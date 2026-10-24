@@ -7,8 +7,8 @@ const decodeIntent = Schema.decodeUnknownSync(ProviderRouteIntent.Info)
 const decodeAction = Schema.decodeUnknownSync(ScheduledTask.Action)
 
 describe("ProviderRouteIntent", () => {
-  test("decodes auto, public, and account without fabricating public account identity", () => {
-    expect(decodeIntent({ kind: "auto" })).toEqual({ kind: "auto" })
+  test("decodes strategy, public, and account without fabricating public account identity", () => {
+    expect(decodeIntent({ kind: "strategy" })).toEqual({ kind: "strategy" })
     expect(decodeIntent({ kind: "public" })).toEqual({ kind: "public" })
     expect(decodeIntent({ kind: "account", accountID: "acct-a", pin: "soft" })).toEqual({
       kind: "account",
@@ -27,15 +27,25 @@ describe("ProviderRouteIntent", () => {
     expect(() => decodeIntent({ kind: "account" })).toThrow()
   })
 
-  test("only Adaptive and Round Robin are valid automatic account-routing strategies", () => {
+  test("only Adaptive and Round Robin are valid account-routing strategies", () => {
     expect(ProviderRouteIntent.effectiveStrategy(undefined)).toBe("adaptive")
-    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "auto" }))).toBe("adaptive")
-    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "auto", strategy: "adaptive" }))).toBe("adaptive")
-    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "auto", strategy: "round-robin" }))).toBe("round-robin")
+    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "strategy" }))).toBe("adaptive")
+    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "strategy", strategy: "adaptive" }))).toBe("adaptive")
+    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "strategy", strategy: "round-robin" }))).toBe("round-robin")
     expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "account", accountID: "a" }))).toBeUndefined()
     expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "public" }))).toBeUndefined()
-    expect(() => decodeIntent({ kind: "auto", strategy: "auto" })).toThrow()
-    expect(() => decodeIntent({ kind: "auto", strategy: "concentrate" })).toThrow()
+    expect(() => decodeIntent({ kind: "strategy", strategy: "auto" })).toThrow()
+    expect(() => decodeIntent({ kind: "strategy", strategy: "concentrate" })).toThrow()
+  })
+
+  test("reads obsolete saved routing intents but only emits canonical strategy intents", () => {
+    const decoded = decodeIntent({ kind: "auto", strategy: "round-robin" })
+    expect(decoded).toEqual({ kind: "strategy", strategy: "round-robin" })
+    expect(Schema.encodeSync(ProviderRouteIntent.Info)(decoded)).toEqual({
+      kind: "strategy",
+      strategy: "round-robin",
+    })
+    expect(decodeIntent({ kind: "auto" })).toEqual({ kind: "strategy" })
   })
 })
 

@@ -98,10 +98,10 @@ export function routingMode(providerID: string, intent: ProviderRouteIntent.Info
   // Hosted account strategies must never change an unrelated provider's
   // account-routing semantics just because a stale/forged intent carried a
   // strategy field across a provider switch.
-  if (intent.kind !== "auto" || (providerID !== "opencode" && providerID !== "opencode-go"))
+  if (intent.kind !== "strategy" || (providerID !== "opencode" && providerID !== "opencode-go"))
     return "concentrate"
   if (ProviderRouteIntent.effectiveStrategy(intent) === "round-robin") return "round-robin"
-  return "session-round-robin"
+  return "concentrate"
 }
 
 /** Unpinned hosted strategies prefer subscription accounts, then consider eligible Public. */
@@ -109,7 +109,7 @@ export function freeRoutePreference(
   providerID: string,
   intent: ProviderRouteIntent.Info,
 ): ProviderRouteResolution.FreeRoutePreference {
-  return intent.kind === "auto" && (providerID === "opencode" || providerID === "opencode-go")
+  return intent.kind === "strategy" && (providerID === "opencode" || providerID === "opencode-go")
     ? "account-first"
     : "public-first-for-free"
 }
@@ -200,13 +200,13 @@ export function compose<CredentialError = unknown>(
 
       const current = yield* options.routes.get(input.sessionID, input.affinityDomain)
       if (
-        input.routeIntent.kind === "auto" &&
+        input.routeIntent.kind === "strategy" &&
         current?.routeKind === "public" &&
         input.allowPublic &&
         input.publicEligible
       ) {
         // Compile only the exact Public generation we observed, without
-        // account enumeration or ANY route mutation. Running the full Auto
+        // account enumeration or ANY route mutation. Running the full strategy
         // resolver with an empty candidate snapshot here could undo a
         // concurrent account rebinding by erroneously falling back to Public.
         return yield* compileExisting({
@@ -228,7 +228,7 @@ export function compose<CredentialError = unknown>(
       }
 
       if (
-        input.routeIntent.kind === "auto" &&
+        input.routeIntent.kind === "strategy" &&
         current === undefined &&
         input.freeRoutePreference === "public-first-for-free" &&
         input.allowPublic &&
@@ -256,7 +256,7 @@ export function compose<CredentialError = unknown>(
    * routing domain.
    *
    * This is the production migration seam for generic provider runtimes. It
-   * prevents an Auto route from hijacking an unrelated direct API-key provider
+   * prevents strategy routing from hijacking an unrelated direct API-key provider
    * merely because the OpenCode account integration is installed, while still
    * failing closed when account discovery is ambiguous or unhealthy.
    *
@@ -265,7 +265,7 @@ export function compose<CredentialError = unknown>(
    */
   const resolveIfApplicable = (input: ResolveInput) =>
     Effect.gen(function* () {
-      if (input.routeIntent.kind !== "auto") return yield* resolve(input)
+      if (input.routeIntent.kind !== "strategy") return yield* resolve(input)
 
       const current = yield* options.routes.get(input.sessionID, input.affinityDomain)
       if (current !== undefined) return yield* resolve(input)
@@ -368,7 +368,7 @@ export function compose<CredentialError = unknown>(
       }
 
       if (
-        input.routeIntent.kind === "auto" &&
+        input.routeIntent.kind === "strategy" &&
         input.freeRoutePreference === "public-first-for-free" &&
         publicAvailable
       ) {

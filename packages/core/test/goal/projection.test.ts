@@ -112,10 +112,11 @@ describe("GoalProjection", () => {
       const spec = initial.find((item) => item.kind === "spec")!
       const progress = initial.find((item) => item.kind === "progress")!
 
-      expect(spec.text).toContain("Ship projection semantics")
-      expect(spec.text).toContain("Do not scan transcript history")
-      expect(spec.text).toContain("Projection is durable")
-      expect(spec.text).toContain("Publish semantic snapshots")
+      expect(spec.text).toContain("Keep mutable Goal state out of privileged System context.")
+      expect(spec.text).not.toContain("Ship projection semantics")
+      expect(spec.text).not.toContain("Do not scan transcript history")
+      expect(spec.text).not.toContain("Projection is durable")
+      expect(spec.text).not.toContain("Publish semantic snapshots")
       expect(spec.text).not.toContain("continuation_policy")
       expect(spec.text).not.toContain("status=\"draft\"")
       expect(progress.text).toContain("<status>draft</status>")
@@ -165,7 +166,7 @@ describe("GoalProjection", () => {
       const specUpdate = yield* goals.update({
         id: detail.goal.id,
         expectedRevision: detail.goal.revision,
-        title: "Ship independent projection semantics",
+        objective: "Ship independent projection semantics",
       })
       expect((yield* reconcile()).published).toBe(1)
       state = yield* history.stateProjections(-1)
@@ -188,7 +189,7 @@ describe("GoalProjection", () => {
       const stateBDetail = yield* goals.update({
         id: detail.goal.id,
         expectedRevision: beforeRecurrence.goal.revision,
-        title: "Temporary projection title",
+        objective: "Temporary projection objective",
       })
       expect((yield* reconcile()).published).toBe(1)
       const stateBMessage = (yield* history.stateProjections(-1)).messages.get(
@@ -199,7 +200,7 @@ describe("GoalProjection", () => {
       const stateAReturn = yield* goals.update({
         id: detail.goal.id,
         expectedRevision: stateBDetail.goal.revision,
-        title: beforeRecurrence.goal.title,
+        objective: beforeRecurrence.goal.objective,
       })
       expect(GoalProjection.sections(stateAReturn).find((item) => item.kind === "spec")!.digest).toBe(stateA.digest)
       expect((yield* reconcile()).published).toBe(1)

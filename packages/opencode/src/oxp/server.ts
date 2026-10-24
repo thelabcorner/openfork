@@ -428,6 +428,13 @@ const layer = Layer.effect(
     const fileActivity = (name: string, args: unknown, result: OxpResult.CapabilityResult) =>
       recordFileActivity(name, args, result).pipe(Effect.catchCause(() => Effect.void))
 
+    // The ingress correlation is the ownership source, never user-supplied worker arguments.
+    // Resolve only for creations: polling, cancellation and discovery stay read-free.
+    const parentSessionFor = (input: OxpWorker.Input, parentCorrelation?: ParentCorrelation) =>
+      input.action === "start" || input.action === "batch_start"
+        ? activity.resolveSession({ parentCorrelation })
+        : Effect.succeed(undefined)
+
     const dispatch = Effect.fn("OxpServer.dispatch")(function* (
       name: string,
       args: unknown,
@@ -454,7 +461,10 @@ const layer = Layer.effect(
         }).pipe(Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP capability arguments" })))
         return yield* capability.execute(input, signal, {
           ...context,
-          workerExecute: (workerInput, workerSignal) => workers.execute(workerInput, workerSignal),
+          workerExecute: (workerInput, workerSignal) =>
+            parentSessionFor(workerInput, parentCorrelation).pipe(
+              Effect.flatMap((parentSession) => workers.execute(workerInput, workerSignal, parentSession)),
+            ),
         })
       }
 
@@ -504,7 +514,8 @@ const layer = Layer.effect(
               }),
           ),
         )
-        return yield* workers.execute(input, signal)
+        const parentSession = yield* parentSessionFor(input, parentCorrelation)
+        return yield* workers.execute(input, signal, parentSession)
       }
 
       if (name === "openfork_info") {
@@ -610,6 +621,7 @@ const layer = Layer.effect(
               code: state.grant.code ?? false,
               browser: state.grant.browser,
               automation: state.grant.automation ?? false,
+              globalUsageAnalytics: state.grant.globalUsageAnalytics ?? false,
               sessionSupervision: state.grant.sessionSupervision,
               requestSupervision: state.grant.requestSupervision,
               delegation: state.grant.delegation,

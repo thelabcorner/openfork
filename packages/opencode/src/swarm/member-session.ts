@@ -30,6 +30,36 @@ export function worktreeNameForMember(memberID: SwarmModel.MemberID) {
   return `swarm-${memberID}`.replace(/[^a-zA-Z0-9_-]+/g, "-").toLowerCase()
 }
 
+/**
+ * Persisted worker Session selections are independent from durable Swarm
+ * desiredProfile. Reused bindings are not evidence that model/account/variant
+ * configuration was honored. Preserve the original Session on a mismatch and
+ * require explicit lifecycle repair rather than reassigning a live worker.
+ */
+export function selectionMatchesProfile(
+  profile: SwarmModel.MemberExecutionProfile,
+  // V1 createManagedRoot and Core SessionStore project different branded
+  // agent ID types. Compare their common persisted scalar selection instead
+  // of casting one Session generation into another.
+  session: {
+    readonly agent?: string
+    readonly model?: {
+      readonly providerID: string
+      readonly id: string
+      readonly accountID?: string
+      readonly variant?: string
+    }
+  },
+) {
+  const desired = profile.model
+  const actual = session.model
+  return session.agent === "swarm-m" &&
+    actual?.providerID === desired.providerID &&
+    actual?.id === desired.id &&
+    (actual?.accountID ?? undefined) === (desired.accountID ?? undefined) &&
+    (actual?.variant ?? "default") === (desired.variant ?? "default")
+}
+
 export function effectiveBoundary(
   profile: SwarmModel.MemberExecutionProfile,
   workspace: SwarmModel.WorkspacePolicy,
@@ -286,11 +316,19 @@ export const layer = Layer.effect(
           ),
         )
       if (session.projectID !== target.swarm.projectID || session.parentID !== undefined) {
-        yield* cleanupCandidate(candidate)
+        if (!before) yield* cleanupCandidate(candidate)
         return yield* fail(
           target,
           `Candidate Session resolved outside the required root/project scope (${session.projectID}).`,
         )
+      }
+      if (!selectionMatchesProfile(profile, session)) {
+        // Existing deterministic candidate may be a partially restored/stale
+        // Session. Never bind it with the wrong reasoning variant or account,
+        // and never delete a pre-existing Session to force a retry.
+        if (!before) yield* cleanupCandidate(candidate)
+        return yield* fail(target,
+          "Candidate Session selection differs from the managed worker profile (agent/provider/model/account/variant). Preserve the existing Session and inspect or repair its selection before retrying admission.")
       }
 
       // Install the hard ceiling before the Session becomes a schedulable Swarm
@@ -357,6 +395,11 @@ export const layer = Layer.effect(
       if (target.member.sessionID) {
         const existing = yield* sessionStore.get(target.member.sessionID)
         if (existing) {
+          const desired = target.member.desiredProfile
+          if (!desired || !selectionMatchesProfile(desired, existing) || existing.projectID !== target.swarm.projectID || existing.parentID !== undefined) {
+            return yield* fail(target,
+              "Bound worker Session selection or project differs from its durable Swarm profile. The existing Session is preserved; explicitly inspect model, account, variant and member lifecycle before repairing it.")
+          }
           return {
             status: "already_bound",
             member: target.member,

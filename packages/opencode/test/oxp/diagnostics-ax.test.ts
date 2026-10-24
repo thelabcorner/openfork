@@ -9,6 +9,35 @@ class SqlError extends Error {
   }
 }
 
+class EffectDrizzleQueryError extends Error {
+  reason?: unknown
+  constructor(reason?: unknown) {
+    super("sensitive Drizzle statement and parameter payload")
+    this.reason = reason
+  }
+}
+
+test("SQLite incident classifier unwraps adapter errors and bounded Effect reasons without exposing SQL", () => {
+  const examples = [
+    [new EffectDrizzleQueryError({ cause: { code: "SQLITE_BUSY", message: "secret parameter" } }), "SQLITE_BUSY"],
+    [new EffectDrizzleQueryError({ reasons: [{ cause: { code: "SQLITE_CONSTRAINT_FOREIGNKEY" } }] }), "SQLITE_CONSTRAINT_FOREIGNKEY"],
+    [new EffectDrizzleQueryError({ reasons: [{ reason: { errno: 517 } }] }), "SQLITE_BUSY_SNAPSHOT"],
+    [new EffectDrizzleQueryError(), "SQLITE_UNCLASSIFIED"],
+  ] as const
+  for (const [cause, expected] of examples) {
+    const result = OxpDiagnostics.record({ cause, phase: "activity_recording", activityOperation: "link" })
+    expect(result.errorName).toBe("EffectDrizzleQueryError")
+    expect(result.errorCode).toBe(expected)
+    expect(JSON.stringify(result)).not.toContain("sensitive Drizzle")
+    expect(JSON.stringify(result)).not.toContain("secret parameter")
+  }
+  const unrelated = OxpDiagnostics.record({
+    cause: Object.assign(new Error("SQLITE_BUSY"), { reason: { code: "SQLITE_BUSY" } }),
+    phase: "tool_boundary",
+  })
+  expect(unrelated.errorCode).toBeUndefined()
+})
+
 test("OXP SQL incidents preserve safe native codes across Effect's reason/cause wrapping", () => {
   for (const [cause, expected] of [
     [new SqlError({ cause: { code: "SQLITE_BUSY_SNAPSHOT", errno: 517, message: "secret parameter" } }), "SQLITE_BUSY_SNAPSHOT"],

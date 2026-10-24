@@ -49,29 +49,10 @@ function escapeAttribute(value: string) {
   return escapeText(value).replaceAll('"', "&quot;").replaceAll("'", "&apos;")
 }
 
-function optionalAttribute(name: string, value: string | number | undefined) {
-  return value === undefined ? "" : ` ${name}="${escapeAttribute(String(value))}"`
-}
-
 export function renderSpec(detail: Goal.Detail) {
   return [
     `<goal_spec state="current" goal_id="${escapeAttribute(detail.goal.id)}">`,
-    `  <title>${escapeText(detail.goal.title)}</title>`,
     `  <objective>${escapeText(detail.goal.objective)}</objective>`,
-    "  <constraints>",
-    ...detail.goal.constraints.map((constraint) => `    <constraint>${escapeText(constraint)}</constraint>`),
-    "  </constraints>",
-    "  <acceptance_criteria>",
-    ...detail.criteria.map(
-      (criterion) => `    <criterion id="${escapeAttribute(criterion.id)}">${escapeText(criterion.description)}</criterion>`,
-    ),
-    "  </acceptance_criteria>",
-    "  <steps>",
-    ...detail.steps.map(
-      (step) =>
-        `    <step id="${escapeAttribute(step.id)}" title="${escapeAttribute(step.title)}">${escapeText(step.description)}</step>`,
-    ),
-    "  </steps>",
     "</goal_spec>",
   ].join("\n")
 }
@@ -81,17 +62,6 @@ export function renderProgress(detail: Goal.Detail) {
     `<goal_progress state="current" goal_id="${escapeAttribute(detail.goal.id)}">`,
     `  <status>${detail.goal.status}</status>`,
     detail.goal.blocker ? `  <blocker>${escapeText(detail.goal.blocker)}</blocker>` : "  <blocker />",
-    "  <criteria>",
-    ...detail.criteria.map(
-      (criterion) => `    <criterion id="${escapeAttribute(criterion.id)}" status="${criterion.status}" />`,
-    ),
-    "  </criteria>",
-    "  <steps>",
-    ...detail.steps.map(
-      (step) =>
-        `    <step id="${escapeAttribute(step.id)}" status="${step.status}" attempts="${step.attempts}"${optionalAttribute("assigned_session_id", step.assignedSessionID)} />`,
-    ),
-    "  </steps>",
     "</goal_progress>",
   ].join("\n")
 }

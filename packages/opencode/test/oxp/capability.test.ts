@@ -809,7 +809,7 @@ describe("OxpCapability", () => {
       const descriptor = yield* capability.describe("usage")
       expect(descriptor.inputSchema).toMatchObject({
         type: "object",
-        required: expect.arrayContaining(["action", "sessionID"]),
+        required: expect.arrayContaining(["action"]),
       })
       expect(JSON.stringify(descriptor.inputSchema)).not.toContain("systemPrompt")
       expect(JSON.stringify(descriptor.inputSchema)).not.toContain("apiKey")
@@ -817,7 +817,7 @@ describe("OxpCapability", () => {
       const invalidAction = yield* capability
         .call("usage", { action: "totals", sessionID: "ses_unauthorized" })
         .pipe(Effect.flip)
-      expect(invalidAction._tag).toBe("OXP_INVALID_ARGUMENT")
+      expect(invalidAction._tag).toBe("OXP_AUTH_DENIED")
 
       const inaccessible = yield* capability
         .call("usage", { action: "context", sessionID: "ses_unauthorized" })
@@ -833,7 +833,7 @@ describe("OxpCapability", () => {
       const capability = yield* OxpCapability.Service
       yield* config.setEnabled(true)
       yield* config.setGrant({ read: true, sessionSupervision: "approved-roots" })
-      const listed = yield* capability.list("models", "lazy")
+      const listed = yield* capability.list("public model metadata", "lazy")
       expect(listed).toEqual([
         expect.objectContaining({ id: "models", authority: "read", load: "lazy", mutation: "none" }),
       ])

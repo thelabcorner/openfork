@@ -7,6 +7,90 @@ import { Auth, LLMClient } from "../src/route"
 import { it } from "./lib/effect"
 
 describe("tool schema projections", () => {
+  test("anthropic projects root oneOf MCP action branches without changing nested unions or the source", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        rootID: { type: "string" },
+        path: { type: "string" },
+        filter: { anyOf: [{ type: "string" }, { type: "null" }] },
+      },
+      oneOf: [{ required: ["rootID"] }, { required: ["path"] }],
+      additionalProperties: false,
+    }
+    const before = structuredClone(schema)
+    const lowered = ToolSchemaProjection.anthropic(schema)
+    expect(lowered).toMatchObject({
+      type: "object",
+      properties: schema.properties,
+      additionalProperties: false,
+    })
+    expect(lowered).not.toHaveProperty("oneOf")
+    expect(lowered).not.toHaveProperty("anyOf")
+    expect(lowered).not.toHaveProperty("allOf")
+    expect(lowered).not.toHaveProperty("required")
+    expect(lowered.description).toContain("exactly one")
+    expect(schema).toEqual(before)
+    expect(ToolSchemaProjection.anthropic(lowered)).toBe(lowered)
+  })
+
+  test("anthropic merges root allOf requirements and alternative properties while preserving conflicts under fields", () => {
+    const allOf = ToolSchemaProjection.anthropic({
+      allOf: [
+        { type: "object", required: ["action"], properties: { action: { type: "string" } } },
+        { type: "object", required: ["target"], properties: { target: { type: "integer" } } },
+      ],
+    })
+    expect(allOf).toMatchObject({
+      type: "object",
+      properties: { action: { type: "string" }, target: { type: "integer" } },
+      required: ["action", "target"],
+    })
+    expect(allOf).not.toHaveProperty("allOf")
+
+    const anyOf = ToolSchemaProjection.anthropic({
+      anyOf: [
+        { type: "object", properties: { value: { type: "string" }, a: { type: "number" } }, required: ["value"] },
+        { type: "object", properties: { value: { type: "number" }, b: { type: "boolean" } }, required: ["value"] },
+      ],
+    })
+    expect(anyOf).toMatchObject({
+      type: "object",
+      required: ["value"],
+      properties: {
+        value: { anyOf: [{ type: "string" }, { type: "number" }] },
+        a: { type: "number" },
+        b: { type: "boolean" },
+      },
+    })
+    expect(anyOf).not.toHaveProperty("anyOf")
+  })
+
+  test("anthropic leaves compatible schemas untouched by identity", () => {
+    const schema = { type: "object", properties: { variants: { oneOf: [{ type: "string" }, { type: "number" }] } } }
+    expect(ToolSchemaProjection.anthropic(schema)).toBe(schema)
+  })
+
+  test("anthropic exposes required-only alternative field names even with additionalProperties false", () => {
+    const input = {
+      type: "object",
+      additionalProperties: false,
+      anyOf: [{ required: ["route"] }, { required: ["file"] }],
+    }
+    expect(ToolSchemaProjection.anthropic(input)).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      properties: { route: {}, file: {} },
+    })
+    const typed = ToolSchemaProjection.anthropic({
+      anyOf: [
+        { required: ["route"], properties: { route: { type: "string" } } },
+        { required: ["file"] },
+      ],
+    })
+    expect(typed.properties).toEqual({ route: { type: "string" }, file: {} })
+  })
+
   test("moonshot strips $ref siblings and converts tuple arrays to a schema object", () => {
     expect(
       ToolSchemaProjection.moonshot({

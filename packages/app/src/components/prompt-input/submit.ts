@@ -188,7 +188,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
     await input.api.prompt({
       sessionID: input.draft.sessionID,
       id: messageID,
-      agent: humanInterjection ? undefined : input.draft.agent,
+       agent: input.draft.agent,
       model: input.draft.model,
       variant: input.draft.variant,
       subProvider: input.draft.subProvider,
@@ -423,7 +423,9 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     const currentModel = selectedModel ?? (humanInterjection && worker.model
       ? { id: worker.model.id, provider: { id: worker.model.providerID } }
       : undefined)
-    const currentAgent = humanInterjection && worker.agent ? { name: worker.agent } : local.agent.current()
+    const currentAgent = humanInterjection
+      ? { name: local.agent.explicitSession() ?? worker.agent ?? local.agent.current()?.name ?? "" }
+      : local.agent.current()
     const variant = selectedModel ? modelSelection.variant.current() : worker?.model?.variant ?? modelSelection.variant.current()
     const routeIntent = selectedModel ? modelSelection.routeIntent.current() : worker?.model?.routeIntent
     const subProvider =

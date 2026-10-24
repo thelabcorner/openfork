@@ -546,7 +546,9 @@ const fromRequest = Effect.fn("AnthropicMessages.fromRequest")(function* (reques
           lowerTool(
             breakpoints,
             tool,
-            ToolSchemaProjection.modelCompatibility(tool.inputSchema, toolSchemaCompatibility),
+            ToolSchemaProjection.anthropic(
+              ToolSchemaProjection.modelCompatibility(tool.inputSchema, toolSchemaCompatibility),
+            ),
           ),
         )
   const system =

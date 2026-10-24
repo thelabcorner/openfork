@@ -420,7 +420,7 @@ it.instance(
 
 
 it.instance(
-  "Auto routing excludes a health-quarantined stable account without disabling healthy accounts",
+  "Adaptive routing excludes a health-quarantined stable account without disabling healthy accounts",
   Effect.gen(function* () {
     seen.length = 0
     const credentials = yield* Credential.Service
@@ -468,7 +468,7 @@ it.instance(
       sessionID,
       providerID,
       modelID,
-      routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
     })
     if (!routed) throw new Error("expected routed model")
 
@@ -1141,7 +1141,7 @@ it.instance(
     yield* seedRouteSession(sessionID)
 
     const routed = yield* dispatchHostedCompat(provider, sessionID, {
-      routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
     })
     if (!routed) throw new Error("expected an env-key compat route")
     const accountID = stableZenIdentity(KEY)
@@ -1181,7 +1181,7 @@ it.instance(
     yield* seedRouteSession(sessionID)
 
     const routed = yield* dispatchHostedCompat(provider, sessionID, {
-      routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
     })
     if (!routed) throw new Error("expected a configured-key compat route")
     const lease = routed.route.lease.route
@@ -1232,7 +1232,7 @@ it.instance(
     yield* seedRouteSession(sessionID)
 
     const routed = yield* dispatchHostedCompat(provider, sessionID, {
-      routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
     })
     if (!routed) throw new Error("expected a legacy-auth compat route")
     const lease = routed.route.lease.route
@@ -1325,7 +1325,7 @@ it.instance(
     yield* seedRouteSession(sessionID)
 
     const routed = yield* dispatchHostedCompat(provider, sessionID, {
-      routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
     })
     if (!routed) throw new Error("expected a compat route before the quota failure")
     const accountID = stableZenIdentity(KEY)

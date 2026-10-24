@@ -116,7 +116,7 @@ function resolveInput(
     providerID,
     modelID: "gpt-5",
     affinityDomain,
-    routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+    routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
     mode: "session-round-robin",
     freeRoutePreference: "account-first",
     allowPublic: true,
@@ -130,16 +130,16 @@ describe("OpenCode production provider-route composition", () => {
   it.effect("maps exactly two hosted account-routing strategies, including legacy unqualified intent", () =>
     Effect.sync(() => {
       for (const hosted of ["opencode", "opencode-go"]) {
-        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "auto" })).toBe("session-round-robin")
-        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "auto", strategy: "adaptive" })).toBe("session-round-robin")
-        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "auto", strategy: "round-robin" })).toBe("round-robin")
-        expect(OpencodeProviderRoute.freeRoutePreference(hosted, { kind: "auto", strategy: "adaptive" })).toBe("account-first")
-        expect(OpencodeProviderRoute.freeRoutePreference(hosted, { kind: "auto", strategy: "round-robin" })).toBe("account-first")
+        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "strategy" })).toBe("concentrate")
+        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "strategy", strategy: "adaptive" })).toBe("concentrate")
+        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "strategy", strategy: "round-robin" })).toBe("round-robin")
+        expect(OpencodeProviderRoute.freeRoutePreference(hosted, { kind: "strategy", strategy: "adaptive" })).toBe("account-first")
+        expect(OpencodeProviderRoute.freeRoutePreference(hosted, { kind: "strategy", strategy: "round-robin" })).toBe("account-first")
         expect(OpencodeProviderRoute.routingMode(hosted, { kind: "account", accountID: "acct-a" })).toBe("concentrate")
       }
-      expect(OpencodeProviderRoute.routingMode("anthropic", { kind: "auto" })).toBe("concentrate")
-      expect(OpencodeProviderRoute.routingMode("anthropic", { kind: "auto", strategy: "round-robin" })).toBe("concentrate")
-      expect(OpencodeProviderRoute.routingMode("openai", { kind: "auto", strategy: "adaptive" })).toBe("concentrate")
+      expect(OpencodeProviderRoute.routingMode("anthropic", { kind: "strategy" })).toBe("concentrate")
+      expect(OpencodeProviderRoute.routingMode("anthropic", { kind: "strategy", strategy: "round-robin" })).toBe("concentrate")
+      expect(OpencodeProviderRoute.routingMode("openai", { kind: "strategy", strategy: "adaptive" })).toBe("concentrate")
     }),
   )
   it.effect("uses one stable provider-scoped affinity namespace across runtimes", () =>
@@ -178,7 +178,7 @@ describe("OpenCode production provider-route composition", () => {
     }),
   )
 
-  it.effect("Auto account-first prepares A2 candidates once and returns the exact committed lease", () =>
+  it.effect("Adaptive account-first prepares A2 candidates once and returns the exact committed lease", () =>
     Effect.gen(function* () {
       const sessionID = SessionSchema.ID.make("ses_opencode_route_account")
       yield* seedSession(sessionID)
@@ -222,7 +222,7 @@ describe("OpenCode production provider-route composition", () => {
     }),
   )
 
-  it.effect("a sticky Public Auto route remains credential-free even when policy later becomes account-first", () =>
+  it.effect("a sticky Public strategy route remains credential-free even when policy later becomes account-first", () =>
     Effect.gen(function* () {
       const sessionID = SessionSchema.ID.make("ses_opencode_route_sticky_public")
       yield* seedSession(sessionID)
@@ -252,7 +252,7 @@ describe("OpenCode production provider-route composition", () => {
     }),
   )
 
-  it.effect("a concurrent account selection cannot be overwritten by sticky Public Auto", () =>
+  it.effect("a concurrent account selection cannot be overwritten by a sticky Public strategy", () =>
     Effect.gen(function* () {
       const sessionID = SessionSchema.ID.make("ses_opencode_public_account_race")
       yield* seedSession(sessionID)
@@ -465,7 +465,7 @@ describe("OpenCode production provider-route composition", () => {
     }),
   )
 
-  it.effect("standalone Auto mirrors initial public-first then P1 account ordering without sticky state", () =>
+  it.effect("standalone strategy mirrors initial public-first then P1 account ordering without sticky state", () =>
     Effect.gen(function* () {
       const routes = yield* ProviderRoute.Service
       const fake = fakeSource()
@@ -474,7 +474,7 @@ describe("OpenCode production provider-route composition", () => {
       const free = yield* runtime.resolveTransient({
         providerID,
         modelID: "gpt-5",
-        routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+        routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
         mode: "concentrate",
         freeRoutePreference: "public-first-for-free",
         allowPublic: true,
@@ -486,7 +486,7 @@ describe("OpenCode production provider-route composition", () => {
       const paid = yield* runtime.resolveTransient({
         providerID,
         modelID: "gpt-5",
-        routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+        routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
         mode: "concentrate",
         freeRoutePreference: "account-first",
         allowPublic: true,
@@ -497,7 +497,7 @@ describe("OpenCode production provider-route composition", () => {
     }),
   )
 
-  it.effect("Auto leaves an unrelated direct provider unbound when every known account says model-unsupported", () =>
+  it.effect("Adaptive leaves an unrelated direct provider unbound when every known account says model-unsupported", () =>
     Effect.gen(function* () {
       const sessionID = SessionSchema.ID.make("ses_opencode_route_unowned_direct")
       yield* seedSession(sessionID)

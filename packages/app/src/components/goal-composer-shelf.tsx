@@ -7,7 +7,6 @@ import { ScrollViewOverlayScrollbar } from "@opencode-ai/ui/scroll-view"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
-import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useSessionNavigation } from "@opencode-ai/session-ui/context"
 import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, untrack, type JSX } from "solid-js"
@@ -30,9 +29,7 @@ import { showToast } from "@/utils/toast"
 import {
   formatGoalElapsed,
   goalLifecycleAction,
-  goalProgress,
   isGoalTerminal,
-  nextCriterionStatus,
 } from "./goal-composer-shelf-model"
 import {
   applyRevisedGoalObjective,
@@ -63,13 +60,6 @@ const META = "text-[10px] leading-[14px] text-v2-text-text-muted"
 
 function number(value: number | string) {
   return typeof value === "number" ? value : Number(value) || 0
-}
-
-function lines(value: string) {
-  return value
-    .split("\n")
-    .map((item) => item.trim())
-    .filter(Boolean)
 }
 
 function firstLine(value: string) {
@@ -189,23 +179,6 @@ export function GoalComposerShelf(props: Props) {
     if (!value) return ""
     return formatGoalElapsed((number(value.time.completed ?? 0) || now()) - number(value.time.created))
   })
-  const progress = createMemo(() => {
-    const value = detail()
-    if (!value) return { done: 0, total: 0, percent: 0 }
-    return goalProgress(value)
-  })
-  const criteria = createMemo(() => detail()?.criteria ?? [])
-  /** Collapsed subtitle: whatever the Goal is actually waiting on right now. */
-  const preview = createMemo(() => {
-    const value = detail()
-    if (!value) return ""
-    if (value.goal.status === "draft" && value.criteria.length === 0) return language.t("goal.startRequiresCriterion")
-    const step = value.steps.find((item) => item.status === "active")
-    if (step) return step.title
-    const pending = value.criteria.find((item) => item.status === "pending")
-    if (pending) return pending.description
-    return firstLine(value.goal.objective)
-  })
 
   // A different Goal is a different surface: never inherit the previous one's
   // expansion, or focusing a Goal silently reopens a panel the user closed.
@@ -246,8 +219,6 @@ export function GoalComposerShelf(props: Props) {
     if (action) return run(() => goals.transition(props.sessionID, action))
   }
 
-  const lifecycleBlocked = createMemo(() => goal()?.status === "draft" && criteria().length === 0)
-
   // Expansion animates exactly like the todo dock it stacks on: one spring
   // driving max-height against the measured panel, so the two surfaces open
   // and close with the same motion instead of one popping and one sliding.
@@ -281,8 +252,8 @@ export function GoalComposerShelf(props: Props) {
           aria-expanded={open()}
           // Named explicitly: the row seats its own buttons, and a name computed
           // from contents would swallow their labels into this one.
-          aria-label={goal()!.title}
-          title={`${goal()!.title} · ${goalStatusLabel(language, displayStatus()!)} · ${elapsed()}`}
+          aria-label={goal()!.objective}
+          title={`${goal()!.objective} · ${goalStatusLabel(language, displayStatus()!)} · ${elapsed()}`}
           class="flex h-[42px] min-w-0 cursor-default items-center gap-2 pl-3 pr-2 transition-colors"
           classList={{
             "border-b border-v2-border-border-muted bg-v2-background-bg-layer-01": open(),
@@ -296,38 +267,23 @@ export function GoalComposerShelf(props: Props) {
           }}
         >
           <GoalStatusGlyph status={displayStatus()!} />
-          <span class="max-w-[46%] shrink-0 truncate text-[13px] font-[500] leading-5 tracking-[-0.04px] text-v2-text-text-base">
-            {goal()!.title}
-          </span>
-          <span class="min-w-0 flex-1 truncate text-[13px] font-[440] leading-5 tracking-[-0.04px] text-v2-text-text-faint">
-            {preview()}
+          <span class="min-w-0 flex-1 truncate text-[13px] font-[500] leading-5 tracking-[-0.04px] text-v2-text-text-base">
+            {goal()!.objective}
           </span>
 
           <div class="ml-auto flex shrink-0 items-center gap-2 pl-1">
-            <GoalCriteriaTicks items={criteria()} />
-            <Show when={progress().total > 0}>
-              <span class="shrink-0 text-[11px] font-[520] tabular-nums leading-4 text-v2-text-text-muted">
-                {progress().done}/{progress().total}
-              </span>
-            </Show>
             <span class="shrink-0 text-[11px] tabular-nums leading-4 text-v2-text-text-faint">{elapsed()}</span>
             <GoalStatusChip status={displayStatus()!} />
             <GoalAuditorSessionLink sessionID={auditorSessionID()} />
             <span class="h-4 w-px shrink-0 bg-v2-border-border-muted" />
             <Show when={["draft", "active", "paused", "blocked"].includes(goal()!.status)}>
-              <TooltipV2
-                value={
-                  lifecycleBlocked()
-                    ? language.t("goal.startRequiresCriterion")
-                    : lifecycleLabel(language, goal()!.status)
-                }
-              >
+              <TooltipV2 value={lifecycleLabel(language, goal()!.status)}>
                 <IconButtonV2
                   type="button"
                   size="small"
                   variant="ghost-muted"
                   class="shrink-0"
-                  disabled={busy() || lifecycleBlocked()}
+                  disabled={busy()}
                   aria-label={lifecycleLabel(language, goal()!.status)}
                   icon={<Icon name={goal()!.status === "active" ? "pause" : "play"} size="small" />}
                   onClick={(event: MouseEvent) => {
@@ -382,36 +338,6 @@ export function GoalComposerShelf(props: Props) {
   )
 }
 
-/**
- * Criterion ribbon: one tick per acceptance criterion, so the collapsed row
- * carries the same shape of information as the expanded checklist. A single
- * percentage bar hides which checks failed; ticks do not.
- */
-function GoalCriteriaTicks(props: { items: { status: string }[] }) {
-  const shown = createMemo(() => props.items.slice(0, 10))
-  const overflow = createMemo(() => props.items.length - shown().length)
-  return (
-    <Show when={props.items.length > 0}>
-      <div class="flex shrink-0 items-center gap-[3px]" aria-hidden="true">
-        <For each={shown()}>
-          {(item) => (
-            <span
-              class="h-[3px] w-2.5 rounded-full transition-colors duration-150"
-              classList={{
-                "bg-v2-state-fg-success": item.status === "passed",
-                "bg-v2-state-fg-danger": item.status === "failed",
-                "bg-v2-border-border-strong": item.status !== "passed" && item.status !== "failed",
-              }}
-            />
-          )}
-        </For>
-        <Show when={overflow() > 0}>
-          <span class="text-[9px] font-[540] tabular-nums leading-[14px] text-v2-text-text-faint">+{overflow()}</span>
-        </Show>
-      </div>
-    </Show>
-  )
-}
 
 function GoalStatusGlyph(props: { status: GoalDisplayStatus }) {
   const tone = () => goalTone(props.status)
@@ -494,22 +420,11 @@ function GoalPanel(props: {
     return typeof value === "string" && value.trim() ? value.trim() : undefined
   })
   const auditorRuns = createMemo(() => Math.max(0, Math.floor(number(goal().auditorRuns))))
-  /** Evidence attached per criterion - the visible reason completion is gated. */
-  const evidenceCount = createMemo(() => {
-    const counts = new Map<string, number>()
-    for (const item of expanded()?.evidence ?? []) {
-      if (!item.criterionID) continue
-      counts.set(item.criterionID, (counts.get(item.criterionID) ?? 0) + 1)
-    }
-    return counts
-  })
-  const criteriaPassed = createMemo(() => detail().criteria.filter((item) => item.status === "passed").length)
   const activityCount = createMemo(
     () => (expanded()?.evidence?.length ?? 0) + (expanded()?.audit?.length ?? 0) + (expanded()?.focuses?.length ?? 0),
   )
   const hasComposerText = createMemo(() => promptDraftText(props.promptText).length > 0)
   const startTooltip = createMemo(() => {
-    if (detail().criteria.length === 0) return language.t("goal.startRequiresCriterion")
     if (hasComposerText()) return language.t("goal.startAndSendHint")
     return language.t("goal.readyToStart")
   })
@@ -522,10 +437,10 @@ function GoalPanel(props: {
     }
     if (runtimePhase() === "audit_requested") return language.t("goal.auditRequestedHint")
     if (runtimePhase() === "auditing") return language.t("goal.auditingHint")
-    if (draft()) return detail().criteria.length === 0 ? language.t("goal.startRequiresCriterion") : startTooltip()
+    if (draft()) return startTooltip()
     if (goal().status === "verifying") return language.t("goal.auditNotRunningHint")
     if (goal().status === "active") return language.t("goal.autoContinueHint")
-    return language.t("goal.criterion.cycle")
+    return language.t("goal.autoContinueHint")
   })
 
   /** Start a draft and make sure the agent actually receives work. */
@@ -543,9 +458,6 @@ function GoalPanel(props: {
       await goals.dispatch(props.sessionID, "start", live ?? snapshot)
       showToast({ variant: "success", title: language.t("goal.startedAndSent") })
     })
-
-  const cycleCriterion = (criterionID: string, status: string) =>
-    props.onRun(() => goals.updateCriterion(props.sessionID, criterionID, nextCriterionStatus(status)))
 
   return (
     <div class="flex min-w-0 flex-col bg-v2-background-bg-base text-v2-text-text-base">
@@ -569,16 +481,6 @@ function GoalPanel(props: {
               busy={props.busy}
               promptText={props.promptText}
               onRun={props.onRun}
-            />
-          </Show>
-
-          <Show when={!draft()}>
-            <GoalCriteriaChecklist
-              items={detail().criteria}
-              passed={criteriaPassed()}
-              evidence={evidenceCount()}
-              disabled={props.busy || isGoalTerminal(goal().status)}
-              onCycle={(item) => void cycleCriterion(item.id, item.status)}
             />
           </Show>
 
@@ -758,7 +660,7 @@ function GoalPanel(props: {
                 size="small"
                 variant="contrast"
                 class="shrink-0 whitespace-nowrap"
-                disabled={props.busy || detail().criteria.length === 0}
+                disabled={props.busy}
                 onClick={startAndDispatch}
               >
                 {hasComposerText() ? language.t("goal.startAndSend") : language.t("goal.start")}
@@ -771,130 +673,7 @@ function GoalPanel(props: {
   )
 }
 
-/**
- * Acceptance checklist. Borrowed wholesale from the question card's option
- * list: 26px rows, roving tabindex, digit shortcuts, hover-revealed keybinds.
- * Clicking (or pressing the row's digit) cycles pending -> passed -> failed.
- */
-function GoalCriteriaChecklist(props: {
-  items: GoalDetail["criteria"]
-  passed: number
-  evidence: Map<string, number>
-  disabled: boolean
-  onCycle: (item: GoalDetail["criteria"][number]) => void
-}) {
-  const language = useLanguage()
-  let rows: HTMLButtonElement[] = []
-  const [cursor, setCursor] = createSignal(-1)
 
-  const focusRow = (target: number) => {
-    const list = props.items
-    if (list.length === 0) return
-    const next = ((target % list.length) + list.length) % list.length
-    setCursor(next)
-    rows[next]?.focus()
-  }
-
-  const onKeyDown = (event: KeyboardEvent) => {
-    if (event.defaultPrevented || props.disabled) return
-    const plain = !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey
-    if (!plain) return
-    if (event.key === "ArrowDown") {
-      event.preventDefault()
-      focusRow(cursor() + 1)
-      return
-    }
-    if (event.key === "ArrowUp") {
-      event.preventDefault()
-      focusRow(cursor() - 1)
-      return
-    }
-    if (/^[1-9]$/.test(event.key)) {
-      const index = Number(event.key) - 1
-      const item = props.items[index]
-      if (!item) return
-      event.preventDefault()
-      props.onCycle(item)
-      focusRow(index)
-    }
-  }
-
-  return (
-    <section class="min-w-0 bg-v2-background-bg-base">
-      <div class="flex h-7 min-w-0 items-center gap-1.5 px-2.5">
-        <span class={`shrink-0 ${LABEL}`}>{language.t("goal.criteria")}</span>
-        <span class="shrink-0 text-[9px] font-[440] tabular-nums leading-[14px] text-v2-text-text-faint">
-          {props.passed}/{props.items.length}
-        </span>
-      </div>
-      <Show
-        when={props.items.length > 0}
-        fallback={<EmptyRow>{language.t("goal.startRequiresCriterion")}</EmptyRow>}
-      >
-        <div class="flex min-w-0 flex-col gap-px px-1 pb-1" onKeyDown={onKeyDown}>
-          <For each={props.items}>
-            {(item, index) => {
-              const count = () => props.evidence.get(item.id) ?? 0
-              const missing = () => item.status === "passed" && count() === 0
-              return (
-                <button
-                  type="button"
-                  ref={(el) => (rows[index()] = el)}
-                  data-goal-criterion={item.id}
-                  data-status={item.status}
-                  tabIndex={cursor() === index() || (cursor() < 0 && index() === 0) ? 0 : -1}
-                  disabled={props.disabled}
-                  title={language.t("goal.criterion.cycle")}
-                  onFocus={() => setCursor(index())}
-                  onClick={() => props.onCycle(item)}
-                  class="group flex min-h-[26px] w-full min-w-0 shrink-0 items-center gap-2 rounded-[6px] px-1.5 text-start outline-none transition-colors hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover disabled:pointer-events-none disabled:opacity-50"
-                >
-                  <CriterionIcon status={item.status as "pending" | "passed" | "failed"} />
-                  <span
-                    class="min-w-0 flex-1 truncate text-[12px] leading-4"
-                    classList={{
-                      "font-[440] text-v2-text-text-muted line-through decoration-v2-border-border-strong":
-                        item.status === "passed",
-                      "font-[450] text-v2-text-text-base": item.status !== "passed",
-                    }}
-                  >
-                    {item.description}
-                  </span>
-                  <Show when={missing()}>
-                    <span class="shrink-0 text-v2-state-fg-warning" title={language.t("goal.criterion.needsEvidence")}>
-                      <Icon name="warning" size="small" class="size-3" />
-                    </span>
-                  </Show>
-                  <Show when={count() > 0}>
-                    <span
-                      class="shrink-0 text-[9px] font-[540] tabular-nums leading-[14px] text-v2-text-text-faint"
-                      title={language.t("goal.criterion.evidence", { count: String(count()) })}
-                    >
-                      {count()}x
-                    </span>
-                  </Show>
-                  <Show when={index() < 9}>
-                    <KeybindV2
-                      keys={[String(index() + 1)]}
-                      variant="ghost"
-                      class="shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
-                    />
-                  </Show>
-                </button>
-              )
-            }}
-          </For>
-        </div>
-      </Show>
-    </section>
-  )
-}
-
-/**
- * Collapsible section with an IDE-style disclosure triangle. Secondary detail
- * (steps, activity) folds away so the panel opens on the parts that decide
- * what happens next.
- */
 function Disclosure(props: { title: string; meta?: string; defaultOpen?: boolean; children: JSX.Element }) {
   const [open, setOpen] = createSignal(props.defaultOpen ?? true)
   return (
@@ -923,10 +702,6 @@ function Disclosure(props: { title: string; meta?: string; defaultOpen?: boolean
       </Show>
     </section>
   )
-}
-
-function EmptyRow(props: { children: JSX.Element }) {
-  return <div class="px-2.5 pb-1.5 text-[10px] leading-[14px] text-v2-text-text-faint">{props.children}</div>
 }
 
 function ActivityRow(props: { icon: string; meta?: string; detail?: string; children: JSX.Element }) {
@@ -962,23 +737,21 @@ function GoalBriefEditor(props: {
 }) {
   const goals = useGoals()
   const language = useLanguage()
-  const [title, setTitle] = createSignal("")
   const [objective, setObjective] = createSignal("")
   const editable = createMemo(() => ["active", "paused", "blocked"].includes(props.detail().goal.status))
 
   // Seed from the server, but never clobber an in-flight edit: SSE bumps the
   // focused detail on every goal event, and re-seeding blindly would wipe
   // whatever the user is typing into the live brief.
-  let seeded: { id: string; title: string; objective: string } | undefined
+  let seeded: { id: string; objective: string } | undefined
   const seed = (detail: GoalDetail) => {
-    seeded = { id: detail.goal.id, title: detail.goal.title, objective: detail.goal.objective }
-    setTitle(detail.goal.title)
+    seeded = { id: detail.goal.id, objective: detail.goal.objective }
     setObjective(detail.goal.objective)
   }
   createEffect(() => {
     const detail = props.detail()
     untrack(() => {
-      const untouched = !seeded || (title() === seeded.title && objective() === seeded.objective)
+      const untouched = !seeded || objective() === seeded.objective
       if (seeded && seeded.id === detail.goal.id && !untouched) return
       seed(detail)
     })
@@ -986,20 +759,16 @@ function GoalBriefEditor(props: {
 
   const dirty = createMemo(() => {
     const detail = props.detail()
-    return title().trim() !== detail.goal.title || objective().trim() !== detail.goal.objective
+    return objective().trim() !== detail.goal.objective
   })
-  const valid = createMemo(() => !!title().trim() && !!objective().trim())
+  const valid = createMemo(() => !!objective().trim())
 
   const refine = createGoalRefine({
     sessionID: () => props.sessionID,
     targetKey: () => `goal:${props.detail().goal.id}`,
     durableObjective: () => props.detail().goal.objective,
     objective,
-    criteriaText: () =>
-      props
-        .detail()
-        .criteria.map((item) => item.description)
-        .join("\n"),
+    criteriaText: () => "",
     promptText: props.promptText,
     disabled: () => props.busy || !editable(),
     onApply: setObjective,
@@ -1007,7 +776,7 @@ function GoalBriefEditor(props: {
 
   const save = (notify: boolean) =>
     props.onRun(async () => {
-      const next = await goals.updateActive(props.sessionID, { title: title().trim(), objective: objective().trim() })
+      const next = await goals.updateActive(props.sessionID, { title: titleFromObjective(objective()), objective: objective().trim() })
       seed(next)
       await refine.commit()
       if (!notify) return
@@ -1019,14 +788,6 @@ function GoalBriefEditor(props: {
     <>
       <Section title={language.t("goal.brief")} action={refine.trigger()}>
         <div class="flex min-w-0 flex-col border-t border-v2-border-border-muted">
-          <GoalInlineField
-            singleLine
-            label={language.t("goal.field.title")}
-            value={title()}
-            disabled={!editable()}
-            onInput={setTitle}
-            placeholder={language.t("goal.field.titlePlaceholder")}
-          />
           <GoalInlineField
             label={language.t("goal.field.objective")}
             value={objective()}
@@ -1074,9 +835,7 @@ function GoalDraftSetup(props: {
 }) {
   const goals = useGoals()
   const language = useLanguage()
-  const [title, setTitle] = createSignal("")
   const [objective, setObjective] = createSignal("")
-  const [criteria, setCriteria] = createSignal("")
   const [auditorModel, setAuditorModel] = createSignal<GoalModelRef | undefined>()
 
   const modelRef = (detail: GoalDetail) => {
@@ -1086,20 +845,15 @@ function GoalDraftSetup(props: {
   const modelKey = (model: GoalModelRef | undefined) => (model ? `${model.providerID}/${model.modelID}` : "")
 
   // Same in-flight-edit protection as the live brief editor.
-  let seeded: { id: string; title: string; objective: string; criteria: string; model: string } | undefined
+  let seeded: { id: string; objective: string; model: string } | undefined
   const seed = (detail: GoalDetail) => {
-    const criteriaText = detail.criteria.map((item) => item.description).join("\n")
     const model = modelRef(detail)
     seeded = {
       id: detail.goal.id,
-      title: detail.goal.title,
       objective: detail.goal.objective,
-      criteria: criteriaText,
       model: modelKey(model),
     }
-    setTitle(detail.goal.title)
     setObjective(detail.goal.objective)
-    setCriteria(criteriaText)
     setAuditorModel(model)
   }
   createEffect(() => {
@@ -1107,10 +861,7 @@ function GoalDraftSetup(props: {
     untrack(() => {
       const untouched =
         !seeded ||
-        (title() === seeded.title &&
-          objective() === seeded.objective &&
-          criteria() === seeded.criteria &&
-          modelKey(auditorModel()) === seeded.model)
+        (objective() === seeded.objective && modelKey(auditorModel()) === seeded.model)
       if (seeded && seeded.id === detail.goal.id && !untouched) return
       seed(detail)
     })
@@ -1119,9 +870,7 @@ function GoalDraftSetup(props: {
   const dirty = createMemo(() => {
     const detail = props.detail()
     return (
-      title().trim() !== detail.goal.title ||
       objective().trim() !== detail.goal.objective ||
-      lines(criteria()).join("\n") !== detail.criteria.map((item) => item.description).join("\n") ||
       modelKey(auditorModel()) !== modelKey(modelRef(detail))
     )
   })
@@ -1131,7 +880,7 @@ function GoalDraftSetup(props: {
     targetKey: () => `goal:${props.detail().goal.id}`,
     durableObjective: () => props.detail().goal.objective,
     objective,
-    criteriaText: criteria,
+    criteriaText: () => "",
     promptText: props.promptText,
     disabled: () => props.busy,
     onApply: setObjective,
@@ -1140,9 +889,8 @@ function GoalDraftSetup(props: {
   const save = () =>
     props.onRun(async () => {
       const next = await goals.updateDraft(props.sessionID, {
-        title: title().trim(),
+        title: titleFromObjective(objective()),
         objective: objective().trim(),
-        criteria: lines(criteria()),
         auditorPolicy: {
           ...props.detail().goal.auditorPolicy,
           model: auditorModel() ? { providerID: auditorModel()!.providerID, id: auditorModel()!.modelID } : undefined,
@@ -1156,26 +904,11 @@ function GoalDraftSetup(props: {
     <Section title={language.t("goal.setup")} action={refine.trigger()}>
       <div class="flex min-w-0 flex-col border-t border-v2-border-border-muted">
         <GoalInlineField
-          singleLine
-          label={language.t("goal.field.title")}
-          value={title()}
-          onInput={setTitle}
-          placeholder={language.t("goal.field.titlePlaceholder")}
-        />
-        <GoalInlineField
           label={language.t("goal.field.objective")}
           value={objective()}
           rows={3}
           onInput={setObjective}
           placeholder={language.t("goal.field.objectivePlaceholder")}
-        />
-        <GoalInlineField
-          label={language.t("goal.field.criteria")}
-          value={criteria()}
-          rows={2}
-          onInput={setCriteria}
-          placeholder={language.t("goal.field.criteriaPlaceholder")}
-          description={language.t("goal.field.criteriaDescription")}
         />
         <div class="flex h-7 min-w-0 items-center gap-1.5 px-2.5">
           <span class={`shrink-0 ${LABEL}`}>{language.t("goal.auditor")}</span>
@@ -1195,7 +928,7 @@ function GoalDraftSetup(props: {
             size="small"
             variant="neutral"
             class="shrink-0 whitespace-nowrap"
-            disabled={props.busy || !title().trim() || !objective().trim()}
+            disabled={props.busy || !objective().trim()}
             onClick={save}
           >
             {language.t("goal.saveSetup")}
@@ -1588,7 +1321,6 @@ export function GoalComposerLauncher(props: LauncherProps) {
   const [submitting, setSubmitting] = createSignal(false)
   const [creating, setCreating] = createSignal(false)
   const [objective, setObjective] = createSignal("")
-  const [criteria, setCriteria] = createSignal("")
   const [auditorModel, setAuditorModel] = createSignal<GoalModelRef | undefined>()
   const current = createMemo(() => (props.sessionID ? goals.focused(props.sessionID) : null))
   const session = createMemo(() =>
@@ -1600,7 +1332,7 @@ export function GoalComposerLauncher(props: LauncherProps) {
     targetKey: () => `new:${props.armKey}`,
     requireExplicitRecovery: true,
     objective,
-    criteriaText: criteria,
+    criteriaText: () => "",
     promptText: props.promptText,
     disabled: submitting,
     onApply: setObjective,
@@ -1646,14 +1378,11 @@ export function GoalComposerLauncher(props: LauncherProps) {
     // hydrated first: that introduces a race where a valid sessionID is already
     // usable but sync().data.session has not populated yet.
     if (!sessionID || !objective().trim()) return
-    const acceptance = lines(criteria())
-    if (start && acceptance.length === 0) return
     setSubmitting(true)
     try {
       const detail = await goals.createAndFocus(sessionID, {
         title: titleFromObjective(objective()),
         objective: objective().trim(),
-        criteria: acceptance,
         auditorPolicy: auditorModel()
           ? { model: goalRuntimeModelRef(auditorModel()!.providerID, auditorModel()!.modelID) }
           : undefined,
@@ -1663,12 +1392,11 @@ export function GoalComposerLauncher(props: LauncherProps) {
       const composerText = promptDraftText(props.promptText)
       if (start && !composerText) {
         // No composer text: publish only the user's start action. The mutable
-        // objective/criteria are already supplied by the Goal STATE projection.
+        // The objective is already supplied by the host Goal projection.
         await goals.dispatch(sessionID, "start", detail)
         showToast({ variant: "success", title: language.t("goal.startedAndSent") })
       }
       setObjective("")
-      setCriteria("")
       setAuditorModel(undefined)
       setCreating(false)
       setShown(false)
@@ -1823,22 +1551,12 @@ export function GoalComposerLauncher(props: LauncherProps) {
                     autofocus
                     placeholder={language.t("goal.field.objectivePlaceholder")}
                   />
-                  <GoalInlineField
-                    label={language.t("goal.field.criteria")}
-                    value={criteria()}
-                    onInput={setCriteria}
-                    rows={2}
-                    placeholder={language.t("goal.field.criteriaPlaceholder")}
-                    description={language.t("goal.field.criteriaDescription")}
-                  />
                   <div class="flex h-7 min-w-0 items-center justify-end px-2">{refine.trigger()}</div>
                 </div>
 
                 <div class="flex h-9 shrink-0 items-center justify-between gap-2 border-t border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2">
                   <span class="min-w-0 truncate px-0.5 text-[9px] leading-[13px] text-v2-text-text-faint">
-                    {lines(criteria()).length
-                      ? language.t("goal.autoContinueHint")
-                      : language.t("goal.startRequiresCriterion")}
+                    {language.t("goal.autoContinueHint")}
                   </span>
                   <div class="flex shrink-0 items-center gap-1">
                     <ButtonV2
@@ -1854,7 +1572,7 @@ export function GoalComposerLauncher(props: LauncherProps) {
                       size="small"
                       variant="contrast"
                       class="shrink-0 whitespace-nowrap"
-                      disabled={submitting() || !objective().trim() || lines(criteria()).length === 0}
+                      disabled={submitting() || !objective().trim()}
                       onClick={() => void create(true)}
                     >
                       {language.t("goal.create")}

@@ -18,9 +18,12 @@ const agenda = {
 }
 
 describe("Telegram quota selection presentation", () => {
-  test("identifies only OpenCode Go 5h as rolling, preserving fixed-window semantics", () => {
+  test("identifies Go and Claude moving windows without classifying unrelated fixed deadlines as rolling", () => {
     expect(isRollingQuotaOption({ providerId: "opencode-go", windowKey: "5h" })).toBe(true)
     expect(isRollingQuotaOption({ providerId: "opencode-go", windowKey: "week" })).toBe(false)
+    expect(isRollingQuotaOption({ providerId: "claude", windowKey: "5h" })).toBe(true)
+    expect(isRollingQuotaOption({ providerId: "claude", windowKey: "weekly" })).toBe(true)
+    expect(isRollingQuotaOption({ providerId: "claude", windowKey: "weekly:all" })).toBe(true)
     expect(isRollingQuotaOption({ providerId: "another-provider", windowKey: "5h" })).toBe(false)
   })
 

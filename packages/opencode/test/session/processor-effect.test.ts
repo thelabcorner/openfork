@@ -1031,7 +1031,7 @@ itClaudeFallback.live("session.processor never persists a Claude fallback over p
             providerID: String(claudeRef.providerID),
             modelID: String(claudeRef.modelID),
             variant: "high",
-            routeIntent: { kind: "auto" },
+            routeIntent: { kind: "strategy" },
           },
           nestedDelegation: false,
         }),
@@ -1073,7 +1073,7 @@ itClaudeFallback.live("session.processor never persists a Claude fallback over p
         providerID: String(claudeRef.providerID),
         modelID: String(claudeRef.modelID),
         variant: "high",
-        routeIntent: { kind: "auto" },
+        routeIntent: { kind: "strategy" },
       })
     }),
   ),

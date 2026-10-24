@@ -52,7 +52,7 @@ export const CAPABILITY_DESCRIPTIONS = Object.freeze({
     "Run typed semantic inference through OpenFork's System One provider primitive in an approved root. Preserves provider/account routing and reports probabilities, usage, and cost.",
   test: "List tests cheaply or run the detected Bun/Vitest/Jest/node:test/Mocha/AVA/Playwright harness. Runs use OXP-owned processes with timeout cleanup.",
   usage:
-    "Read bounded durable token, cost, and context-part accounting for an authorized Session ID. Does not expose live window occupancy or global analytics.",
+    "Inspect supervised Session context or, with a separate default-off grant, aggregate usage, native workload (≤90d), selected summary sections, or empirical OXP attribution.",
   models:
     "Search, filter, sort and page public model metadata, with opt-in supervised Session activity. Configured access, quota and global accounting remain host-private.",
   typecheck:

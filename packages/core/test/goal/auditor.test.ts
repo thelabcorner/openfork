@@ -950,7 +950,7 @@ describe("GoalAuditor", () => {
       expect(generateRequests).toHaveLength(2)
       const repairTranscript = JSON.stringify(generateRequests[1]!.messages)
       expect(repairTranscript).toContain("audit_verdict was called with an empty payload")
-      expect(repairTranscript).toContain("exact id from ACCEPTANCE CRITERIA")
+      expect(repairTranscript).toContain("no criterion IDs are needed")
     }),
   )
 
@@ -968,7 +968,8 @@ describe("GoalAuditor", () => {
       expect(wire.type).toBe("object")
       expect(wire.anyOf).toBeUndefined()
       expect(wire.properties?.decision).toMatchObject({ type: "string", enum: ["continue", "complete", "blocked"] })
-      expect(wire.required ?? []).toEqual(expect.arrayContaining(["decision", "rationale", "progressMade", "criteria"]))
+      expect(wire.required ?? []).toEqual(expect.arrayContaining(["decision", "rationale", "progressMade"]))
+      expect(wire.properties?.criteria).toBeUndefined()
       expect(JSON.stringify(wire)).not.toContain("Goal.AuditorVerdict")
     }),
   )

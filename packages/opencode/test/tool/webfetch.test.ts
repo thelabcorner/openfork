@@ -5,7 +5,9 @@ import { Effect, Exit, Layer } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
-import { WebFetchTool, applyGitHubNudge, isGitHubUrl } from "../../src/tool/webfetch"
+import { WebFetchTool } from "../../src/tool/webfetch"
+import { classifyGitHubFetch, githubFetchGuidance } from "../../src/tool/github-fetch-guidance"
+import { classify as classifyGithub } from "../../src/tool/github"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { Tool } from "@/tool/tool"
 import { testEffect } from "../lib/effect"
@@ -139,38 +141,109 @@ describe("tool.webfetch", () => {
   )
 })
 
-describe("tool.webfetch github routing", () => {
-  test("recognizes GitHub content hosts", () => {
-    for (const url of [
-      "https://github.com/owner/repo/pull/123.diff",
-      "https://www.github.com/owner/repo",
-      "https://api.github.com/repos/owner/repo",
-      "https://raw.githubusercontent.com/owner/repo/main/file.ts",
-      "https://patch-diff.githubusercontent.com/raw/owner/repo/pull/123.diff",
-      "https://codeload.github.com/owner/repo/tar.gz/main",
-      "https://GITHUB.COM/owner/repo",
-    ]) {
-      expect(isGitHubUrl(url)).toBe(true)
+describe("tool.webfetch github AX routing", () => {
+  const raw = "https://raw.githubusercontent.com/storytold/vectorcraft/main/crates/geom/src/lib.rs"
+
+  test("gives concrete, non-fetched REST guidance for raw source RAG", () => {
+    const result = githubFetchGuidance(raw, "markdown")!
+    expect(result.metadata).toEqual({
+      advisory: "github-preferred",
+      contentFetched: false,
+      recommendedTool: "github",
+      kind: "file",
+    })
+    expect(result.output).toContain('"endpoint":"repos/storytold/vectorcraft/contents/crates/geom/src/lib.rs"')
+    expect(result.output).toContain('"ref":"main"')
+    expect(result.output).toContain('"Accept":"application/vnd.github.raw+json"')
+    expect(result.output).toContain("not an error")
+    expect(result.output).toContain("forceWeb:true")
+    expect(result.output).toContain("403/rate-limit exhaustion")
+    expect(result.output).toContain("private repository files")
+    const route = classifyGitHubFetch(raw, "text")!
+    const input = JSON.parse(route.example.slice("github(".length, -1))
+    expect(classifyGithub(input).access).toBe("read")
+  })
+
+  test("recognizes repo, blob, directory, issue and pull source workflows", () => {
+    const cases: [string, string, string][] = [
+      ["https://github.com/storytold/vectorcraft", "repository", '"repo","view"'],
+      ["https://github.com/storytold/vectorcraft/", "repository", '"repo","view"'],
+      ["https://github.com/storytold/vectorcraft/blob/main/crates/geom/src/projective.rs", "file", '"endpoint":"repos/storytold/vectorcraft/contents/crates/geom/src/projective.rs"'],
+      ["https://github.com/storytold/vectorcraft/tree/main/crates/geom", "directory", '"endpoint":"repos/storytold/vectorcraft/contents/crates/geom"'],
+      ["https://github.com/storytold/vectorcraft/issues/17", "issue", '"issue","view","17"'],
+      ["https://github.com/storytold/vectorcraft/pull/29", "pull", '"pr","view","29"'],
+      ["https://github.com/storytold/vectorcraft/pull/29.diff", "pull", '"pr","diff","29"'],
+      ["https://api.github.com/repos/storytold/vectorcraft/issues/17", "api", '"repos/storytold/vectorcraft/issues/17"'],
+    ]
+    for (const [url, kind, command] of cases) {
+      const result = githubFetchGuidance(url, "text")
+      expect(String(result?.metadata.kind)).toBe(kind)
+      expect(result?.output).toContain(command)
+      const example = classifyGitHubFetch(url, "text")!.example
+      const input = JSON.parse(example.slice("github(".length, -1))
+      expect(classifyGithub(input).access).toBe("read")
     }
   })
 
-  test("leaves non-GitHub and unsupported hosts alone", () => {
+  test("abstains from ambiguous or non-repository web traffic", () => {
     for (const url of [
       "https://example.com/page",
+      "https://github.com.evil.example/storytold/vectorcraft/blob/main/file.rs",
       "https://gist.github.com/user/abc",
       "https://github.example.com/owner/repo",
+      "https://codeload.github.com/storytold/vectorcraft/zip/main",
+      "https://patch-diff.githubusercontent.com/raw/storytold/vectorcraft/pull/123.diff",
+      "https://github.com/marketplace",
+      "http://raw.githubusercontent.com/storytold/vectorcraft/main/file.rs",
+      "https://github.com/owner/repo/blob/main/file.rs?plain=1",
+      "https://raw.githubusercontent.com/owner/repo/main/file.rs?token=private",
+      "https://raw.githubusercontent.com/owner/repo/main/dir%2ffile.rs",
       "not a url",
       "",
     ]) {
-      expect(isGitHubUrl(url)).toBe(false)
+      expect(githubFetchGuidance(url, "markdown")).toBeUndefined()
     }
+    expect(githubFetchGuidance(raw, "html")).toBeUndefined()
+    expect(classifyGitHubFetch("https://github.com/owner/repo/blob/main/file.rs#L18", "text")?.kind).toBe("file")
   })
 
-  test("nudges toward the github tool only for GitHub hosts", () => {
-    const nudged = applyGitHubNudge("diff content", "https://github.com/owner/repo/pull/123.diff")
-    expect(nudged.startsWith("diff content")).toBe(true)
-    expect(nudged).toContain("github tool")
-    expect(nudged).toContain('argv:["pr","diff","123"]')
-    expect(applyGitHubNudge("hello", "https://example.com/page")).toBe("hello")
+  test("ambiguous slash-bearing refs receive discovery guidance, not a guessed contents path", () => {
+    const result = githubFetchGuidance("https://raw.githubusercontent.com/o/r/feature/big-change/src/mod.rs", "text")!
+    expect(result.output).toContain("ref/path boundary")
+    expect(result.output).toContain('action":"catalog"')
+    expect(result.output).not.toContain('"endpoint":"repos/o/r/contents/')
   })
+
+  it.instance("returns successful guidance without permission or outbound fetch", () =>
+    Effect.gen(function* () {
+      const info = yield* WebFetchTool
+      const tool = yield* info.init()
+      let asked = 0
+      const result = yield* tool.execute({ url: raw, format: "text" }, {
+        ...ctx,
+        ask: () => Effect.sync(() => { asked++ }),
+      })
+      expect(asked).toBe(0)
+      expect("contentFetched" in result.metadata && result.metadata.contentFetched).toBe(false)
+      expect(result.output).toContain("Recommended github arguments:")
+      expect(result.attachments).toBeUndefined()
+    }),
+  )
+
+  it.instance("forceWeb bypasses the advisory and reaches the ordinary webfetch permission gate", () =>
+    Effect.gen(function* () {
+      const info = yield* WebFetchTool
+      const tool = yield* info.init()
+      let asked = 0
+      const exit = yield* Effect.exit(tool.execute({ url: raw, format: "text", forceWeb: true }, {
+        ...ctx,
+        ask: () => Effect.gen(function* () {
+          asked++
+          return yield* Effect.die(new Error("test: permission gate reached"))
+        }),
+      }))
+      expect(asked).toBe(1)
+      expect(Exit.isFailure(exit)).toBe(true)
+    }),
+  )
 })

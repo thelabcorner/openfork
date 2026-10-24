@@ -1735,6 +1735,8 @@ export class RouteResolutionError extends Schema.TaggedErrorClass<RouteResolutio
         ? this.cause.message
         : this.cause instanceof ProviderRouteResolution.NoEligibleRouteError
         ? "No eligible subscription account can serve this model. Check connected credentials, model access, and quota."
+        : this.cause instanceof ProviderRouteResolution.ExplicitAccountUnavailableError
+          ? `The selected account (${this.cause.accountID}) is unavailable or ineligible for this model. Select another account, Adaptive, or Round Robin.`
         : this.cause instanceof ProviderRouteResolution.BoundRouteUnavailableError
           ? this.cause.hardPin
             ? "The selected account is pinned and unavailable."
@@ -3984,9 +3986,9 @@ const layer = Layer.effect(
             providerID: input.providerID,
             modelID: input.modelID,
             affinityDomain: input.affinityDomain,
-            routeIntent: { kind: "auto" },
-            mode: OpencodeProviderRoute.routingMode(input.providerID, { kind: "auto" }),
-            freeRoutePreference: OpencodeProviderRoute.freeRoutePreference(input.providerID, { kind: "auto" }),
+            routeIntent: { kind: "strategy" },
+            mode: OpencodeProviderRoute.routingMode(input.providerID, { kind: "strategy" }),
+            freeRoutePreference: OpencodeProviderRoute.freeRoutePreference(input.providerID, { kind: "strategy" }),
             allowPublic: input.allowPublic,
             publicEligible: input.publicEligible,
             expected: resolution.attribution,
@@ -4323,9 +4325,9 @@ const layer = Layer.effect(
           providerID: input.providerID,
           modelID: accountModelID,
           affinityDomain,
-          routeIntent: { kind: "auto" },
-          mode: OpencodeProviderRoute.routingMode(input.providerID, { kind: "auto" }),
-          freeRoutePreference: OpencodeProviderRoute.freeRoutePreference(input.providerID, { kind: "auto" }),
+          routeIntent: { kind: "strategy" },
+          mode: OpencodeProviderRoute.routingMode(input.providerID, { kind: "strategy" }),
+          freeRoutePreference: OpencodeProviderRoute.freeRoutePreference(input.providerID, { kind: "strategy" }),
           allowPublic,
           publicEligible,
           expected: input.route,

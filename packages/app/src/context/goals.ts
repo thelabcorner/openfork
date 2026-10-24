@@ -41,7 +41,7 @@ export type GoalArmIntent = true
 export type GoalCreateAndFocusInput = {
   title: string
   objective: string
-  criteria: string[]
+  criteria?: string[]
   constraints?: string[]
   steps?: Array<{ title: string; description?: string }>
   auditorPolicy?: GoalAuditorPolicy
@@ -239,10 +239,6 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
       return createAndFocus(sessionID, {
         title: quickTitle(input.objective),
         objective: input.objective,
-        // Quick mode stays zero-friction while retaining the same evidence gate
-        // as structured Goals. The agent/verifier must still attach concrete
-        // proof before this criterion can pass.
-        criteria: ["The Goal objective is fully satisfied and the result is verified."],
         start: true,
       })
     }
@@ -299,7 +295,7 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
         input: {
           title: string
           objective: string
-          criteria: string[]
+          criteria?: string[]
           constraints?: string[]
           steps?: Array<{ title: string; description?: string }>
           auditorPolicy?: GoalAuditorPolicy

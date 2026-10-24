@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Layer, Option } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivitySchema } from "@opencode-ai/core/oxp-activity/schema"
@@ -48,6 +48,9 @@ export interface Interface {
    * handshake never fails because attribution failed.
    */
   readonly registerSession: (input: RegisterSessionInput) => Effect.Effect<RegisterSessionOutcome>
+  /** Resolve stable pseudonymized OXP session ownership and the stored handshake title. */
+  readonly resolveSession: (input: { readonly parentCorrelation?: ParentCorrelation }) =>
+    Effect.Effect<{ readonly ref: string; readonly title?: string } | undefined>
 }
 
 export interface RegisterSessionInput {
@@ -141,8 +144,22 @@ const DETAIL_MAX_OBJECT_KEYS = 64
 // Activity is optional observability, not user-visible tool execution.
 // Retry only SQLITE_BUSY/SNAPSHOT, and only the complete atomic DB operation.
 // The native busy_timeout stays short to avoid blocking Bun's event loop.
+// NOTE: a Core transaction can independently retry BEGIN for up to 15 seconds
+// on the primary SQLite lane, BEFORE its failure reaches our retry owner.
+// Bound the whole optional activity attempt as well as our own busy retries.
+// The timeout is an UNKNOWN attribution outcome, not evidence of rollback:
+// never replay non-idempotent user mutations based on it.
+class ActivityDeadlineExceeded extends Error {
+  readonly code = "OXP_ACTIVITY_TIMEOUT"
+  constructor() { super("Optional OXP activity recording deadline exceeded; durable outcome may be unknown") }
+}
 const recordWrite = <A, E, R>(attempt: () => Effect.Effect<A, E, R>) =>
-  retrySqliteBusyCause(attempt, { maxElapsedMs: 450, delayMs: 20, maxDelayMs: 75 })
+  retrySqliteBusyCause(attempt, { maxElapsedMs: 450, delayMs: 20, maxDelayMs: 75 }).pipe(
+    Effect.timeoutOption(650),
+    Effect.flatMap((outcome) => Option.isSome(outcome)
+      ? Effect.succeed(outcome.value)
+      : Effect.fail(new ActivityDeadlineExceeded())),
+  )
 const SECRET_KEY =
   /(?:pass(?:word)?|secret|token|api[_-]?key|authorization|cookie|credential|private[_-]?key|access[_-]?key|refresh[_-]?token)/i
 
@@ -1005,7 +1022,22 @@ const layer = Layer.effect(
       )
     }
 
-    return Service.of({ begin, success, failure, registerSession })
+    const resolveSession: Interface["resolveSession"] = (input) => {
+      if (!input.parentCorrelation) return Effect.succeed(undefined)
+      return identity.pseudonymize(input.parentCorrelation).pipe(
+        Effect.flatMap((correlation) =>
+          activity.sessionTitle(correlation).pipe(
+            // A transient title-read failure must not erase the session identity
+            // and accidentally merge workers into the legacy shared group.
+            Effect.catchCause(() => Effect.succeed(undefined)),
+            Effect.map((title) => ({ ref: correlation.digest, ...(title ? { title } : {}) })),
+          ),
+        ),
+        Effect.catchCause(() => Effect.succeed(undefined)),
+      )
+    }
+
+    return Service.of({ begin, success, failure, registerSession, resolveSession })
   }),
 )
 

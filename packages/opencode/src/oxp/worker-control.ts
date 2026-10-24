@@ -34,6 +34,8 @@ export interface StartInput {
   readonly agent: string
   readonly model: ModelSelection
   readonly origin: Origin
+  /** Stable, pseudonymized originating ChatGPT/OXP conversation (never the raw correlation). */
+  readonly parentSession?: { readonly ref: string; readonly title?: string }
   /** Durable navigation owner for OXP workers; supplied by the native adapter. */
   readonly groupID?: string
 }

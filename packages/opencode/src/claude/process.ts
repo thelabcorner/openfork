@@ -37,6 +37,17 @@ export interface SpawnExit {
 /** Bounded tail of combined output kept for pattern matching, never display. */
 const MAX_BUFFERED_OUTPUT = 64 * 1024
 
+/**
+ * Node cannot spawn Windows .cmd/.bat files directly on all supported Node
+ * releases. Keep auth/login subprocesses working by routing only those shims
+ * through cmd.exe; native .exe paths (including the Agent SDK path) stay direct.
+ */
+function spawnSpec(file: string, args: readonly string[], platform = process.platform): { file: string; args: string[] } {
+  if (platform !== "win32" || !/\.(?:cmd|bat)$/i.test(file)) return { file, args: [...args] }
+  const command = `"${file.replace(/"/g, '""')}" ${args.map((arg) => `"${arg.replace(/"/g, '""')}"`).join(" ")}`
+  return { file: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", `"${command}"`] }
+}
+
 export interface SpawnHandle {
   readonly pid: number | undefined
   write(text: string): boolean
@@ -162,7 +173,8 @@ class NodeSpawnHandle implements SpawnHandle {
 export const nodeProcessPort: ClaudeProcessPort = {
   async exec(file, args, options) {
     try {
-      const result = spawnSync(file, [...args], {
+      const invocation = spawnSpec(file, args)
+      const result = spawnSync(invocation.file, invocation.args, {
         encoding: "utf8",
         timeout: options?.timeoutMs,
         env: GitRuntime.environment(options?.env === undefined ? process.env : undefined, options?.env as NodeJS.ProcessEnv | undefined),
@@ -185,7 +197,8 @@ export const nodeProcessPort: ClaudeProcessPort = {
   },
 
   async spawn(file, args, options) {
-    const child = spawn(file, [...args], {
+    const invocation = spawnSpec(file, args)
+    const child = spawn(invocation.file, invocation.args, {
       cwd: options?.cwd,
       env: GitRuntime.environment(options?.env === undefined ? process.env : undefined, options?.env as NodeJS.ProcessEnv | undefined),
       stdio: ["pipe", "pipe", "pipe"],

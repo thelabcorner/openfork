@@ -159,6 +159,8 @@ export interface Interface {
    * Updated event. Cheap: one indexed read plus at most two writes.
    */
   readonly registerSession: (input: RegisterSessionInput) => Effect.Effect<RegisterSessionResult>
+  /** Indexed, read-only title lookup; never creates a session or changes recency. */
+  readonly sessionTitle: (correlation: RegisterSessionInput["correlation"]) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/core/OxpActivity") {}
@@ -166,7 +168,11 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/co
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db, filename } = yield* Database.Service
+    const database = yield* Database.Service
+    // Optional telemetry never holds the foreground Session writer permit for
+    // its own long BEGIN retry. The activity writer has its own bounded lane.
+    const db = database.activityDb ? yield* database.activityDb() : database.db
+    const { filename } = database
     const events = yield* EventV2.Service
     yield* Effect.forkScoped(runHistoricalContextBackfillLoop(filename))
     yield* Effect.forkScoped(runInvocationDetailRetentionLoop(filename))
@@ -749,6 +755,22 @@ const layer = Layer.effect(
       return changed
     })
 
+    const sessionTitle = Effect.fn("OxpActivity.sessionTitle")(function* (
+      correlation: RegisterSessionInput["correlation"],
+    ) {
+      const row = yield* db
+        .select({ title: OxpParentActivityTable.title })
+        .from(OxpCorrelationRefTable)
+        .innerJoin(OxpParentActivityTable, eq(OxpParentActivityTable.id, OxpCorrelationRefTable.activity_id))
+        .where(and(
+          eq(OxpCorrelationRefTable.scheme, correlation.scheme),
+          eq(OxpCorrelationRefTable.digest, correlation.digest),
+        ))
+        .get()
+        .pipe(Effect.orDie)
+      return row?.title ?? undefined
+    })
+
     const registerSession = Effect.fn("OxpActivity.registerSession")(function* (
       input: RegisterSessionInput,
     ) {
@@ -926,6 +948,7 @@ const layer = Layer.effect(
       archive,
       deleteHistory,
       registerSession,
+      sessionTitle,
     })
 
   }),

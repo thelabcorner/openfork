@@ -4,6 +4,7 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { SessionInspection } from "@opencode-ai/core/session/inspection"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { OxpAuthority } from "./authority"
+import { OxpConfig } from "./config"
 import { OxpError } from "./error"
 import { OxpSchema } from "./schema"
 import type { OxpSessionControl } from "./session-control"
@@ -40,16 +41,18 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const authority = yield* OxpAuthority.Service
+    const config = yield* OxpConfig.Service
     const inspection = yield* SessionInspection.Service
 
     const authorizeRow: Interface["authorizeRow"] = Effect.fnUntraced(
       function* (row, operation, rootID) {
+        const native = !rootID && (yield* config.get()).grant.sessionSupervision === "all-native"
         return yield* authority.authorize({
           plane: "supervision",
           operation,
           phase: "supervise",
-          rootID,
-          path: row.directory,
+          ...(rootID ? { rootID } : {}),
+          ...(native ? {} : { path: row.directory }),
         })
       },
     )
@@ -103,7 +106,7 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [OxpAuthority.node, SessionInspection.node],
+  deps: [OxpAuthority.node, OxpConfig.node, SessionInspection.node],
 })
 
 export * as OxpSupervision from "./supervision"

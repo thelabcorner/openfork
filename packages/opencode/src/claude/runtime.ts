@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process"
 import { ClaudeDisposedError, ClaudeSdkUnavailableError, sanitizeDetail } from "./errors"
 import { decodeTransportEvent, type ResultEvent, type RuntimeEventSink } from "./events"
 import { buildChildEnv, type ChildEnv } from "./env"
-import { defaultSdkLoader, resolveCliPath, type ClaudeSdkModuleShape } from "./availability"
+import { defaultSdkLoader, resolveSdkCliPath, sdkCliUsesNode, type ClaudeSdkModuleShape } from "./availability"
 import { isClaudeEffort } from "./models"
 import { refreshClaudeSubscriptionModelsFromHandle } from "./model-discovery"
 import {
@@ -196,8 +196,13 @@ export interface TurnRequest {
 export type TurnStatus = "completed" | "cancelled" | "timedOut" | "stalled" | "failed" | "disposed"
 
 export interface TurnUsage {
+  /** Anthropic non-cached prompt tokens (not inclusive of cache reads/writes). */
   readonly input_tokens?: number
   readonly output_tokens?: number
+  readonly cache_read_input_tokens?: number
+  readonly cache_creation_input_tokens?: number
+  /** Subset of output_tokens when provided by recent Agent SDK releases. */
+  readonly thinking_tokens?: number
 }
 
 export interface TurnOutcome {
@@ -380,12 +385,18 @@ export class ClaudeAgentRuntime {
 
     const abortHandler = () => requestStop("cancelled")
     request.signal?.addEventListener("abort", abortHandler, { once: true })
+    // addEventListener does not fire retroactively for an already-aborted signal.
+    // Reject before SDK loading or creating a Claude process in that case.
+    if (request.signal?.aborted) requestStop("cancelled")
 
     this.diag.turnsStarted += 1
     this.emit({ kind: "started", turnID })
 
     let handle: SdkQueryHandle | undefined
     try {
+      if (stopReason || this.disposed) {
+        return this.outcomeForStop(turnID, stopReason ?? "disposed", turnMs, stallMs)
+      }
       const sdk = await this.loadSdk()
       if (stopReason || this.disposed) {
         return this.outcomeForStop(turnID, stopReason ?? "disposed", turnMs, stallMs)
@@ -431,7 +442,18 @@ export class ClaudeAgentRuntime {
         apiErrorStatus: pumped.result?.api_error_status,
         leafUuid: pumped.leafUuid,
         usage: pumped.result?.usage
-          ? { input_tokens: pumped.result.usage.input_tokens, output_tokens: pumped.result.usage.output_tokens }
+          ? {
+              ...(pumped.result.usage.input_tokens !== undefined
+                ? { input_tokens: pumped.result.usage.input_tokens } : {}),
+              ...(pumped.result.usage.output_tokens !== undefined
+                ? { output_tokens: pumped.result.usage.output_tokens } : {}),
+              ...(pumped.result.usage.cache_read_input_tokens !== undefined
+                ? { cache_read_input_tokens: pumped.result.usage.cache_read_input_tokens } : {}),
+              ...(pumped.result.usage.cache_creation_input_tokens !== undefined
+                ? { cache_creation_input_tokens: pumped.result.usage.cache_creation_input_tokens } : {}),
+              ...(pumped.result.usage.output_tokens_details?.thinking_tokens !== undefined
+                ? { thinking_tokens: pumped.result.usage.output_tokens_details.thinking_tokens } : {}),
+            }
           : undefined,
       }
       if (pumped.error) {
@@ -543,8 +565,18 @@ export class ClaudeAgentRuntime {
         this.emit({ kind: "transport", turnID, event })
         if (result) break
       }
-      if (!sawInit && !result) {
-        return { error: { category: "empty-stream", message: "Claude stream ended without any events" } }
+      // An init/assistant message is not a terminal acknowledgement. Treat a
+      // prematurely closed SDK process as failed even when it streamed output;
+      // otherwise the host durably records a fabricated completed turn.
+      if (!result) {
+        return {
+          error: {
+            category: "empty-stream",
+            message: sawInit ? "Claude stream ended without a terminal result" : "Claude stream ended without any events",
+          },
+          sessionID,
+          leafUuid,
+        }
       }
       return { result, sessionID, sawOutput, refusal, leafUuid }
     } catch (error) {
@@ -681,8 +713,11 @@ export class ClaudeAgentRuntime {
       }
       request.onMcpToolsRegistered?.(true)
     }
-    const executable = this.options.executablePath ?? resolveCliPath(this.options.env ?? process.env)
-    if (executable) options.pathToClaudeCodeExecutable = executable
+    const executable = resolveSdkCliPath(this.options.env ?? process.env, undefined, process.platform, this.options.executablePath)
+    if (executable) {
+      options.pathToClaudeCodeExecutable = executable
+      if (sdkCliUsesNode(executable)) options.executable = "node"
+    }
     if (request.model) options.model = request.model
     if (request.resume) options.resume = request.resume
     if (request.resumeSessionAt) options.resumeSessionAt = request.resumeSessionAt

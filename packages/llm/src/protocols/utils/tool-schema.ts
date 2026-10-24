@@ -63,6 +63,95 @@ const openAI = (schema: JsonSchema): JsonSchema => {
   return isRecord(normalized) ? normalized : { type: "object" }
 }
 
+// Anthropic requires an object-shaped tool input_schema with no composition
+// keywords at its root. Keep nested unions intact: they are legal property
+// schemas, and rewriting them would unnecessarily change the tool contract.
+// This is a wire projection only; the executable tool retains its source schema.
+const anthropic = (schema: JsonSchema): JsonSchema => {
+  const combiners = ["oneOf", "anyOf", "allOf"] as const
+  if (!combiners.some((key) => key in schema)) return schema
+
+  const result: Record<string, unknown> = Object.fromEntries(
+    Object.entries(schema).filter(([key]) => !combiners.some((combiner) => combiner === key)),
+  )
+  const properties: Record<string, unknown> = isRecord(schema.properties) ? { ...schema.properties } : {}
+  const required = new Set(
+    Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === "string") : [],
+  )
+  const hints: string[] = []
+
+  for (const combiner of combiners) {
+    const branches = Array.isArray(schema[combiner]) ? schema[combiner].filter(isRecord) : []
+    if (branches.length === 0) continue
+
+    // AllOf requires the union of required fields. AnyOf/OneOf can safely
+    // require only fields common to every alternative.
+    const requirements = branches.map((branch) =>
+      Array.isArray(branch.required)
+        ? branch.required.filter((key): key is string => typeof key === "string")
+        : [],
+    )
+    if (combiner === "allOf") {
+      for (const fields of requirements) for (const field of fields) required.add(field)
+    } else {
+      for (const field of requirements[0] ?? []) {
+        if (requirements.every((fields) => fields.includes(field))) required.add(field)
+      }
+    }
+
+    // Preserve all discoverable parameters. If alternatives disagree on a
+    // property type, retain the alternatives *inside that property*, where
+    // Anthropic does allow compositions.
+    for (const branch of branches) {
+      if (!isRecord(branch.properties)) continue
+      for (const [field, definition] of Object.entries(branch.properties)) {
+        if (!(field in properties)) {
+          properties[field] = definition
+          continue
+        }
+        if (JSON.stringify(properties[field]) === JSON.stringify(definition)) continue
+        if (isRecord(schema.properties) && field in schema.properties) continue
+        const key = combiner === "allOf" ? "allOf" : "anyOf"
+        const previous = properties[field]
+        if (isRecord(previous) && Object.keys(previous).length === 1 && Array.isArray(previous[key])) {
+          properties[field] = { [key]: [...previous[key], definition] }
+        } else {
+          properties[field] = { [key]: [previous, definition] }
+        }
+      }
+    }
+
+    // Add required-only names after collecting typed branch properties, so
+    // an untyped placeholder never masks a meaningful property definition.
+    for (const fields of requirements) {
+      for (const field of fields) {
+        if (!(field in properties)) properties[field] = {}
+      }
+    }
+
+    // Required-only branches (common in MCP rootID/path and action unions)
+    // otherwise lose their cross-field constraint. Keep a short model-facing
+    // hint; the original tool still performs authoritative validation.
+    if (requirements.length === branches.length && requirements.every((fields) => fields.length > 0)) {
+      const join = combiner === "allOf" ? " and " : " or "
+      const condition = combiner === "oneOf" ? "exactly one" : combiner === "anyOf" ? "at least one" : "all"
+      hints.push(`${condition} of (${requirements.map((fields) => fields.join(" + ")).join(join)})`)
+    }
+  }
+
+  result.type = "object"
+  result.properties = properties
+  if (required.size) result.required = [...required]
+  else delete result.required
+  if (hints.length) {
+    const note = `Parameter combinations: ${hints.join("; ")}.`
+    result.description = [typeof schema.description === "string" ? schema.description : "", note]
+      .filter(Boolean)
+      .join(" ")
+  }
+  return result
+}
+
 const gemini = (schema: JsonSchema): JsonSchema => GeminiToolSchema.convert(schema) ?? {}
 
 const modelCompatibility = (
@@ -79,6 +168,7 @@ const modelCompatibility = (
 }
 
 export const ToolSchemaProjection = {
+  anthropic,
   gemini,
   modelCompatibility,
   moonshot,

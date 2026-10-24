@@ -1,6 +1,7 @@
 import type { ModelMessage, ToolResultPart } from "ai"
 import { mergeDeep, unique } from "remeda"
 import type { JSONSchema7 } from "@ai-sdk/provider"
+import { ToolSchemaProjection } from "@opencode-ai/llm"
 import type * as Provider from "./provider"
 import type * as ModelsDev from "@opencode-ai/core/models-dev"
 import { iife } from "@/util/iife"
@@ -1722,6 +1723,32 @@ function sanitizeOpenAISchema(value: unknown): unknown {
   return result
 }
 
+// Last-mile defense for tools injected after the registry schema pass (for
+// example, structured-output or plugin tools). Applied to provider-visible
+// AI SDK V3 tool definitions, after SDK argument validators are constructed.
+// Never rewrite executable tools or their original argument validators.
+export function anthropicWireTools<T extends { type: string; inputSchema?: unknown }>(
+  model: Provider.Model,
+  tools: T[] | undefined,
+): T[] | undefined {
+  if (
+    !tools ||
+    (model.api.npm !== "@ai-sdk/anthropic" && model.api.npm !== "@ai-sdk/google-vertex/anthropic")
+  ) return tools
+
+  let changed = false
+  const lowered = tools.map((tool) => {
+    if (tool.type !== "function") return tool
+    const original = tool.inputSchema
+    if (!original || typeof original !== "object" || Array.isArray(original)) return tool
+    const projected = ToolSchemaProjection.anthropic(original as Record<string, unknown>)
+    if (projected === original) return tool
+    changed = true
+    return { ...tool, inputSchema: projected }
+  })
+  return changed ? (lowered as T[]) : tools
+}
+
 export function schema(model: Provider.Model, schema: JSONSchema7): JSONSchema7 {
   /*
   if (["openai", "azure"].includes(providerID)) {
@@ -1740,6 +1767,10 @@ export function schema(model: Provider.Model, schema: JSONSchema7): JSONSchema7 
     }
   }
   */
+
+  if (model.api.npm === "@ai-sdk/anthropic" || model.api.npm === "@ai-sdk/google-vertex/anthropic") {
+    schema = ToolSchemaProjection.anthropic(schema as unknown as Record<string, unknown>) as JSONSchema7
+  }
 
   if (model.api.npm === "@ai-sdk/openai" || model.api.npm === "@ai-sdk/azure") {
     schema = sanitizeOpenAISchema(schema) as JSONSchema7

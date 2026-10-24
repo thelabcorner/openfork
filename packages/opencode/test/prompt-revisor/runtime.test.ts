@@ -509,7 +509,7 @@ describe("Prompt Revisor production runtime", () => {
     const exit = await Effect.runPromiseExit(runtime.resolveModel({ candidates: [sessionRef], session }))
     expect(exit._tag).toBe("Failure")
     expect(transientCalls).toEqual([
-      { providerID: "opencode", modelID: "gpt-5-nano", routeIntent: { kind: "auto" }, executionPurpose: "special-agent" },
+      { providerID: "opencode", modelID: "gpt-5-nano", routeIntent: { kind: "strategy" }, executionPurpose: "special-agent" },
     ])
   })
 
@@ -551,7 +551,7 @@ describe("Prompt Revisor production runtime", () => {
     expect(result.route).toEqual({ routeKind: "account", accountID: "revisor-account" })
     expect(result.ref.accountID).toBe("revisor-account")
     expect(calls).toEqual([
-      { providerID: "opencode", modelID: "gpt-5-nano", routeIntent: { kind: "auto" }, executionPurpose: "special-agent" },
+      { providerID: "opencode", modelID: "gpt-5-nano", routeIntent: { kind: "strategy" }, executionPurpose: "special-agent" },
     ])
     expect(writes).toBe(0)
   })
@@ -600,7 +600,7 @@ describe("Prompt Revisor production runtime", () => {
     const resolved = await Effect.runPromise(runtime.resolveModel({ candidates: [sessionRef], session }))
 
     expect(transientCalls).toEqual([
-      { providerID: "opencode", modelID: "gpt-5-nano", routeIntent: { kind: "auto" }, executionPurpose: "special-agent" },
+      { providerID: "opencode", modelID: "gpt-5-nano", routeIntent: { kind: "strategy" }, executionPurpose: "special-agent" },
     ])
     expect(resolved.route).toEqual({ routeKind: "account", accountID: "revisor-account" })
     expect(resolved.value).toBe(transientModel)
@@ -656,7 +656,7 @@ describe("Prompt Revisor production runtime", () => {
     )
 
     expect(transientCalls).toEqual([
-      { providerID: "opencode", modelID: "gpt-5-nano", routeIntent: { kind: "auto" }, executionPurpose: "special-agent" },
+      { providerID: "opencode", modelID: "gpt-5-nano", routeIntent: { kind: "strategy" }, executionPurpose: "special-agent" },
     ])
     expect(resolved.route).toEqual({ routeKind: "account", accountID: "new-session-account" })
     expect(resolved.value).toBe(transientModel)

@@ -241,6 +241,8 @@ describe("tool.swarm_member", () => {
       for (const [input, missing] of [
         [{ action: "send", to: "peer" }, "body"],
         [{ action: "send", body: "Hi" }, "to"],
+        [{ action: "send", to: "peer", body: "Review this", kind: "review" }, "replyExpected=true"],
+        [{ action: "send", to: "peer", body: "Review this", kind: "review", replyExpected: false }, "replyExpected=true"],
         [{ action: "fail" }, "failureKind"],
         [{ action: "shared.put", key: "notes" }, "value"],
         [{ action: "shared.put", value: null }, "key"],
@@ -252,6 +254,12 @@ describe("tool.swarm_member", () => {
       expect(yield* Schema.decodeUnknownEffect(Parameters)({
         action: "shared.put", key: "notes", value: null,
       })).toMatchObject({ action: "shared.put", key: "notes", value: null })
+      expect(yield* Schema.decodeUnknownEffect(Parameters)({
+        action: "send", to: "peer", body: "Review this", kind: "review", replyExpected: true,
+      })).toMatchObject({ action: "send", kind: "review", replyExpected: true })
+      expect(yield* Schema.decodeUnknownEffect(Parameters)({
+        action: "send", to: "peer", body: "Ordinary one-way mail", kind: "message",
+      })).toMatchObject({ action: "send", kind: "message" })
       const badCursor = yield* Schema.decodeUnknownEffect(Parameters)({
         action: "shared.get", key: "notes", afterKey: "first",
       }).pipe(Effect.flip)

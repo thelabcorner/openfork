@@ -1034,7 +1034,7 @@ describe("tool.task", () => {
                 providerID: delegatedModel.providerID,
                 modelID: delegatedModel.modelID,
                 variant: delegatedModel.variant,
-                routeIntent: { kind: "auto" },
+                routeIntent: { kind: "strategy" },
               },
             }),
           })

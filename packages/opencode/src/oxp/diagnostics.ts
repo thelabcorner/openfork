@@ -68,7 +68,10 @@ export function sqliteIncidentCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined
   const top = error as { name?: unknown; _tag?: unknown; constructor?: { name?: unknown } }
   const name = top._tag ?? top.constructor?.name ?? top.name
-  if (name !== "SqlError" && name !== "SQLITE_ERROR") return undefined
+  // Effect/Drizzle wraps real SQLite failures as EffectDrizzleQueryError.
+  // This is a known adapter boundary, not permission to scan arbitrary
+  // Error.message text or user-supplied objects for SQLITE-looking strings.
+  if (name !== "SqlError" && name !== "SQLITE_ERROR" && name !== "EffectDrizzleQueryError") return undefined
   const stack: unknown[] = [error]
   const seen = new Set<object>()
   while (stack.length > 0 && seen.size < 24) {
@@ -100,6 +103,18 @@ export function sqliteIncidentCode(error: unknown): string | undefined {
     for (const field of ["reason", "cause", "error", "defect", "failure"] as const) {
       try { if (node[field] && typeof node[field] === "object") stack.push(node[field]) } catch {}
     }
+    // Effect Cause can use a bounded collection of reason objects. Only
+    // traverse that structural slot; never descend through query bindings or
+    // arbitrary enumerable fields containing private SQL and user payloads.
+    try {
+      const reasons = node.reasons
+      if (Array.isArray(reasons)) {
+        for (let index = 0; index < Math.min(reasons.length, 8); index++) {
+          const reason = reasons[index]
+          if (reason && typeof reason === "object") stack.push(reason)
+        }
+      }
+    } catch {}
   }
   return "SQLITE_UNCLASSIFIED"
 }

@@ -5,7 +5,9 @@
 - Use this tool when you need to retrieve and analyze web content
 
 Usage notes:
-  - For github.com repo/issue/PR/diff/Actions URLs (including raw/api content hosts), use the github tool instead: it is authenticated and returns structured, paginated output, e.g. github({action:"command", argv:["pr","diff","123"]}). Use webfetch for github.com only when gh auth is unavailable.
+  - For GitHub repository source files, issues, PRs, and known REST repository URLs, use the lazy github tool instead: it runs gh under the user account and its own permissions. Such fetches may return a successful, pre-network AX guidance response containing the correct github arguments, NOT retrieved content or an error.
+  - After a github guidance response, activate the lazy github tool through tool describe/call (or @github) and perform the lookup. If gh is unavailable, denied, returns 403 due to account rate-limit exhaustion, or exact public HTTP output is required, repeat the original PUBLIC URL with forceWeb:true. Do not loop on exhausted API quotas; private repository data remains inaccessible to an unauthenticated WebFetch. The override still needs ordinary webfetch permission; it does not grant GitHub credentials.
+  - Archives, unrecognized GitHub pages, non-HTTPS URLs, and explicit HTML requests are not intercepted by this guidance.
   - The URL must be a fully-formed valid URL
   - HTTP and HTTPS URLs are supported; redirects are followed by the HTTP client
   - Format options: "markdown" (default), "text", or "html"

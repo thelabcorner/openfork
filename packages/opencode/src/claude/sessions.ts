@@ -427,16 +427,22 @@ export function boundHistory(messages: ReadonlyArray<{ role: string; content: st
   let chars = 0
   const result: Array<{ role: string; content: string }> = []
   let truncated = sliced.length < messages.length
-  for (const m of sliced) {
-    const len = m.content.length
-    if (chars + len > MAX_HISTORY_TRANSFER_CHARS) {
+  // Preserve the most recent context when history exceeds the character
+  // budget. Reading oldest-first can silently omit the latest tool result or
+  // user instruction, which is precisely what a resumed session needs.
+  for (let i = sliced.length - 1; i >= 0; i--) {
+    const m = sliced[i]!
+    const remaining = MAX_HISTORY_TRANSFER_CHARS - chars
+    if (m.content.length > remaining) {
       truncated = true
-      const remaining = MAX_HISTORY_TRANSFER_CHARS - chars
-      if (remaining > 0) result.push({ role: m.role, content: m.content.slice(0, remaining) + " …truncated" })
+      const marker = "…truncated\n"
+      if (remaining > marker.length) {
+        result.unshift({ role: m.role, content: marker + m.content.slice(-(remaining - marker.length)) })
+      }
       break
     }
-    result.push(m)
-    chars += len
+    result.unshift(m)
+    chars += m.content.length
   }
   return { messages: result, truncated }
 }

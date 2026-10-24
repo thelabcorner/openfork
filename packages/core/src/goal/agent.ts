@@ -53,6 +53,10 @@ export const Input = Schema.Struct({
 })
 export type Input = typeof Input.Type
 
+/** The only model-authored Goal input. Lifecycle and verification belong to the host. */
+export const ObjectiveInput = Schema.Struct({ objective: Schema.String })
+export type ObjectiveInput = typeof ObjectiveInput.Type
+
 export const Output = Schema.Struct({
   action: Schema.String,
   goal: GoalModel.Detail,
@@ -61,6 +65,12 @@ export const Output = Schema.Struct({
 export type Output = typeof Output.Type
 
 export interface Interface {
+  readonly submit: (
+    sessionID: SessionSchema.ID,
+    input: ObjectiveInput,
+    turn?: GoalCreationPolicy.TurnProvenance,
+  ) => Effect.Effect<Output, GoalSchema.Error>
+  /** Legacy/internal operations are not exposed in the model tool schema. */
   readonly execute: (
     sessionID: SessionSchema.ID,
     input: Input,
@@ -107,12 +117,6 @@ const layer = Layer.effect(
           })
         }
         const criteria = (input.criteria ?? []).map((item) => item.trim()).filter(Boolean)
-        if (criteria.length === 0) {
-          // A human can request a durable Goal without writing its acceptance
-          // checklist first. Anchor the audit to the full persisted objective
-          // instead of rejecting creation or making the model fabricate details.
-          criteria.push("The complete Goal objective has been achieved and independently verified.")
-        }
         const existing = yield* goals.focused(sessionID)
         const shouldStart =
           GoalCreationPolicy.explicitlyRequestsDraft(turn!.userText) ||
@@ -339,7 +343,28 @@ const layer = Layer.effect(
       return { action: input.action, goal: detail, ...(evidence ? { evidence } : {}) }
     })
 
-    return Service.of({ execute })
+    const submit = Effect.fn("GoalAgent.submit")(function* (
+      sessionID: SessionSchema.ID,
+      input: ObjectiveInput,
+      turn?: GoalCreationPolicy.TurnProvenance,
+    ) {
+      const objective = input.objective.trim()
+      if (!objective) return yield* new GoalSchema.ValidationError({ reason: "Goal objective cannot be empty" })
+      const current = yield* goals.focused(sessionID)
+      if (current && current.detail.goal.objective === objective) {
+        return { action: "create", goal: current.detail }
+      }
+      if (current) {
+        // Never replace the focused objective without a fresh, explicit human
+        // update request. The model cannot invent or silently broaden the work.
+        const authorization = GoalCreationPolicy.authorizeUpdate(turn)
+        if (!authorization.allowed) return yield* new GoalSchema.ValidationError({ reason: authorization.reason })
+        return yield* execute(sessionID, { action: "update", objective }, turn)
+      }
+      return yield* execute(sessionID, { action: "create", objective }, turn)
+    })
+
+    return Service.of({ execute, submit })
   }),
 )
 

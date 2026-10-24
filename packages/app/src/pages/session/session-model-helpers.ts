@@ -34,11 +34,11 @@ const sameRouteIntent = (providerID: string, left?: ProviderRouteIntentInfo, rig
   // composer and session model stores after restoring older histories.
   if (
     isHostedAccountProvider(providerID) &&
-    (!left || left.kind === "auto") &&
-    (!right || right.kind === "auto")
+    (!left || left.kind === "strategy") &&
+    (!right || right.kind === "strategy")
   ) return effectiveStrategy(left) === effectiveStrategy(right)
   if (left?.kind !== right?.kind) return false
-  if (left?.kind === "auto" && right?.kind === "auto")
+  if (left?.kind === "strategy" && right?.kind === "strategy")
     return effectiveStrategy(left) === effectiveStrategy(right)
   if (left?.kind === "account" && right?.kind === "account")
     return left.accountID === right.accountID && left.pin === right.pin

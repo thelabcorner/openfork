@@ -87,7 +87,9 @@ const MemberArguments = Schema.Struct({
   kind: Schema.optional(SwarmModel.MessageKind).annotate({ description: "send only: message kind." }),
   priority: Schema.optional(SwarmModel.MessagePriority).annotate({ description: "send only: message priority." }),
   body: Schema.optional(Schema.String).annotate({ description: "send only: message body." }),
-  replyExpected: Schema.optional(Schema.Boolean).annotate({ description: "send only: reply contract." }),
+  replyExpected: Schema.optional(Schema.Boolean).annotate({
+    description: "send only: whether the recipient can reply. REQUIRED true when kind=review; omit or false for ordinary one-way messages.",
+  }),
   key: Schema.optional(Schema.String).annotate({ description: "shared.get/shared.put: shared-state key." }),
   afterKey: Schema.optional(Schema.String).annotate({
     description: "shared.get without key only: resume keyset pagination using the previous result.nextKey. Never guess a cursor.",
@@ -129,6 +131,8 @@ const MemberActionInputs = Schema.makeFilter<Schema.Schema.Type<typeof MemberArg
   })
   if (missing.length > 0)
     return `swarm_member action "${value.action}" is missing required input(s): ${missing.join(", ")}.`
+  if (value.action === "send" && value.kind === "review" && value.replyExpected !== true)
+    return "swarm_member send kind=review requires replyExpected=true. Set replyExpected=true for a reply-capable review, or choose kind=message/finding for a one-way notice."
   if (value.afterKey !== undefined && (value.action !== "shared.get" || value.key !== undefined))
     return "afterKey is only valid for shared.get without key; use the previous nextKey as afterKey."
   if (value.afterKey !== undefined && value.afterKey.trim() === "")

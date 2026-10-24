@@ -1,6 +1,6 @@
 export * as SessionMetadataOwnership from "./metadata-ownership"
 
-import { Schema } from "effect"
+import { Option, Schema } from "effect"
 import { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
 
 /**
@@ -131,7 +131,7 @@ function sameRouteIntent(left: ProviderRouteIntent.Info, right: ProviderRouteInt
 /**
  * Canonicalize the protected delegated-worker model migration window.
  *
- * Legacy accountID is a hard account pin; missing route data is Auto. Explicit
+ * Legacy accountID is a hard account pin; missing route data selects Adaptive. Explicit
  * route intent is authoritative but may coexist with legacy accountID only when
  * both name the exact same account. Account intent without the compatibility
  * field is projected back into accountID so old Session/model surfaces retain
@@ -150,10 +150,16 @@ export function normalizeWorkerDelegationModel(value: unknown): WorkerDelegation
   let routeIntent: ProviderRouteIntent.Info
 
   if (rawRouteIntent === undefined) {
-    routeIntent = accountID ? { kind: "account", accountID, pin: "hard" } : { kind: "auto" }
+    routeIntent = accountID ? { kind: "account", accountID, pin: "hard" } : { kind: "strategy" }
   } else {
-    if (!Schema.is(ProviderRouteIntent.Info)(rawRouteIntent)) return
-    routeIntent = rawRouteIntent
+    // Persisted Sessions may still contain the old { kind: "auto" } route.
+    // Schema.is checks the canonical output shape and therefore rejects that
+    // valid legacy *input*, making the entire worker delegation appear corrupt.
+    // Decode at this durable read boundary; Info migrates "auto" to "strategy"
+    // without introducing a third runtime routing mode.
+    const decoded = Schema.decodeUnknownOption(ProviderRouteIntent.Info)(rawRouteIntent)
+    if (Option.isNone(decoded)) return
+    routeIntent = decoded.value
     if (accountID !== undefined) {
       if (routeIntent.kind !== "account" || routeIntent.accountID !== accountID) return
     } else if (routeIntent.kind === "account") {

@@ -305,6 +305,102 @@ const seed = (approvedDir: string, outsideDir: string) =>
   })
 
 describe("OxpSession", () => {
+  it.live("paginates large native Session inventories without skipping partially consumed pages", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const sessions = yield* OxpSession.Service
+    const { db } = yield* Database.Service
+    const approvedDir = path.join(suite, "approved")
+    const outsideDir = path.join(suite, "outside")
+    yield* Effect.promise(() => Promise.all([
+      fs.mkdir(approvedDir, { recursive: true }),
+      fs.mkdir(outsideDir, { recursive: true }),
+    ]))
+    yield* seed(approvedDir, outsideDir)
+    const now = Date.now()
+    yield* db.insert(SessionTable).values(Array.from({ length: 130 }, (_, i) => ({
+      id: SessionSchema.ID.make(`ses_oxp_native_page_${String(i).padStart(4, "0")}`),
+      project_id: Project.ID.global,
+      slug: `native-page-${i}`,
+      directory: outsideDir,
+      title: `Native pagination fixture ${i}`,
+      version: "test",
+      time_created: now + i,
+      time_updated: now + i,
+    }))).run().pipe(Effect.orDie)
+
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ sessionSupervision: "all-native" })
+
+    const first = yield* sessions.execute({ action: "list", limit: 80 })
+    const firstData = first.structured as { sessions: Array<{ id: string }>; nextCursor: string; truncated: boolean }
+    expect(firstData.sessions).toHaveLength(80)
+    expect(firstData.truncated).toBe(true)
+    expect(firstData.nextCursor).toBeTruthy()
+
+    const second = yield* sessions.execute({ action: "list", limit: 80, cursor: firstData.nextCursor })
+    const secondData = second.structured as { sessions: Array<{ id: string }>; truncated: boolean; nextCursor?: string }
+    const all = [...firstData.sessions, ...secondData.sessions].map((row) => row.id)
+    expect(all).toHaveLength(133)
+    expect(new Set(all).size).toBe(133)
+    expect(all).toContain(outsideID)
+    expect(all).toContain(approvedID)
+    expect(secondData.truncated).toBe(false)
+    expect(secondData.nextCursor).toBeUndefined()
+
+    const invalid = yield* sessions.execute({ action: "list", cursor: "bad!" }).pipe(Effect.flip)
+    expect(invalid._tag).toBe("OXP_INVALID_ARGUMENT")
+  }))
+
+  it.live("supervises all native Sessions independently of OXP filesystem roots, with explicit root filters and revocation", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const sessions = yield* OxpSession.Service
+    const approvedDir = path.join(suite, "approved")
+    const outsideDir = path.join(suite, "outside")
+    yield* Effect.promise(() => Promise.all([
+      fs.mkdir(approvedDir, { recursive: true }),
+      fs.mkdir(outsideDir, { recursive: true }),
+    ]))
+    yield* seed(approvedDir, outsideDir)
+    const root = yield* roots.approve(approvedDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ sessionSupervision: "approved-roots" })
+
+    const initiallyHidden = yield* sessions.execute({ action: "get", sessionID: outsideID }).pipe(Effect.flip)
+    expect(initiallyHidden._tag).toBe("OXP_NOT_FOUND")
+
+    yield* config.setGrant({ sessionSupervision: "all-native" })
+    const listed = yield* sessions.execute({ action: "list", roots: true, limit: 10 })
+    const visible = (listed.structured as { sessions: Array<{ id: string }> }).sessions.map((row) => row.id)
+    expect(visible).toContain(outsideID)
+    expect(visible).toContain(approvedID)
+
+    const outside = yield* sessions.execute({ action: "get", sessionID: outsideID })
+    expect((outside.structured as { location: { scope: string; path: string } }).location)
+      .toEqual({ scope: "native-session", path: outsideDir })
+
+    const found = yield* sessions.execute({ action: "search", search: "Outside Session" })
+    expect((found.structured as { sessions: Array<{ sessionId: string }> }).sessions.map((row) => row.sessionId))
+      .toContain(outsideID)
+
+    const steered = yield* sessions.execute({ action: "steer", sessionID: outsideID, text: "steer existing native Session" })
+    expect(steered.mutation).toEqual({ attempted: true, committed: true })
+    expect(controlCalls.at(-1)).toMatchObject({ action: "steer", target: { sessionID: outsideID, directory: outsideDir } })
+
+    const sent = yield* sessions.execute({ action: "send", sessionID: outsideID, text: "continue the same research" })
+    expect(sent.mutation).toEqual({ attempted: true, committed: true })
+    expect(controlCalls.at(-1)).toMatchObject({ action: "send", target: { sessionID: outsideID, directory: outsideDir } })
+
+    const explicitRootDenied = yield* sessions.execute({ action: "get", sessionID: outsideID, rootID: root.id }).pipe(Effect.flip)
+    expect(explicitRootDenied._tag).toBe("OXP_NOT_FOUND")
+
+    yield* config.setGrant({ sessionSupervision: "approved-roots" })
+    const revoked = yield* sessions.execute({ action: "get", sessionID: outsideID }).pipe(Effect.flip)
+    expect(revoked._tag).toBe("OXP_NOT_FOUND")
+    const approved = yield* sessions.execute({ action: "get", sessionID: approvedID })
+    expect((approved.structured as { id: string }).id).toBe(approvedID)
+  }))
+
   it.live("projects missing native runtime services without erasing the actionable dependency", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
     const roots = yield* OxpRoot.Service

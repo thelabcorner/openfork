@@ -539,7 +539,7 @@ const layer = Layer.effect(
           modelID: model.modelID,
           ...(input.model?.accountID
             ? { accountID: input.model.accountID }
-            : { routeIntent: { kind: "auto" as const } }),
+            : { routeIntent: { kind: "strategy" as const } }),
           executionPurpose: "special-agent",
         })
         if (Provider.isHostedZenProvider(model.providerID) && (!routed || routed.route.route.kind !== "account")) {

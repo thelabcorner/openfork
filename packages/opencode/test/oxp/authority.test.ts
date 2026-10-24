@@ -42,6 +42,68 @@ afterAll(async () => {
 })
 
 describe("OxpAuthority", () => {
+  it.live("keeps global usage analytics default-off and independently revocable", Effect.gen(function* () {
+    const authority = yield* OxpAuthority.Service
+    const config = yield* OxpConfig.Service
+    yield* config.setEnabled(true)
+    const denied = yield* attempt(authority.authorize({ plane: "augmentation", operation: "usage.global", phase: "read" }))
+    expect(denied._tag).toBe("Left")
+    if (denied._tag === "Left") expect(denied.left._tag).toBe("OXP_AUTH_DENIED")
+
+    yield* config.setGrant({ globalUsageAnalytics: true })
+    const admission = yield* authority.authorize({ plane: "augmentation", operation: "usage.global", phase: "read" })
+    expect(admission.authority).toBe("globalUsageAnalytics")
+    expect(admission.root).toBeUndefined()
+    yield* config.setGrant({ globalUsageAnalytics: false })
+    const revoked = yield* attempt(authority.revalidate(admission, "egress"))
+    expect(revoked._tag).toBe("Left")
+    if (revoked._tag === "Left") expect(revoked.left._tag).toBe("OXP_AUTH_REVOKED")
+  }))
+
+  it.live(
+    "separates all-native Session authority from filesystem capabilities and revokes scope changes",
+    Effect.gen(function* () {
+      const authority = yield* OxpAuthority.Service
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const rootDir = path.join(suite, "workspace")
+      const foreignDir = path.join(suite, "outside")
+      yield* Effect.promise(() => Promise.all([fs.mkdir(rootDir), fs.mkdir(foreignDir)]))
+      const root = yield* roots.approve(rootDir)
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true, sessionSupervision: "all-native" })
+
+      const native = yield* authority.authorize({
+        plane: "supervision",
+        operation: "session.get",
+        phase: "supervise",
+      })
+      expect(native.authority).toBe("sessionSupervision")
+      expect(native.root).toBeUndefined()
+
+      const noFilesystemRoot = yield* attempt(authority.authorize({
+        plane: "augmentation", operation: "read", phase: "read",
+      }))
+      expect(noFilesystemRoot._tag).toBe("Left")
+      if (noFilesystemRoot._tag === "Left") expect(noFilesystemRoot.left._tag).toBe("OXP_ROOT_REQUIRED")
+
+      const outsideRead = yield* attempt(authority.authorize({
+        plane: "augmentation", operation: "read", phase: "read", path: foreignDir,
+      }))
+      expect(outsideRead._tag).toBe("Left")
+
+      const insideRead = yield* authority.authorize({
+        plane: "augmentation", operation: "read", phase: "read", rootID: root.id,
+      })
+      expect(insideRead.root?.root.id).toBe(root.id)
+
+      yield* config.setGrant({ sessionSupervision: "approved-roots" })
+      const revoked = yield* attempt(authority.revalidate(native, "supervise"))
+      expect(revoked._tag).toBe("Left")
+      if (revoked._tag === "Left") expect(revoked.left._tag).toBe("OXP_AUTH_REVOKED")
+    }),
+  )
+
   it.live(
     "keeps augmentation grants independent and requires explicit root authority",
     Effect.gen(function* () {

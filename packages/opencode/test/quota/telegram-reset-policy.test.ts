@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { ResetAgendaResult, ResetOccurrence } from "../../src/quota/schema"
 import {
+  detectEarlyQuotaRecovery,
   quotaDeliveryKey,
   quotaNotificationDeadlines,
   quotaSubscriptionKey,
@@ -136,5 +137,92 @@ describe("Telegram quota reset notification policy", () => {
     const [before] = quotaNotificationDeadlines({ agenda: agenda(occurrence()), subscriptions: [choice], now })
     if (!before) throw new Error("missing deadline")
     expect(quotaDeliveryKey(before, "111")).not.toBe(quotaDeliveryKey(before, "222"))
+  })
+
+  test("detects an early reset only on fresh capacity recovery plus a new provider period", () => {
+    const future = now + 3600_000
+    const [baseline] = quotaNotificationDeadlines({
+      agenda: agenda(occurrence({ resetAt: future })), subscriptions: [choice], now,
+    })
+    if (!baseline) throw new Error("missing baseline")
+    const observedAt = future - 20 * 60_000
+    const fresh = occurrence({
+      observedAt, resetAt: future + 5 * 3600_000,
+      windows: [{ key: "five-hour", usedPercent: 0, remainingPercent: 100, valueLabel: null, source: "provider" }],
+    })
+    const result = detectEarlyQuotaRecovery(baseline, agenda(fresh), observedAt)
+    expect(result).toMatchObject({
+      kind: "reset", observedAt, expectedResetAt: future,
+      nextResetAt: future + 5 * 3600_000,
+      previousRemainingPercent: 1, remainingPercent: 100,
+    })
+    expect(result?.id).toBe(JSON.stringify(["early-quota-recovery", baseline.subscriptionKey, future]))
+    expect(detectEarlyQuotaRecovery(baseline, agenda({ ...fresh, observedAt: future - 30_000 }), future - 30_000))
+      .toBeUndefined() // near the deadline
+    expect(detectEarlyQuotaRecovery(baseline, agenda({
+      ...fresh, windows: [{ ...fresh.windows[0]!, remainingPercent: 1 }],
+    }), observedAt)).toBeUndefined() // timestamp movement alone
+  })
+
+  test("rejects stale, cross-account, non-provider, rolling and jitter-only evidence", () => {
+    const future = now + 3600_000
+    const [baseline] = quotaNotificationDeadlines({
+      agenda: agenda(occurrence({ resetAt: future })), subscriptions: [choice], now,
+    })
+    if (!baseline) throw new Error("missing baseline")
+    const at = now + 2000
+    const changed = occurrence({
+      observedAt: at, resetAt: future + 5 * 3600_000,
+      windows: [{ key: "five-hour", usedPercent: 0, remainingPercent: 100, valueLabel: null, source: "provider" }],
+    })
+    expect(detectEarlyQuotaRecovery(baseline, agenda({ ...changed, accountId: "another" }), at)).toBeUndefined()
+    expect(detectEarlyQuotaRecovery(baseline, agenda({ ...changed, observedAt: baseline.observedAt }), at)).toBeUndefined()
+    expect(detectEarlyQuotaRecovery(baseline, agenda({ ...changed, observedAt: at + 1 }), at)).toBeUndefined()
+    expect(detectEarlyQuotaRecovery(baseline, agenda({
+      ...changed, windows: changed.windows.map((w) => ({ ...w, source: "inferred" as const })),
+    }), at)).toBeUndefined()
+    expect(detectEarlyQuotaRecovery({ ...baseline, source: "inferred" }, agenda(changed), at)).toBeUndefined()
+    expect(detectEarlyQuotaRecovery({ ...baseline, providerId: "claude", windowKey: "weekly" },
+      agenda({ ...changed, providerId: "claude", windows: changed.windows.map((w) => ({ ...w, key: "weekly" })) }), at))
+      .toBeUndefined()
+    expect(detectEarlyQuotaRecovery(baseline, agenda({ ...changed, resetAt: future + 1_000 }), at))
+      .toMatchObject({ kind: "replenishment" }) // large refill, but not a confirmed new period
+    expect(detectEarlyQuotaRecovery(baseline, agenda({
+      ...changed, resetAt: future + 1_000,
+      windows: [{ key: "five-hour", usedPercent: 80, remainingPercent: 20, valueLabel: null, source: "provider" }],
+    }), at)).toBeUndefined()
+  })
+
+  test("prefers strong new-period evidence if several projected rows describe one window", () => {
+    const future = now + 3600_000
+    const [baseline] = quotaNotificationDeadlines({
+      agenda: agenda(occurrence({ resetAt: future })), subscriptions: [choice], now,
+    })
+    if (!baseline) throw new Error("missing baseline")
+    const observedAt = now + 3000
+    const bonus = occurrence({
+      observedAt, resetAt: future,
+      windows: [{ key: "five-hour", usedPercent: 55, remainingPercent: 45, valueLabel: null, source: "provider" }],
+    })
+    const nextPeriod = occurrence({ ...bonus, resetAt: future + 5 * 3600_000 })
+    const result = detectEarlyQuotaRecovery(baseline, agenda(bonus, nextPeriod), observedAt)
+    expect(result).toMatchObject({ kind: "reset", nextResetAt: future + 5 * 3600_000 })
+  })
+
+  test("distinguishes unexpected bonus capacity from a confirmed early reset", () => {
+    const future = now + 3600_000
+    const [baseline] = quotaNotificationDeadlines({
+      agenda: agenda(occurrence({ resetAt: future })), subscriptions: [choice], now,
+    })
+    if (!baseline) throw new Error("missing baseline")
+    const fresh = occurrence({
+      observedAt: now + 2000, resetAt: future,
+      windows: [{ key: "five-hour", usedPercent: 70, remainingPercent: 30, valueLabel: null, source: "provider" }],
+    })
+    const result = detectEarlyQuotaRecovery(baseline, agenda(fresh), now + 2000)
+    expect(result).toMatchObject({ kind: "replenishment", previousRemainingPercent: 1, remainingPercent: 30 })
+    expect(detectEarlyQuotaRecovery(baseline, agenda({
+      ...fresh, windows: [{ ...fresh.windows[0]!, remainingPercent: 19 }],
+    }), now + 2000)).toBeUndefined()
   })
 })

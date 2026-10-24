@@ -85,6 +85,12 @@ export interface Interface {
    * databases return the primary connection. Optional for injected fixtures.
    */
   controlDb?: () => Effect.Effect<DatabaseShape>
+  /**
+   * Low-priority, disposable-observability writer. Isolate optional OXP
+   * activity transaction admission from the foreground 15-second BEGIN retry
+   * path and from control-plane lease/heartbeat writes. In-memory aliases db.
+   */
+  activityDb?: () => Effect.Effect<DatabaseShape>
   /** Exclusively owns one read connection for all statements in a callback. */
   /** Optional on legacy injectable fixtures; the production Database always implements it. */
   withScanDb?: <A, E, R>(read: (connection: DatabaseShape) => Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
@@ -329,6 +335,50 @@ const layer = (filename: string, scanReaders: number, asyncReadWorker: boolean) 
           ),
         )
       })
+      // Unlike a foreground Session transaction, an OXP activity write is
+      // optional observability. Its independent writer has a 350ms BEGIN
+      // retry budget and may drop attribution under sustained WAL contention.
+      // This separation also ensures a stalled activity transaction never
+      // monopolizes the control lane used for leases and interrupts.
+      const activityAdmission = yield* Semaphore.make(1)
+      let activityConnection: DatabaseShape | undefined
+      const activityDb = Effect.fn("Database.activityDb")(function* () {
+        if (filename === ":memory:") return db
+        if (activityConnection) return activityConnection
+        return yield* activityAdmission.withPermits(1)(
+          Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              if (activityConnection) return activityConnection
+              const connection = yield* acquireScopedResource<DatabaseShape, never, never>(
+                lifetimeScope,
+                (candidate) =>
+                  restore(
+                    Effect.gen(function* () {
+                      const context = yield* Layer.buildWithScope(
+                        sqliteLayer({
+                          filename,
+                          permitLane: "activity",
+                          disableWAL: true,
+                          checkpointOnClose: false,
+                          asyncWorker: true,
+                        }),
+                        candidate,
+                      )
+                      const connection = yield* makeDatabase.pipe(Effect.provide(context))
+                      yield* connection.run("PRAGMA busy_timeout = 25")
+                      yield* connection.run("PRAGMA wal_autocheckpoint = 0")
+                      yield* connection.run("PRAGMA synchronous = NORMAL")
+                      yield* connection.run("PRAGMA foreign_keys = ON")
+                      return connection
+                    }).pipe(Effect.orDie, Effect.provideService(Scope.Scope, candidate)),
+                  ),
+              )
+              activityConnection = connection
+              return connection
+            }),
+          ),
+        )
+      })
       // The sealer intentionally owns a second SQLite connection so maintenance
       // cannot monopolize the foreground client's single permit. Plain
       // `:memory:` handles are independent databases, not shared connections;
@@ -435,7 +485,7 @@ const layer = (filename: string, scanReaders: number, asyncReadWorker: boolean) 
         )
       }
 
-      return { db, readDb, scanDb, controlDb, withScanDb: scanPool.withLease, filename }
+      return { db, readDb, scanDb, controlDb, activityDb, withScanDb: scanPool.withLease, filename }
     }).pipe(Effect.orDie),
   )
 

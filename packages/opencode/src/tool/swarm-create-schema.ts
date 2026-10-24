@@ -47,8 +47,10 @@ export const CreateMemberInput = Schema.Struct({
   name: Schema.String.annotate({ description: "Unique worker roster name." }),
   role: Schema.String.annotate({ description: "Concise worker role." }),
   providerID: Provider.ID.annotate({ description: "Managed worker model provider id." }),
-  modelID: Model.ID.annotate({ description: "Managed worker model id." }),
-  accountID: Schema.optional(Schema.String).annotate({ description: "Optional provider account id." }),
+  modelID: Model.ID.annotate({ description: "Exact catalog model ID. For OpenCode Go, choose either an account-qualified modelID or a base modelID with the matching stable accountID; do not mix two different account selectors." }),
+  accountID: Schema.optional(Schema.String).annotate({
+    description: "Optional stable provider account ID from the live model catalog (e.g. zen-...). Display labels such as key3 are not IDs. Do not combine a modelID ending in @accountID with a different accountID.",
+  }),
   variant: Schema.optional(Model.VariantID).annotate({ description: "Optional model variant id." }),
   permissionBoundary: Permission.Boundary.annotate({
     description:

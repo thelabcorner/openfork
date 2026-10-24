@@ -28,6 +28,11 @@ const goal = Layer.succeed(
         captured.push(turn)
         return { action: "create", goal: detail }
       }) as any,
+    submit: (_sessionID, _input, turn) =>
+      Effect.sync(() => {
+        captured.push(turn)
+        return { action: "create", goal: detail }
+      }) as any,
   }),
 )
 
@@ -64,6 +69,16 @@ const agent = Layer.succeed(
 const it = testEffect(Layer.mergeAll(goal, truncate, agent))
 
 describe("tool.goal", () => {
+  it.effect("exposes exactly one model input: objective", () =>
+    Effect.gen(function* () {
+      const info = yield* GoalTool
+      const tool = yield* info.init()
+      expect(Object.keys((tool.parameters as { fields: Record<string, unknown> }).fields)).toEqual(["objective"])
+      expect(tool.description).not.toContain("criterionID")
+      expect(tool.description).not.toContain("add_evidence")
+    }),
+  )
+
   it.effect("passes trusted V1 user-turn provenance to GoalAgent creation", () =>
     Effect.gen(function* () {
       captured.length = 0
@@ -90,7 +105,7 @@ describe("tool.goal", () => {
       }
 
       yield* tool.execute(
-        { action: "create", objective: "Finish the work", criteria: ["The work is verified"] },
+        { objective: "Finish the work" },
         ctx,
       )
 
@@ -126,11 +141,7 @@ describe("tool.goal", () => {
       }
 
       yield* tool.execute(
-        {
-          action: "create",
-          objective: "Implement the plan end to end",
-          criteria: ["The plan is implemented end to end"],
-        },
+        { objective: "Implement the plan end to end" },
         ctx,
       )
 
@@ -143,7 +154,7 @@ describe("tool.goal", () => {
     }),
   )
 
-  it.effect("exposes Goal update and passes the explicit current human update directive", () =>
+  it.effect("allows an explicit objective revision without exposing criterion actions", () =>
     Effect.gen(function* () {
       captured.length = 0
       const info = yield* GoalTool
@@ -170,10 +181,7 @@ describe("tool.goal", () => {
       }
 
       yield* tool.execute(
-        {
-          action: "update",
-          criteria: ["Stress-test corpuses cover difficult cases", "Rendered output maintains 1:1 bitmap parity"],
-        },
+        { objective: "Add stress-test corpuses and 1:1 bitmap parity." },
         ctx,
       )
 

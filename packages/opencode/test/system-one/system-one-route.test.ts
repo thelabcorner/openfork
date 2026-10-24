@@ -261,8 +261,8 @@ describe("System One routed transient authority", () => {
           ),
         )
 
-      yield* infer({ routeIntent: { kind: "auto" }, accountID: "account-a" })
-      yield* infer({ routeIntent: { kind: "auto" } })
+      yield* infer({ routeIntent: { kind: "strategy" }, accountID: "account-a" })
+      yield* infer({ routeIntent: { kind: "strategy" } })
 
       expect(captured.map((request) => request.authorization)).toEqual([
         `Bearer ${SELECTED_ACCOUNT_SECRET}`,
@@ -302,7 +302,7 @@ describe("System One routed transient authority", () => {
 
   it.effect("fails a hosted request closed when the route authority resolves nothing", () =>
     Effect.gen(function* () {
-      const error = yield* infer({ routeIntent: { kind: "auto" } }).pipe(Effect.flip)
+      const error = yield* infer({ routeIntent: { kind: "strategy" } }).pipe(Effect.flip)
 
       expect(error._tag).toBe("ProviderRouteResolutionError")
       expect(captured).toEqual([])

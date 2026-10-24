@@ -90,3 +90,14 @@ packages/opencode/.tmp-spad-*
 packages/opencode/.openfork-runtime-locks/
 packages/opencode/.opencode-runtime-locks/
 packages/browser-visual/.interop-*/
+
+# Local-only OpenFork build, test and diagnostic output.
+/.artifacts/
+/.openfork-e2e/
+/.tmp/
+/.tmp-*
+**/.tmp-*/
+**/.tmp-*
+**/.opencode-runtime-locks/
+**/.openfork-runtime-locks/
+packages/desktop/test/.electron-ipc-gate-*/

@@ -3,6 +3,8 @@ import {
   pathCandidates,
   knownCandidates,
   resolveCliPath,
+  resolveSdkCliPath,
+  sdkCliUsesNode,
   parseVersionOutput,
   checkAvailability,
 } from "../../src/claude/availability"
@@ -28,14 +30,18 @@ function fakePort(overrides: Partial<ClaudeProcessPort> = {}): ClaudeProcessPort
 describe("ClaudeAvailability resolution", () => {
   test("pathCandidates splits PATH by platform separator and applies extensions", () => {
     const win = pathCandidates("claude", { PATH: "C:\\a;C:\\b" }, "win32")
-    expect(win).toEqual(["C:\\a/claude.cmd", "C:\\a/claude.exe", "C:\\a/claude.bat", "C:\\a/claude", "C:\\b/claude.cmd", "C:\\b/claude.exe", "C:\\b/claude.bat", "C:\\b/claude"])
+    expect(win).toEqual(["C:\\a/claude.exe", "C:\\a/claude.cmd", "C:\\a/claude.bat", "C:\\a/claude", "C:\\b/claude.exe", "C:\\b/claude.cmd", "C:\\b/claude.bat", "C:\\b/claude"])
     const posix = pathCandidates("claude", { PATH: "/usr/bin:/usr/local/bin" }, "linux")
     expect(posix).toEqual(["/usr/bin/claude", "/usr/local/bin/claude"])
   })
 
   test("knownCandidates uses home and skips npm-global on Windows", () => {
     expect(knownCandidates("claude", { HOME: "/home/u" }, "linux")).toEqual(["/home/u/.local/bin/claude", "/home/u/.npm-global/bin/claude"])
-    expect(knownCandidates("claude", { USERPROFILE: "C:\\Users\\u" }, "win32")).toEqual(["C:\\Users\\u/.local/bin/claude"])
+    expect(knownCandidates("claude", { USERPROFILE: "C:\\Users\\u" }, "win32")).toEqual([
+      "C:\\Users\\u/.local/bin/claude.exe",
+      "C:\\Users\\u/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+      "C:\\Users\\u/AppData/Roaming/npm/claude.cmd",
+    ])
     expect(knownCandidates("claude", {}, "linux")).toEqual([])
   })
 
@@ -45,6 +51,20 @@ describe("ClaudeAvailability resolution", () => {
     const found = resolveCliPath({ PATH: "/usr/bin:/usr/local/bin", HOME: "/home/u" }, (p) => existing.has(p), "linux")
     expect(found).toBe("/usr/local/bin/claude")
     expect(port.execCalls.length).toBe(0)
+  })
+
+  test("SDK executable unwraps Windows npm shims to native binary or node cli.js", () => {
+    const env = { PATH: "C:/tools;C:/other", USERPROFILE: "C:/Users/u" }
+    const shim = "C:/tools/claude.cmd"
+    const exe = "C:/tools/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+    const script = "C:/tools/node_modules/@anthropic-ai/claude-code/cli.js"
+    expect(resolveCliPath(env, (p) => p === shim, "win32")).toBe(shim)
+    expect(resolveSdkCliPath(env, (p) => p === shim || p === exe, "win32")).toBe(exe)
+    expect(resolveSdkCliPath(env, (p) => p === shim || p === script, "win32")).toBe(script)
+    expect(sdkCliUsesNode(script)).toBe(true)
+    expect(resolveSdkCliPath(env, (p) => p === shim, "win32")).toBeUndefined()
+    const later = "C:/other/claude.exe"
+    expect(resolveSdkCliPath(env, (p) => p === shim || p === later, "win32")).toBe(later)
   })
 
   test("parseVersionOutput extracts semver from noisy output", () => {

@@ -10,6 +10,7 @@ import { Parameters as CheckpointParameters } from "@/tool/checkpoint"
 import { ExchangeError } from "@/exchange/error"
 import { ExchangeSessionSearch } from "@/exchange/session-search"
 import { OxpAuthority } from "./authority"
+import { OxpConfig } from "./config"
 import { OxpError } from "./error"
 import { OxpModelSelection } from "./model-selection"
 import { OxpResult } from "./result"
@@ -100,6 +101,7 @@ export const Parameters = Schema.Struct({
   parentID: Schema.optional(SessionIDInput),
   limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_LIST }))),
   search: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))),
+  cursor: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512))),
   tool: Schema.optional(Schema.String.check(Schema.isMaxLength(128))),
   roots: Schema.optional(Schema.Boolean),
   includeArchived: Schema.optional(Schema.Boolean),
@@ -120,6 +122,11 @@ export const DirectParameters = Schema.Struct({
   parentID: Schema.optional(SessionIDInput),
   limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_LIST }))),
   search: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))),
+  // Keep direct OXP supervision equivalent to the executing Session adapter:
+  // exact tool recall and lossless list continuation must not require the
+  // on-demand capability broker or an undocumented "tool:name" string.
+  tool: Schema.optional(Schema.String.check(Schema.isMaxLength(128))),
+  cursor: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512))),
   roots: Schema.optional(Schema.Boolean),
   includeArchived: Schema.optional(Schema.Boolean),
   ranking: Schema.optional(Schema.Literals(["recent", "relevance"])),
@@ -154,6 +161,26 @@ function truncateUtf8(text: string, maxBytes: number) {
   return { text: bytes.subarray(0, maxBytes).toString("utf8"), truncated: true }
 }
 
+/** Stable continuation for the native Session-record order (not an authority token). */
+function encodeListCursor(before: NonNullable<SessionInspection.ListInput["before"]>): string {
+  return Buffer.from(JSON.stringify([before.updatedAt, before.id]), "utf8").toString("base64url")
+}
+
+function decodeListCursor(cursor: string): NonNullable<SessionInspection.ListInput["before"]> {
+  try {
+    if (cursor.length > 512 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error("Invalid encoding")
+    const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"))
+    if (!Array.isArray(value) || value.length !== 2) throw new Error("Invalid shape")
+    const [updatedAt, id] = value
+    if (!Number.isSafeInteger(updatedAt) || updatedAt < 0 || typeof id !== "string" || id.length < 1 || id.length > 128) {
+      throw new Error("Invalid position")
+    }
+    return { updatedAt, id: SessionSchema.ID.make(id) }
+  } catch {
+    throw new OxpError.InvalidArgument({ detail: "Invalid OXP Session list cursor" })
+  }
+}
+
 function parseSearchOperand(value?: string) {
   const search = value?.trim()
   if (!search) return { query: undefined, tool: undefined }
@@ -171,6 +198,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const authority = yield* OxpAuthority.Service
+    const config = yield* OxpConfig.Service
     const inspection = yield* SessionInspection.Service
     const control = yield* OxpSessionControl.Service
     const supervision = yield* OxpSupervision.Service
@@ -184,9 +212,11 @@ const layer = Layer.effect(
 
     const project = (row: SessionInspection.SessionRow, admission: OxpAuthority.Admission, observedAt: number) => {
       const root = admission.root
-      if (!root || !("path" in root)) {
-        throw new OxpError.NotFound({ detail: "Session is not available to OXP supervision" })
-      }
+      // Explicit all-native Session authorization may have no approved filesystem
+      // root. Do not pretend it has one; raw Session location is metadata only.
+      const location = root && "path" in root
+        ? { rootID: root.root.id, path: root.virtualPath }
+        : { scope: "native-session" as const, path: row.directory }
       return {
         id: row.id,
         title: row.title,
@@ -204,10 +234,7 @@ const layer = Layer.effect(
               ),
             }
           : {}),
-        location: {
-          rootID: root.root.id,
-          path: root.virtualPath,
-        },
+        location,
         paused: row.pausedAt !== undefined,
         archived: row.archivedAt !== undefined,
         cost: row.cost,
@@ -444,7 +471,13 @@ const layer = Layer.effect(
         const requested = Math.min(input.limit ?? 50, MAX_LIST)
         const retrievedAt = Date.now()
         const rows: Array<ReturnType<typeof project>> = []
-        let before: SessionInspection.ListInput["before"]
+        const initialCursor = yield* Effect.try({
+          try: () => input.cursor ? decodeListCursor(input.cursor) : undefined,
+          catch: (cause) => OxpError.isError(cause)
+            ? cause
+            : new OxpError.InvalidArgument({ detail: "Invalid OXP Session list cursor" }),
+        })
+        let before: SessionInspection.ListInput["before"] = initialCursor
         let scanned = 0
         let exhausted = false
 
@@ -458,14 +491,19 @@ const layer = Layer.effect(
             includeArchived: input.includeArchived,
             ...(before ? { before } : {}),
           })
-          if (page.length === 0) break
-          scanned += page.length
-          exhausted = page.length < SCAN_PAGE
-          const tail = page.at(-1)
-          if (tail) before = { updatedAt: tail.updatedAt, id: tail.id }
+          if (page.length === 0) {
+            exhausted = true
+            break
+          }
+          let processed = 0
 
           for (const row of page) {
-            if (rows.length >= requested) break
+            if (rows.length >= requested || scanned >= MAX_SCAN) break
+            scanned++
+            processed++
+            // Cursor tracks the last CONSUMED row, never the fetched page tail:
+            // a partially consumed SQLite page must not skip authorized Sessions.
+            before = { updatedAt: row.updatedAt, id: row.id }
             const admitted = yield* supervision.authorizeRow(row, operation, input.rootID).pipe(
               Effect.map((admission) => ({ ok: true as const, admission })),
               Effect.catch((error) =>
@@ -477,6 +515,7 @@ const layer = Layer.effect(
             if (!admitted.ok) continue
             rows.push(yield* projectSafe(row, admitted.admission, retrievedAt))
           }
+          if (processed === page.length && page.length < SCAN_PAGE) exhausted = true
         }
 
         const result = {
@@ -489,13 +528,14 @@ const layer = Layer.effect(
           },
           sessions: rows,
           scanned,
-          truncated: !exhausted && scanned >= MAX_SCAN,
+          truncated: !exhausted,
+          ...(!exhausted && before ? { nextCursor: encodeListCursor(before) } : {}),
         }
         return {
           title: "OpenFork Sessions",
           output: JSON.stringify(result),
           structured: result,
-          metadata: { count: rows.length, scanned, truncated: result.truncated },
+          metadata: { count: rows.length, scanned, truncated: result.truncated, ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}) },
         } satisfies OxpResult.CapabilityResult
       }
 
@@ -515,7 +555,10 @@ const layer = Layer.effect(
           })
         }
 
-        const admissions = yield* authorizeSearchRoots(operation, input.rootID)
+        const nativeScope = !input.rootID && (yield* config.get()).grant.sessionSupervision === "all-native"
+        const admissions = nativeScope
+          ? [yield* authority.authorize({ plane: "supervision", operation, phase: "supervise" })]
+          : yield* authorizeSearchRoots(operation, input.rootID)
         yield* cancelled(signal)
         const admittedRoots = admissions
           .flatMap((admission) => admission.root ? [admission.root] : [])
@@ -530,13 +573,13 @@ const layer = Layer.effect(
           {
             ...(query ? { query } : {}),
             ...(tool ? { tool } : {}),
-            directoryPrefixes: admittedRoots.map((entry) => entry.canonicalPath),
+            ...(nativeScope ? {} : { directoryPrefixes: admittedRoots.map((entry) => entry.canonicalPath) }),
             ...(input.parentID ? { parentID: SessionSchema.ID.make(input.parentID) } : {}),
             ...(input.roots !== undefined ? { roots: input.roots } : {}),
             includeArchived: input.includeArchived === true,
             ranking: input.ranking ?? "recent",
             limit: Math.min(input.limit ?? 20, MAX_LIST),
-            scopeLabel: input.rootID ? "root:" + input.rootID : "approved-roots",
+            scopeLabel: input.rootID ? "root:" + input.rootID : nativeScope ? "native-sessions" : "approved-roots",
           },
           {
             revalidate: () =>
@@ -547,6 +590,7 @@ const layer = Layer.effect(
                 }
               }),
             projectDirectory: (directory) => {
+              if (nativeScope) return directory
               const entry = admittedRoots.find((root) => OxpRoot.isContained(root.canonicalPath, directory))
               if (!entry) throw new Error("Session search result is outside every admitted OXP root")
               return roots.toVirtualPath(entry.root, directory)
@@ -948,7 +992,7 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [OxpAuthority.node, SessionInspection.node, OxpSessionControl.node, OxpSupervision.node, OxpRoot.node, Database.node],
+  deps: [OxpAuthority.node, OxpConfig.node, SessionInspection.node, OxpSessionControl.node, OxpSupervision.node, OxpRoot.node, Database.node],
 })
 
 export * as OxpSession from "./session"

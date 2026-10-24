@@ -58,6 +58,47 @@ const it = testEffect(
   ),
 )
 
+it.instance("reconciles delegation group titles at the durable owner without rekeying membership", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const groups = yield* SessionGroup.Service
+    const session = yield* sessions.create({ title: "Worker A" })
+    const ownerRef = "oxp-session:connector-a:conversation-a"
+    const first = yield* groups.resolveOrCreate({
+      name: "Initial Research",
+      kind: "delegation",
+      ownerRef,
+      updateName: true,
+    })
+    yield* groups.addSession({
+      groupId: first.id,
+      sessionId: session.id,
+      locked: true,
+      origin: "delegation",
+    })
+    const renamed = yield* groups.resolveOrCreate({
+      name: "Revised Research",
+      kind: "delegation",
+      ownerRef,
+      updateName: true,
+    })
+    expect(renamed.id).toBe(first.id)
+    expect(renamed.name).toBe("Revised Research")
+    expect((yield* groups.listWithSessions()).find((entry) => entry.group.id === first.id)?.sessions).toHaveLength(1)
+
+    // No handshake title must never clobber the verified producer name.
+    const provisional = yield* groups.resolveOrCreate({
+      name: "OXP session",
+      kind: "delegation",
+      ownerRef,
+      updateName: false,
+    })
+    expect(provisional.name).toBe("Revised Research")
+    expect((yield* groups.list()).find((entry) => entry.id === first.id)?.name).toBe("Revised Research")
+    yield* sessions.remove(session.id)
+  }),
+)
+
 it.instance("supports multiple memberships and preserves a replacement primary group", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service

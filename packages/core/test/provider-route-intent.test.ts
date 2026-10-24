@@ -27,7 +27,7 @@ const left = (input: ProviderRouteIntentRuntime.NormalizeInput) => {
 
 describe("ProviderRouteIntentRuntime.normalize", () => {
   test("maps an empty legacy account selection to the unpinned Adaptive default wire intent", () => {
-    expect(right({})).toEqual({ kind: "auto" })
+    expect(right({})).toEqual({ kind: "strategy" })
   })
 
   test("maps a legacy account selection to an explicit hard account pin", () => {
@@ -39,7 +39,7 @@ describe("ProviderRouteIntentRuntime.normalize", () => {
   })
 
   test("preserves the unpinned strategy wire intent and Public transport intent", () => {
-    expect(right({ routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }) })).toEqual({ kind: "auto" })
+    expect(right({ routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }) })).toEqual({ kind: "strategy" })
     expect(right({ routeIntent: ProviderRouteIntent.Info.make({ kind: "public" }) })).toEqual({ kind: "public" })
   })
 
@@ -59,15 +59,15 @@ describe("ProviderRouteIntentRuntime.normalize", () => {
     expect(right({ routeIntent: unpinned, legacyAccountID: "acct-a" })).toEqual(unpinned)
   })
 
-  test("rejects legacy account identity alongside explicit Auto or Public", () => {
+  test("rejects legacy account identity alongside explicit strategies or Public", () => {
     const auto = left({
-      routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
       legacyAccountID: "acct-a",
     })
     expect(auto._tag).toBe("ProviderRouteIntent.Conflict")
     if (auto._tag === "ProviderRouteIntent.Conflict") {
       expect(auto.legacyAccountID).toBe("acct-a")
-      expect(auto.routeKind).toBe("auto")
+      expect(auto.routeKind).toBe("strategy")
       expect(auto.routeAccountID).toBeUndefined()
     }
 

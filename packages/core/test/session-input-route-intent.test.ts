@@ -82,7 +82,7 @@ describe("SessionInput SyntheticExecution route intent", () => {
       yield* setup
       const { db } = yield* Database.Service
       const intents = [
-        ProviderRouteIntent.Info.make({ kind: "auto" }),
+        ProviderRouteIntent.Info.make({ kind: "strategy" }),
         ProviderRouteIntent.Info.make({ kind: "public" }),
         ProviderRouteIntent.Info.make({ kind: "account", accountID: "acct-a", pin: "soft" }),
       ] as const
@@ -162,7 +162,7 @@ describe("SessionInput SyntheticExecution route intent", () => {
         execution: {
           agent: "build",
           model,
-          routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+          routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
         },
       }).pipe(Effect.exit)
 

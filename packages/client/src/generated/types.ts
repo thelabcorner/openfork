@@ -164,7 +164,7 @@ export type AgentsListOutput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
@@ -300,7 +300,7 @@ export type SessionsListOutput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
@@ -384,7 +384,7 @@ export type SessionsSearchOutput = {
         readonly accountID?: string
         readonly variant?: string
         readonly routeIntent?:
-          | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+          | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
           | { readonly kind: "public" }
           | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
       }
@@ -446,7 +446,7 @@ export type SessionsCreateInput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
@@ -461,7 +461,7 @@ export type SessionsCreateInput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
@@ -476,7 +476,7 @@ export type SessionsCreateInput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
@@ -491,7 +491,7 @@ export type SessionsCreateInput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
@@ -511,7 +511,7 @@ export type SessionsCreateOutput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
@@ -633,7 +633,7 @@ export type SessionsGetOutput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
@@ -681,7 +681,7 @@ export type SessionsSwitchModelInput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
@@ -878,7 +878,7 @@ export type SessionsContextOutput = {
           readonly accountID?: string
           readonly variant?: string
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -968,7 +968,7 @@ export type SessionsContextOutput = {
           readonly accountID?: string
           readonly variant?: string
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -1125,7 +1125,7 @@ export type SessionsHistoryOutput = {
             readonly accountID?: string
             readonly variant?: string
             readonly routeIntent?:
-              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
               | { readonly kind: "public" }
               | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
@@ -1254,12 +1254,12 @@ export type SessionsHistoryOutput = {
               readonly accountID?: string
               readonly variant?: string
               readonly routeIntent?:
-                | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+                | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
                 | { readonly kind: "public" }
                 | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
             }
             readonly routeIntent?:
-              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
               | { readonly kind: "public" }
               | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
@@ -1305,12 +1305,12 @@ export type SessionsHistoryOutput = {
               readonly accountID?: string
               readonly variant?: string
               readonly routeIntent?:
-                | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+                | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
                 | { readonly kind: "public" }
                 | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
             }
             readonly routeIntent?:
-              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
               | { readonly kind: "public" }
               | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
@@ -1420,7 +1420,7 @@ export type SessionsHistoryOutput = {
             readonly accountID?: string
             readonly variant?: string
             readonly routeIntent?:
-              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
               | { readonly kind: "public" }
               | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
@@ -1838,7 +1838,7 @@ export type SessionsEventsOutput =
           readonly accountID?: string
           readonly variant?: string
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -1967,12 +1967,12 @@ export type SessionsEventsOutput =
             readonly accountID?: string
             readonly variant?: string
             readonly routeIntent?:
-              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
               | { readonly kind: "public" }
               | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -2018,12 +2018,12 @@ export type SessionsEventsOutput =
             readonly accountID?: string
             readonly variant?: string
             readonly routeIntent?:
-              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
               | { readonly kind: "public" }
               | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -2133,7 +2133,7 @@ export type SessionsEventsOutput =
           readonly accountID?: string
           readonly variant?: string
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -2516,7 +2516,7 @@ export type SessionsRegenerateTitleInput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
@@ -2529,7 +2529,7 @@ export type SessionsRegenerateTitleInput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
@@ -2582,7 +2582,7 @@ export type SessionsMessageOutput = {
           readonly accountID?: string
           readonly variant?: string
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -2672,7 +2672,7 @@ export type SessionsMessageOutput = {
           readonly accountID?: string
           readonly variant?: string
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -2975,7 +2975,7 @@ export type MessagesListOutput = {
           readonly accountID?: string
           readonly variant?: string
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -3065,7 +3065,7 @@ export type MessagesListOutput = {
           readonly accountID?: string
           readonly variant?: string
           readonly routeIntent?:
-            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -3857,7 +3857,7 @@ export type CommandsListOutput = {
       readonly accountID?: string
       readonly variant?: string
       readonly routeIntent?:
-        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "strategy"; readonly strategy?: "adaptive" | "round-robin" }
         | { readonly kind: "public" }
         | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }

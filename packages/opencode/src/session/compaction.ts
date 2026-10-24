@@ -435,7 +435,7 @@ const layer = Layer.effect(
             modelID: parsed.modelID,
             ...(parsed.accountID
               ? { accountID: parsed.accountID }
-              : { routeIntent: { kind: "auto" as const } }),
+              : { routeIntent: { kind: "strategy" as const } }),
             executionPurpose: "special-agent",
           })
           .pipe(Effect.option)
@@ -662,7 +662,7 @@ const layer = Layer.effect(
             modelID: userMessage.model.modelID,
             ...(userMessage.model.accountID
               ? { accountID: userMessage.model.accountID }
-              : { routeIntent: { kind: "auto" as const } }),
+              : { routeIntent: { kind: "strategy" as const } }),
             executionPurpose: "special-agent",
           })
           .pipe(Effect.option)

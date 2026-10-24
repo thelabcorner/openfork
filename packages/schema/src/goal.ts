@@ -127,13 +127,14 @@ const AuditorVerdictBase = {
   rationale: Schema.String,
   progressMade: Schema.Boolean,
   confidence: Schema.Number.pipe(optional),
+  /** Legacy-only assessment data; new audits judge the objective as a whole. */
   criteria: Schema.Array(
     Schema.Struct({
       criterionID: CriterionID,
       status: CriterionStatus,
       evidence: Schema.String,
     }).annotate({ identifier: "Goal.AuditorCriterionAssessment" }),
-  ),
+  ).pipe(optional),
 } as const
 
 /**
@@ -141,9 +142,8 @@ const AuditorVerdictBase = {
  * the next autonomous worker cycle. `continuationPrompt` is deliberately
  * decision-specific rather than optional on every verdict: if the auditor
  * authorizes more work, it must say what the next worker should actually do.
- * `criteria` is the auditor's independent criterion-by-criterion verification
- * result. Core, not the model, decides how those findings mutate durable Goal
- * state and whether they are sufficient to complete successfully. Goal Mode is
+ * Core, not the model, owns legacy criterion storage and lifecycle transitions.
+ * New auditors judge the complete objective without criterion IDs. Goal Mode is
  * intrinsically autonomous: an auditor either authorizes the next worker cycle,
  * verifies completion, or records a genuine blocker. It does not own a separate
  * terminal-failure escape hatch.

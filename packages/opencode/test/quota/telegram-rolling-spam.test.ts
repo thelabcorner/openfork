@@ -140,6 +140,56 @@ describe("Telegram OpenCode Go rolling 5h anti-spam regression", () => {
     } finally { await rm(dir, { recursive: true, force: true }) }
   })
 
+  test("large restoration before a moving estimate gets a distinct, cautious early-replenishment alert", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "openfork-telegram-rolling-early-"))
+    const file = join(dir, "quota.json")
+    let current = agenda(start, start + 5 * 3600_000, 0)
+    try {
+      const source = new QuotaNotificationSource(async () => current, file)
+      await source.initialize()
+      await source.update({ enabled: true, subscriptions: [sub] })
+      expect(await source.collect(start)).toEqual([])
+      current = agenda(start + interval, start + interval + 5 * 3600_000, 95)
+      const [notice] = await source.collect(start + interval)
+      expect(notice?.text).toContain("UNEXPECTED EARLY QUOTA REPLENISHMENT (rolling)")
+      expect(notice?.text).toContain("Available: 0% → 95% (+95 pp)")
+      expect(notice?.text).toContain("Prior estimated reset:")
+      expect(notice?.text).toContain("provider gift or full reset is not confirmed")
+      expect(source.status().scheduled).toBe(1)
+      const restarted = new QuotaNotificationSource(async () => current, file)
+      await restarted.initialize()
+      expect((await restarted.collect(start + interval)).map((r) => r.id)).toEqual([notice?.id])
+      if (!notice) throw new Error("missing early notice")
+      await restarted.acknowledge(notice.id)
+      expect(await restarted.collect(start + interval)).toEqual([])
+      current = agenda(start + 2 * interval, start + 2 * interval + 5 * 3600_000, 95)
+      expect(await restarted.collect(start + 2 * interval)).toEqual([])
+    } finally { await rm(dir, { recursive: true, force: true }) }
+  })
+
+  test("ordinary rolling recoveries remain ordinary; a major leap can override their cooldown", () => {
+    const sample = (n: number, available: number, estimate = start + 5 * 3600_000): RollingObservation => ({
+      subscriptionKey: subKey, providerName: "OpenCode Go", windowKey: "5h",
+      observedAt: start + n * interval, remainingPercent: available, resetAt: estimate,
+    })
+    let state = observeRollingCapacity(undefined, sample(0, 0))
+    state = observeRollingCapacity(state, sample(1, 1))
+    expect(state.pending?.text).toContain("rolling quota capacity increased")
+    state = { ...state, pending: undefined } // simulated acknowledgment
+    state = observeRollingCapacity(state, sample(2, 80))
+    expect(state.pending?.text).toContain("UNEXPECTED EARLY QUOTA REPLENISHMENT")
+    expect(state.lastEarlyAlertAt).toBe(start + 2 * interval)
+    state = { ...state, pending: undefined }
+    state = observeRollingCapacity(state, sample(3, 90))
+    expect(state.pending).toBeUndefined()
+    state = observeRollingCapacity(state, sample(4, 90, start + 5 * 3600_000 + 4))
+    expect(state.pending).toBeUndefined()
+    let withoutEstimate = observeRollingCapacity(undefined, { ...sample(0, 0), resetAt: undefined })
+    withoutEstimate = observeRollingCapacity(withoutEstimate, { ...sample(1, 100), resetAt: undefined })
+    expect(withoutEstimate.pending?.text).toContain("rolling quota capacity increased")
+    expect(withoutEstimate.pending?.text).not.toContain("UNEXPECTED EARLY")
+  })
+
   test("100% used forever: new reset timestamp every five minutes is never a quota event", () => {
     const sample = (n: number, remainingPercent: number): RollingObservation => ({
       subscriptionKey: subKey, providerName: "OpenCode Go", accountLabel: "Migrated key",

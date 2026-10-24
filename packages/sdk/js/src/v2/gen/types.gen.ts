@@ -228,7 +228,7 @@ export type SnapshotFileDiff = {
 
 export type ProviderRouteIntent =
   | {
-      kind: "auto"
+      kind: "strategy"
       strategy?: ProviderRouteIntentStrategy
     }
   | {

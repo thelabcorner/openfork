@@ -679,14 +679,14 @@ export function make<CommitError = never, CredentialError = never>(
       return yield* rebind(input, winner, route, "explicit")
     })
 
-  const resolveExistingAuto = (
+  const resolveExistingStrategy = (
     input: ResolveInput,
     current: ProviderRoute.Binding,
   ) =>
     Effect.gen(function* () {
       yield* validateProvider(current, input.providerID)
       if (current.routeKind === "public") {
-        // Account-first decides INITIAL Auto selection; it must never cause a
+        // Account-first decides initial strategy selection; it must never cause a
         // healthy, already-committed worker Public generation to churn solely
         // because a config or account-roster preference changed.
         // If upstream Public is no longer eligible, fail over to a real account.
@@ -703,12 +703,10 @@ export function make<CommitError = never, CredentialError = never>(
           item.credentialHandle === current.credentialHandle,
       )
 
-      // An account pin is authoritative only while the current turn explicitly
-      // selects that account. Auto clears a pin from an earlier turn but keeps
-      // a healthy session route sticky. The selected policy chooses new routes
-      // and actual failovers; changing policy alone must not churn a healthy
-      // route or make Round-robin advance from a manual pin instead of its
-      // durable cursor.
+      // A pin remains authoritative while the turn explicitly selects the
+      // account. When the user explicitly changes to a strategy, release the
+      // pin and run that strategy's transactional account selection rather than
+      // silently retaining a formerly pinned account as the policy winner.
       if (current.pin === "hard") {
         const softened = yield* rebind(
           input,
@@ -724,12 +722,10 @@ export function make<CommitError = never, CredentialError = never>(
           "model-selection",
         )
 
-        if (candidate?.admissible) return yield* compile(input, softened)
-
         const rebound = yield* commitAccount(
           input,
           "failover",
-          new Set([current.credentialHandle]),
+          candidate?.admissible ? new Set() : new Set([current.credentialHandle]),
           input.mode,
           softened,
         )
@@ -748,12 +744,15 @@ export function make<CommitError = never, CredentialError = never>(
         })
       }
 
-      if (candidate?.admissible) return yield* compile(input, current)
+      // Preserve route affinity across ordinary model/tool steps, but a newly
+      // selected strategy must take effect on this turn. The atomic policy
+      // commit updates both the binding mode and the credential cursor.
+      if (candidate?.admissible && current.mode === input.mode) return yield* compile(input, current)
 
       const rebound = yield* commitAccount(
         input,
         "failover",
-        new Set([current.credentialHandle]),
+        candidate?.admissible ? new Set() : new Set([current.credentialHandle]),
         input.mode,
         current,
       )
@@ -809,7 +808,7 @@ export function make<CommitError = never, CredentialError = never>(
         return yield* compile(input, binding)
       }
 
-      if (current) return yield* resolveExistingAuto(input, current)
+      if (current) return yield* resolveExistingStrategy(input, current)
 
       if (input.freeRoutePreference === "public-first-for-free" && publicAvailable(input)) {
         const binding = yield* bindDesired(input, publicRoute(input.providerID), false)

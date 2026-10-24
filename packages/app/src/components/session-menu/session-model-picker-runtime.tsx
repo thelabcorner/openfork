@@ -228,7 +228,7 @@ function ModelWrapperPopover(props: {
     if (selected.routeIntent) return selected.routeIntent
 
     const fromSession = promptFromSession(props.session)
-    if (fromSession?.providerID === selected.providerID && fromSession.routeIntent?.kind === "auto") {
+    if (fromSession?.providerID === selected.providerID && fromSession.routeIntent?.kind === "strategy") {
       return fromSession.routeIntent
     }
 
@@ -237,12 +237,12 @@ function ModelWrapperPopover(props: {
     if (
       current?.provider.id === selected.providerID &&
       current.id === selected.modelID &&
-      localIntent?.kind === "auto"
+      localIntent?.kind === "strategy"
     ) {
       return localIntent
     }
   }
-  const inheritAutoIntent = (previous: SessionModelSelection | undefined, next: PromptModel | undefined) => {
+  const inheritStrategyIntent = (previous: SessionModelSelection | undefined, next: PromptModel | undefined) => {
     const intent = routeIntentFor(previous)
     if (
       !previous ||
@@ -251,7 +251,7 @@ function ModelWrapperPopover(props: {
       previous.providerID !== next.providerID ||
       splitModelIDForProvider(previous.modelID, previous.providerID).accountID ||
       splitModelIDForProvider(next.modelID, next.providerID).accountID ||
-      intent?.kind !== "auto"
+      intent?.kind !== "strategy"
     ) {
       return undefined
     }
@@ -280,7 +280,7 @@ function ModelWrapperPopover(props: {
       opts?: { recent?: boolean },
     ) => {
       const previous = selectedPromptModel()
-      const inherited = inheritAutoIntent(previous, value)
+      const inherited = inheritStrategyIntent(previous, value)
       const selected =
         value && !value.routeIntent && inherited
           ? { ...value, routeIntent: inherited }

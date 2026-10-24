@@ -20,7 +20,7 @@ export class ConflictError extends Schema.TaggedErrorClass<ConflictError>()(
   "ProviderRouteIntent.Conflict",
   {
     legacyAccountID: Schema.String,
-    routeKind: Schema.Literals(["auto", "public", "account"]),
+    routeKind: Schema.Literals(["strategy", "public", "account"]),
     routeAccountID: Schema.optional(Schema.String),
   },
 ) {}
@@ -46,7 +46,7 @@ export const normalize = Effect.fn("ProviderRouteIntent.normalize")(function* (i
   const intent = input.routeIntent
   if (!intent) {
     if (legacyAccountID === undefined) {
-      return { kind: "auto" } satisfies ProviderRouteIntent.Info
+      return { kind: "strategy" } satisfies ProviderRouteIntent.Info
     }
     return {
       kind: "account",

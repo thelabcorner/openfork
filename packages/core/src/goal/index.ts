@@ -457,11 +457,6 @@ const layer = Layer.effect(
       const auditorPolicy = normalizeAuditorPolicy(input.auditorPolicy ?? {})
       if (!auditorPolicy.ok) return yield* new GoalSchema.ValidationError({ reason: auditorPolicy.reason })
       const start = input.start ?? true
-      if (start && criteria.value.length === 0) {
-        return yield* new GoalSchema.ValidationError({
-          reason: "a Goal needs at least one acceptance criterion before it can start",
-        })
-      }
       const now = Date.now()
       const actor = input.actor ?? "user"
 
@@ -935,20 +930,6 @@ const layer = Layer.effect(
                 })
               }
 
-              if (input.action === "start") {
-                const criterion = yield* tx
-                  .select({ id: GoalCriterionTable.id })
-                  .from(GoalCriterionTable)
-                  .where(eq(GoalCriterionTable.goal_id, input.id))
-                  .limit(1)
-                  .get()
-                  .pipe(Effect.orDie)
-                if (!criterion) {
-                  return yield* new GoalSchema.ValidationError({
-                    reason: "a Goal needs at least one acceptance criterion before it can start",
-                  })
-                }
-              }
               if (input.action === "block" && !input.blocker?.trim()) {
                 return yield* new GoalSchema.ValidationError({ reason: "blocking a Goal requires a blocker reason" })
               }
@@ -1983,15 +1964,19 @@ const layer = Layer.effect(
                 .orderBy(asc(GoalCriterionTable.position))
                 .all()
                 .pipe(Effect.orDie)
-              if (input.verdict.criteria.length !== criteriaRows.length) {
+              // New verdicts judge the full objective. Preserve legacy criteria
+              // without fabricating per-criterion passes or verification evidence.
+              const assessments = input.verdict.criteria ?? []
+              if (input.verdict.criteria && assessments.length !== criteriaRows.length) {
                 return yield* new GoalSchema.ValidationError({
                   reason: `auditor verdict must assess all ${criteriaRows.length} acceptance criteria`,
                 })
               }
-              const assessmentByID = new Map(input.verdict.criteria.map((item) => [item.criterionID, item]))
+              const assessmentByID = new Map(assessments.map((item) => [item.criterionID, item]))
               if (
-                assessmentByID.size !== criteriaRows.length ||
-                criteriaRows.some((row) => !assessmentByID.has(row.id))
+                input.verdict.criteria &&
+                (assessmentByID.size !== criteriaRows.length ||
+                  criteriaRows.some((row) => !assessmentByID.has(row.id)))
               ) {
                 return yield* new GoalSchema.ValidationError({
                   reason: "auditor verdict criteria do not match this Goal",
@@ -1999,7 +1984,7 @@ const layer = Layer.effect(
               }
               if (
                 input.verdict.decision === "complete" &&
-                input.verdict.criteria.some((assessment) => assessment.status !== "passed")
+                assessments.some((assessment) => assessment.status !== "passed")
               ) {
                 return yield* new GoalSchema.ValidationError({
                   reason: "auditor complete requires every acceptance criterion to pass",
@@ -2013,7 +1998,7 @@ const layer = Layer.effect(
                   decision: input.verdict.decision,
                   rationale: input.verdict.rationale,
                   progressMade: input.verdict.progressMade,
-                  criteria: input.verdict.criteria,
+                  ...(input.verdict.criteria === undefined ? {} : { criteria: assessments }),
                   ...(input.verdict.confidence === undefined ? {} : { confidence: input.verdict.confidence }),
                   ...(input.verdict.decision === "blocked" ? { blocker: input.verdict.blocker } : {}),
                   ...(input.verdict.decision === "continue"
@@ -2050,7 +2035,8 @@ const layer = Layer.effect(
 
               let changed = false
               for (const criterion of criteriaRows) {
-                const assessment = assessmentByID.get(criterion.id)!
+                const assessment = assessmentByID.get(criterion.id)
+                if (!assessment) continue
                 // A *prior independently verified* pass is durable evidence. A
                 // later auditor's uncertainty cannot erase it merely because its
                 // current inspection scope cannot reach the original execution

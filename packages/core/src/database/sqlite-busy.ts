@@ -76,7 +76,7 @@ export function sqliteRetryableBegin(query: string): boolean {
  * foreground durable user work retains the established full admission budget.
  * Only native BEGIN is repeated, never an admitted transaction body. */
 export function sqliteBeginRetryElapsedMs(lane?: string): number {
-  if (lane === "maintenance") return 350
+  if (lane === "maintenance" || lane === "activity") return 350
   if (lane === "control") return 3_000
   return 15_000
 }

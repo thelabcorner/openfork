@@ -873,7 +873,7 @@ const layer = Layer.effect(
           schema: OxpUsage.Parameters,
           execute: (input, signal) =>
             Schema.decodeUnknownEffect(OxpUsage.Parameters)(input, { onExcessProperty: "error" }).pipe(
-              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "OXP usage requires action=context and an explicit sessionID" })),
+              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP usage arguments; context requires sessionID and aggregate actions require the separate global-usage grant" })),
               Effect.flatMap((params) => usage.execute(params, signal)),
             ),
         },

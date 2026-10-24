@@ -1,5 +1,5 @@
 import { Cause, Clock, Effect, Exit, Layer } from "effect"
-import { createHash } from "node:crypto"
+import { delegatedWorkerGroup } from "@opencode-ai/core/oxp-activity/delegation-group"
 import { OxpRuntimeV1 } from "./runtime-v1"
 import { OxpWorkerControl } from "./worker-control"
 
@@ -102,12 +102,17 @@ const start: OxpWorkerControl.Interface["start"] = (target, input) =>
       Effect.gen(function* () {
         const worker = yield* runtime.DelegatedWorker.make
         const groups = yield* runtime.SessionGroup.Service
-        const ownerRef = `${input.origin.principalRef}:${input.origin.rootRef}`
+        const sessionGroup = delegatedWorkerGroup({
+          principalRef: input.origin.principalRef,
+          rootRef: input.origin.rootRef,
+          parentSession: input.parentSession,
+        })
         const group = yield* groups.resolveOrCreate({
-          id: runtime.SessionGroup.ID.make("grp_oxp_" + createHash("sha256").update(ownerRef).digest("hex")),
-          name: "OXP delegated workers",
+          id: runtime.SessionGroup.ID.make(sessionGroup.id),
+          name: sessionGroup.name,
           kind: "delegation",
-          ownerRef,
+          ownerRef: sessionGroup.ownerRef,
+          updateName: sessionGroup.authoritativeTitle,
           policy: {
             autoAddDescendants: false,
             lockAdded: true,

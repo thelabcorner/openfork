@@ -237,7 +237,7 @@ test("Goal auditor uses an account-backed transient route when the parent is on 
   expect(attempted).toEqual([{
     providerID: "opencode",
     modelID: "gpt-5-nano",
-    routeIntent: { kind: "auto" },
+    routeIntent: { kind: "strategy" },
     executionPurpose: "special-agent",
   }])
   expect(resolved.value).toBe(model)
@@ -272,7 +272,7 @@ test("Goal runtime refuses hosted Public even when transient routing returns it"
       }))
     }).pipe(Effect.provide(provider.layer)),
   )
-  expect(calls).toEqual([{ providerID, modelID, routeIntent: { kind: "auto" }, executionPurpose: "special-agent" }])
+  expect(calls).toEqual([{ providerID, modelID, routeIntent: { kind: "strategy" }, executionPurpose: "special-agent" }])
   expect(exit._tag).toBe("Failure")
   expect(f.streamInputs).toHaveLength(0)
 })

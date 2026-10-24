@@ -35,6 +35,77 @@ export type TelegramQuotaVerification =
   | { readonly state: "pending"; readonly reason: "not-due" | "no-fresh-observation" | "reset-not-advanced" | "no-measured-recovery" }
   | { readonly state: "unverifiable"; readonly reason: "not-provider-authoritative" | "missing-identity" | "rolling-window" }
 
+export type TelegramQuotaEarlyRecovery = {
+  readonly id: string
+  readonly kind: "reset" | "replenishment"
+  readonly observedAt: number
+  readonly expectedResetAt: number
+  readonly nextResetAt: number
+  readonly previousRemainingPercent: number
+  readonly remainingPercent: number
+}
+
+const MIN_EARLY_LEAD_MS = 2 * 60_000
+const MIN_NEW_PERIOD_ADVANCE_MS = 5 * 60_000
+const MIN_RECOVERY_PP = 1
+// Without a new provider-reported period, a small increase could be an
+// adjustment/refund rather than a gift. Report large increases as replenishment,
+// never as confirmed resets.
+const MIN_UNSCHEDULED_REPLENISHMENT_PP = 20
+
+/**
+ * Detect a measured recovery BEFORE a previously captured provider deadline.
+ * Compare against the prior durable baseline, not a new deadline obtained in
+ * the current poll (which would erase the evidence of an early transition).
+ * Timestamp movement by itself, inferred estimates, and rolling windows are
+ * never evidence of an early reset.
+ */
+export function detectEarlyQuotaRecovery(
+  previous: TelegramQuotaDeadline,
+  fresh: ResetAgendaResult,
+  now: number,
+): TelegramQuotaEarlyRecovery | undefined {
+  if (isRollingQuotaWindow(previous) || previous.source !== "provider") return
+  if (!Number.isFinite(now) || now >= previous.resetAt - MIN_EARLY_LEAD_MS) return
+  if (previous.observedAt >= previous.resetAt || !validRemaining(previous.remainingPercent)) return
+  if ((previous.scope === "account" || previous.scope === "account-model") && !previous.accountId) return
+
+  let best: TelegramQuotaEarlyRecovery | undefined
+  for (const occurrence of fresh.occurrences) {
+    if (occurrence.providerId !== previous.providerId || occurrence.scope !== previous.scope) continue
+    if ((occurrence.accountId ?? "") !== (previous.accountId ?? "")) continue
+    if ((occurrence.model ?? "") !== (previous.model ?? "")) continue
+    if (!Number.isFinite(occurrence.observedAt) || occurrence.observedAt <= previous.observedAt ||
+        occurrence.observedAt > now || occurrence.observedAt >= previous.resetAt - MIN_EARLY_LEAD_MS) continue
+    const window = occurrence.windows.find((row) => row.key === previous.windowKey && row.source === "provider")
+    if (!window || !validRemaining(window.remainingPercent)) continue
+    const gain = window.remainingPercent - previous.remainingPercent
+    if (gain < MIN_RECOVERY_PP - 1e-7) continue
+    const newPeriod = occurrence.resetAt >= previous.resetAt + MIN_NEW_PERIOD_ADVANCE_MS
+    if (!newPeriod && gain < MIN_UNSCHEDULED_REPLENISHMENT_PP - 1e-7) continue
+
+    const candidate: TelegramQuotaEarlyRecovery = {
+      id: JSON.stringify(["early-quota-recovery", previous.subscriptionKey, previous.resetAt]),
+      kind: newPeriod ? "reset" : "replenishment",
+      observedAt: occurrence.observedAt,
+      expectedResetAt: previous.resetAt,
+      nextResetAt: occurrence.resetAt,
+      previousRemainingPercent: previous.remainingPercent,
+      remainingPercent: window.remainingPercent,
+    }
+    // Multiple agenda occurrences may represent the same selected window.
+    // Prefer evidence of a new period, then the freshest observation.
+    if (!best ||
+        (candidate.kind === "reset" && best.kind !== "reset") ||
+        (candidate.kind === best.kind && candidate.observedAt > best.observedAt)) best = candidate
+  }
+  return best
+}
+
+function validRemaining(value: number | null): value is number {
+  return value !== null && Number.isFinite(value) && value >= 0 && value <= 100
+}
+
 /**
  * These providers expose quota recovery through moving reset estimates, not
  * stable period boundaries. In particular, Claude's 5h and weekly resetAt

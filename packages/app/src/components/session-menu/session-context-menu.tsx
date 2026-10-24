@@ -810,7 +810,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
   type PokePromptInput = {
     sessionID: string
     id: string
-    agent: string
+    agent?: string
     model?: { providerID: string; modelID: string; variant?: string }
     text: string
     legacyParts?: Array<{ id: string; type: "text"; text: string }>
@@ -822,7 +822,10 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const conn = global.servers.list().find((c) => ServerConnection.key(c) === props.server)
     if (!conn) return
     const ctx = global.ensureServerCtx(conn)
-    const model = await holdSurface(async () => {
+    // Human Poke is a continuation, not a model or agent reassignment. Let
+    // the server bind the exact delegated route/account/variant from ownership.
+    const delegated = sess.humanInterjection === true
+    const model = delegated ? undefined : await holdSurface(async () => {
       const ps = await ensurePromptSession()
       return ps?.model.current() ?? promptFromSession(sess)
     })
@@ -830,7 +833,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const input: PokePromptInput = {
       sessionID: sid,
       id: messageID,
-      agent: "build",
+      agent: delegated ? undefined : (sess.agent ?? "build"),
       model: model
         ? { providerID: model.providerID, modelID: model.modelID, variant: model.variant ?? undefined }
         : undefined,
@@ -860,19 +863,23 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       "sessionGroup.pokeAll.done",
       targets,
       async (member) => {
-        const { createPromptSession } = await loadPromptRuntime()
-        if (!owner || !member.directory) throw new Error("Session prompt is unavailable")
-        const prompt = runWithOwner(owner, () =>
-          createPromptSession(ctx.sdk.scope, { dir: base64Encode(member.directory!), id: member.id }),
-        )
-        if (!prompt) throw new Error("Session prompt is unavailable")
-        await prompt.ready.promise
-        const model = prompt.model.current() ?? promptFromSession(member.session)
+        const delegated = member.session?.humanInterjection === true
+        let model: PromptModel | undefined
+        if (!delegated) {
+          const { createPromptSession } = await loadPromptRuntime()
+          if (!owner || !member.directory) throw new Error("Session prompt is unavailable")
+          const prompt = runWithOwner(owner, () =>
+            createPromptSession(ctx.sdk.scope, { dir: base64Encode(member.directory!), id: member.id }),
+          )
+          if (!prompt) throw new Error("Session prompt is unavailable")
+          await prompt.ready.promise
+          model = prompt.model.current() ?? promptFromSession(member.session)
+        }
         const messageID = Identifier.ascending("message")
         await sessionAPI.prompt({
           sessionID: member.id,
           id: messageID,
-          agent: "build",
+          agent: delegated ? undefined : (member.session?.agent ?? "build"),
           model: model
             ? { providerID: model.providerID, modelID: model.modelID, variant: model.variant ?? undefined }
             : undefined,

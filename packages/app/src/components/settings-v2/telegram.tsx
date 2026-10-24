@@ -365,13 +365,14 @@ export const SettingsTelegramV2: Component<{ section?: Accessor<SettingsSection 
               <span class="settings-telegram-muted">{selected()} selected</span>
             </div>
             <p class="settings-telegram-hint">
-              Services manage notifications independently. Fixed provider resets may be confirmed; estimates
-              generate unverified reminders. Rolling 5h windows alert on verified capacity increases of at least one percentage point.
+              Fixed provider windows distinguish on-time resets, early resets, and unexpected bonus capacity.
+              Estimated deadlines remain unverified. Rolling windows report measured increases separately,
+              including substantial recoveries ahead of their moving estimates; provider gifts are never assumed.
             </p>
             <SettingsListV2>
               <SettingsRowV2
                 title="Quota alerts"
-                description="Choose per-account fixed reset alerts, estimated reminders, or observed rolling capacity increases."
+                 description="Choose account windows for confirmed and early resets, estimated reminders, and measured replenishment alerts."
               >
                 <Switch checked={quota()?.enabled === true} disabled={!status()?.configured || !!busy()} onChange={setQuotaEnabled} />
               </SettingsRowV2>
@@ -404,10 +405,10 @@ export const SettingsTelegramV2: Component<{ section?: Accessor<SettingsSection 
                         <div class="settings-telegram-window-source">
                           {isRollingQuotaOption(option)
                             ? option.source === "provider"
-                              ? "Alert on ≥1 percentage-point increase in available capacity (even 98% → 99%) · 1h cooldown"
+                               ? "Alert on ≥1 percentage-point increase (even 98% → 99%); major early replenishment is labeled separately"
                               : "Capacity change alerts require live official provider usage · local estimates never trigger"
                             : option.source === "provider"
-                              ? "Provider-reported · alert after confirmed reset"
+                               ? "Provider-reported · distinguish scheduled reset, verified early reset, and unexpected bonus capacity"
                               : `${option.source} estimate · scheduled reminder, not reset confirmation`}
                         </div>
                       </div>

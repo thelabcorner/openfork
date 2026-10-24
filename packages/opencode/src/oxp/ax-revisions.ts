@@ -9,7 +9,8 @@
 export const AX_IMPLEMENTATION = Object.freeze({
   capabilitySearch: "ranked-shared-v6-intent-scaffolding-abstention",
   schemaProjection: "guided-focus-null-preserving-v3-nested-project-workdir",
-  activityPersistence: "bounded-busy-retry-sequential-links-sqlite-diagnostics-v2",
+  activityPersistence: "isolated-350ms-sqlite-activity-lane-wrapper-diagnostics-v3",
+  sessionSwarmReliability: "bound-profile-drift-guard-direct-tool-recall-v1",
   contractReplay: "owner-held-schema-digest-v1",
   transportStreaming: "bounded-backpressure-no-full-buffer-v1",
   timingDiagnostics: "lifetime-quantized-phase-latency-v1",

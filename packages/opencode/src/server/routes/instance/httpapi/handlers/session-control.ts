@@ -1,4 +1,3 @@
-import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
 import { GoalAutomation } from "@opencode-ai/core/goal/automation"
 import { SessionRecovery } from "@opencode-ai/core/session/recovery"
@@ -45,13 +44,10 @@ export const sessionControlHandlers = HttpApiBuilder.group(SessionControlApi, "s
       const sessionID = ctx.params.sessionID
       const current = yield* session.get(sessionID).pipe(Effect.option)
       if (Option.isSome(current)) {
-        if (
-          SessionMetadataOwnership.isProducerOwned(current.value.metadata ?? undefined) &&
-          !SessionMetadataOwnership.isHumanControllableWorker(current.value.metadata ?? undefined)
-        ) {
-          return yield* new HttpApiError.BadRequest({})
-        }
-
+        // Operator Stop is a user control-plane action, independent of the
+        // Session's producer. A scheduler, special agent or delegated worker
+        // does not get veto power over explicit human interruption. Execution
+        // generation-CAS and location checks below remain authoritative.
         const route = yield* WorkspaceRouteContext
         const request = yield* HttpServerRequest.HttpServerRequest
         const url = new URL(request.url, "http://localhost")

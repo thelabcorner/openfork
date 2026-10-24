@@ -82,6 +82,10 @@ export function isDefaultTitle(title: string) {
 
 type SessionRow = typeof SessionTable.$inferSelect
 
+// Normalize historical persisted routing at the DB read boundary. Never emit
+// the obsolete discriminator through session APIs or carry it into execution.
+const decodeStoredRouteIntent = Schema.decodeUnknownSync(ProviderRouteIntent.Info)
+
 export function fromRow(row: SessionRow): Info {
   const summary =
     row.summary_additions !== null || row.summary_deletions !== null || row.summary_files !== null
@@ -117,7 +121,9 @@ export function fromRow(row: SessionRow): Info {
           providerID: ProviderV2.ID.make(row.model.providerID),
           ...(row.model.accountID ? { accountID: row.model.accountID } : {}),
           variant: row.model.variant,
-          ...(row.model.routeIntent ? { routeIntent: row.model.routeIntent } : {}),
+          ...(row.model.routeIntent
+            ? { routeIntent: decodeStoredRouteIntent(row.model.routeIntent) }
+            : {}),
         }
       : undefined,
     version: row.version,

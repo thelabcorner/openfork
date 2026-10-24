@@ -16,7 +16,7 @@ Ordinary `send` is scoped to your selected Swarm. For a deliberate cross-Swarm m
 
 done and fail resolve the exact active running task run for this Session. They deliberately refuse to settle work that is only admitted (assigned but not yet executing), held by a human, retiring, or bound to a superseded or rebound Session. If you receive "no active running task", call status and report it rather than retrying: repeating done will not change the outcome.
 
-`to` in send accepts a Swarm member roster name, or `all` to broadcast. It is a roster name, never an opaque id.
+`to` in send accepts a Swarm member roster name, or `all` to broadcast. It is a roster name, never an opaque id. Get the exact roster name from `status` or `inbox` rather than guessing names like `coordinator`. For kind=`review`, set `replyExpected=true` (the reply-capable contract); ordinary one-way mail can use kind=`message` or `finding`.
 
 "Peer" is overloaded in OpenFork. In this tool it always means a Swarm member of this Swarm, addressed by the `to` roster name above. An OFXP peer is a different thing: a trusted remote OpenFork machine reached through the separate `ofxp` tool by `peerID`. The two are different channels, and naming one never grants membership, trust, or authority; only the host resolves those.
 

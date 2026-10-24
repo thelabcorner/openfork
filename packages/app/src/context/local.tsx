@@ -60,7 +60,7 @@ const clone = (value: State | undefined) => {
 }
 
 function inheritRouteIntent(item: ModelKey | undefined, previous: ModelKey | undefined) {
-  if (!item || item.routeIntent || previous?.providerID !== item.providerID || previous.routeIntent?.kind !== "auto")
+  if (!item || item.routeIntent || previous?.providerID !== item.providerID || previous.routeIntent?.kind !== "strategy")
     return item
   if (splitModelIDForProvider(item.modelID, item.providerID).accountID) return item
   return { ...item, routeIntent: previous.routeIntent }
@@ -208,6 +208,13 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const agent = {
       list,
       visible: agentsVisible,
+      // Only an explicitly saved per-Session choice overrides the assigned
+      // worker agent. A global last-used agent cannot silently take over a
+      // delegated worker when its composer first opens.
+      explicitSession() {
+        const session = id()
+        return session ? saved.session[session]?.agent : undefined
+      },
       current() {
         return pickAgent(agentsVisible() ? (scope()?.agent ?? store.current) : "build")
       },

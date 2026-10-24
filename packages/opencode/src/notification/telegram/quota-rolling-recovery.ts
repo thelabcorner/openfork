@@ -13,6 +13,9 @@ const MIN_INCREASE_PP = 1
 const COOLDOWN_MS = 60 * 60_000
 const MAX_OBSERVATION_GAP_MS = 20 * 60_000
 const FLOAT_EPSILON = 1e-7
+const MIN_LARGE_ROLLING_GAIN_PP = 25
+const MIN_LARGE_ROLLING_REMAINING = 70
+const MIN_ROLLING_EARLY_LEAD_MS = 30 * 60_000
 
 export type RollingObservation = {
   readonly subscriptionKey: string
@@ -22,16 +25,19 @@ export type RollingObservation = {
   readonly windowKey: string
   readonly observedAt: number
   readonly remainingPercent: number
+  readonly resetAt?: number
 }
 
 export type RollingCapacityState = {
   readonly subscriptionKey: string
   readonly observedAt: number
+  readonly resetAt?: number
   /** Missing in pre-change state; the first subsequent reading only seeds a baseline. */
   readonly remainingPercent?: number
   /** Lowest sampled remaining percentage since the last qualifying increase. */
   readonly lowWaterPercent?: number
   readonly lastAlertAt?: number
+  readonly lastEarlyAlertAt?: number
   readonly pending?: { readonly id: string; readonly text: string }
 }
 
@@ -43,6 +49,9 @@ export function validRollingCapacity(value: unknown): value is RollingCapacitySt
   if (row.remainingPercent !== undefined && !validPercent(row.remainingPercent)) return false
   if (row.lowWaterPercent !== undefined && !validPercent(row.lowWaterPercent)) return false
   if (row.lastAlertAt !== undefined && (typeof row.lastAlertAt !== "number" || !Number.isFinite(row.lastAlertAt))) return false
+  if (row.lastEarlyAlertAt !== undefined &&
+      (typeof row.lastEarlyAlertAt !== "number" || !Number.isFinite(row.lastEarlyAlertAt))) return false
+  if (row.resetAt !== undefined && (typeof row.resetAt !== "number" || !Number.isFinite(row.resetAt))) return false
   if (row.pending !== undefined) {
     if (!row.pending || typeof row.pending !== "object" || Array.isArray(row.pending)) return false
     const pending = row.pending as Record<string, unknown>
@@ -97,6 +106,7 @@ export function rollingObservations(input: {
         windowKey: window.key,
         observedAt: occurrence.observedAt,
         remainingPercent: window.remainingPercent,
+        resetAt: occurrence.resetAt,
       }
       if (!output.has(subscriptionKey) || output.get(subscriptionKey)!.observedAt < row.observedAt) {
         output.set(subscriptionKey, row)
@@ -132,21 +142,41 @@ export function observeRollingCapacity(
     subscriptionKey: observation.subscriptionKey,
     observedAt: observation.observedAt,
     remainingPercent: available,
+    ...(observation.resetAt !== undefined ? { resetAt: observation.resetAt } : {}),
     lowWaterPercent: available,
     ...(previous?.lastAlertAt !== undefined ? { lastAlertAt: previous.lastAlertAt } : {}),
+    ...(previous?.lastEarlyAlertAt !== undefined ? { lastEarlyAlertAt: previous.lastEarlyAlertAt } : {}),
     ...(previous?.pending ? { pending: previous.pending } : {}),
   }
 
   let floor = Math.min(previous?.lowWaterPercent ?? before, available)
   let pending = previous?.pending
   let lastAlertAt = previous?.lastAlertAt
+  let lastEarlyAlertAt = previous?.lastEarlyAlertAt
 
   // Only an ACTUAL positive transition can generate a message. The low-water
   // mark permits 98.0 -> 98.5 -> 99.0 to meet a one-point threshold.
   const increasing = available > before + FLOAT_EPSILON
   const material = available - floor >= MIN_INCREASE_PP - FLOAT_EPSILON
   if (increasing && material) {
-    if (!pending && (lastAlertAt === undefined || observation.observedAt - lastAlertAt >= COOLDOWN_MS)) {
+    // This timestamp is an advisory moving estimate, not a fixed period
+    // boundary. A major pre-estimate recovery is noteworthy but is not proof
+    // of a provider gift or a newly started fixed quota period.
+    const largeEarlyRecovery = available - before >= MIN_LARGE_ROLLING_GAIN_PP - FLOAT_EPSILON &&
+      available >= MIN_LARGE_ROLLING_REMAINING &&
+      previous?.resetAt !== undefined &&
+      previous.resetAt - observation.observedAt >= MIN_ROLLING_EARLY_LEAD_MS &&
+      (lastEarlyAlertAt === undefined || observation.observedAt - lastEarlyAlertAt >= COOLDOWN_MS)
+    if (largeEarlyRecovery) {
+      const target = [observation.providerName, observation.accountLabel, observation.model]
+        .map(safeLabel).filter(Boolean).join(" · ")
+      pending = {
+        id: JSON.stringify(["rolling-early-capacity-recovery", observation.subscriptionKey, observation.observedAt]),
+        text: `OpenFork · UNEXPECTED EARLY QUOTA REPLENISHMENT (rolling)\n${target}\nWindow: ${safeLabel(observation.windowKey)} (rolling)\nAvailable: ${formatPercent(before)}% → ${formatPercent(available)}% (+${formatPercent(available - before)} pp)\nPrior estimated reset: ${new Date(previous.resetAt).toISOString()}\nLarge recovery occurred ahead of the displayed estimate. Rolling-window recovery can be natural; a provider gift or full reset is not confirmed.`,
+      }
+      lastEarlyAlertAt = observation.observedAt
+      lastAlertAt = observation.observedAt
+    } else if (!pending && (lastAlertAt === undefined || observation.observedAt - lastAlertAt >= COOLDOWN_MS)) {
       const target = [observation.providerName, observation.accountLabel, observation.model]
         .map(safeLabel).filter(Boolean).join(" · ")
       const id = JSON.stringify(["rolling-capacity-increased", observation.subscriptionKey, observation.observedAt])
@@ -165,8 +195,10 @@ export function observeRollingCapacity(
     subscriptionKey: observation.subscriptionKey,
     observedAt: observation.observedAt,
     remainingPercent: available,
+    ...(observation.resetAt !== undefined ? { resetAt: observation.resetAt } : {}),
     lowWaterPercent: floor,
     ...(lastAlertAt !== undefined ? { lastAlertAt } : {}),
+    ...(lastEarlyAlertAt !== undefined ? { lastEarlyAlertAt } : {}),
     ...(pending ? { pending } : {}),
   }
 }

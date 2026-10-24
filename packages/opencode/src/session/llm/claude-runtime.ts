@@ -134,6 +134,10 @@ export function resetSharedState(): void {
 export interface StreamInput {
   readonly sessionID: string
   readonly system: readonly string[]
+  /** Explicit OpenFork agent instruction, distinct from Claude Code preset/CLAUDE.md. */
+  readonly agentPrompt?: string
+  /** Explicit user-supplied turn-level system instruction. */
+  readonly userSystem?: string
   readonly messages: readonly ModelMessage[]
   readonly tools: Record<string, Tool>
   readonly modelID: string
@@ -388,6 +392,62 @@ export function toolOutput(value: unknown): string {
   }
 }
 
+
+/**
+ * Give the host tool a real bounded execution lifetime. SDK/Session stop can
+ * arrive through different signals; a non-cooperative tool must never keep the
+ * Claude turn's pending-task join alive indefinitely. Aborting its signal is
+ * advisory for in-flight side effects, but terminal settlement is authoritative.
+ */
+export class ClaudeToolDeadlineError extends Error {
+  constructor() {
+    super("Claude tool execution timed out")
+    this.name = "ClaudeToolDeadlineError"
+  }
+}
+
+export async function runClaudeToolBounded<T>(input: {
+  readonly run: (signal: AbortSignal) => Promise<T> | T
+  readonly signals: readonly AbortSignal[]
+  readonly timeoutMs: number
+  readonly onTimeout?: () => void
+}): Promise<T> {
+  const controller = new AbortController()
+  const timeoutMs = Number.isFinite(input.timeoutMs) ? Math.max(1, Math.min(600_000, input.timeoutMs)) : 120_000
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let rejectStopped!: (error: Error) => void
+  const stopped = new Promise<never>((_, reject) => {
+    rejectStopped = reject
+  })
+  const cancel = () => {
+    controller.abort()
+    rejectStopped(new Error("Claude tool execution cancelled"))
+  }
+  for (const signal of input.signals) signal.addEventListener("abort", cancel, { once: true })
+  try {
+    if (input.signals.some((signal) => signal.aborted)) {
+      // Reject before starting any user tool, not merely after a later abort.
+      throw new Error("Claude tool execution cancelled")
+    }
+    timer = setTimeout(() => {
+      controller.abort()
+      try { input.onTimeout?.() } catch { /* host teardown may already own this entry */ }
+      rejectStopped(new ClaudeToolDeadlineError())
+    }, timeoutMs)
+    return await Promise.race([
+      Promise.resolve().then(() => {
+        // Cancellation may arrive between scheduling and the tool microtask.
+        if (controller.signal.aborted) throw new Error("Claude tool execution cancelled")
+        return input.run(controller.signal)
+      }),
+      stopped,
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+    for (const signal of input.signals) signal.removeEventListener("abort", cancel)
+  }
+}
+
 // ── Prompt assembly ──
 // Match @openchamber/opencode-claude SdkUserPrompt: the Agent SDK CLI rejects
 // streaming-input items whose inner message.role is missing
@@ -414,6 +474,72 @@ function messageText(message: ModelMessage): string {
     .map((part) => (part && typeof part === "object" && "text" in part ? String(part.text) : ""))
     .filter(Boolean)
     .join("\n")
+}
+
+
+// Text-only transfer is a fallback for an inaccessible/reverted Claude transcript.
+// Preserve the *answered* tool step, including its tool name and result, without
+// re-executing it. Attachments cannot be faithfully serialized as plain text.
+const MAX_TRANSFER_TOOL_TEXT = 32_000
+
+function transferValue(value: unknown): string {
+  if (typeof value === "string") return value
+  if (isRecord(value)) {
+    if (value.type === "text" && typeof value.value === "string") return value.value
+    if (value.type === "json") value = value.value
+    else if (value.type === "content" && Array.isArray(value.value)) {
+      return value.value
+        .map((part) => (isRecord(part) && part.type === "text" ? String(part.text ?? "") : "[non-text attachment omitted]"))
+        .join("\n")
+    }
+  }
+  try {
+    return JSON.stringify(value ?? "") ?? ""
+  } catch {
+    return "[non-serializable tool output omitted]"
+  }
+}
+
+function cappedTransferText(text: string): string {
+  return text.length > MAX_TRANSFER_TOOL_TEXT
+    ? text.slice(0, MAX_TRANSFER_TOOL_TEXT) + "\n[tool output truncated]"
+    : text
+}
+
+/** Stable role-aware history projection shared by first start and resume invalidation. */
+export function historyTransferRows(messages: readonly ModelMessage[]): Array<{ role: string; content: string }> {
+  const rows: Array<{ role: string; content: string }> = []
+  for (const message of messages) {
+    if (message.role === "user") {
+      const content = messageText(message)
+      if (content) rows.push({ role: "user", content })
+      continue
+    }
+    if (message.role === "assistant") {
+      const parts: readonly unknown[] = Array.isArray(message.content) ? message.content : []
+      const calls = parts
+        .filter((part): part is Record<string, unknown> => isRecord(part) && part.type === "tool-call")
+        .map((part) =>
+          `Tool call: ${String(part.toolName ?? "unknown")} (id: ${String(part.toolCallId ?? "unknown")})`,
+        )
+      const content = [messageText(message), ...calls].filter(Boolean).join("\n")
+      if (content) rows.push({ role: "assistant", content })
+      continue
+    }
+    if (message.role !== "tool" || !Array.isArray(message.content)) continue
+    for (const value of message.content as readonly unknown[]) {
+      if (!isRecord(value) || value.type !== "tool-result") continue
+      const part: Record<string, unknown> = value
+      const name = typeof part.toolName === "string" ? part.toolName : "unknown"
+      const id = typeof part.toolCallId === "string" ? part.toolCallId : "unknown"
+      const result = cappedTransferText(transferValue(part.output))
+      rows.push({
+        role: "tool",
+        content: `Result of ${name} (id: ${id})${part.isError ? " [error]" : ""}:\n${result}`,
+      })
+    }
+  }
+  return rows
 }
 
 // ── Attachment conversion (ported/adapted from plugin prompt.ts for 1:1) ──
@@ -609,18 +735,13 @@ export function buildPrompt(input: {
   // Claude Code preset owns the agent system prompt (plugin prompt.ts).
   const history =
     input.historyTransfer ??
-    boundHistory(
-      input.messages
-        .slice(0, -1)
-        .filter((message) => message.role === "user" || message.role === "assistant")
-        .map((message) => ({ role: message.role, content: messageText(message) }))
-        .filter((message) => message.content.length > 0),
-    ).messages
+    boundHistory(historyTransferRows(input.messages.slice(0, -1))).messages
   const transcript = history
     .map((message) => {
       if (message.role === "user") return `User:\n${message.content}`
-      if (message.role === "assistant") return `Assistant:\n${message.content}`
-      return null
+       if (message.role === "assistant") return `Assistant:\n${message.content}`
+       if (message.role === "tool") return `Tool result (already executed; do not repeat):\n${message.content}`
+       return null
     })
     .filter((line): line is string => Boolean(line))
     .join("\n\n")
@@ -906,10 +1027,7 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
                 settingsDigest: hashSettings(settings),
                 transcriptExists: true,
               },
-              historyMessages: priorMessages
-                .filter((message) => message.role === "user" || message.role === "assistant")
-                .map((message) => ({ role: message.role, content: messageText(message) }))
-                .filter((message) => message.content.length > 0),
+               historyMessages: historyTransferRows(priorMessages),
               historyFingerprints,
               priorHistoryFingerprints,
               transcriptExists: input.transcriptExists
@@ -1028,10 +1146,15 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       try {
         const tool = input.tools[name]
         if (!tool.execute) throw new Error(`tool has no execute handler: ${name}`)
-        const raw = await tool.execute(callInput, {
-          toolCallId: callID,
-          messages: input.messages as ModelMessage[],
-          abortSignal: signal,
+        const raw = await runClaudeToolBounded({
+          timeoutMs: store.get(callID)?.timeoutMs ?? 120_000,
+          signals: signal === input.abort ? [input.abort] : [input.abort, signal],
+          onTimeout: () => { store.timeout(callID) },
+          run: (toolSignal) => tool.execute!(callInput, {
+            toolCallId: callID,
+            messages: input.messages as ModelMessage[],
+            abortSignal: toolSignal,
+          }),
         })
         rawToolOutput = raw
         outputText = toolOutput(raw)
@@ -1246,7 +1369,11 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       mcpTools,
       mcpServerName: MCP_SERVER_NAME,
       toolAliases: toolAliases(input.tools),
-      systemPromptAppend: runtimeInstructions(input.modelID, input.effort),
+       // Structured instruction owners prevent double-injecting CLAUDE.md or
+       // the default Claude Code preset while preserving custom OpenFork agents.
+       systemPromptAppend: [input.agentPrompt?.trim(), input.userSystem?.trim(), runtimeInstructions(input.modelID, input.effort)]
+         .filter((text): text is string => Boolean(text))
+         .join("\n\n"),
       onMcpToolsRegistered: (registered) => {
         mcpRegistered = registered
       },
@@ -1298,10 +1425,29 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
     }
 
     if (outcome.status === "completed") {
-      const usage =
-        outcome.usage && (outcome.usage.input_tokens !== undefined || outcome.usage.output_tokens !== undefined)
-          ? { inputTokens: outcome.usage.input_tokens, outputTokens: outcome.usage.output_tokens }
-          : undefined
+      // The Agent SDK reports Anthropic's non-cached input separately from
+      // cache read/write tokens. Preserve the breakdown and derive an inclusive
+      // input total once from the final turn result (never sum it with per-call
+      // assistant snapshots). Thinking is a subset of output, not extra tokens.
+      const rawUsage = outcome.usage
+      const validToken = (n: number | undefined): number | undefined =>
+        n !== undefined && Number.isFinite(n) && n >= 0 ? n : undefined
+      const nonCached = validToken(rawUsage?.input_tokens)
+      const cacheRead = validToken(rawUsage?.cache_read_input_tokens)
+      const cacheWrite = validToken(rawUsage?.cache_creation_input_tokens)
+      const outputTokens = validToken(rawUsage?.output_tokens)
+      const thinkingTokens = validToken(rawUsage?.thinking_tokens)
+      const hasInput = nonCached !== undefined || cacheRead !== undefined || cacheWrite !== undefined
+      const usage = rawUsage
+        ? {
+            ...(hasInput ? { inputTokens: (nonCached ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0) } : {}),
+            ...(nonCached !== undefined ? { nonCachedInputTokens: nonCached } : {}),
+            ...(cacheRead !== undefined ? { cacheReadInputTokens: cacheRead } : {}),
+            ...(cacheWrite !== undefined ? { cacheWriteInputTokens: cacheWrite } : {}),
+            ...(outputTokens !== undefined ? { outputTokens } : {}),
+            ...(thinkingTokens !== undefined ? { reasoningTokens: thinkingTokens } : {}),
+          }
+        : undefined
       const reason = outcome.isError ? ("error" as const) : finishReasonForClaude(outcome.stopReason)
       out.push(LLMEvent.stepFinish({ index: 0, reason, ...(usage ? { usage } : {}) }))
       out.push(LLMEvent.finish({ reason, ...(usage ? { usage } : {}) }))

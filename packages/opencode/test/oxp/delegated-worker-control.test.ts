@@ -14,6 +14,7 @@ import { OxpError } from "@/oxp/error"
 import { OxpWorker } from "@/oxp/worker"
 import { OxpWorkerControl } from "@/oxp/worker-control"
 import { OxpWorkerControlV1 } from "@/oxp/worker-control-v1"
+import { delegatedWorkerGroup } from "@opencode-ai/core/oxp-activity/delegation-group"
 import { Permission } from "@/permission"
 import { Provider } from "@/provider/provider"
 import { Question } from "@/question"
@@ -36,6 +37,39 @@ const ORIGIN = {
   model: { providerID: "test", modelID: "test-model" },
   nestedDelegation: false,
 } as const
+
+describe("OXP originating-session worker groups", () => {
+  const start = (ref?: string, title?: string, rootRef: string = ORIGIN.rootRef) => ({
+    principalRef: ORIGIN.principalRef,
+    rootRef,
+    ...(ref ? { parentSession: { ref, ...(title ? { title } : {}) } } : {}),
+  })
+
+  test("same OXP session groups across roots and title updates without changing identity", () => {
+    const a = delegatedWorkerGroup(start("session-a", "Silica Fidelity"))
+    const renamed = delegatedWorkerGroup(start("session-a", "Silica Accuracy", "other-root"))
+    expect(a.id).toBe(renamed.id)
+    expect(a.ownerRef).toBe(renamed.ownerRef)
+    expect(a.name).toBe("Silica Fidelity")
+    expect(renamed.name).toBe("Silica Accuracy")
+  })
+
+  test("two OXP sessions with identical titles never merge, even under one connector", () => {
+    const a = delegatedWorkerGroup(start("session-a", "Research"))
+    const b = delegatedWorkerGroup(start("session-b", "Research"))
+    expect(a.id).not.toBe(b.id)
+    expect(a.ownerRef).not.toBe(b.ownerRef)
+  })
+
+  test("missing title remains session-isolated; unattributed legacy workers keep their group", () => {
+    const unnamed = delegatedWorkerGroup(start("session-a"))
+    const legacy = delegatedWorkerGroup(start())
+    expect(unnamed.name).toBe("OXP session")
+    expect(legacy.name).toBe("OXP delegated workers")
+    expect(legacy.ownerRef).toBe(`${ORIGIN.principalRef}:${ORIGIN.rootRef}`)
+    expect(unnamed.id).not.toBe(legacy.id)
+  })
+})
 
 const identity = {
   producer: "oxp",

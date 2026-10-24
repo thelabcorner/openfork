@@ -16,7 +16,7 @@ import { testEffect } from "../lib/effect"
 const directory = "/swarm/preflight"
 
 const base = {
-  agent: AgentModel.ID.make("build"),
+  agent: AgentModel.ID.make("swarm-m"),
   model: {
     providerID: ProviderV2.ID.make("anthropic"),
     id: ModelV2.ID.make("claude-opus-5"),
@@ -49,7 +49,7 @@ const instance = {
 } as never
 
 const agentMock = Layer.mock(Agent.Service, {
-  get: (name: string) => Effect.succeed(name === "build" ? ({ name: "build" } as any) : (undefined as any)),
+  get: (name: string) => Effect.succeed(name === "swarm-m" ? ({ name: "swarm-m" } as any) : (undefined as any)),
 })
 
 const providerMock = Layer.mock(ProviderService.Service, {
@@ -117,14 +117,14 @@ describe("SwarmProfilePreflight", () => {
     }),
   )
 
-  it.effect("fails closed on an unknown agent", () =>
+  it.effect("fails closed on an unsupported managed-worker agent mode", () =>
     Effect.gen(function* () {
       const service = yield* SwarmProfilePreflight.Service
       const result = yield* scoped(
         service.check({ directory, profile: { ...base, agent: AgentModel.ID.make("ghost") } }),
       ).pipe(Effect.exit)
       expect(result._tag).toBe("Failure")
-      if (result._tag === "Failure") expect(failureText(result.cause)).toContain("Agent not found: ghost")
+      if (result._tag === "Failure") expect(failureText(result.cause)).toContain("Managed Swarm workers must use the swarm-m agent mode; received ghost")
     }),
   )
 
@@ -201,4 +201,44 @@ describe("SwarmProfilePreflight", () => {
       true,
     )
   })
+
+  test("detects contradictory Go account identities without modifying the selected account", () => {
+    const selected = {
+      providerID: "opencode-go",
+      id: "minimax-m3.1-flash-free@zen-fa947268cd12",
+      accountID: "key3",
+    }
+    const issue = SwarmProfilePreflight.qualifiedGoAccountConflict(selected)
+    expect(issue).toContain("Conflicting OpenCode Go account selectors")
+    expect(issue).toContain("key3")
+    expect(issue).toContain("zen-fa947268cd12")
+    expect(SwarmProfilePreflight.qualifiedGoAccountConflict({ ...selected, accountID: "zen-fa947268cd12" })).toBeUndefined()
+    expect(SwarmProfilePreflight.qualifiedGoAccountConflict({ ...selected, accountID: undefined })).toBeUndefined()
+    expect(SwarmProfilePreflight.qualifiedGoAccountConflict({ ...selected, id: "minimax-m3.1-flash-free" })).toBeUndefined()
+    expect(SwarmProfilePreflight.qualifiedGoAccountConflict({ ...selected, providerID: "anthropic" })).toBeUndefined()
+  })
+
+  it.effect("rejects incompatible Go account selectors before provider resolution or durable admission", () =>
+    Effect.gen(function* () {
+      const service = yield* SwarmProfilePreflight.Service
+      const result = yield* scoped(service.check({
+        directory,
+        profile: {
+          ...base,
+          model: {
+            providerID: ProviderV2.ID.make("opencode-go"),
+            id: ModelV2.ID.make("minimax-m3.1-flash-free@zen-fa947268cd12"),
+            accountID: "key3",
+            variant: ModelV2.VariantID.make("max"),
+          },
+        },
+      })).pipe(Effect.exit)
+      expect(result._tag).toBe("Failure")
+      if (result._tag === "Failure") {
+        const error = failureText(result.cause)
+        expect(error).toContain("Conflicting OpenCode Go account selectors")
+        expect(error).toContain("stable account ID")
+      }
+    }),
+  )
 })

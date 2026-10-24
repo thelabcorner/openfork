@@ -29,7 +29,10 @@ export interface PathLike {
   (path: string): boolean
 }
 
-const WINDOWS_EXTS = [".cmd", ".exe", ".bat", ""] as const
+// Agent SDK invokes this path directly with child_process.spawn(). Windows
+// command shims cannot be spawned that way (Node reports EINVAL), so prefer
+// a native executable whenever a PATH directory exposes both forms.
+const WINDOWS_EXTS = [".exe", ".cmd", ".bat", ""] as const
 const POSIX_EXTS = [""] as const
 
 function isWindows(platform: string): boolean {
@@ -63,9 +66,19 @@ export function pathCandidates(name: string, env: AvailabilityEnv, platform: str
 export function knownCandidates(name: string, env: AvailabilityEnv, platform: string = process.platform): string[] {
   const home = homeDir(env)
   if (!home) return []
-  const candidates = [joinPath(joinPath(joinPath(home, ".local"), "bin"), name)]
-  if (!isWindows(platform)) candidates.push(joinPath(joinPath(joinPath(home, ".npm-global"), "bin"), name))
-  return candidates
+  const localBin = joinPath(joinPath(home, ".local"), "bin")
+  if (isWindows(platform)) {
+    const appData = typeof env.APPDATA === "string" && env.APPDATA
+      ? env.APPDATA
+      : joinPath(joinPath(home, "AppData"), "Roaming")
+    const npm = joinPath(appData, "npm")
+    return [
+      joinPath(localBin, name + ".exe"),
+      joinPath(joinPath(joinPath(joinPath(npm, "node_modules"), "@anthropic-ai"), "claude-code"), "bin/claude.exe"),
+      joinPath(npm, name + ".cmd"),
+    ]
+  }
+  return [joinPath(localBin, name), joinPath(joinPath(joinPath(home, ".npm-global"), "bin"), name)]
 }
 
 /**
@@ -85,6 +98,40 @@ export function resolveCliPath(
     if (exists(candidate)) return candidate
   }
   return undefined
+}
+
+/**
+ * The SDK uses a direct spawn, unlike auth's ComSpec-aware process port.
+ * On Windows npm shims are not spawnable as SDK executables. Resolve the
+ * installed native binary or Node cli.js without invoking npm or a shell.
+ */
+export function resolveSdkCliPath(
+  env: AvailabilityEnv = process.env,
+  exists: PathLike = (path) => existsSync(path),
+  platform: string = process.platform,
+  explicitPath?: string,
+): string | undefined {
+  if (!isWindows(platform)) return explicitPath ?? resolveCliPath(env, exists, platform)
+  const candidates = explicitPath
+    ? [explicitPath]
+    : [...pathCandidates(CLAUDE_BINARY_NAME, env, platform), ...knownCandidates(CLAUDE_BINARY_NAME, env, platform)]
+  for (const candidate of candidates) {
+    if (!exists(candidate)) continue
+    if (/\.exe$/i.test(candidate) || /\.[cm]?js$/i.test(candidate)) return candidate
+    if (!/\.(?:cmd|bat)$/i.test(candidate)) continue
+    const dir = candidate.replace(/[/\\][^/\\]+$/, "")
+    const packageDir = joinPath(joinPath(joinPath(dir, "node_modules"), "@anthropic-ai"), "claude-code")
+    for (const target of [joinPath(joinPath(packageDir, "bin"), "claude.exe"), joinPath(packageDir, "cli.js")]) {
+      if (exists(target)) return target
+    }
+  }
+  // Never pass a Windows npm .cmd/.bat shim to the Agent SDK direct spawn.
+  return undefined
+}
+
+/** SDK must select Node explicitly for npm's JavaScript-only Windows install. */
+export function sdkCliUsesNode(path: string): boolean {
+  return /\.[cm]?js$/i.test(path)
 }
 
 /** First `x.y.z` version-looking token in CLI output. */

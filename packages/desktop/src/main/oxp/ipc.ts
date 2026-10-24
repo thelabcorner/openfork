@@ -11,6 +11,8 @@ const grantKeys = new Set<keyof SidecarOxpGrant>([
   "read",
   "write",
   "process",
+  "code",
+  "globalUsageAnalytics",
   "git",
   "integrations",
   "browser",
@@ -40,7 +42,7 @@ function grantPatch(value: unknown): Partial<SidecarOxpGrant> {
     const key = rawKey as keyof SidecarOxpGrant
     if (!grantKeys.has(key)) throw new Error(`Unknown OXP grant field: ${rawKey}`)
     if (key === "sessionSupervision") {
-      if (item !== "none" && item !== "approved-roots") throw new Error("Invalid session supervision policy")
+      if (item !== "none" && item !== "approved-roots" && item !== "all-native") throw new Error("Invalid session supervision policy")
       result.sessionSupervision = item
       continue
     }

@@ -13,7 +13,7 @@ const explicit = {
 } satisfies OxpSchema.ModelSelection
 
 const publicIntent: ProviderRouteIntent.Info = { kind: "public" }
-const autoIntent: ProviderRouteIntent.Info = { kind: "auto" }
+const autoIntent: ProviderRouteIntent.Info = { kind: "strategy" }
 const accountIntent = (accountID: string, pin?: "hard" | "soft"): ProviderRouteIntent.Info => ({
   kind: "account",
   accountID,
@@ -89,15 +89,15 @@ describe("OxpModelSelection", () => {
     ).toThrow("does not expose first-class account selection")
   })
 
-  test("keeps omitted account selection explicitly automatic", () => {
+  test("keeps omitted account selection as the default Adaptive strategy", () => {
     const result = OxpModelSelection.materialize({
       providerID: "workbuddy",
       modelID: "deepseek-v4.1-flash",
       variant: "max",
     })
 
-    expect(result.accountMode).toBe("automatic")
-    expect(result.routeIntent).toEqual({ kind: "auto" })
+    expect(result.accountMode).toBe("adaptive")
+    expect(result.routeIntent).toEqual({ kind: "strategy" })
     expect(result.providerModelID).toBe("deepseek-v4.1-flash")
     expect(result.selection.accountID).toBeUndefined()
   })
@@ -235,7 +235,7 @@ describe("OxpModelSelection", () => {
     expect(projected.routeIntent).toBeUndefined()
 
     const result = OxpModelSelection.materialize(projected)
-    expect(result.routeIntent).toEqual({ kind: "auto" })
-    expect(result.accountMode).toBe("automatic")
+    expect(result.routeIntent).toEqual({ kind: "strategy" })
+    expect(result.accountMode).toBe("adaptive")
   })
 })

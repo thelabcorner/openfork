@@ -4,6 +4,7 @@ import * as path from "node:path"
 import { Global } from "@opencode-ai/core/global"
 import type { ResetAgendaResult } from "@/quota/schema"
 import {
+  detectEarlyQuotaRecovery,
   isRollingQuotaWindow,
   quotaNotificationDeadlines,
   quotaSubscriptionKey,
@@ -40,6 +41,20 @@ type State = {
   subscriptions: TelegramQuotaSubscription[]
   deadlines: TelegramQuotaDeadline[]
   rolling: RollingCapacityState[]
+  early: EarlyPending[]
+}
+type EarlyPending = NotificationIntent & { readonly subscriptionKey: string }
+
+function validEarlyPending(value: unknown): value is EarlyPending {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const row = value as Record<string, unknown>
+  return typeof row.subscriptionKey === "string" && row.subscriptionKey.length <= 2048 &&
+    typeof row.id === "string" && row.id.length > 0 && row.id.length <= 3000 &&
+    typeof row.text === "string" && row.text.length > 0 && row.text.length <= 4096
+}
+
+function percent(value: number): string {
+  return (Math.round(value * 10) / 10).toString()
 }
 
 function validSubscription(value: unknown): value is TelegramQuotaSubscription {
@@ -94,7 +109,7 @@ function coalesceDeadlines(rows: readonly TelegramQuotaDeadline[], now: number):
 export class QuotaNotificationSource implements NotificationSource {
   readonly id = "quota"
   readonly title = "Quota alerts"
-  private state: State = { enabled: false, subscriptions: [], deadlines: [], rolling: [] }
+  private state: State = { enabled: false, subscriptions: [], deadlines: [], rolling: [], early: [] }
   private writeTail: Promise<void> = Promise.resolve()
   private revision = 0
 
@@ -117,11 +132,14 @@ export class QuotaNotificationSource implements NotificationSource {
       this.state.rolling = Array.isArray(raw.rolling)
         ? raw.rolling.filter(validRollingCapacity).map(migrateRollingCapacity).slice(0, MAX_SUBSCRIPTIONS)
         : []
+      this.state.early = Array.isArray(raw.early)
+        ? raw.early.filter(validEarlyPending).slice(0, MAX_SUBSCRIPTIONS)
+        : []
     } catch (cause) {
       if ((cause as NodeJS.ErrnoException).code !== "ENOENT") {
         // Corrupt/unreadable data must not initialize notifications with unknown
         // selection. Preserve the file for forensics and remain disabled.
-        this.state = { enabled: false, subscriptions: [], deadlines: [], rolling: [] }
+        this.state = { enabled: false, subscriptions: [], deadlines: [], rolling: [], early: [] }
       }
     }
   }
@@ -134,7 +152,7 @@ export class QuotaNotificationSource implements NotificationSource {
     return {
       enabled: this.state.enabled,
       subscriptions: this.state.subscriptions.map((sub) => ({ ...sub })),
-      scheduled: this.state.deadlines.length + this.state.rolling.filter((row) => row.pending).length,
+      scheduled: this.state.deadlines.length + this.state.rolling.filter((row) => row.pending).length + this.state.early.length,
     }
   }
 
@@ -164,7 +182,15 @@ export class QuotaNotificationSource implements NotificationSource {
     this.state.enabled = input.enabled
     this.state.subscriptions = [...unique.values()]
     const selected = new Set(this.state.subscriptions.filter((s) => s.enabled).map(quotaSubscriptionKey))
-    this.state.deadlines = this.state.deadlines.filter((row) => selected.has(row.subscriptionKey) && !isRollingQuotaWindow(row))
+    // Disabling and later re-enabling must seed a new pre-deadline baseline.
+    // Otherwise a snapshot from a paused interval could create a fake early
+    // reset, just as it could for rolling capacity recovery.
+    this.state.deadlines = input.enabled && wasEnabled
+      ? this.state.deadlines.filter((row) => selected.has(row.subscriptionKey) && !isRollingQuotaWindow(row))
+      : []
+    this.state.early = input.enabled && wasEnabled
+      ? this.state.early.filter((row) => selected.has(row.subscriptionKey))
+      : []
     // Re-enabling the service must not compare a current snapshot with a
     // previously disabled/stale baseline to fabricate a retrospective event.
     this.state.rolling = input.enabled && wasEnabled
@@ -179,27 +205,29 @@ export class QuotaNotificationSource implements NotificationSource {
     // The Go official snapshot cache has a 5-minute TTL; this service needs
     // independent observations of the rolling capacity (not reset estimates).
     // Never increase the poll frequency beyond that shared provider gate.
-    const rollingPoll = this.state.subscriptions.some((sub) => sub.enabled && isRollingQuotaWindow(sub))
-      ? 5 * 60_000 + 2_000 : 30 * 60_000
+    const pollDelay = this.state.subscriptions.some((sub) => sub.enabled && isRollingQuotaWindow(sub))
+      ? 5 * 60_000 + 2_000 : 10 * 60_000
     const earliest = this.state.deadlines.reduce((min, row) => Math.min(min, row.resetAt + 60_000), Infinity)
-    if (!Number.isFinite(earliest)) return rollingPoll
-    if (earliest <= now) return Math.min(rollingPoll, 5 * 60_000)
-    return Math.min(rollingPoll, earliest - now)
+    if (!Number.isFinite(earliest)) return pollDelay
+    if (earliest <= now) return Math.min(pollDelay, 5 * 60_000)
+    return Math.min(pollDelay, earliest - now)
   }
 
   async acknowledge(id: string) {
     const before = this.state.deadlines.length
     this.state.deadlines = this.state.deadlines.filter((row) => row.id !== id)
+    const pendingBefore = this.state.early.length
+    this.state.early = this.state.early.filter((row) => row.id !== id)
     const rolling = this.state.rolling.find((row) => row.pending?.id === id)
     if (rolling) this.state.rolling = this.state.rolling.map((row) =>
       row === rolling ? { ...row, pending: undefined } : row,
     )
-    if (this.state.deadlines.length !== before || rolling) await this.save()
+    if (this.state.deadlines.length !== before || this.state.early.length !== pendingBefore || rolling) await this.save()
   }
 
   async clear() {
     this.revision++
-    this.state = { enabled: false, subscriptions: [], deadlines: [], rolling: [] }
+    this.state = { enabled: false, subscriptions: [], deadlines: [], rolling: [], early: [] }
     await this.save()
   }
 
@@ -213,6 +241,37 @@ export class QuotaNotificationSource implements NotificationSource {
     const agenda = await this.agenda(now, now + HORIZON, providers)
     if (revision !== this.revision || !this.active()) return []
     const selected = new Set(this.state.subscriptions.filter((s) => s.enabled).map(quotaSubscriptionKey))
+    const earlyIds = new Set(this.state.early.map((row) => row.id))
+    for (const baseline of this.state.deadlines) {
+      if (!selected.has(baseline.subscriptionKey)) continue
+      const recovery = detectEarlyQuotaRecovery(baseline, agenda, now)
+      if (!recovery || earlyIds.has(recovery.id)) continue
+      const target = [baseline.providerName, baseline.accountLabel, baseline.model]
+        .map(safeMessagePart).filter(Boolean).join(" · ")
+      const leadMs = recovery.expectedResetAt - recovery.observedAt
+      const leadMinutes = Math.floor(leadMs / 60_000)
+      const timing = leadMinutes >= 60
+        ? `${Math.floor(leadMinutes / 60)}h ${leadMinutes % 60}m`
+        : `${leadMinutes}m`
+      const isReset = recovery.kind === "reset"
+      this.state.early.push({
+        id: recovery.id,
+        subscriptionKey: baseline.subscriptionKey,
+        text: [
+          isReset ? "OpenFork · EARLY QUOTA RESET DETECTED" : "OpenFork · UNEXPECTED EARLY QUOTA REPLENISHMENT",
+          target,
+          `Window: ${safeMessagePart(baseline.windowKey)}`,
+          `Available: ${percent(recovery.previousRemainingPercent)}% → ${percent(recovery.remainingPercent)}%`,
+          `Detected at least ${timing} before expected reset.`,
+          `Previously expected: ${new Date(recovery.expectedResetAt).toISOString()}`,
+          isReset
+            ? `Provider's new reset time: ${new Date(recovery.nextResetAt).toISOString()}`
+            : "Provider's reset schedule has not advanced to a new period; this may be bonus capacity.",
+        ].join("\n"),
+      })
+      earlyIds.add(recovery.id)
+    }
+    this.state.early = this.state.early.slice(-MAX_SUBSCRIPTIONS)
     this.state.deadlines = coalesceDeadlines([
       ...this.state.deadlines.filter((row) => selected.has(row.subscriptionKey)),
       ...quotaNotificationDeadlines({ agenda, subscriptions: this.state.subscriptions, now }),
@@ -251,6 +310,7 @@ export class QuotaNotificationSource implements NotificationSource {
     for (const row of this.state.rolling) {
       if (row.pending) notices.push(row.pending)
     }
+    notices.push(...this.state.early)
     return notices
   }
 }

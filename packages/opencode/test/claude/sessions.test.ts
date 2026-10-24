@@ -165,6 +165,18 @@ describe("ClaudeSessions binding lifecycle", () => {
     expect(bounded2.messages[0]!.content.length).toBeLessThanOrEqual(MAX_HISTORY_TRANSFER_CHARS + 20)
     expect(bounded2.truncated).toBe(true)
 
+    const newest = boundHistory([
+      { role: "user", content: "old-".repeat(60_000) },
+      { role: "assistant", content: "tool call already completed" },
+      { role: "tool", content: "critical latest tool result" },
+    ])
+    expect(newest.truncated).toBe(true)
+    expect(newest.messages.at(-1)).toEqual({ role: "tool", content: "critical latest tool result" })
+    expect(newest.messages.at(-2)).toEqual({ role: "assistant", content: "tool call already completed" })
+    expect(newest.messages.reduce((sum, row) => sum + row.content.length, 0)).toBeLessThanOrEqual(
+      MAX_HISTORY_TRANSFER_CHARS,
+    )
+
     const small = [{ role: "user", content: "hi" }]
     const bounded3 = boundHistory(small)
     expect(bounded3.messages.length).toBe(1)

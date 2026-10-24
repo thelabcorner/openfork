@@ -11,6 +11,18 @@ import {
 } from "./model-hosted-account-selection"
 
 describe("hosted account model selection", () => {
+  test("accepts hard pins for all visible account quota states without rewriting the model", () => {
+    const model = { id: "deepseek-v4.1-flash", provider: { id: "opencode-go" } }
+    for (const state of ["ready", "cooling", "exhausted", "unknown"] as const) {
+      const accountID = `zen-${state}`
+      expect(hostedAccountStillVisible(accountID, [{ accountID }])).toBe(true)
+      expect(pinnedHostedAccount(model, accountID)).toEqual({
+        providerID: "opencode-go",
+        modelID: model.id,
+        routeIntent: { kind: "account", accountID, pin: "hard" },
+      })
+    }
+  })
   test("empty live roster never resurrects old catalog-qualified account variants", () => {
     const model = { id: "model", name: "Model", provider: { id: "opencode-go", name: "OpenCode Go" } }
     const cachedCatalogGroup = {
@@ -30,7 +42,7 @@ describe("hosted account model selection", () => {
     })
     expect(hostedAccountStillVisible("revoked-key", visible.variants)).toBe(false)
     expect(showAccountSubmenu("opencode-go", visible.variants.length, true)).toBe(true)
-    expect(hostedAccountRoutingStrategies("opencode-go", true)).toEqual(["adaptive", "round-robin"])
+    expect(hostedAccountRoutingStrategies("opencode-go", true, visible.variants.length)).toBeUndefined()
   })
 
   test("after live roster reappears, it restores only current account identities", () => {
@@ -121,28 +133,36 @@ describe("hosted account model selection", () => {
     expect(showAccountSubmenu("opencode", 1)).toBe(true)
     expect(showAccountSubmenu("opencode-go", 0)).toBe(true)
     expect(showAccountSubmenu("opencode", 0)).toBe(true)
-    expect(showAccountSubmenu("workbuddy", 1)).toBe(false)
+    expect(showAccountSubmenu("workbuddy", 1)).toBe(true)
     expect(showAccountSubmenu("workbuddy", 2)).toBe(true)
   })
   test("model-only pickers cannot expose hosted route policies or pins", () => {
     for (const provider of ["opencode", "opencode-go"]) {
       for (const count of [0, 1, 4]) expect(showAccountSubmenu(provider, count, false)).toBe(false)
-      expect(hostedAccountRoutingStrategies(provider, false)).toBeUndefined()
+      expect(hostedAccountRoutingStrategies(provider, false, 4)).toBeUndefined()
       expect(showAccountSubmenu(provider, 4, true)).toBe(true)
-      expect(hostedAccountRoutingStrategies(provider, true)).toEqual(["adaptive", "round-robin"])
+      expect(hostedAccountRoutingStrategies(provider, true, 4)).toEqual(["adaptive", "round-robin"])
     }
     expect(showAccountSubmenu("workbuddy", 2, false)).toBe(true)
-    expect(showAccountSubmenu("workbuddy", 1, false)).toBe(false)
-    expect(hostedAccountRoutingStrategies("workbuddy", true)).toBeUndefined()
+    expect(showAccountSubmenu("workbuddy", 1, false)).toBe(true)
+    expect(hostedAccountRoutingStrategies("workbuddy", true, 2)).toBeUndefined()
     expect(showAccountSubmenu("opencode-go", 0, true)).toBe(true)
-    expect(hostedAccountRoutingStrategies("opencode-go", true)).toEqual(["adaptive", "round-robin"])
+    expect(hostedAccountRoutingStrategies("opencode-go", true, 0)).toBeUndefined()
   })
-  test("missing unqualified catalog alias never switches hosted routing back to a legacy Auto row", () => {
+  test("routing strategies require more than one live account for hosted providers", () => {
+    for (const provider of ["opencode", "opencode-go"]) {
+      for (const count of [0, 1]) {
+        expect(hostedAccountRoutingStrategies(provider, true, count)).toBeUndefined()
+      }
+      expect(hostedAccountRoutingStrategies(provider, true, 2)).toEqual(["adaptive", "round-robin"])
+    }
+  })
+  test("missing unqualified catalog alias never creates a nonexistent third hosted routing option", () => {
     // The strategy policy intentionally takes provider/capability, not group.auto.
     const group = { variants: [{ accountID: "zen-a" }, { accountID: "zen-b" }], auto: undefined }
     expect(group.auto).toBeUndefined()
     expect(showAccountSubmenu("opencode-go", group.variants.length, true)).toBe(true)
-    expect(hostedAccountRoutingStrategies("opencode-go", true)).toEqual(["adaptive", "round-robin"])
+    expect(hostedAccountRoutingStrategies("opencode-go", true, group.variants.length)).toEqual(["adaptive", "round-robin"])
   })
   test.each(["opencode", "opencode-go"])("pins %s independently of per-account catalog entries", (providerID) => {
     const model = { id: "deepseek-v4.1-flash", provider: { id: providerID } }

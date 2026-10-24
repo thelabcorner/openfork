@@ -302,6 +302,10 @@ const live: Layer.Layer<
             stream: ClaudeRuntimeAdapter.stream({
               sessionID: input.sessionID,
               system: prepared.system,
+              // Carry explicitly owned instruction sources instead of scraping
+              // the merged provider system prompt, which may duplicate CLAUDE.md.
+              agentPrompt: input.agent.prompt,
+              userSystem: input.user.system,
               messages: prepared.messages,
               tools: prepared.tools,
               modelID: input.model.id,
@@ -498,6 +502,10 @@ const live: Layer.Layer<
                 specificationVersion: "v3" as const,
                 async transformParams(args) {
                   if (args.type === "stream") {
+                    // The SDK lowers schemas after registry construction. This
+                    // catches late-injected/plugin tools without modifying the
+                    // executable tool's source schema or validation contract.
+                    args.params.tools = ProviderTransform.anthropicWireTools(input.model, args.params.tools)
                     // @ts-expect-error
                     args.params.prompt = ProviderTransform.message(
                       args.params.prompt,

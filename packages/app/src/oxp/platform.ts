@@ -19,7 +19,8 @@ export type OxpGrant = {
   filesReceive: boolean
   filesSend: boolean
   automation: boolean
-  sessionSupervision: "none" | "approved-roots"
+  globalUsageAnalytics: boolean
+  sessionSupervision: "none" | "approved-roots" | "all-native"
   requestSupervision: boolean
   delegation: "disabled" | "spawn"
   nestedDelegation: boolean

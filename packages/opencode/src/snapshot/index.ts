@@ -3,6 +3,8 @@ import {
   Cause,
   Duration,
   Effect,
+  Exit,
+  Fiber,
   Layer,
   Schedule,
   Schema,
@@ -608,12 +610,11 @@ const layer: Layer.Layer<
           if (!(yield* enabled())) return
 
           // Tiny admission section: one in-flight capture per project revision.
-          // Effect.cached is the repository-sanctioned single-flight primitive,
-          // so sibling sessions that overlap one scan join it rather than
-          // storing custom Deferred/Fiber state or queueing N scans behind the
-          // Git mutex. Completed trees are retained only while the project
-          // inventory proves coverage (see `completedReuse`); otherwise reuse is
-          // limited to callers overlapping the in-flight capture.
+          // The producer must outlive individual Session waiters. Effect.cached
+          // executes under its first caller, so cancellation of that caller
+          // interrupts every other waiter. The project materialization ref owns
+          // one independently running fiber per revision; callers only join it.
+          // Completed trees are retained only with inventory coverage proof.
           const shared = yield* SynchronizedRef.modifyEffect(
             materialization,
             Effect.fnUntraced(function* (current) {
@@ -623,30 +624,37 @@ const layer: Layer.Layer<
 
               const revision = current.revision
               const token = {}
-              const capture = yield* Effect.cached(
+              // Capture timeout reports distinguish lock admission from Git.
+              let capturePhase = "waiting-mutation-barrier"
+              const producer = yield* Effect.forkDetach(
                 TxReentrantLock.withWriteLock(
                   mutationBarrier,
-                  locked(
-                    Effect.gen(function* () {
-                      yield* SynchronizedRef.update(materialization, (snapshot) => ({
-                        ...snapshot,
-                        captures: snapshot.captures + 1,
-                      }))
-                      const tree = yield* trackBody()
+                  Effect.suspend(() => {
+                    capturePhase = "waiting-shadow-git-lock"
+                    return locked(
+                      Effect.gen(function* () {
+                        capturePhase = "git-capture"
+                        yield* SynchronizedRef.update(materialization, (snapshot) => ({
+                          ...snapshot,
+                          captures: snapshot.captures + 1,
+                        }))
+                        const tree = yield* trackBody()
+                        capturePhase = "capture-settlement"
 
-                      // Retain this memo only when the project inventory proves
-                      // its domain is watcher-complete; never retain an
-                      // undefined/failed capture. A watcher or mutation
-                      // invalidation racing this capture bumps the revision, so a
-                      // stale completion cannot be served as the current tree.
-                      if (!(yield* completedReuse()) || !tree) {
-                        yield* SynchronizedRef.update(materialization, (snapshot) =>
-                          snapshot.cached?.token === token ? { ...snapshot, cached: undefined } : snapshot,
-                        )
-                      }
-                      return tree
-                    }),
-                  ),
+                        // Retain this memo only when the project inventory proves
+                        // its domain is watcher-complete; never retain an
+                        // undefined/failed capture. A watcher or mutation
+                        // invalidation racing this capture bumps the revision, so a
+                        // stale completion cannot be served as the current tree.
+                        if (!(yield* completedReuse()) || !tree) {
+                          yield* SynchronizedRef.update(materialization, (snapshot) =>
+                            snapshot.cached?.token === token ? { ...snapshot, cached: undefined } : snapshot,
+                          )
+                        }
+                        return tree
+                      }),
+                    )
+                  }),
                 ).pipe(
                   Effect.timeoutOrElse({
                     duration: CAPTURE_TIMEOUT,
@@ -656,6 +664,7 @@ const layer: Layer.Layer<
                         yield* Effect.logWarning("snapshot capture timed out", {
                           directory: state.directory,
                           git: state.gitdir,
+                          capturePhase,
                           captures: current.captures,
                           invalidations: current.invalidations,
                         })
@@ -665,10 +674,23 @@ const layer: Layer.Layer<
                         return undefined
                       }),
                   }),
+                  // Failure/interruption of the producer must evict its memo.
+                  // A timed-out Session waiter never interrupts this producer;
+                  // eviction is restricted to this token to protect successors.
+                  Effect.onExit((exit) =>
+                    Exit.isFailure(exit)
+                      ? SynchronizedRef.update(materialization, (snapshot) =>
+                          snapshot.cached?.token === token
+                            ? { ...snapshot, cached: undefined }
+                            : snapshot,
+                        )
+                      : Effect.void,
+                  ),
                 ),
               )
-              const cached: CachedCapture = { revision, token, effect: capture }
-              return [capture, { ...current, cached }] as const
+              const shared = Fiber.join(producer)
+              const cached: CachedCapture = { revision, token, effect: shared }
+              return [shared, { ...current, cached }] as const
             }),
           )
           return yield* shared

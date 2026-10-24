@@ -92,7 +92,7 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
           item &&
           !item.routeIntent &&
           previous?.providerID === item.providerID &&
-          previous.routeIntent?.kind === "auto" &&
+          previous.routeIntent?.kind === "strategy" &&
           !splitModelIDForProvider(item.modelID, item.providerID).accountID
         ) {
           item = { ...item, routeIntent: previous.routeIntent }

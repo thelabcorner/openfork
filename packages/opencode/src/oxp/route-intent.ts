@@ -21,13 +21,7 @@ export type RouteSelection = OxpSchema.ModelSelection & {
   readonly routeIntent?: ProviderRouteIntent.Info
 }
 
-export type AccountMode = "automatic" | "explicit" | "public"
-
-const ACCOUNT_MODES = {
-  auto: "automatic",
-  public: "public",
-  account: "explicit",
-} as const satisfies Record<ProviderRouteIntent.Info["kind"], AccountMode>
+export type AccountMode = "adaptive" | "round-robin" | "explicit" | "public"
 
 export interface NormalizeInput {
   readonly routeIntent?: ProviderRouteIntent.Info
@@ -41,7 +35,7 @@ export interface NormalizeInput {
  * The compatibility rules are not restated here: the Core P6-N normalizer owns
  * them, and this adapter only projects its typed failure into the OXP error
  * contract. Callers therefore fail closed instead of degrading an explicit
- * route choice into automatic routing or into a different account.
+ * route choice into a different strategy or into a different account.
  */
 export function normalize(input: NormalizeInput): ProviderRouteIntent.Info {
   const outcome = Effect.runSync(
@@ -59,10 +53,12 @@ export function normalize(input: NormalizeInput): ProviderRouteIntent.Info {
 
 /** OXP-facing account mode, derived from route intent rather than a missing account. */
 export function accountMode(routeIntent: ProviderRouteIntent.Info): AccountMode {
-  return ACCOUNT_MODES[routeIntent.kind]
+  return routeIntent.kind === "strategy"
+    ? routeIntent.strategy ?? "adaptive"
+    : routeIntent.kind === "account" ? "explicit" : "public"
 }
 
-/** The account a provider lowering may use. Auto and Public resolve no account. */
+/** Strategy and Public selections have no pinned account identity. */
 export function accountRouteID(routeIntent: ProviderRouteIntent.Info): string | undefined {
   return routeIntent.kind === "account" ? routeIntent.accountID : undefined
 }

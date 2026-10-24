@@ -21,29 +21,36 @@ used consistently for submenu rendering **and** pooled-tooltip suppression.
 
 ## Invariants
 
-- Hosted `opencode` / `opencode-go` with persistent `routeIntent`: offer
-  **Adaptive**, **Round-robin**, and explicit account pins. These policies are
-  session-level; the account chosen by the resolver remains sticky during a
-  healthy session. A missing unqualified catalog entry does **not** change
-  which strategies are available.
-- The hosted strategy submenu remains available when the account roster is
-  empty, loading, or temporarily unavailable. A zero-account roster disables
-  account *pins*, not account-routing policy selection. Rendering must not
-  fabricate accounts or credential identities. Direct-provider and model-only
-  pickers retain their existing capability gates.
-- **There is no third `Auto` routing strategy.** The historically named
-  serialized `routeIntent.kind: "auto"` is an unpinned account-selection
-  *discriminant* still used by the local wire/persistence contract,
-  not a strategy or user-facing choice. Its optional `strategy` field
-  selects exactly `adaptive` or `round-robin`; omission (including old
-  persisted records) means Adaptive. Shared Schema
-  `ProviderRouteIntent.effectiveStrategy` owns this normalization. Do not
-  expose the wire discriminant as a label or as a third menu entry.
+- Hosted `opencode` / `opencode-go` with persistent `routeIntent` and more than
+  one live account: offer exactly **Adaptive** and **Round Robin** as strategies,
+  and offer independent explicit account pinning. Account routes remain sticky across ordinary
+  healthy Session steps, but an explicit change of strategy triggers a fresh
+  transactional policy selection and updates the binding mode. Explicitly
+  switching from a manual pin to a strategy releases that pin and selects
+  under the chosen strategy. A missing unqualified catalog entry does **not**
+  change which strategies are available.
+- Hosted strategy choices (Adaptive / Round Robin) are offered only when the
+  live account roster has **more than one** account. With zero or one
+  account/key there is nothing to route across, so the Routing section is
+  omitted (the submenu falls back to the Provider default row). Account *pins*
+  follow the submenu gate, not the strategy gate. Rendering must not fabricate
+  accounts or credential identities. Direct-provider and model-only pickers
+  retain their existing capability gates.
+- **Only Adaptive and Round Robin exist as hosted automatic account-selection
+  policies.** Their common wire intent is `routeIntent.kind: "strategy"`;
+  its `strategy` field selects `adaptive` or `round-robin`, and omission
+  defaults to Adaptive. Shared Schema `ProviderRouteIntent.effectiveStrategy`
+  owns that default. No third account-selection policy exists.
+  Obsolete serialized `kind: "auto"` records decode to Adaptive/Round Robin
+  through a one-way compatibility decoder; canonical runtime and encoding
+  never emit that obsolete discriminator.
 - Explicit `kind: "account"` means a manual account pin, and `kind: "public"`
   is upstream Public transport selection. Neither is an account-routing
   strategy. Internal Core routing modes (`concentrate`,
   `session-round-robin`, `round-robin`) are implementation mechanisms, not
-  additional model-picker policies.
+  additional model-picker policies. Hosted Adaptive maps to `concentrate`,
+  prioritizing eligible accounts by time-adjusted allowance urgency and usage;
+  Round Robin maps to `round-robin` and ignores quota-ranking bias.
 - The shared runtime ignores hosted routing-strategy hints for unrelated
   providers even if a legacy/stale or external client sends one. A provider
   switch cannot silently turn a third-party route into a round-robin pool.

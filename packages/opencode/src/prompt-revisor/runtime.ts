@@ -153,7 +153,7 @@ export const makeRuntime = (
           .resolveTransientRoutedModel({
             providerID: candidate.providerID,
             modelID: candidate.id,
-            ...(accountID ? { accountID } : { routeIntent: { kind: "auto" as const } }),
+            ...(accountID ? { accountID } : { routeIntent: { kind: "strategy" as const } }),
             executionPurpose: "special-agent",
           })
           .pipe(Effect.option)
@@ -226,7 +226,7 @@ export const makeRuntime = (
         .resolveTransientRoutedModel({
           providerID: fallbackRef.providerID,
           modelID: fallbackRef.modelID,
-          routeIntent: { kind: "auto" },
+          routeIntent: { kind: "strategy" },
           executionPurpose: "special-agent",
         })
         .pipe(Effect.mapError(unavailable))

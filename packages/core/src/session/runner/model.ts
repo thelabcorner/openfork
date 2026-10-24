@@ -516,7 +516,7 @@ export const locationLayer = Layer.effect(
                 // The committed attribution is now the authority. P2 may
                 // advance credential revision, but this refresh is not allowed
                 // to re-enter account/public selection or failover.
-                routeIntent: { kind: "auto" },
+                routeIntent: { kind: "strategy" },
                 mode: "concentrate",
                 freeRoutePreference: "public-first-for-free",
                 allowPublic,
@@ -716,7 +716,7 @@ export const locationLayer = Layer.effect(
               // The committed attribution is now the authority. This inherit
               // is not allowed to re-enter account/public selection or
               // failover.
-              routeIntent: { kind: "auto" },
+              routeIntent: { kind: "strategy" },
               mode: "concentrate",
               freeRoutePreference: "public-first-for-free",
               allowPublic,

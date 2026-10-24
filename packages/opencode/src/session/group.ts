@@ -99,6 +99,8 @@ interface CreateInput {
   anchorSessionId?: string
   ownerPlugin?: string
   ownerRef?: string
+  /** The producer has a verified title and may reconcile a managed group name. */
+  updateName?: boolean
   policy?: GroupPolicy
 }
 
@@ -313,7 +315,24 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
           .where(and(eq(SessionGroupTable.kind, "delegation"), eq(SessionGroupTable.owner_ref, input.ownerRef)))
           .get()
           .pipe(Effect.orDie)
-        if (existing) return fromGroupRow(existing)
+        if (existing) {
+          // Delegation groups are a durable navigation projection. Their name
+          // follows the producer-owned session title, never a UI inference.
+          // Missing handshake metadata must not erase a previously known title.
+          if (!input.updateName || existing.name === input.name) return fromGroupRow(existing)
+          const changed = yield* database.db
+            .update(SessionGroupTable)
+            .set({ name: input.name, time_updated: Date.now() })
+            .where(and(eq(SessionGroupTable.id, existing.id), ne(SessionGroupTable.name, input.name)))
+            .returning()
+            .get()
+            .pipe(Effect.orDie)
+          if (!changed) return fromGroupRow(existing)
+          invalidate()
+          const info = fromGroupRow(changed)
+          yield* events.publish(Event.Updated, { groupID: info.id, info })
+          return info
+        }
         return yield* create(input)
       }
 

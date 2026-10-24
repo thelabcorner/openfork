@@ -438,7 +438,7 @@ describe("ProviderRoute atomic account policy commit", () => {
           sessionID,
           providerID,
           affinityDomain,
-          routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+          routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
           mode: "session-round-robin",
           freeRoutePreference: "account-first",
           allowPublic: false,

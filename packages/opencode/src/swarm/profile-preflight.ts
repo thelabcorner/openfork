@@ -43,6 +43,22 @@ export interface Resolved {
   readonly model: ProviderModel
 }
 
+/**
+ * OpenCode Go catalog IDs can be account-qualified as model@zen-<id>.
+ * The provider resolver interprets accountID as an explicit override and
+ * replaces the model suffix, so a display label such as "key3" silently
+ * points at a nonexistent model. Reject contradictory inputs before any
+ * durable member/swarm admission; never guess or rewrite the account.
+ */
+export function qualifiedGoAccountConflict(model: { providerID: string; id: string; accountID?: string }) {
+  if (model.providerID !== "opencode-go" || model.accountID === undefined) return undefined
+  const at = model.id.lastIndexOf("@")
+  if (at <= 0 || at === model.id.length - 1) return undefined
+  const qualifier = model.id.slice(at + 1)
+  if (qualifier === model.accountID) return undefined
+  return `Conflicting OpenCode Go account selectors: modelID ends with @${qualifier} but accountID is ${model.accountID}. Use the exact stable account ID published by the model catalog in accountID with the unqualified modelID, or use the catalog-qualified modelID without accountID. Display labels such as key3 are not account IDs.`
+}
+
 export function supportsModelRequirement(model: ProviderModel, requirement: SwarmModel.ModelRequirement) {
   switch (requirement) {
     case "toolcall":
@@ -133,6 +149,8 @@ export const layer = Layer.effect(
         }
         const agent = yield* agents.get(profile.agent)
         if (!agent) return yield* new SwarmSchema.ValidationError({ reason: `Agent not found: ${profile.agent}` })
+        const accountConflict = qualifiedGoAccountConflict(profile.model)
+        if (accountConflict) return yield* new SwarmSchema.ValidationError({ reason: accountConflict })
 
         const model = yield* providers
           .getModel(profile.model.providerID, profile.model.id, profile.model.accountID)

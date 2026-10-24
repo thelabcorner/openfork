@@ -1470,6 +1470,7 @@ export function classifyUnavailableWorkBuddy(
   accounts: WorkBuddyAccount[],
   model: string,
   attempts: number,
+  explicitAccountID?: string,
 ): { status: number; type: string; message: string } {
   if (accounts.length === 0) {
     return {
@@ -1478,12 +1479,25 @@ export function classifyUnavailableWorkBuddy(
       message: "No WorkBuddy accounts are enrolled. Sign in or add a WorkBuddy account.",
     }
   }
-  const eligible = accounts.filter((account) => !account.catalog || account.catalog.ids.has(model))
+  // An explicit hard pin may never borrow another account's entitlement or
+  // report another account's availability. Classification is scoped to the
+  // selected identity, unlike automatic pool-level routing.
+  const targeted = explicitAccountID ? accounts.filter((account) => account.id === explicitAccountID) : accounts
+  if (targeted.length === 0) {
+    return {
+      status: 404,
+      type: "account_not_found",
+      message: `Selected WorkBuddy account ${explicitAccountID} is no longer enrolled.`,
+    }
+  }
+  const eligible = targeted.filter((account) => !account.catalog || account.catalog.ids.has(model))
   if (!eligible.length) {
     return {
       status: 404,
       type: "model_not_found",
-      message: `No enrolled WorkBuddy account advertises model ${model}.`,
+      message: explicitAccountID
+        ? `Selected WorkBuddy account ${explicitAccountID} does not advertise model ${model}. The account pin was kept.`
+        : `No enrolled WorkBuddy account advertises model ${model}.`,
     }
   }
 
@@ -1639,7 +1653,7 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
   if (routed.kind === "unavailable") {
     cleanupCancellation()
     if (res.writableEnded || res.destroyed) return
-    const failure = classifyUnavailableWorkBuddy(accountRegistry.all(), requestedModel, routed.attemptedAccountIds.length)
+    const failure = classifyUnavailableWorkBuddy(accountRegistry.all(), requestedModel, routed.attemptedAccountIds.length, explicitAccount)
     return sendJson(res, failure.status, {
       error: { message: failure.message, type: failure.type },
     })
@@ -2023,9 +2037,21 @@ async function materializeWorkBuddyModels(
   )
   const merged: Record<string, Model> = mode === "local" ? { ...provider.models } : {}
 
+  // Account selection is independent of per-account model entitlement. A
+  // model offered by *any* enrolled account must be pinnable to *every*
+  // enrolled account; the WorkBuddy router remains the execution-time source
+  // of truth for entitlement, quota and restrictions, and never reroutes an
+  // explicit account pin. Preserve the selected account's own metadata when
+  // it advertises a model, falling back only for display/selection aliases.
+  const union = new Map<string, CatalogEntry>()
+  for (const catalog of catalogs.values()) {
+    for (const entry of catalog) if (!union.has(entry.id)) union.set(entry.id, entry)
+  }
+
   for (const account of accounts) {
-    const catalog = catalogs.get(account.id) ?? []
-    for (const entry of catalog) {
+    const own = new Map((catalogs.get(account.id) ?? []).map((entry) => [entry.id, entry] as const))
+    for (const [id, fallback] of union) {
+      const entry = own.get(id) ?? fallback
       for (const item of exposedModels(baseURL, entry, account.id, labels.get(account.id), {
         ...headers,
         "X-WorkBuddy-Account": account.id,

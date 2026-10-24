@@ -245,6 +245,61 @@ describe("SwarmMemberSession", () => {
       expect(order).toEqual([])
     }),
   )
+
+  it.effect("detects a bound worker with reasoning-variant drift without deleting or replacing its Session", () =>
+    Effect.gen(function* () {
+      reset()
+      const service = yield* SwarmMemberSession.Service
+      const first = yield* service.materialize({ swarmID, memberID })
+      const stored = sessions.get(first.sessionID)!
+      sessions.set(first.sessionID, {
+        ...stored,
+        model: { ...profile.model, variant: ModelV2.VariantID.make("default") },
+      })
+      order = []
+      const refused = yield* service.materialize({ swarmID, memberID }).pipe(Effect.exit)
+      expect(refused._tag).toBe("Failure")
+      expect(order).toEqual([])
+      expect(member.sessionID).toBe(first.sessionID)
+      expect(sessions.has(first.sessionID)).toBe(true)
+      expect(sessions.get(first.sessionID)?.model?.variant).toBe(ModelV2.VariantID.make("default"))
+    }),
+  )
+
+  it.effect("refuses a previously bound worker Session moved beneath a parent Session", () =>
+    Effect.gen(function* () {
+      reset()
+      const service = yield* SwarmMemberSession.Service
+      const first = yield* service.materialize({ swarmID, memberID })
+      const stored = sessions.get(first.sessionID)!
+      sessions.set(first.sessionID, { ...stored, parentID: SessionV2.ID.make("ses_unexpected_parent") })
+      order = []
+      const refused = yield* service.materialize({ swarmID, memberID }).pipe(Effect.exit)
+      expect(refused._tag).toBe("Failure")
+      expect(order).toEqual([])
+      expect(member.sessionID).toBe(first.sessionID)
+      expect(sessions.has(first.sessionID)).toBe(true)
+    }),
+  )
+
+  it.effect("detects account drift on an already bound worker while preserving its original identity", () =>
+    Effect.gen(function* () {
+      reset()
+      const service = yield* SwarmMemberSession.Service
+      const first = yield* service.materialize({ swarmID, memberID })
+      const stored = sessions.get(first.sessionID)!
+      sessions.set(first.sessionID, {
+        ...stored,
+        model: { ...profile.model, accountID: "unexpected-account" },
+      })
+      order = []
+      const refused = yield* service.materialize({ swarmID, memberID }).pipe(Effect.exit)
+      expect(refused._tag).toBe("Failure")
+      expect(order).toEqual([])
+      expect(member.sessionID).toBe(first.sessionID)
+      expect(sessions.has(first.sessionID)).toBe(true)
+    }),
+  )
 })
 
 describe("SwarmMemberSession legacy execution profiles", () => {

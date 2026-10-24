@@ -4,13 +4,15 @@ export type SidecarOxpGrant = {
   process: boolean
   /** Added compatibly: older resident sidecars omit this and therefore mean false. */
   code?: boolean
+  /** Added compatibly: older resident sidecars omit this and therefore mean false. */
+  globalUsageAnalytics?: boolean
   git: boolean
   integrations: boolean
   browser: boolean
   filesReceive: boolean
   filesSend: boolean
   automation: boolean
-  sessionSupervision: "none" | "approved-roots"
+  sessionSupervision: "none" | "approved-roots" | "all-native"
   requestSupervision: boolean
   delegation: "disabled" | "spawn"
   nestedDelegation: boolean
@@ -21,7 +23,14 @@ export type SidecarOxpModelSelection = {
   modelID: string
   accountID?: string
   variant?: string
+  routeIntent?: SidecarOxpRouteIntent
 }
+
+/** Secret-free provider routing preference carried with OXP worker defaults. */
+export type SidecarOxpRouteIntent =
+  | { kind: "strategy"; strategy?: "adaptive" | "round-robin" }
+  | { kind: "public" }
+  | { kind: "account"; accountID: string; pin?: "hard" | "soft" }
 
 export type SidecarOxpWorkerPolicy = {
   /** Compatibility-only remnants of the retired selection allowlist. */
@@ -149,7 +158,7 @@ const SCHEMA_FINGERPRINT = /^[a-f0-9]{64}$/
 
 function parseModelSelection(value: unknown): SidecarOxpModelSelection | undefined {
   if (!isRecord(value)) return
-  const allowed = new Set(["providerID", "modelID", "accountID", "variant"])
+  const allowed = new Set(["providerID", "modelID", "accountID", "variant", "routeIntent"])
   if (Object.keys(value).some((key) => !allowed.has(key))) return
   const providerID = value.providerID
   const modelID = value.modelID
@@ -169,12 +178,39 @@ function parseModelSelection(value: unknown): SidecarOxpModelSelection | undefin
         ? value.variant
         : null
   if (variant === null) return
+  const routeIntent = value.routeIntent === undefined ? undefined : parseSidecarOxpRouteIntent(value.routeIntent)
+  if (value.routeIntent !== undefined && routeIntent === undefined) return
   return {
     providerID,
     modelID,
     ...(accountID === undefined ? {} : { accountID }),
     ...(variant === undefined ? {} : { variant }),
+    ...(routeIntent === undefined ? {} : { routeIntent }),
   }
+}
+
+function parseSidecarOxpRouteIntent(value: unknown): SidecarOxpRouteIntent | undefined {
+  if (!isRecord(value)) return
+  if (value.kind === "strategy") {
+    if (Object.keys(value).some((key) => key !== "kind" && key !== "strategy")) return
+    if (value.strategy !== undefined && value.strategy !== "adaptive" && value.strategy !== "round-robin") return
+    return { kind: "strategy", ...(value.strategy === undefined ? {} : { strategy: value.strategy }) }
+  }
+  if (value.kind === "public") {
+    if (Object.keys(value).some((key) => key !== "kind")) return
+    return { kind: "public" }
+  }
+  if (value.kind === "account") {
+    if (Object.keys(value).some((key) => key !== "kind" && key !== "accountID" && key !== "pin")) return
+    if (!isBoundedString(value.accountID, 256) || /[\x00-\x1f\x7f]/.test(value.accountID)) return
+    if (value.pin !== undefined && value.pin !== "hard" && value.pin !== "soft") return
+    return {
+      kind: "account",
+      accountID: value.accountID,
+      ...(value.pin === undefined ? {} : { pin: value.pin }),
+    }
+  }
+  return
 }
 
 function isWorkerPolicy(value: unknown): value is SidecarOxpWorkerPolicy {
@@ -257,6 +293,7 @@ const grantKeys = new Set<keyof SidecarOxpGrant>([
   "write",
   "process",
   "code",
+  "globalUsageAnalytics",
   "git",
   "integrations",
   "browser",
@@ -270,7 +307,7 @@ const grantKeys = new Set<keyof SidecarOxpGrant>([
 ])
 
 function isGrantValue(key: keyof SidecarOxpGrant, value: unknown) {
-  if (key === "sessionSupervision") return value === "none" || value === "approved-roots"
+  if (key === "sessionSupervision") return value === "none" || value === "approved-roots" || value === "all-native"
   if (key === "delegation") return value === "disabled" || value === "spawn"
   return typeof value === "boolean"
 }
@@ -312,8 +349,8 @@ export function isSidecarOxpGrant(value: unknown): value is SidecarOxpGrant {
   if (!isRecord(value)) return false
   if (Object.keys(value).some((key) => !grantKeys.has(key as keyof SidecarOxpGrant))) return false
   return [...grantKeys].every((key) =>
-    key === "code"
-      ? value.code === undefined || isGrantValue(key, value.code)
+    key === "code" || key === "globalUsageAnalytics"
+      ? value[key] === undefined || isGrantValue(key, value[key])
       : key in value && isGrantValue(key, value[key]),
   )
 }

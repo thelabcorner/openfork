@@ -167,7 +167,7 @@ export const resolveMaintenanceModel = Effect.fn("MaintenanceRoute.resolveMainte
       .resolveTransientRoutedModel({
         providerID: input.providerID,
         modelID: input.modelID,
-        ...(input.accountID ? { accountID: input.accountID } : { routeIntent: { kind: "auto" as const } }),
+        ...(input.accountID ? { accountID: input.accountID } : { routeIntent: { kind: "strategy" as const } }),
         executionPurpose: "special-agent",
       })
       .pipe(Effect.option)

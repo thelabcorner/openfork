@@ -56,8 +56,13 @@ import * as CurrentParts from "@opencode-ai/core/session/current-parts"
 import { toolMayMutateWorkspace } from "@/tool/registry"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { NativeToolSettlement } from "./native-tool-settlement"
+import { awaitOptionalStepEnrichment } from "./optional-step-enrichment"
 
 const DOOM_LOOP_THRESHOLD = 3
+// Snapshot capture/patch is optional step metadata. All enrichment phases
+// share this budget; three serial 30-second timeouts must not consume the
+// entire provider consumer watchdog before the terminal event is released.
+const STEP_SNAPSHOT_BUDGET_MS = 30_000
 export type Result = "compact" | "stop" | "continue"
 type HaltSource = "interrupt" | "failure"
 
@@ -965,6 +970,7 @@ const layer = Layer.effect(
             // Snapshot is auxiliary step enrichment, not a prerequisite for
             // consuming the provider's terminal event. A contended Git capture
             // must never strand the provider stream for the entire idle budget.
+            const enrichmentDeadline = performance.now() + STEP_SNAPSHOT_BUDGET_MS
             const boundedSnapshot = <A, E, R>(
               phase: string,
               task: Effect.Effect<A, E, R>,
@@ -974,8 +980,17 @@ const layer = Layer.effect(
                 // captures and filesystem errors must not turn successful
                 // provider output into a failed assistant request. Preserve
                 // cancellation, rather than swallowing interrupted fibers.
-                const result = yield* task.pipe(
-                  Effect.timeoutOption("30 seconds"),
+                const remainingMs = Math.max(0, Math.ceil(enrichmentDeadline - performance.now()))
+                if (remainingMs === 0) {
+                  yield* Effect.logWarning("step snapshot enrichment skipped (shared budget exhausted)", {
+                    sessionID: ctx.sessionID,
+                    messageID: ctx.assistantMessage.id,
+                    phase,
+                    budgetMs: STEP_SNAPSHOT_BUDGET_MS,
+                  })
+                  return undefined
+                }
+                const result = yield* awaitOptionalStepEnrichment(task, remainingMs).pipe(
                   Effect.catchCause((cause) =>
                     Cause.hasInterruptsOnly(cause)
                       ? Effect.failCause(cause)
@@ -992,7 +1007,8 @@ const layer = Layer.effect(
                   sessionID: ctx.sessionID,
                   messageID: ctx.assistantMessage.id,
                   phase,
-                  timeoutMs: 30_000,
+                  timeoutMs: remainingMs,
+                  budgetMs: STEP_SNAPSHOT_BUDGET_MS,
                 })
                 return undefined
               })

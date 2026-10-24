@@ -97,10 +97,16 @@ export const Parameters = Schema.Struct({
 })
 export type Input = Schema.Schema.Type<typeof Parameters>
 
+export interface ParentSession {
+  readonly ref: string
+  readonly title?: string
+}
+
 export interface Interface {
   readonly execute: (
     input: Input,
     signal?: AbortSignal,
+    parentSession?: ParentSession,
   ) => Effect.Effect<OxpResult.CapabilityResult, OxpError.Error>
 }
 
@@ -555,6 +561,7 @@ const layer = Layer.effect(
     const executeRaw = Effect.fn("OxpWorker.execute")(function* (
       input: Input,
       signal?: AbortSignal,
+      parentSession?: ParentSession,
     ) {
       yield* cancelled(signal)
       const operation = "worker." + input.action
@@ -825,6 +832,7 @@ const layer = Layer.effect(
             rootRuntimeTarget(admission, nested, workdir.path),
             {
               title: input.title ?? "OXP delegated worker",
+              parentSession,
               prompt: input.prompt,
               agent: selected.agent,
               model: selected.model,
@@ -1443,8 +1451,8 @@ const layer = Layer.effect(
       })
     })
 
-    const execute: Interface["execute"] = (input, signal) =>
-      executeRaw(input, signal).pipe(
+    const execute: Interface["execute"] = (input, signal, parentSession) =>
+      executeRaw(input, signal, parentSession).pipe(
         Effect.catch((error) =>
           OxpError.isError(error)
             ? Effect.fail(error)

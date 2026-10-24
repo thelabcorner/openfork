@@ -184,7 +184,7 @@ describe("maintenance model resolution never owns a durable route", () => {
     )
 
     expect(transientCalls).toEqual([
-      { providerID: otherProviderID, modelID: otherModelID, routeIntent: { kind: "auto" }, executionPurpose: "special-agent" },
+      { providerID: otherProviderID, modelID: otherModelID, routeIntent: { kind: "strategy" }, executionPurpose: "special-agent" },
     ])
     expect(result?.model).toBe(model)
     expect(result?.route).toEqual({ routeKind: "public" })
@@ -285,7 +285,7 @@ describe("maintenance model resolution never owns a durable route", () => {
         modelID: parentModelID,
       }),
     )
-    expect(calls).toEqual([{ providerID: parentProviderID, modelID: parentModelID, routeIntent: { kind: "auto" }, executionPurpose: "special-agent" }])
+    expect(calls).toEqual([{ providerID: parentProviderID, modelID: parentModelID, routeIntent: { kind: "strategy" }, executionPurpose: "special-agent" }])
     expect(result?.model).toBe(model)
     expect(result?.route).toEqual({ routeKind: "account", accountID: "account-auto" })
   })

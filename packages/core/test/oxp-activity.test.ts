@@ -41,6 +41,22 @@ const failingEventLayer = AppNodeBuilder.build(
 const failingEventIt = testEffect(failingEventLayer)
 
 describe("OxpActivity", () => {
+  it.live(
+    "looks up OXP handshake titles by pseudonymized session without creating missing rows",
+    Effect.gen(function* () {
+      const activity = yield* OxpActivity.Service
+      const inspection = yield* OxpActivityInspection.Service
+      const correlation = { scheme: "openai/session", digest: "conversation-a", scope: "conversation" as const }
+      expect(yield* activity.sessionTitle(correlation)).toBeUndefined()
+      expect(yield* inspection.list()).toHaveLength(0)
+      yield* activity.registerSession({ correlation, title: "Silica Research" })
+      expect(yield* activity.sessionTitle(correlation)).toBe("Silica Research")
+      expect(yield* activity.sessionTitle({ ...correlation, digest: "conversation-b" })).toBeUndefined()
+      yield* activity.registerSession({ correlation, title: "Silica Fidelity" })
+      expect(yield* activity.sessionTitle(correlation)).toBe("Silica Fidelity")
+      expect(yield* inspection.list()).toHaveLength(1)
+    }),
+  )
   failingEventIt.live(
     "keeps durable truth successful when live projection publication fails",
     Effect.gen(function* () {

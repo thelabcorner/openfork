@@ -55,6 +55,70 @@ describe("ProviderTransform.schema - Muse Spark wire compatibility", () => {
     expect(ProviderTransform.schema(muse, schema)).toEqual(schema)
     expect(ProviderTransform.schema(nonMuse, schema)).toBe(schema)
   })
+
+})
+
+describe("ProviderTransform.schema - Anthropic MCP top-level combiners", () => {
+  const root = {
+    type: "object",
+    properties: { rootID: { type: "string" }, path: { type: "string" } },
+    oneOf: [{ required: ["rootID"] }, { required: ["path"] }],
+  } as any
+
+  test.each(["@ai-sdk/anthropic", "@ai-sdk/google-vertex/anthropic"])(
+    "removes top-level oneOf on %s without mutating MCP source",
+    (npm) => {
+      const model = { providerID: "custom", api: { id: "claude-haiku-5-5", npm } } as any
+      const copy = structuredClone(root)
+      const projected = ProviderTransform.schema(model, root) as any
+      expect(projected.type).toBe("object")
+      expect(projected.properties).toEqual(root.properties)
+      expect(projected).not.toHaveProperty("oneOf")
+      expect(root).toEqual(copy)
+    },
+  )
+
+  test("preserves nested property unions and leaves other transports unchanged", () => {
+    const schema = { ...root, properties: { options: { oneOf: [{ type: "string" }, { type: "number" }] } } }
+    const anthropic = ProviderTransform.schema(
+      { providerID: "anthropic", api: { id: "claude-haiku-5-5", npm: "@ai-sdk/anthropic" } } as any,
+      schema,
+    ) as any
+    expect(anthropic.properties.options.oneOf).toEqual(schema.properties.options.oneOf)
+    expect(
+      ProviderTransform.schema(
+        { providerID: "other", api: { id: "other", npm: "@ai-sdk/openai-compatible" } } as any,
+        schema,
+      ),
+    ).toBe(schema)
+  })
+})
+
+describe("ProviderTransform.anthropicWireTools - late injected tool schemas", () => {
+  test("projects function tools without rewriting unrelated models, provider tools or source", () => {
+    const model = { providerID: "anthropic", api: { id: "claude-haiku-5-5", npm: "@ai-sdk/anthropic" } } as any
+    const root = {
+      type: "object",
+      properties: { route: { type: "string" }, file: { type: "string" } },
+      oneOf: [{ required: ["route"] }, { required: ["file"] }],
+    }
+    const tools = [
+      { type: "function", name: "plugin_tool", inputSchema: root },
+      { type: "provider", name: "web_search", inputSchema: root },
+    ]
+    const copy = structuredClone(tools)
+    const projected = ProviderTransform.anthropicWireTools(model, tools)!
+    expect(projected[0].inputSchema).not.toHaveProperty("oneOf")
+    expect(projected[1]).toBe(tools[1])
+    expect(tools).toEqual(copy)
+    expect(ProviderTransform.anthropicWireTools(model, projected)).toBe(projected)
+    expect(
+      ProviderTransform.anthropicWireTools(
+        { providerID: "other", api: { npm: "@ai-sdk/openai-compatible" } } as any,
+        tools,
+      ),
+    ).toBe(tools)
+  })
 })
 
 describe("ProviderTransform.options - setCacheKey", () => {

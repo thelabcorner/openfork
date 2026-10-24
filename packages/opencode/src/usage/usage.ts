@@ -22,6 +22,9 @@ import { summarizeUsageActivity } from "./activity-summary"
 import { makeUsageRatesCache } from "./model-rates-cache"
 import { runWorkload } from "./workload-query"
 import type { WorkloadRequest, WorkloadSnapshot } from "./workload"
+// Public inspection types used by authorized OXP adapters and their typed
+// fixtures. Re-export the actual workload owner instead of duplicating shapes.
+export type { WorkloadRequest, WorkloadSnapshot } from "./workload"
 
 /**
  * Global usage aggregation across every session in the database.

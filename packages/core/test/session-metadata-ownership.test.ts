@@ -2,6 +2,32 @@ import { describe, expect, test } from "bun:test"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 
 describe("Session metadata ownership", () => {
+  test("legacy persisted auto routing does not lock the human out of an OXP worker", () => {
+    const legacy = {
+      workerDelegation: {
+        producer: "oxp",
+        principalRef: "oxp:existing-principal",
+        invocationRef: "oxp-inv:original-turn",
+        rootRef: "approved-root",
+        agent: "yolo",
+        model: { providerID: "openai", modelID: "gpt-6-luna", routeIntent: { kind: "auto" } },
+        nestedDelegation: false,
+      },
+    }
+    const resolved = SessionMetadataOwnership.workerDelegation(legacy)
+    expect(resolved?.model.routeIntent).toEqual({ kind: "strategy" })
+    expect(SessionMetadataOwnership.isHumanControllableWorker(legacy)).toBe(true)
+    expect(SessionMetadataOwnership.isProducerOwned(legacy)).toBe(true)
+    expect(SessionMetadataOwnership.sameWorkerDelegationModel(resolved!.model, {
+      providerID: "openai", modelID: "gpt-6-luna", routeIntent: { kind: "strategy" },
+    })).toBe(true)
+    expect(SessionMetadataOwnership.isHumanControllableWorker({
+      workerDelegation: { ...legacy.workerDelegation, model: {
+        providerID: "openai", modelID: "gpt-6-luna", routeIntent: { kind: "malformed" },
+      } },
+    })).toBe(false)
+  })
+
   test("human worker control does not transfer producer ownership or bypass mixed/malformed origins", () => {
     const metadata = SessionMetadataOwnership.delegatedWorker({
       producer: "oxp",
@@ -252,7 +278,7 @@ describe("Session metadata ownership", () => {
     ).toEqual({
       providerID: "opencode",
       modelID: "model-a",
-      routeIntent: { kind: "auto" },
+      routeIntent: { kind: "strategy" },
     })
 
     expect(
@@ -297,7 +323,7 @@ describe("Session metadata ownership", () => {
   test("worker delegation route/account conflicts stay producer-owned but fail closed", () => {
     for (const routeIntent of [
       { kind: "public" } as const,
-      { kind: "auto" } as const,
+      { kind: "strategy" } as const,
       { kind: "account", accountID: "acct-b", pin: "hard" } as const,
     ]) {
       const metadata = {
@@ -347,7 +373,7 @@ describe("Session metadata ownership", () => {
         {
           providerID: "opencode",
           modelID: "model-a",
-          routeIntent: { kind: "auto" },
+          routeIntent: { kind: "strategy" },
         },
       ),
     ).toBe(false)

@@ -63,10 +63,10 @@ export const ACTION_SCOPES = Object.freeze({
       "Native/OXP grep shares bounded read/search; outline and around reuse shared Symbols AST/cache, with around snippets never granting edit grounding.",
   }),
   usage: Object.freeze({
-    exposed: ["context"],
-    unavailable: ["totals", "breakdown", "timeline", "maintenance", "profile"],
-    externalOnly: [],
-    reason: "Global and cross-project usage analytics require separately authorized accounting access.",
+    exposed: ["context", "totals", "breakdown", "timeline", "maintenance", "profile", "workload", "summary", "oxpContext"],
+    unavailable: [],
+    externalOnly: ["workload", "summary", "oxpContext"],
+    reason: "Native and OXP share durable usage inspection. Global/cross-project actions require the independent default-off globalUsageAnalytics grant; workload, summary and oxpContext are OXP-specific accounting projections, not native Session permissions.",
   }),
 } as const)
 

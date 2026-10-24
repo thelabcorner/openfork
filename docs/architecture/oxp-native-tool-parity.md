@@ -9,6 +9,12 @@ OXP, OFXP, ACP, MCP and future interfaces. See
 OXP's passing inventory/dispatcher checks must not be interpreted as
 certification of the other surfaces.
 
+Native Session accessibility is a distinct, independent supervision authority:
+see the [October 2026 native Session visibility parity contract](./oxp-session-access-parity.md)
+for the explicit `all-native` supervision scope, why project-root discovery
+previously omitted real Sessions, the paged inventory contract, and the
+remaining cross-runtime federation and live deployment boundaries.
+
 ## Architectural contract
 
 **Every provider-visible OpenFork builtin MUST have a discoverable, executable,
@@ -234,7 +240,7 @@ difference is documented as a boundary, not presented as full action parity.
 - Custom/plugin and MCP tool inventories are dynamic and workspace-dependent.
   They are not blindly promoted from local Session permission or credentials;
   OXP's `namespace=mcp` requires an explicit root and independent authorization.
-- **Usage:** OXP `usage` is a lazy, read-only capability for `action=context`
+- **Usage:** OXP `usage` is lazy and read-only. `action=context`
   and an explicit existing `sessionID`. `OxpSupervision.resolve` verifies
   Session ownership and approved-root admission before the authoritative
   `Usage.sessionContext` read; admission is revalidated before egress. The
@@ -245,9 +251,26 @@ difference is documented as a boundary, not presented as full action parity.
   settled generation, with explicit provenance. It intentionally does **not**
   guess an in-flight request's final context-window occupancy. Neither the
   cumulative Session token total nor an unrelated ChatGPT conversation can
-  substitute for that measured provider footprint. Native cross-project totals, breakdown, timeline,
-  maintenance, and model profile remain unavailable over OXP until a separately
-  authorized project/global analytics boundary is implemented.
+  substitute for that measured provider footprint. Aggregate `totals`,
+  `breakdown`, `timeline`, `maintenance`, and `profile` reuse
+  `UsageInspectionContract` and `Usage.Service`; they require the independent
+  `globalUsageAnalytics` grant, default false and configurable in Desktop OXP
+  settings / `setGrant`. This grants aggregate settled usage only, not Session,
+  filesystem or process access. Admission is revalidated at egress and range
+  results use the existing bounded inspection contract. `workload` reuses
+  `Usage.workload` for native tool outcomes, wall-time distributions, bounded
+  tool/project leaderboards and generation latency; OXP caps rows at 20 and
+  rejects ranges longer than 90 days. Tool wall-time totals may overlap and are
+  not elapsed human time. Percentiles retain the owner's sample suppression and
+  null semantics; recorded tool telemetry may omit historical calls.
+  `summary` selects compact `activity`, `models`, `economics`, and/or `series`
+  projections from `Usage.summary`, with bounded leaderboard/series rows.
+  `oxpContext` reuses `OxpAttribution.snapshot` (including its optional bounded
+  workload buckets), so estimated OXP/surrounding tokens, calibration,
+  provenance, and coverage come from the same producer used by Desktop's OXP
+  Context panel; its 90-day max applies. All three require the same independent
+  global grant and revalidate before egress. Live in-flight context occupancy
+  remains unavailable.
 - **GitHub and quota:** ambient GitHub and model-provider credentials/accounts
   belong to the host principal. OXP must never silently inherit them. Dedicated
   external-principal integrations may be added with their own authentication
@@ -380,7 +403,7 @@ adapters are checked against both native and OXP parameter schemas.
 | `@code` | `search`, `describe`, `run` | `save`, `call` | — | Native saved-run publication and invocation require the real Session capability inventory. |
 | `@project` | `snapshot`, `summary`, `structure`, `recent`, `toolchain` | — | `structure` | Native/OXP snapshot supports summary, structure and full tiers through shared metadata inspection; OXP additionally requires process authority for toolchain. |
 | `@read` | `read`, `tail`, `grep`, `outline`, `around` | — | — | Native/OXP grep shares bounded read/search; outline and around reuse shared Symbols AST/cache, with around snippets never granting edit grounding. |
-| `@usage` | `context` | `totals`, `breakdown`, `timeline`, `maintenance`, `profile` | — | Global and cross-project usage analytics require separately authorized accounting access. |
+| `@usage` | `context`, `totals`, `breakdown`, `timeline`, `maintenance`, `profile`, `workload`, `summary`, `oxpContext` | — | `workload`, `summary`, `oxpContext` | Native and OXP share durable usage inspection. Global/cross-project actions require the independent default-off globalUsageAnalytics grant; workload, summary and oxpContext are OXP-specific accounting projections, not native Session permissions. |
 <!-- OXP-NATIVE-ACTION-SCOPES:END -->
 
 ## Deployment boundary

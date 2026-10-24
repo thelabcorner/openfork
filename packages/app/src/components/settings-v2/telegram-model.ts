@@ -31,9 +31,11 @@ export type QuotaAgendaView = {
   }[]
 }
 
-/** The OpenCode Go 5h quota is rolling, not a fixed-time reset. */
+/** Keep UI and backend consistent about moving/rolling reset estimates. */
 export function isRollingQuotaOption(row: Pick<TelegramSubscription, "providerId" | "windowKey">) {
-  return row.providerId === "opencode-go" && row.windowKey === "5h"
+  return (row.providerId === "opencode-go" && row.windowKey === "5h") ||
+    (row.providerId === "claude" &&
+      (row.windowKey === "5h" || row.windowKey === "weekly" || row.windowKey.startsWith("weekly:")))
 }
 
 export function subscriptionKey(row: Omit<TelegramSubscription, "enabled">) {

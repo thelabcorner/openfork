@@ -148,7 +148,7 @@ export const makeRuntime = (
             modelID: candidate.id,
             ...(candidate.accountID
               ? { accountID: candidate.accountID }
-              : { routeIntent: { kind: "auto" as const } }),
+              : { routeIntent: { kind: "strategy" as const } }),
             executionPurpose: "special-agent",
           })
           .pipe(Effect.option)
@@ -201,7 +201,7 @@ export const makeRuntime = (
         .resolveTransientRoutedModel({
           providerID: fallbackRef.providerID,
           modelID: fallbackRef.modelID,
-          routeIntent: { kind: "auto" },
+          routeIntent: { kind: "strategy" },
           executionPurpose: "special-agent",
         })
         .pipe(

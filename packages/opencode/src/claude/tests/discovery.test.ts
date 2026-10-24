@@ -35,6 +35,12 @@ describe("claude provider discovery", () => {
     expect(MODEL_IDS).toContain("claude-opus-4-8")
     expect(MODEL_IDS).toContain("claude-sonnet-4-6")
     expect(MODEL_IDS).toContain("claude-haiku-4-5")
+    expect(MODEL_IDS).toContain("claude-opus-5-5")
+    expect(MODEL_IDS).toContain("claude-sonnet-5-5")
+    expect(MODEL_IDS).toContain("claude-haiku-5-5")
+    expect(MODEL_METADATA["claude-opus-5-5"]?.contextLimit).toBe(1_000_000)
+    expect(MODEL_METADATA["claude-sonnet-5-5"]?.contextLimit).toBe(200_000)
+    expect(MODEL_METADATA["claude-haiku-5-5"]?.contextLimit).toBe(1_000_000)
   })
 
   it("aliases resolve to canonical IDs", () => {

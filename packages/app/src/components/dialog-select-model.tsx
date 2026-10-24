@@ -1927,7 +1927,7 @@ function createModelSelectorController(input: {
         {
           modelID: splitModelIDForProvider(item.id, item.provider.id).baseModelID,
           providerID: item.provider.id,
-          routeIntent: { kind: "auto", strategy },
+          routeIntent: { kind: "strategy", strategy },
         },
         { recent: true },
       )
@@ -2080,6 +2080,7 @@ function ModelSelectorPopoverV2View(props: {
       string,
       {
         label: string
+        state: "ready" | "cooling" | "exhausted" | "unknown"
         exhausted: boolean
         usedObserved: number | null
         limitEstimate: number | null
@@ -3221,6 +3222,10 @@ function ModelSelectorPopoverV2View(props: {
           })
           return
         }
+        // Account pinning expresses user intent, not route admissibility.
+        // Cooling, exhausted, or model-incompatible accounts remain pinnable;
+        // generation-time resolution reports any actual execution failure.
+        // Never silently substitute a different account for an explicit pin.
         if (!props.selectPinnedAccount(item, accountID)) throw new Error("Invalid hosted account selection")
         return
       }
@@ -3393,7 +3398,7 @@ function ModelSelectorPopoverV2View(props: {
           selectedAccountID={current() ? (props.currentAccountID?.() ?? props.currentVariant()?.accountID) : undefined}
           auto={displayGroup.auto}
           selectedAuto={current() && !props.currentVariant() && !props.currentAccountID?.()}
-           routingOptions={hostedAccountRoutingStrategies(item.provider.id, props.supportsRouteIntent)}
+           routingOptions={hostedAccountRoutingStrategies(item.provider.id, props.supportsRouteIntent, displayGroup.variants.length)}
           selectedRoutingStrategy={
             (() => {
               const intent = props.currentRouteIntent()
@@ -3402,7 +3407,7 @@ function ModelSelectorPopoverV2View(props: {
                 !current() ||
                 props.currentVariant() ||
                 props.currentAccountID?.() ||
-                (intent && intent.kind !== "auto")
+                (intent && intent.kind !== "strategy")
               ) {
                 return undefined
               }

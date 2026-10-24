@@ -74,7 +74,7 @@ export const ProviderRouteBindingTable = sqliteTable(
 
 
 /**
- * Durable provider/affinity cursor for provider-neutral Auto account policy.
+ * Durable provider/affinity cursor for provider-neutral account strategies.
  *
  * This state is intentionally secret-free. It is mutated only in the same
  * transaction that wins a ProviderRoute bind/rebind so a losing/stale routing

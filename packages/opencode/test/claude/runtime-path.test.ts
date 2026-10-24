@@ -4,7 +4,7 @@ import * as Stream from "effect/Stream"
 import type { ModelMessage, Tool } from "ai"
 import { LLMEvent } from "@opencode-ai/llm"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { ClaudeRuntimeAdapter, resetSharedState, userHistoryFingerprints } from "../../src/session/llm/claude-runtime"
+import { ClaudeRuntimeAdapter, ClaudeToolDeadlineError, buildPrompt, historyTransferRows, resetSharedState, runClaudeToolBounded, userHistoryFingerprints } from "../../src/session/llm/claude-runtime"
 import { markCanonicalFindToolMap } from "../../src/session/llm/tool-call-heal"
 import { ClaudeAgentRuntime } from "../../src/claude/runtime"
 import { BridgeStore } from "../../src/claude/bridge"
@@ -139,6 +139,97 @@ async function events(stream: ReturnType<typeof ClaudeRuntimeAdapter.stream>) {
 }
 
 describe("claude runtime integration: fake SDK through the real adapter path", () => {
+  test("non-cooperative tool cannot leave pending execution hanging past its deadline", async () => {
+    let gotAbort = false
+    let timeouts = 0
+    const result = runClaudeToolBounded({
+      signals: [new AbortController().signal],
+      timeoutMs: 15,
+      onTimeout: () => { timeouts++ },
+      run: (signal) => {
+        signal.addEventListener("abort", () => { gotAbort = true }, { once: true })
+        return new Promise<string>(() => {})
+      },
+    })
+    await expect(result).rejects.toBeInstanceOf(ClaudeToolDeadlineError)
+    expect(gotAbort).toBe(true)
+    expect(timeouts).toBe(1)
+  }, 1000)
+
+  test("pre-aborted tool does not execute and combined signal cancellation terminates it", async () => {
+    const aborted = new AbortController()
+    aborted.abort()
+    let ran = false
+    await expect(runClaudeToolBounded({
+      signals: [aborted.signal],
+      timeoutMs: 100,
+      run: () => { ran = true; return "invalid" },
+    })).rejects.toThrow("cancelled")
+    expect(ran).toBe(false)
+    const main = new AbortController()
+    const sdk = new AbortController()
+    let launchedAfterCancel = false
+    const done = runClaudeToolBounded({
+      signals: [main.signal, sdk.signal],
+      timeoutMs: 1000,
+      run: () => {
+        launchedAfterCancel = true
+        return new Promise(() => {})
+      },
+    })
+    // Abort in the same event-loop turn, before the scheduled execution task.
+    sdk.abort()
+    await expect(done).rejects.toThrow("cancelled")
+    expect(launchedAfterCancel).toBe(false)
+  }, 1000)
+
+  test("history transfer retains answered tool calls with names/results after session model switch", () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: "Inspect package.json" },
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "read-1", toolName: "read", input: { path: "package.json" } }],
+      },
+      {
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: "read-1", toolName: "read", output: { type: "text", value: "version 5.5.0" } }],
+      },
+      { role: "user", content: "Continue using the result" },
+    ] as ModelMessage[]
+    const rows = historyTransferRows(messages.slice(0, -1))
+    expect(rows.some((row) => row.content.includes("Tool call: read (id: read-1)"))).toBe(true)
+    expect(rows.some((row) => row.role === "tool" && row.content.includes("version 5.5.0"))).toBe(true)
+    const prompt = buildPrompt({ system: [], messages, resume: false, historyTransfer: rows })
+    expect(prompt).toBeString()
+    expect(prompt).toContain("Tool result (already executed; do not repeat):")
+    expect(prompt).toContain("Result of read (id: read-1)")
+    expect(prompt).toContain("Latest user message:")
+    expect(prompt).toContain("Continue using the result")
+  })
+
+  test("explicit custom agent and user instructions reach SDK privileged append without duplicating default prompt", async () => {
+    resetSharedState()
+    const script = new SdkScript()
+    const runtime = testRuntime({ loader: async () => fakeSdk(script) as never })
+    const run = events(ClaudeRuntimeAdapter.stream(baseInput({
+      runtime,
+      tools: {},
+      agentPrompt: "Agent specialization: review changes, never write files.",
+      userSystem: "For this request, produce only concise findings.",
+      system: ["Unrelated provider-compiled Claude default prompt; do not duplicate."],
+    })))
+    script.push({ type: "system", subtype: "init", session_id: "ext-agent-policy" })
+    script.push({ type: "result", subtype: "success", is_error: false, session_id: "ext-agent-policy", result: "done" })
+    script.end()
+    await run
+    const option = script.requests[0]?.options.systemPrompt as { type: string; preset: string; append: string }
+    expect(option.type).toBe("preset")
+    expect(option.preset).toBe("claude_code")
+    expect(option.append).toContain("Agent specialization: review changes, never write files.")
+    expect(option.append).toContain("For this request, produce only concise findings.")
+    expect(option.append).not.toContain("Unrelated provider-compiled Claude default prompt")
+  })
+
   test("history fingerprints ignore Plan reminders and promoted tool media", () => {
     const stable = userHistoryFingerprints([
       { role: "user" as const, content: "one" },
@@ -266,7 +357,13 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
       is_error: false,
       result: "All done.",
       session_id: "ext-rt-1",
-      usage: { input_tokens: 12, output_tokens: 7 },
+      usage: {
+        input_tokens: 12,
+        output_tokens: 7,
+        cache_read_input_tokens: 200,
+        cache_creation_input_tokens: 30,
+        output_tokens_details: { thinking_tokens: 3 },
+      },
     })
     script.end()
 
@@ -286,8 +383,12 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     const finish = list.find(LLMEvent.is.finish)
     expect(finish).toBeDefined()
     expect(finish?.reason).toBe("stop")
-    expect(finish?.usage?.inputTokens).toBe(12)
+    expect(finish?.usage?.inputTokens).toBe(242)
+    expect(finish?.usage?.nonCachedInputTokens).toBe(12)
+    expect(finish?.usage?.cacheReadInputTokens).toBe(200)
+    expect(finish?.usage?.cacheWriteInputTokens).toBe(30)
     expect(finish?.usage?.outputTokens).toBe(7)
+    expect(finish?.usage?.reasoningTokens).toBe(3)
 
     // Bridge recorded an exact-once completed settlement.
     const entry = store.get("call-1")

@@ -114,7 +114,7 @@ function resolveInput(
     providerID,
     modelID: "gpt-5",
     affinityDomain,
-    routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }),
+    routeIntent: ProviderRouteIntent.Info.make({ kind: "strategy" }),
     mode: "session-round-robin",
     freeRoutePreference: "account-first",
     allowPublic: true,

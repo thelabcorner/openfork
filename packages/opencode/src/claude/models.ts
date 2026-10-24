@@ -39,6 +39,9 @@ export const MODEL_HAIKU_ALIAS = "haiku"
 export const MODEL_OPUS_4_8 = "claude-opus-4-8"
 export const MODEL_SONNET_4_6 = "claude-sonnet-4-6"
 export const MODEL_HAIKU_4_5 = "claude-haiku-4-5"
+export const MODEL_OPUS_5_5 = "claude-opus-5-5"
+export const MODEL_SONNET_5_5 = "claude-sonnet-5-5"
+export const MODEL_HAIKU_5_5 = "claude-haiku-5-5"
 
 const LIMIT_1M = { context: 1_000_000, output: 128_000 } as const
 const LIMIT_200K = { context: 200_000, output: 64_000 } as const
@@ -69,6 +72,9 @@ export const MODEL_IDS = [
   MODEL_OPUS_4_8,
   MODEL_SONNET_4_6,
   MODEL_HAIKU_4_5,
+  MODEL_OPUS_5_5,
+  MODEL_SONNET_5_5,
+  MODEL_HAIKU_5_5,
 ]
 
 export const ClaudeModelStatus = Schema.Literals(["active", "unavailable", "setup-required", "deprecated"])
@@ -317,6 +323,40 @@ export const MODEL_METADATA: Record<string, ClaudeModelInfo> = {
     contextLimit: LIMIT_200K.context,
     outputLimit: LIMIT_200K.output,
   },
+  [MODEL_OPUS_5_5]: {
+    id: MODEL_OPUS_5_5,
+    name: "Claude Opus 5.5",
+    family: "claude-opus",
+    status: "active",
+    capabilities: CLAUDE_CAPABILITIES,
+    variants: effortVariants(ADAPTIVE_EFFORTS),
+    releaseDate: "",
+    contextLimit: LIMIT_1M.context,
+    outputLimit: LIMIT_1M.output,
+  },
+  [MODEL_SONNET_5_5]: {
+    id: MODEL_SONNET_5_5,
+    name: "Claude Sonnet 5.5",
+    family: "claude-sonnet",
+    status: "active",
+    capabilities: CLAUDE_CAPABILITIES,
+    variants: effortVariants(ADAPTIVE_EFFORTS),
+    releaseDate: "",
+    contextLimit: LIMIT_200K.context,
+    outputLimit: LIMIT_200K.output,
+  },
+  [MODEL_HAIKU_5_5]: {
+    id: MODEL_HAIKU_5_5,
+    name: "Claude Haiku 5.5",
+    family: "claude-haiku",
+    status: "active",
+    capabilities: CLAUDE_CAPABILITIES,
+    variants: {},
+    releaseDate: "",
+    // OpenChamber v1.4.1 corrected Haiku 5.5's advertised 200K to 1M.
+    contextLimit: LIMIT_1M.context,
+    outputLimit: LIMIT_1M.output,
+  },
 }
 
 /**
@@ -337,7 +377,8 @@ export interface ClaudeSdkModelRow {
   readonly supportedEffortLevels?: readonly string[]
 }
 
-const SUBSCRIPTION_CACHE_VERSION = 1
+// Invalidate v1 rows: older Haiku 5.5 snapshots advertised a false 200K window.
+const SUBSCRIPTION_CACHE_VERSION = 2
 export const CLAUDE_SUBSCRIPTION_MODEL_REFRESH_MS = 10 * 60_000
 const SUBSCRIPTION_CACHE_MAX_MODELS = 64
 const SUBSCRIPTION_CACHE_FILE = "claude-subscription-models.json"
@@ -469,6 +510,7 @@ const ONE_M_FAMILIES: ReadonlyArray<{ match: RegExp; mode: "default" | "optional
   { match: /^claude-opus-4-6/, mode: "default" },
   { match: /^claude-opus-4-[78]/, mode: "fixed" },
   { match: /^claude-sonnet-(5|4-6)/, mode: "optional" },
+  { match: /^claude-haiku-5/, mode: "fixed" },
 ]
 
 function normalizeClaudeModelID(id: string) {
@@ -571,13 +613,13 @@ export function claudeSubscriptionModelsFromSdk(
 }
 
 function emergencySubscriptionModels(modelsDev?: ModelsDev.Provider): Record<string, ClaudeModelInfo> {
-  // Bootstrap only. These concrete IDs mirror the current upstream
-  // opencode-claude fallback. models.dev may enrich these rows, but it never
+  // Bootstrap only. Keep this compact and current; models.dev may enrich these
+  // rows, but it never
   // decides which subscription models the signed-in account is entitled to.
   return claudeSubscriptionModelsFromSdk([
     {
-      value: "claude-opus-5-5",
-      resolvedModel: "claude-opus-5-5",
+      value: MODEL_OPUS_5_5,
+      resolvedModel: MODEL_OPUS_5_5,
       supportedEffortLevels: [...ADAPTIVE_EFFORTS],
     },
     {
@@ -586,18 +628,28 @@ function emergencySubscriptionModels(modelsDev?: ModelsDev.Provider): Record<str
       supportedEffortLevels: [...ADAPTIVE_EFFORTS],
     },
     {
+      value: MODEL_SONNET_5_5,
+      resolvedModel: MODEL_SONNET_5_5,
+      supportedEffortLevels: [...ADAPTIVE_EFFORTS],
+    },
+    {
       value: "claude-sonnet-5",
       resolvedModel: "claude-sonnet-5",
       supportedEffortLevels: [...ADAPTIVE_EFFORTS],
     },
     {
-      value: "claude-haiku-4-5",
-      resolvedModel: "claude-haiku-4-5",
+      value: MODEL_HAIKU_5_5,
+      resolvedModel: MODEL_HAIKU_5_5,
       supportedEffortLevels: [],
     },
     {
-      value: "claude-opus-4-8",
-      resolvedModel: "claude-opus-4-8",
+      value: MODEL_HAIKU_4_5,
+      resolvedModel: MODEL_HAIKU_4_5,
+      supportedEffortLevels: [],
+    },
+    {
+      value: MODEL_OPUS_4_8,
+      resolvedModel: MODEL_OPUS_4_8,
       supportedEffortLevels: [...ADAPTIVE_EFFORTS],
     },
   ], modelsDev)
@@ -680,6 +732,7 @@ export function resolveAlias(alias: string): string | undefined {
 
 // Return true if the model ID is a Claude-family model.
 export function isClaudeModel(modelID: string): boolean {
+  if (modelID === "fable" || modelID === "claude/fable") return true
   if (
     MODEL_IDS.includes(modelID) ||
     Boolean(getClaudeSubscriptionModelMetadata()[modelID]) ||
